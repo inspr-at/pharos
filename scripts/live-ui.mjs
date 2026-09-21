@@ -596,6 +596,7 @@ async function run(command) {
   } finally {
     await shutdownLiveSession({
       close: async () => {
+        if (gate && typeof gate.beginShutdown === "function") gate.beginShutdown();
         if (!browser) return;
         for (const context of browser.contexts()) {
           await context.close();

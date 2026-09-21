@@ -35,6 +35,7 @@ import {
   ISSUER_LOGIN_POST_PATHS,
   loadPasswordFile,
   loadUsernameFile,
+  openGuardedBrowser,
   installPrimaryFrameRoute,
   parseClientDraft,
   planInventory,
@@ -270,7 +271,7 @@ function percentOdd(secret) {
     .join("");
 }
 
-test("pathname, encoding, fragment, and short secrets stay out of verdicts", () => {
+test("pathname, encoding, fragment, and short secrets stay out of verdicts", async () => {
   const secret = FIXTURE_PASSWORD;
   const short = "s3cr";
   const tiny = "ab1";
@@ -288,6 +289,8 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", () 
     `https://pharos.barta.cm/pharos/hosts/pres3crpost`,
     `https://pharos.barta.cm/pharos/hosts/pre-ab1-post`,
     `https://pharos.barta.cm/pharos/map?x=pre-a%62%31-post`,
+    `https://pharos.barta.cm/pharos/map?pre-a%62%31-post=1`,
+    `https://pharos.barta.cm/pharos/map?${secret}=1`,
     `https://pharos.barta.cm/pharos/hosts/pre-%2561%2562%2531-post`,
     `https://user:${short}@pharos.barta.cm/pharos/map`,
   ];
@@ -311,6 +314,106 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", () 
   );
   assert.equal(leaks(evidence, secrets), false);
   assert.equal(publicPath(`/pharos/${short}`, [short]), "path-category");
+  const punctuated = "Ab!cdEF12";
+  const key = request("GET", `https://pharos.barta.cm/pharos/map?${encodeURIComponent(punctuated)}=1`, [punctuated]);
+  assert.equal(key.allow, false);
+  assert.equal(key.reason, "secret-in-url");
+  assert.equal(leaks(key, [punctuated]), false);
+  const keyedFetch = fakeFetchSession();
+  assert.equal(
+    await settleFetchPause(
+      keyedFetch,
+      { requestId: "query-key", request: { method: "GET", url: "https://pharos.barta.cm/pharos/map?pre-a%62%31-post=1" } },
+      { secrets: ["ab1"] },
+    ),
+    "failed",
+  );
+  assert.equal(keyedFetch.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  const main = { id: "main" };
+  const routed = primaryFrameDecision(
+    {
+      url: () => "https://pharos.barta.cm/pharos/map?pre-a%62%31-post=1",
+      method: () => "GET",
+      resourceType: () => "document",
+      frame: () => main,
+    },
+    { mainFrame: () => main },
+    { secrets: ["ab1"] },
+  );
+  assert.equal(routed.allow, false);
+  assert.equal(routed.reason, "secret-in-url");
+  assert.equal(leaks(routed, ["ab1"]), false);
+});
+
+test("unicode secrets match through percent-decoded paths, keys, and values", async () => {
+  const secret = "é!";
+  const face = "\u{1F600}";
+  const reviewer = "https://pharos.barta.cm/pharos/map?pre-%25C3%25A9!-post=1";
+  const hidden = [
+    reviewer,
+    `https://pharos.barta.cm/pharos/map?${encodeURIComponent(secret)}=1`,
+    `https://pharos.barta.cm/pharos/map?note=${encodeURIComponent(secret)}`,
+    `https://pharos.barta.cm/pharos/map?note=${encodeURIComponent(encodeURIComponent(secret))}`,
+    `https://pharos.barta.cm/pharos/map?pre-${encodeURIComponent(encodeURIComponent(secret))}-post=1`,
+    `https://pharos.barta.cm/pharos/${encodeURIComponent(secret)}`,
+    `https://pharos.barta.cm/pharos/%25C3%25A9!`,
+    `https://pharos.barta.cm/pharos/map#${encodeURIComponent(secret)}`,
+    `https://pharos.barta.cm/pharos/map#${encodeURIComponent(encodeURIComponent(secret))}`,
+    `https://pharos.barta.cm/pharos/map?${encodeURIComponent(face)}=1`,
+    `https://pharos.barta.cm/pharos/map?note=${encodeURIComponent(face)}`,
+    `https://pharos.barta.cm/pharos/map?pre-${encodeURIComponent(encodeURIComponent(face))}-post=1`,
+    `https://pharos.barta.cm/pharos/${encodeURIComponent(face)}`,
+    "https://pharos.barta.cm/pharos/map?x=%ED%A0%BD%ED%B8%80",
+    "https://pharos.barta.cm/pharos/map?x=%E0%83%A9!",
+  ];
+  for (const url of hidden) {
+    const result = request("GET", url, [secret, face]);
+    assert.equal(result.allow, false, url);
+    assert.equal(result.reason, "secret-in-url");
+    assert.equal(leaks(result, [secret, face, "%C3%A9", "%25C3%25A9"]), false);
+    const sanitized = sanitizeNavigationError(new Error(`navigation failed ${url}`), [secret, face]);
+    assert.equal(leaks(sanitized, [secret, face]), false);
+  }
+  const keyedFetch = fakeFetchSession();
+  assert.equal(
+    await settleFetchPause(
+      keyedFetch,
+      { requestId: "unicode-key", request: { method: "GET", url: reviewer } },
+      { secrets: [secret] },
+    ),
+    "failed",
+  );
+  assert.equal(keyedFetch.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  assert.equal(keyedFetch.calls[0].method, "Fetch.failRequest");
+  const main = { id: "main" };
+  const routed = primaryFrameDecision(
+    {
+      url: () => reviewer,
+      method: () => "GET",
+      resourceType: () => "document",
+      frame: () => main,
+    },
+    { mainFrame: () => main },
+    { secrets: [secret] },
+  );
+  assert.equal(routed.allow, false);
+  assert.equal(routed.reason, "secret-in-url");
+  assert.equal(leaks(routed, [secret]), false);
+  for (const url of [
+    "https://pharos.barta.cm/pharos/map?section=settings",
+    "https://pharos.barta.cm/pharos/map?q=%",
+    "https://pharos.barta.cm/pharos/map?q=%2",
+    "https://pharos.barta.cm/pharos/map?q=%ZZ",
+    "https://pharos.barta.cm/pharos/map?q=%C3%",
+    "https://pharos.barta.cm/pharos/map?q=%ED%A0%80",
+    "https://pharos.barta.cm/pharos/map",
+  ]) {
+    assert.equal(request("GET", url, [secret, face]).allow, true, url);
+  }
+  assert.equal(
+    request("GET", "https://pharos.barta.cm/pharos/map?q=%ZZ&pre-%25C3%25A9!-post=1", [secret]).allow,
+    false,
+  );
 });
 
 test("issuer reads are allowlisted and incidental channels fail closed", () => {
@@ -886,6 +989,11 @@ test("the browser session is headless, memory-only, and guarded before login", (
   assert.ok(loginAt > armAt);
   assert.ok(runner.indexOf("shutdownLiveSession", finallyAt) > finallyAt);
   assert.ok(runner.indexOf("gate.close()", finallyAt) > runner.indexOf("shutdownLiveSession", finallyAt));
+  const shutdownClose = runner.slice(runner.indexOf("close: async () => {"), runner.indexOf("sessions: fetchSessions"));
+  assert.ok(shutdownClose.indexOf("beginShutdown") >= 0);
+  assert.ok(shutdownClose.indexOf("beginShutdown") < shutdownClose.indexOf("browser.close()"));
+  const openedGuard = guard.slice(guard.indexOf("export async function openGuardedBrowser"));
+  assert.ok(openedGuard.indexOf("setEmergencyClose") < openedGuard.indexOf("await gate.enable"));
   assert.equal(runner.indexOf("secrets.fill", finallyAt), -1);
   assert.equal(runner.indexOf("disposeFetchGuard", finallyAt), -1);
   const shotAt = runner.indexOf("takeAuthenticatedShot", runner.indexOf("async function shoot"));
@@ -1007,16 +1115,24 @@ test("fetch guard enables request-stage pauses, cancels auth, and disposes after
   await enableFetchGuard(session, { secrets: [] }, () => {});
   assert.deepEqual(
     session.calls.map((call) => call.method === "on" ? `on:${call.event}` : call.method),
-    ["on:Fetch.requestPaused", "on:Fetch.authRequired", "Fetch.enable"],
+    ["on:close", "on:Fetch.requestPaused", "on:Fetch.authRequired", "Fetch.enable"],
   );
-  assert.deepEqual(session.calls[2].params.patterns, [{ urlPattern: "*", requestStage: "Request" }]);
-  assert.equal(session.calls[2].params.handleAuthRequests, true);
+  const enabled = session.calls.find((call) => call.method === "Fetch.enable");
+  assert.deepEqual(enabled.params.patterns, [{ urlPattern: "*", requestStage: "Request" }]);
+  assert.equal(enabled.params.handleAuthRequests, true);
   await session.listeners["Fetch.requestPaused"]({
     requestId: "direct-post",
     request: { method: "POST", url: "https://pharos.barta.cm/pharos/auth/logout" },
   });
   assert.equal(session.calls.some((call) => call.method === "Fetch.failRequest"), true);
   assert.equal(session.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  session.listeners.close();
+  await session.listeners["Fetch.requestPaused"]({
+    requestId: "after-close",
+    request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+  });
+  assert.equal(session.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  assert.equal(session.calls.filter((call) => call.method === "Fetch.failRequest").at(-1).params.requestId, "after-close");
 
   const auth = fakeFetchSession();
   assert.equal(await settleFetchAuth(auth, { requestId: "challenge" }), "cancelled");
@@ -1070,8 +1186,12 @@ function attachEvent(type, targetId, sessionId, waitingForDebugger = true) {
 }
 
 test("flat attach resumes only the first page and closes every other target", async () => {
+  const expectedCloses = [];
   const { connection, sent } = flatTransport();
   const gate = createFlatTargetGuard(connection);
+  gate.setEmergencyClose(() => {
+    expectedCloses.push("browser");
+  });
   await gate.enable();
   assert.equal(sent[0].method, "Target.setAutoAttach");
   assert.equal(Object.hasOwn(sent[0], "sessionId"), false);
@@ -1107,28 +1227,281 @@ test("flat attach resumes only the first page and closes every other target", as
   await gate.settled();
   const closed = sent.filter((entry) => entry.method === "Target.closeTarget").map((entry) => entry.params.targetId);
   assert.deepEqual(closed, ["popup", "frame-1", "worker-1", "shared-1", "sw-1"]);
+  assert.deepEqual(expectedCloses, []);
+  assert.equal(gate.compromised(), "");
   assert.equal(sent.filter((entry) => entry.method === "Runtime.runIfWaitingForDebugger").length, 1);
   assert.equal(sent.filter((entry) => entry.method === "Target.closeTarget").every((entry) => !entry.sessionId), true);
   assert.equal(JSON.stringify(sent).includes("secret"), false);
 
+  const unpausedCloses = [];
   const unpaused = flatTransport();
   const unpausedGate = createFlatTargetGuard(unpaused.connection);
+  unpausedGate.setEmergencyClose(() => {
+    unpausedCloses.push("browser");
+  });
   await unpausedGate.enable();
   unpaused.connection.receive(attachEvent("iframe", "already-running", "late", false));
   await unpausedGate.settled();
   assert.equal(unpausedGate.compromised(), "unpaused");
   assert.equal(unpaused.sent.some((entry) => entry.method === "Runtime.runIfWaitingForDebugger"), false);
-  assert.equal(unpaused.sent.some((entry) => entry.method === "Target.closeTarget"), true);
+  assert.deepEqual(unpausedCloses, ["browser"]);
 
+  const brokenCloses = [];
   const broken = flatTransport({ failMethod: "Runtime.runIfWaitingForDebugger" });
   const brokenGate = createFlatTargetGuard(broken.connection);
+  brokenGate.setEmergencyClose(() => {
+    brokenCloses.push("browser");
+  });
   await brokenGate.enable();
   broken.connection.receive(attachEvent("page", "primary", "page-session"));
   await brokenGate.settled();
   assert.equal(brokenGate.compromised(), "primary");
-  assert.equal(broken.sent.some((entry) => entry.method === "Target.closeTarget" && entry.params.targetId === "primary"), true);
+  assert.deepEqual(brokenCloses, ["browser"]);
+  assert.equal(broken.sent.some((entry) => entry.method === "Target.closeTarget"), false);
   assert.equal(JSON.stringify(broken.sent).includes("secret-token"), false);
   assert.equal(JSON.stringify(broken.sent).includes("devtools"), false);
+});
+
+test("lost protocol state closes the primary target and stops later continuations", async () => {
+  const detachedCloses = [];
+  const { connection, sent } = flatTransport();
+  const gate = createFlatTargetGuard(connection);
+  gate.setEmergencyClose(() => {
+    detachedCloses.push("browser");
+  });
+  await gate.enable();
+  connection.receive(attachEvent("page", "primary", "page-session"));
+  await gate.settled();
+  assert.equal(gate.compromised(), "");
+  connection.receive(JSON.stringify({
+    method: "Target.detachedFromTarget",
+    params: { sessionId: "page-session", targetId: "primary" },
+  }));
+  await gate.settled();
+  assert.equal(gate.compromised(), "detached");
+  assert.deepEqual(detachedCloses, ["browser"]);
+  assert.equal(sent.some((entry) => entry.method === "Target.closeTarget" && entry.params.targetId === "primary"), false);
+
+  const lostCloses = [];
+  const lost = flatTransport();
+  const lostGate = createFlatTargetGuard(lost.connection);
+  lostGate.setEmergencyClose(() => {
+    lostCloses.push("browser");
+  });
+  await lostGate.enable();
+  lost.connection.receive(attachEvent("page", "primary", "page-session"));
+  await lostGate.settled();
+  lost.connection.failAll();
+  lostGate.noteDisconnect();
+  lostGate.noteDisconnect();
+  await lostGate.settled();
+  assert.equal(lostGate.compromised(), "disconnected");
+  assert.deepEqual(lostCloses, ["browser"]);
+  assert.equal(lost.sent.some((entry) => entry.method === "Target.closeTarget"), false);
+  const redirected = fakeFetchSession();
+  assert.equal(
+    await settleFetchPause(
+      redirected,
+      {
+        requestId: "redirected-login",
+        redirectedRequestId: "authorize",
+        request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+      },
+      { secrets: ["synthetic-only-secret"], gate: lostGate },
+    ),
+    "failed",
+  );
+  assert.equal(redirected.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  assert.equal(redirected.calls[0].method, "Fetch.failRequest");
+
+  const workerDetach = flatTransport();
+  const workerGate = createFlatTargetGuard(workerDetach.connection);
+  await workerGate.enable();
+  workerDetach.connection.receive(attachEvent("page", "primary", "page-session"));
+  await workerGate.settled();
+  workerDetach.connection.receive(JSON.stringify({
+    method: "Target.detachedFromTarget",
+    params: { sessionId: "shared-session", targetId: "shared-1" },
+  }));
+  await workerGate.settled();
+  assert.equal(workerGate.compromised(), "");
+
+  const commandCloses = [];
+  const command = flatTransport({ failMethod: "Target.closeTarget" });
+  const commandGate = createFlatTargetGuard(command.connection);
+  commandGate.setEmergencyClose(() => {
+    commandCloses.push("browser");
+  });
+  await commandGate.enable();
+  command.connection.receive(attachEvent("page", "primary", "page-session"));
+  await commandGate.settled();
+  command.connection.receive(attachEvent("shared_worker", "shared-1", "shared-session"));
+  await commandGate.settled();
+  assert.equal(commandGate.compromised(), "close");
+  assert.deepEqual(commandCloses, ["browser"]);
+  assert.equal(JSON.stringify(command.sent).includes("devtools"), false);
+
+  const teardownCloses = [];
+  const teardown = flatTransport();
+  const teardownGate = createFlatTargetGuard(teardown.connection);
+  teardownGate.setEmergencyClose(() => {
+    teardownCloses.push("browser");
+  });
+  await teardownGate.enable();
+  teardown.connection.receive(attachEvent("page", "primary", "page-session"));
+  await teardownGate.settled();
+  teardownGate.beginShutdown();
+  teardownGate.noteDisconnect();
+  teardown.connection.receive(JSON.stringify({
+    method: "Target.detachedFromTarget",
+    params: { sessionId: "page-session", targetId: "primary" },
+  }));
+  await teardownGate.settled();
+  teardownGate.close();
+  assert.deepEqual(teardownCloses, []);
+  assert.equal(teardownGate.compromised(), "");
+
+  const fetchCloses = [];
+  const fetchLoss = flatTransport();
+  const fetchGate = createFlatTargetGuard(fetchLoss.connection);
+  fetchGate.setEmergencyClose(() => {
+    fetchCloses.push("browser");
+  });
+  await fetchGate.enable();
+  const session = fakeFetchSession();
+  await enableFetchGuard(session, { gate: fetchGate, secrets: ["synthetic-only-secret"] }, () => {});
+  session.listeners.close();
+  session.listeners.close();
+  assert.deepEqual(fetchCloses, ["browser"]);
+  assert.equal(fetchGate.compromised(), "disconnected");
+  assert.equal(
+    await settleFetchPause(
+      session,
+      {
+        requestId: "after-fetch-close",
+        redirectedRequestId: "authorize",
+        request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+      },
+      { secrets: ["synthetic-only-secret"], gate: fetchGate },
+    ),
+    "failed",
+  );
+});
+
+test("a closed raw debugger socket closes the Playwright browser once", async () => {
+  const browser = {
+    closes: 0,
+    contextsClosed: 0,
+    contexts() {
+      return [{
+        async close() {
+          browser.contextsClosed += 1;
+        },
+      }];
+    },
+    async close() {
+      browser.closes += 1;
+    },
+  };
+  let socket;
+  class Socket {
+    constructor(url) {
+      const parsed = new URL(url);
+      assert.equal(parsed.hostname, "127.0.0.1");
+      assert.equal(parsed.protocol, "ws:");
+      assert.equal(parsed.username, "");
+      assert.equal(parsed.search, "");
+      socket = this;
+      this.listeners = {};
+      this.sent = [];
+    }
+
+    addEventListener(type, fn) {
+      (this.listeners[type] ||= []).push(fn);
+      if (type === "open") fn();
+    }
+
+    send(text) {
+      const envelope = JSON.parse(text);
+      this.sent.push(envelope);
+      queueMicrotask(() => {
+        for (const fn of this.listeners.message || []) {
+          fn({ data: JSON.stringify({ id: envelope.id, result: {} }) });
+        }
+      });
+    }
+
+    close() {
+      for (const fn of this.listeners.close || []) fn();
+    }
+  }
+  const { gate } = await openGuardedBrowser((options) => {
+    assert.equal(options.headless, true);
+    assert.equal(options.args.length, 2);
+    return browser;
+  }, {
+    fetch: async (url) => {
+      const port = new URL(url).port;
+      return {
+        ok: true,
+        text: async () => JSON.stringify({
+          Browser: "Chrome/test",
+          webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/local-id`,
+        }),
+      };
+    },
+    WebSocket: Socket,
+  });
+  assert.equal(browser.closes, 0);
+  socket.close();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(gate.compromised(), "disconnected");
+  assert.equal(browser.contextsClosed, 1);
+  assert.equal(browser.closes, 1);
+  assert.equal(socket.sent.some((entry) => entry.method === "Target.closeTarget"), false);
+  socket.close();
+  for (const fn of socket.listeners.error || []) fn();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(browser.closes, 1);
+
+  const errorBrowser = {
+    closes: 0,
+    contexts() {
+      return [];
+    },
+    async close() {
+      errorBrowser.closes += 1;
+    },
+  };
+  let errorSocket;
+  class ErrorSocket extends Socket {
+    constructor(url) {
+      super(url);
+      errorSocket = this;
+    }
+  }
+  const opened = await openGuardedBrowser(() => errorBrowser, {
+    fetch: async (url) => {
+      const port = new URL(url).port;
+      return {
+        ok: true,
+        text: async () => JSON.stringify({
+          Browser: "Chrome/test",
+          webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/local-id`,
+        }),
+      };
+    },
+    WebSocket: ErrorSocket,
+  });
+  for (const fn of errorSocket.listeners.error || []) fn();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(opened.gate.compromised(), "disconnected");
+  assert.equal(errorBrowser.closes, 1);
+  opened.gate.beginShutdown();
+  opened.gate.close();
+  assert.equal(errorBrowser.closes, 1);
+  gate.beginShutdown();
+  gate.close();
 });
 
 test("the debugger endpoint stays on the reserved loopback port", async () => {

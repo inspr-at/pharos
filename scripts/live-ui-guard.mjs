@@ -305,40 +305,118 @@ function listedSecrets(secrets) {
   return (Array.isArray(secrets) ? secrets : []).filter((secret) => typeof secret === "string" && secret.length > 0);
 }
 
-function decodeOnceSafe(value) {
-  const text = String(value ?? "");
-  if (!text.includes("%")) return text;
+function latin1Bytes(bytes) {
   let out = "";
-  for (let index = 0; index < text.length; index += 1) {
-    if (text[index] === "%" && /^[0-9A-Fa-f]{2}$/.test(text.slice(index + 1, index + 3))) {
-      out += String.fromCharCode(Number.parseInt(text.slice(index + 1, index + 3), 16));
-      index += 2;
+  for (const byte of bytes) out += String.fromCharCode(byte);
+  return out;
+}
+
+function structuralUtf8Length(bytes, index) {
+  const lead = bytes[index];
+  let need = 0;
+  if (lead <= 0x7F) need = 1;
+  else if ((lead & 0xE0) === 0xC0) need = 2;
+  else if ((lead & 0xF0) === 0xE0) need = 3;
+  else if ((lead & 0xF8) === 0xF0 && lead <= 0xF7) need = 4;
+  if (need === 0 || index + need > bytes.length) return 0;
+  for (let cursor = 1; cursor < need; cursor += 1) {
+    if ((bytes[index + cursor] & 0xC0) !== 0x80) return 0;
+  }
+  return need;
+}
+
+function codePointFromUtf8(bytes, index, length) {
+  if (length === 1) return bytes[index];
+  if (length === 2) return ((bytes[index] & 0x1F) << 6) | (bytes[index + 1] & 0x3F);
+  if (length === 3) {
+    return ((bytes[index] & 0x0F) << 12) | ((bytes[index + 1] & 0x3F) << 6) | (bytes[index + 2] & 0x3F);
+  }
+  return (
+    ((bytes[index] & 0x07) << 18) |
+    ((bytes[index + 1] & 0x3F) << 12) |
+    ((bytes[index + 2] & 0x3F) << 6) |
+    (bytes[index + 3] & 0x3F)
+  );
+}
+
+function utf8Bytes(bytes) {
+  const points = [];
+  for (let index = 0; index < bytes.length; ) {
+    const length = structuralUtf8Length(bytes, index);
+    const point = length === 0 ? null : codePointFromUtf8(bytes, index, length);
+    if (point === null || point > 0x10FFFF) {
+      points.push(bytes[index]);
+      index += 1;
+      continue;
+    }
+    points.push(point);
+    index += length;
+  }
+  let out = "";
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const next = points[index + 1];
+    if (point >= 0xD800 && point <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) {
+      out += String.fromCodePoint(0x10000 + ((point - 0xD800) << 10) + (next - 0xDC00));
+      index += 1;
     } else {
-      out += text[index];
+      out += String.fromCodePoint(point);
     }
   }
   return out;
 }
 
-function decodeRepeated(value) {
-  let current = String(value ?? "");
-  const forms = [current];
-  for (let index = 0; index < 8; index += 1) {
-    const next = decodeOnceSafe(current);
-    if (next === current) break;
-    forms.push(next);
-    current = next;
+function decodeOnceSafe(value, mode) {
+  const text = String(value ?? "");
+  if (!text.includes("%")) return text;
+  let out = "";
+  const bytes = [];
+  const flush = () => {
+    if (bytes.length === 0) return;
+    out += mode === "latin1" ? latin1Bytes(bytes) : utf8Bytes(bytes);
+    bytes.length = 0;
+  };
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "%" && /^[0-9A-Fa-f]{2}$/.test(text.slice(index + 1, index + 3))) {
+      bytes.push(Number.parseInt(text.slice(index + 1, index + 3), 16));
+      index += 2;
+    } else {
+      flush();
+      out += text[index];
+    }
   }
-  return forms;
+  flush();
+  return out;
+}
+
+function decodeRepeated(value) {
+  const forms = new Set([String(value ?? "")]);
+  let frontier = [...forms];
+  for (let round = 0; round < 8; round += 1) {
+    const grown = [];
+    for (const current of frontier) {
+      if (!current.includes("%")) continue;
+      for (const mode of ["utf8", "latin1"]) {
+        const next = decodeOnceSafe(current, mode);
+        if (!forms.has(next)) {
+          forms.add(next);
+          grown.push(next);
+        }
+      }
+    }
+    if (grown.length === 0) break;
+    frontier = grown;
+  }
+  return [...forms];
 }
 
 function percentEncode(secret, alphabet) {
-  return [...secret]
-    .map((char) => {
-      const hex = char.charCodeAt(0).toString(16).padStart(2, "0");
-      return `%${alphabet === "upper" ? hex.toUpperCase() : hex}`;
-    })
-    .join("");
+  let out = "";
+  for (const byte of new TextEncoder().encode(String(secret))) {
+    const hex = byte.toString(16).padStart(2, "0");
+    out += `%${alphabet === "upper" ? hex.toUpperCase() : hex}`;
+  }
+  return out;
 }
 
 function secretVariants(secret) {
@@ -348,17 +426,12 @@ function secretVariants(secret) {
   };
   add(percentEncode(secret, "lower"));
   add(percentEncode(secret, "upper"));
-  add(
-    [...secret]
-      .map((char, index) =>
-        index % 2 === 0 ? `%${char.charCodeAt(0).toString(16).padStart(2, "0")}` : char,
-      )
-      .join(""),
-  );
+  const chars = [...String(secret)];
+  add(chars.map((char, index) => (index % 2 === 0 ? percentEncode(char, "lower") : char)).join(""));
   add(secret.replace(/[@/?#&+=\s]/g, (char) => encodeURIComponent(char)));
-  const mid = Math.ceil(secret.length / 2);
-  add(`${percentEncode(secret.slice(0, mid), "lower")}${secret.slice(mid)}`);
-  add(`${secret.slice(0, mid)}${percentEncode(secret.slice(mid), "upper")}`);
+  const mid = Math.ceil(chars.length / 2);
+  add(`${percentEncode(chars.slice(0, mid).join(""), "lower")}${chars.slice(mid).join("")}`);
+  add(`${chars.slice(0, mid).join("")}${percentEncode(chars.slice(mid).join(""), "upper")}`);
   add(percentEncode(percentEncode(secret, "lower"), "lower"));
   return [...variants];
 }
@@ -386,22 +459,32 @@ function rawPath(raw, url) {
   return clean.slice(start) || "/";
 }
 
+function rawQuery(raw) {
+  const clean = String(raw).split("#")[0];
+  const cut = clean.indexOf("?");
+  if (cut < 0) return "";
+  return clean.slice(cut + 1);
+}
+
 function pathLeaks(url, raw, secrets) {
   return pieceMatchesSecret(url.pathname || "/", secrets) || pieceMatchesSecret(rawPath(raw, url), secrets);
 }
 
 function secretInUrl(raw, url, secrets) {
   if (url.username || url.password) return true;
-  for (const key of url.searchParams.keys()) {
-    if (SECRET_QUERY_KEYS.has(String(key).toLowerCase())) return true;
-  }
   const pieces = [
     url.username,
     url.password,
     url.hash.startsWith("#") ? url.hash.slice(1) : url.hash,
     url.pathname,
-    ...url.searchParams.values(),
+    rawQuery(raw),
+    url.search.startsWith("?") ? url.search.slice(1) : url.search,
   ];
+  for (const key of url.searchParams.keys()) {
+    pieces.push(key);
+    if (SECRET_QUERY_KEYS.has(String(key).toLowerCase())) return true;
+  }
+  for (const value of url.searchParams.values()) pieces.push(value);
   if (pieces.some((piece) => pieceMatchesSecret(piece, secrets))) return true;
   return pathLeaks(url, raw, secrets);
 }
@@ -1114,7 +1197,19 @@ function headerUpgrade(headers) {
   return String(headers.upgrade || headers.Upgrade || "");
 }
 
+function protocolLost(policy) {
+  if (policy?.protocolLost === true) return true;
+  const gate = policy?.gate;
+  return typeof gate?.compromised === "function" && Boolean(gate.compromised());
+}
+
 export function decideFetchPause(event, policy = {}) {
+  if (protocolLost(policy)) {
+    return {
+      action: "fail",
+      verdict: decision(false, "network-guard", "?", "/", listedSecrets(policy.secrets)),
+    };
+  }
   if (event?.responseStatusCode || event?.responseErrorReason) {
     return {
       action: "fail",
@@ -1187,7 +1282,23 @@ export async function enableFetchGuard(session, policy, rememberFn) {
   if (!session || typeof session.on !== "function" || typeof session.send !== "function") {
     throw new LiveUiError("network-guard");
   }
-  session.on("Fetch.requestPaused", (paused) => settleFetchPause(session, paused, policy, rememberFn).catch(() => {}));
+  let lost = false;
+  const lose = () => {
+    lost = true;
+    const gate = policy?.gate;
+    if (typeof gate?.noteDisconnect === "function") {
+      try {
+        gate.noteDisconnect();
+      } catch {
+        // The local flag still stops every later continuation.
+      }
+    }
+  };
+  session.on("close", lose);
+  session.on("Fetch.requestPaused", (paused) => {
+    const active = lost ? { ...policy, protocolLost: true } : policy;
+    settleFetchPause(session, paused, active, rememberFn).catch(() => {});
+  });
   session.on("Fetch.authRequired", (challenge) => settleFetchAuth(session, challenge).catch(() => {}));
   await session.send("Fetch.enable", {
     patterns: fetchPausePatterns(),
@@ -1289,21 +1400,36 @@ export function createFlatTargetGuard(connection) {
     throw new LiveUiError("network-guard");
   }
   let primaryId = "";
+  let primarySessionId = "";
   let failure = "";
   let intentionalClose = false;
+  let emergencyStarted = false;
+  let emergencyClose = null;
   let settled = Promise.resolve();
   const fail = (code) => {
     if (!failure) failure = code || "target";
   };
+  const terminate = (reason) => {
+    if (intentionalClose) return;
+    fail(reason);
+    if (emergencyStarted || typeof emergencyClose !== "function") return;
+    emergencyStarted = true;
+    try {
+      const pending = emergencyClose();
+      if (pending && typeof pending.then === "function") pending.catch(() => {});
+    } catch {
+      // The compromised flag already denies later Fetch continuations.
+    }
+  };
   const closeTarget = async (targetId) => {
     if (!targetId) {
-      fail("close");
+      terminate("close");
       return;
     }
     try {
       await connection.send("Target.closeTarget", { targetId });
     } catch {
-      fail("close");
+      terminate("close");
     }
   };
   const onAttached = async (event) => {
@@ -1311,45 +1437,62 @@ export function createFlatTargetGuard(connection) {
     const type = String(info.type || "");
     if (type === "browser" || type === "tab") return;
     if (!event?.waitingForDebugger) {
-      fail("unpaused");
-      await closeTarget(info.targetId);
+      terminate("unpaused");
       return;
     }
     if (type === "page" && !primaryId) {
       const sessionId = String(event.sessionId || "");
       if (!sessionId || !info.targetId) {
-        fail("primary");
-        await closeTarget(info.targetId);
+        terminate("primary");
         return;
       }
       primaryId = info.targetId;
+      primarySessionId = sessionId;
       try {
         await connection.send("Target.setAutoAttach", FLAT_ATTACH, sessionId);
         await connection.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
       } catch {
-        fail("primary");
-        await closeTarget(info.targetId);
+        terminate("primary");
       }
       return;
     }
     await closeTarget(info.targetId);
   };
+  const onDetached = async (event) => {
+    const sessionId = String(event?.sessionId || "");
+    const targetId = String(event?.targetId || "");
+    const primary = (!sessionId && !targetId) || sessionId === primarySessionId || targetId === primaryId;
+    if (!primary || !primaryId) return;
+    terminate("detached");
+  };
   connection.onEvent((method, params) => {
-    if (method !== "Target.attachedToTarget") return;
-    settled = settled.then(() => onAttached(params)).catch(() => fail("attach"));
+    if (method === "Target.attachedToTarget") {
+      settled = settled.then(() => onAttached(params)).catch(() => terminate("attach"));
+      return;
+    }
+    if (method === "Target.detachedFromTarget") {
+      settled = settled.then(() => onDetached(params)).catch(() => terminate("detach"));
+    }
   });
   return {
     compromised: () => failure,
     attachedPrimary: () => primaryId,
+    setEmergencyClose(close) {
+      emergencyClose = close;
+    },
+    beginShutdown() {
+      intentionalClose = true;
+    },
     noteDisconnect() {
-      if (!intentionalClose) fail("disconnected");
+      if (intentionalClose) return;
+      terminate("disconnected");
     },
     settled: () => settled,
     async enable() {
       try {
         await connection.send("Target.setAutoAttach", FLAT_ATTACH);
       } catch {
-        fail("protocol");
+        terminate("protocol");
         throw new LiveUiError("network-guard");
       }
     },
@@ -1466,23 +1609,41 @@ export async function connectFlatDebugger(port, deps = {}) {
   return gate;
 }
 
+async function closeLiveBrowser(browser) {
+  if (!browser) return;
+  try {
+    const contexts = typeof browser.contexts === "function" ? browser.contexts() : [];
+    for (const context of contexts) {
+      if (typeof context?.close === "function") await context.close();
+    }
+  } catch {
+    // The browser close is the termination that does not depend on the raw socket.
+  }
+  if (typeof browser.close === "function") await browser.close();
+}
+
 export async function openGuardedBrowser(launchBrowser, deps) {
   if (typeof launchBrowser !== "function") throw new LiveUiError("browser-launch");
   const port = await reserveLoopbackDebuggerPort();
   const launch = browserLaunchOptions(port);
   let browser;
+  let gate;
   try {
     browser = await launchBrowser(launch);
-    const gate = await connectFlatDebugger(port, deps);
+    gate = await connectFlatDebugger(port, deps);
+    gate.setEmergencyClose(() => closeLiveBrowser(browser));
     try {
       await gate.enable();
     } catch (error) {
+      gate.beginShutdown();
       gate.close();
       throw error;
     }
     return { browser, gate };
   } catch (error) {
-    if (browser && typeof browser.close === "function") await browser.close().catch(() => {});
+    if (browser && typeof browser.close === "function" && !gate?.compromised()) {
+      await browser.close().catch(() => {});
+    }
     if (error instanceof LiveUiError) throw error;
     throw new LiveUiError("network-guard");
   }
