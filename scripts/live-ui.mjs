@@ -59,6 +59,7 @@ const EMPTY_PROBE = Object.freeze({
   rateLimited: false,
   loginForm: false,
   authUiVisible: false,
+  accountSetup: false,
 });
 
 function isDirectRun() {
@@ -183,6 +184,7 @@ async function fillIssuerCredentialsOnce(page, username, password) {
   const origin = await page.evaluate(() => location.origin);
   assertCredentialEntryOrigin(origin);
   const before = await readProbe(page);
+  if (before.accountSetup) return "account-setup-required";
   if (before.mfa) return "mfa-required";
   if (!credentialFillPermitted(before)) return "auth-required";
   const passwords = page.locator("input[type='password']");
@@ -200,11 +202,13 @@ async function fillIssuerCredentialsOnce(page, username, password) {
       await passwords.first().waitFor({ state: "visible", timeout: 15_000 });
     } catch {
       const stalled = await readProbe(page);
+      if (stalled.accountSetup) return "account-setup-required";
       if (stalled.mfa) return "mfa-required";
       return "auth-required";
     }
   }
   const again = await readProbe(page);
+  if (again.accountSetup) return "account-setup-required";
   if (again.mfa) return "mfa-required";
   if (!credentialFillPermitted(again) || (await passwords.count()) !== 1) return "auth-required";
   const fieldOrigin = await passwords.first().evaluate((element) => {
@@ -251,14 +255,19 @@ async function signIn(page, username, password, policy) {
     if (filled !== "submitted") {
       probe = await readProbe(page);
       viewed = observe(page.url(), 0, probe, false, policy.secrets);
-      viewed.classification = filled === "mfa-required" || probe.mfa ? "mfa-required" : "auth-required";
+      if (filled === "account-setup-required" || probe.accountSetup) {
+        viewed.classification = "account-setup-required";
+      } else {
+        viewed.classification = filled === "mfa-required" || probe.mfa ? "mfa-required" : "auth-required";
+      }
       return viewed;
     }
     await waitForReturnedApp(page);
     probe = await readProbe(page);
     viewed = observe(page.url(), 0, probe, false, policy.secrets);
   }
-  if (probe.mfa) viewed.classification = "mfa-required";
+  if (probe.accountSetup) viewed.classification = "account-setup-required";
+  else if (probe.mfa) viewed.classification = "mfa-required";
   return viewed;
 }
 
@@ -517,7 +526,11 @@ async function run(command) {
       seen.add(routePath);
       const viewed = await visitRoute(page, appOrigin, routePath, policy, true);
       visited.push(viewed);
-      if (viewed.class === "mfa-required" || viewed.class === "auth-required") {
+      if (
+        viewed.class === "mfa-required" ||
+        viewed.class === "auth-required" ||
+        viewed.class === "account-setup-required"
+      ) {
         overall = viewed.class;
         break;
       }
@@ -584,7 +597,8 @@ async function run(command) {
       }
       for (const field of draft.fields) field.value = "";
     }
-    if (routes.some((route) => route.class === "mfa-required")) overall = "mfa-required";
+    if (routes.some((route) => route.class === "account-setup-required")) overall = "account-setup-required";
+    else if (routes.some((route) => route.class === "mfa-required")) overall = "mfa-required";
     else if (routes.some((route) => route.class === "auth-required")) overall = "auth-required";
     else if (routes.some((route) => route.class === "policy-denied")) overall = "policy-denied";
     else if (routes.length === 0 || routes.some((route) => route.class !== "authenticated")) {

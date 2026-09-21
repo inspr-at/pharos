@@ -1260,6 +1260,19 @@ is not that form. An optional passkey or security-key link is not
 `mfa-required`. A visible one-time-code field or a passwordless WebAuthn
 challenge stops as `mfa-required` and is not submitted.
 
+The issuer's MFA enrollment prompt is account setup, not a verification
+challenge. It is recognized from visible provider choices
+(`input[type=radio][name=provider]`) with a submit control, and only when
+the page has no password, one-time-code, or WebAuthn challenge field. A
+submit control named `skip` with value `true` marks that prompt optional;
+the class is the same when that control is absent. The runner does not
+choose a provider, click Skip, or submit the prompt. It returns before
+inventory with class `account-setup-required` (exit 5), types no credential
+into the prompt, and takes no screenshot. Finish that enrollment in a
+private browser session before this inspection. Copy that merely mentions
+multi-factor authentication, without those provider controls, stays
+`mfa-required`. The request allowlist is unchanged.
+
 After repeated safe percent-decoding, any substring of the username or
 password denies the request, including a short secret inside a larger path
 segment. Verdicts, navigation errors, and evidence use `path-category` or
@@ -1287,7 +1300,8 @@ arguments, the environment, URLs, screenshots, traces, or stored sessions.
 base-path, and URL overrides, `DEBUG`, `PWDEBUG`, proxy variables, and
 `NODE_TLS_REJECT_UNAUTHORIZED=0` are refused. Classes are `authenticated`
 (exit 0), `broken-ui` or `refused` (exit 1), `auth-required` (exit 2),
-`mfa-required` (exit 3), and `policy-denied` (exit 4). Stdout also reports
+`mfa-required` (exit 3), `policy-denied` (exit 4), and
+`account-setup-required` (exit 5). Stdout also reports
 `server-role=unchanged`.
 
 `node --test tests/live-ui-guard.test.mjs` covers the guard. The CI check job

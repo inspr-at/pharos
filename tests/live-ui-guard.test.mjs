@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   ENTRY_URL,
+  EXIT_CODES,
   PERSONAL_APP_ORIGINS,
   PERSONAL_ISSUER_ORIGIN,
   SERVER_MUTATION_ALLOWLIST,
@@ -577,6 +578,7 @@ test("optional passkey login is not MFA and a real challenge is", () => {
   assert.equal(credentialFillPermitted(resetProbe), false);
   assert.equal(submitLabelRejected("Reset password"), true);
   assert.equal(submitLabelRejected("Next"), false);
+  assert.equal(submitLabelRejected("Skip"), true);
   assert.equal(submitLabelRejected("Sign in with a passkey"), true);
 
   const forgotLink = fakeDocument([
@@ -600,6 +602,112 @@ test("optional passkey login is not MFA and a real challenge is", () => {
     }).mfa,
     false,
   );
+});
+
+test("issuer MFA enrollment is account setup and verification stays MFA", () => {
+  const provider = (value) => domNode("input", { type: "radio", name: "provider", value, required: "true" });
+  const optional = fakeDocument([
+    domNode("form", { method: "POST" }, [
+      domNode("input", { type: "hidden", name: "authRequestID", value: "synthetic-request" }),
+      provider("0"),
+      provider("1"),
+      domNode("button", { type: "submit", name: "skip", value: "true" }, [], "Skip"),
+      domNode("button", { type: "submit" }, [], "Next"),
+    ], "Multi-factor authentication Authenticator App Security Key"),
+  ]);
+  const optionalSurface = collectProbeSurface(optional);
+  const optionalProbe = classifyProbeSurface(optionalSurface);
+  assert.equal(optionalProbe.accountSetup, true);
+  assert.equal(optionalProbe.enrollmentOptional, true);
+  assert.equal(optionalProbe.mfa, false);
+  assert.equal(optionalSurface.otpField, false);
+  assert.equal(optionalSurface.webauthnChallenge, false);
+  assert.equal(optionalProbe.passkeyAlternative, false);
+  assert.equal(optionalProbe.loginForm, false);
+  assert.equal(credentialFillPermitted(optionalProbe), false);
+  const issuer = { origin: PERSONAL_ISSUER_ORIGIN, pathname: "/ui/login/mfa/prompt" };
+  assert.equal(
+    classifyObservation({ location: issuer, status: 200, probe: optionalProbe }),
+    "account-setup-required",
+  );
+  assert.equal(EXIT_CODES["account-setup-required"], 5);
+  assert.notEqual(EXIT_CODES["account-setup-required"], 0);
+  assert.equal(
+    screenshotPermitted({
+      classification: "account-setup-required",
+      location: issuer,
+      probe: optionalProbe,
+    }),
+    false,
+  );
+
+  const required = fakeDocument([
+    domNode("form", { method: "POST" }, [
+      provider("0"),
+      provider("1"),
+      domNode("button", { type: "submit" }, [], "Next"),
+    ], "Multi-factor authentication Authenticator App Security Key"),
+  ]);
+  const requiredProbe = classifyProbeSurface(collectProbeSurface(required));
+  assert.equal(requiredProbe.accountSetup, true);
+  assert.equal(requiredProbe.enrollmentOptional, false);
+  assert.equal(requiredProbe.mfa, false);
+  assert.equal(
+    classifyObservation({ location: issuer, status: 200, probe: requiredProbe }),
+    "account-setup-required",
+  );
+
+  const otp = fakeDocument([
+    domNode("form", {}, [
+      provider("0"),
+      domNode("input", { name: "code", autocomplete: "one-time-code" }),
+      domNode("button", { type: "submit" }, [], "Verify"),
+    ]),
+  ], "Enter the verification code");
+  const otpProbe = classifyProbeSurface(collectProbeSurface(otp));
+  assert.equal(otpProbe.accountSetup, false);
+  assert.equal(otpProbe.mfa, true);
+  assert.equal(
+    classifyObservation({ location: issuer, status: 200, probe: otpProbe }),
+    "mfa-required",
+  );
+
+  const securityKey = fakeDocument([
+    domNode("form", {}, [
+      domNode("button", { type: "submit" }, [], "Continue"),
+    ], "Use your security key"),
+  ]);
+  const securityProbe = classifyProbeSurface(collectProbeSurface(securityKey));
+  assert.equal(securityProbe.accountSetup, false);
+  assert.equal(securityProbe.mfa, true);
+
+  const passwordLogin = fakeDocument([
+    domNode("form", {}, [
+      domNode("input", { type: "password", name: "password", autocomplete: "current-password" }),
+      domNode("a", { href: "/passkey" }, [], "Sign in with a passkey"),
+      domNode("button", { type: "submit" }, [], "Next"),
+    ]),
+  ], "Password Sign in with a passkey Next");
+  const passwordProbe = classifyProbeSurface(collectProbeSurface(passwordLogin));
+  assert.equal(passwordProbe.accountSetup, false);
+  assert.equal(passwordProbe.mfa, false);
+  assert.equal(passwordProbe.passkeyAlternative, true);
+  assert.equal(credentialFillPermitted(passwordProbe), true);
+
+  const copyOnly = fakeDocument([
+    domNode("form", {}, [
+      domNode("button", { type: "submit" }, [], "Continue"),
+    ], "Set up multi-factor authentication"),
+  ]);
+  const copyProbe = classifyProbeSurface(collectProbeSurface(copyOnly));
+  assert.equal(copyProbe.accountSetup, false);
+  assert.equal(copyProbe.mfa, true);
+
+  const runner = fs.readFileSync(new URL("../scripts/live-ui.mjs", import.meta.url), "utf8");
+  assert.equal(runner.includes("account-setup-required"), true);
+  assert.equal(runner.includes("HumanSkip"), false);
+  assert.equal(runner.includes("[name='skip']"), false);
+  assert.equal(runner.includes("ISSUER_LOGIN_POST_PATHS.push"), false);
 });
 
 test("classification separates auth, MFA, policy denial, and broken UI", () => {
