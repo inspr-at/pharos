@@ -1205,6 +1205,175 @@ globalThis.__marker = { updateUrlState, markFleetEntry, withFleetMarker, replace
   assert.equal(elsewhere.history.url, "/backups?host=alpha");
 });
 
+test("an open workflow keeps its parent job across a refresh that has no action or only the child", () => {
+  const start = fleetRuntimeSource.indexOf("function activeHostActionJobId");
+  const end = fleetRuntimeSource.indexOf("function initHostActions");
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const document = { body: { dataset: { hostActionDialogOpen: "true" } } };
+  const context = vm.createContext({ console, document });
+  vm.runInContext(`
+let hostActionContext=null;
+let openHostActionsRoot=null;
+function positionHostActions(){}
+${fleetRuntimeSource.slice(start, end)}
+globalThis.__actions = { updateHostActionState, setContext(value){ hostActionContext=value; } };
+`, context);
+
+  function actionNode() {
+    return { hidden: true, dataset: {}, querySelector() { return null; } };
+  }
+  function rootFor(host) {
+    const nodes = {
+      'system-update': actionNode(),
+      'update-restart': actionNode(),
+      remove: actionNode(),
+      'withdraw-settings': actionNode(),
+      'lifecycle-continue': actionNode(),
+    };
+    return {
+      dataset: {
+        host,
+        canManage: "true",
+        isNix: "true",
+        janusReady: "true",
+        systemUpdateAvailable: "true",
+        actionJobId: "parent-run",
+        actionKind: "settings_change",
+        actionState: "proposal_requested",
+      },
+      querySelector(selector) {
+        const match = selector.match(/data-host-action="([^"]+)"/);
+        return match ? nodes[match[1]] || null : null;
+      },
+    };
+  }
+  const root = rootFor("qa-harbor");
+  const surface = { querySelector() { return root; } };
+  context.__actions.setContext({ root, jobId: "parent-run" });
+
+  context.__actions.updateHostActionState(surface, { preferences_state: "applied" }, null);
+  assert.equal(root.dataset.actionJobId, "parent-run");
+  assert.equal(root.dataset.actionKind, "settings_change");
+  assert.equal(root.dataset.actionState, "proposal_requested");
+
+  context.__actions.updateHostActionState(surface, {
+    preferences_state: "applied",
+    host_action: {
+      id: "child-run",
+      settings_change_id: "parent-run",
+      state: "queued_apply",
+      workflow: { kind: "update_restart" },
+    },
+  }, null);
+  assert.equal(root.dataset.actionJobId, "parent-run");
+  assert.equal(root.dataset.actionKind, "settings_change");
+  assert.equal(root.dataset.actionState, "proposal_requested");
+
+  document.body.dataset.hostActionDialogOpen = "false";
+  context.__actions.updateHostActionState(surface, { preferences_state: "applied" }, null);
+  assert.equal(root.dataset.actionJobId, undefined);
+  assert.equal(root.dataset.actionKind, undefined);
+  assert.equal(root.dataset.actionState, undefined);
+});
+
+test("review update and restart follows a proven nixcfg gap or reboot, not a channel difference", () => {
+  const start = fleetRuntimeSource.indexOf("function activeHostActionJobId");
+  const end = fleetRuntimeSource.indexOf("function initHostActions");
+  const document = { body: { dataset: {} } };
+  const context = vm.createContext({ console, document });
+  vm.runInContext(`
+let hostActionContext=null;
+let openHostActionsRoot=null;
+function positionHostActions(){}
+${fleetRuntimeSource.slice(start, end)}
+globalThis.__actions = { updateHostActionState };
+`, context);
+
+  function project(host, { manage = true, janus = true } = {}) {
+    const restart = { hidden: false, dataset: {}, querySelector() { return { textContent: "" }; } };
+    const update = { hidden: false, dataset: {}, querySelector() { return null; } };
+    const root = {
+      dataset: {
+        host: "qa-harbor",
+        canManage: manage ? "true" : "false",
+        isNix: "true",
+        janusReady: janus ? "true" : "false",
+        systemUpdateAvailable: "true",
+      },
+      querySelector(selector) {
+        if (selector === '[data-host-action="update-restart"]') return restart;
+        if (selector === '[data-host-action="system-update"]') return update;
+        return null;
+      },
+    };
+    context.__actions.updateHostActionState({ querySelector() { return root; } }, host, null);
+    return { restart, update, root };
+  }
+  const channelOnly = project({
+    kernel: { state: "current" },
+    freshness: {
+      nixcfg_comparison: { relation: "current", commits_behind: 0 },
+      nixpkgs_comparison: { relation: "different" },
+    },
+  });
+  assert.equal(channelOnly.root.dataset.updatePending, "false");
+  assert.equal(channelOnly.restart.hidden, true);
+  assert.equal(channelOnly.update.hidden, false);
+
+  for (const commits of [undefined, null, 0, "0"]) {
+    const unknown = project({
+      kernel: { state: "current" },
+      freshness: { nixcfg_comparison: { relation: "behind", commits_behind: commits } },
+    });
+    assert.equal(unknown.root.dataset.updatePending, "false");
+    assert.equal(unknown.restart.hidden, true);
+  }
+
+  const behind = project({
+    kernel: { state: "current" },
+    freshness: { nixcfg_comparison: { relation: "behind", commits_behind: 4 } },
+  });
+  assert.equal(behind.root.dataset.updatePending, "true");
+  assert.equal(behind.restart.hidden, false);
+  assert.equal(behind.update.hidden, false);
+
+  const reboot = project({
+    kernel: { state: "reboot_required" },
+    freshness: { nixcfg_comparison: { relation: "current", commits_behind: 0 } },
+  });
+  assert.equal(reboot.root.dataset.updatePending, "true");
+  assert.equal(reboot.restart.hidden, false);
+
+  const viewer = project({
+    kernel: { state: "reboot_required" },
+    freshness: { nixcfg_comparison: { relation: "behind", commits_behind: 4 } },
+  }, { manage: false });
+  assert.equal(viewer.root.dataset.updatePending, "true");
+  assert.equal(viewer.restart.hidden, true);
+  assert.equal(viewer.update.hidden, true);
+});
+
+test("the first fleet refresh keeps the dialog interval while a host action is open", () => {
+  const callStart = fleetRuntimeSource.lastIndexOf("scheduleRefresh(");
+  const call = fleetRuntimeSource.slice(callStart, fleetRuntimeSource.indexOf(";", callStart) + 1);
+  assert.match(call, /hostActionDialogOpen/);
+  assert.match(call, /DIALOG_REFRESH_MS/);
+  assert.equal(call.includes("scheduleRefresh(3000)"), false);
+
+  const delays = [];
+  const document = { body: { dataset: { hostActionDialogOpen: "true" } } };
+  const context = vm.createContext({
+    document,
+    DIALOG_REFRESH_MS: 60000,
+    scheduleRefresh(delay) { delays.push(delay); },
+  });
+  vm.runInContext(call, context);
+  document.body.dataset.hostActionDialogOpen = "false";
+  vm.runInContext(call, context);
+  assert.deepEqual(delays, [60000, 3000]);
+});
+
 test("a hidden page does not keep the watchdog looping", () => {
   const queue = deferredFetchQueue();
   const page = timelineHarness(queue.fetch);
