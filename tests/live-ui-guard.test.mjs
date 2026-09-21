@@ -17,11 +17,14 @@ import {
   browserContextOptions,
   browserLaunchOptions,
   classifyObservation,
-  createTargetGate,
   classifyProbeSurface,
   collectProbeSurface,
+  connectFlatDebugger,
   continuationAllowed,
+  createFlatCdpConnection,
+  createFlatTargetGuard,
   credentialFillPermitted,
+  debuggerWebSocketUrl,
   decideFetchPause,
   decideIncidental,
   decideRedirect,
@@ -32,14 +35,16 @@ import {
   ISSUER_LOGIN_POST_PATHS,
   loadPasswordFile,
   loadUsernameFile,
+  installPrimaryFrameRoute,
   parseClientDraft,
   planInventory,
+  primaryFrameDecision,
   publicPath,
+  reserveLoopbackDebuggerPort,
   redactEvidence,
   repoRootFromScripts,
   sanitizeNavigationError,
   screenshotName,
-  pausedTargetPlan,
   screenshotPermitted,
   settleFetchAuth,
   shutdownLiveSession,
@@ -807,10 +812,16 @@ test("the browser session is headless, memory-only, and guarded before login", (
   assert.deepEqual(SESSION_ORDER.slice(0, 2), ["install-request-guard", "open-login"]);
   assert.throws(() => assertSessionPrefix(["open-login"]), /session-order/);
   assert.doesNotThrow(() => assertSessionPrefix(["install-request-guard", "open-login"]));
-  const launch = browserLaunchOptions();
+  const launch = browserLaunchOptions(47123);
   assert.equal(launch.headless, true);
+  assert.deepEqual(launch.args, [
+    "--remote-debugging-port=47123",
+    "--remote-debugging-address=127.0.0.1",
+  ]);
+  assert.equal(Object.keys(launch).length, 2);
   assert.equal(launch.channel, undefined);
   assert.equal(launch.executablePath, undefined);
+  assert.throws(() => browserLaunchOptions(0), /browser-launch/);
   const options = browserContextOptions();
   for (const key of ["storageState", "recordVideo", "recordHar", "userDataDir"]) {
     assert.equal(Object.hasOwn(options, key), false);
@@ -831,42 +842,53 @@ test("the browser session is headless, memory-only, and guarded before login", (
     assert.equal(source.includes("webkit"), false);
   }
   const runAt = runner.indexOf("async function run");
-  const guardAt = runner.indexOf("await installGuard", runAt);
   const loginAt = runner.indexOf("await signIn", runAt);
-  assert.ok(guardAt > runAt);
-  assert.ok(loginAt > guardAt);
   assert.equal(runner.includes("mfaCopy"), false);
   assert.ok(runner.includes("collectProbeSurface"));
   assert.ok(runner.includes("classifyProbeSurface"));
   assert.ok(runner.includes("routeWebSocket"));
   assert.ok(runner.includes("decideIncidental(\"download\")"));
-  assert.equal(runner.includes("context.route("), false);
   assert.equal(runner.includes("context.on(\"response\""), false);
   assert.equal(runner.includes("split(/[^A-Za-z0-9"), false);
   assert.ok(runner.includes("enableFetchGuard"));
-  assert.ok(runner.includes("createTargetGate"));
+  assert.ok(runner.includes("openGuardedBrowser"));
+  assert.ok(runner.includes("installPrimaryFrameRoute"));
+  assert.equal(runner.includes("createTargetGate"), false);
+  assert.equal(runner.includes("newBrowserCDPSession"), false);
   assert.ok(runner.includes("shutdownLiveSession"));
-  assert.ok(runner.includes("newBrowserCDPSession"));
   assert.ok(runner.includes("takeAuthenticatedShot"));
   assert.ok(runner.includes("credentialFillPermitted"));
+  assert.ok(guard.includes("context.route("));
   assert.ok(guard.includes("Fetch.failRequest"));
   assert.ok(guard.includes('requestStage: "Request"'));
   assert.equal(guard.includes("ProvideCredentials"), false);
   assert.ok(guard.includes("waitForDebuggerOnStart: true"));
-  assert.ok(guard.includes("flatten: false"));
-  assert.ok(guard.includes("Target.sendMessageToTarget"));
+  assert.ok(guard.includes("flatten: true"));
+  assert.equal(guard.includes("flatten: false"), false);
+  assert.equal(guard.includes("Target.sendMessageToTarget"), false);
+  assert.equal(guard.includes("Target.receivedMessageFromTarget"), false);
+  assert.equal(guard.includes("sec-fetch-dest"), false);
+  assert.equal(guard.includes("allHeaders"), false);
+  assert.ok(guard.includes("envelope.sessionId = sessionId"));
   assert.equal(guard.includes("Target.setDiscoverTargets"), false);
   assert.ok(guard.includes("Target.closeTarget"));
-  const discoverAt = runner.indexOf("await gate.enable()", runAt);
+  const openedAt = runner.indexOf("openGuardedBrowser", runAt);
+  const guardAt = runner.indexOf("await installGuard", runAt);
+  const pageAt = runner.indexOf("context.newPage", runAt);
+  const bindAt = runner.indexOf("pageRef.page = page", runAt);
+  const armAt = runner.indexOf("await guard.armPage", runAt);
   const finallyAt = runner.lastIndexOf("finally");
+  assert.ok(openedAt > runAt);
+  assert.ok(guardAt > openedAt);
+  assert.ok(pageAt > guardAt);
+  assert.ok(bindAt > pageAt);
+  assert.ok(armAt > bindAt);
+  assert.ok(loginAt > armAt);
   assert.ok(runner.indexOf("shutdownLiveSession", finallyAt) > finallyAt);
+  assert.ok(runner.indexOf("gate.close()", finallyAt) > runner.indexOf("shutdownLiveSession", finallyAt));
   assert.equal(runner.indexOf("secrets.fill", finallyAt), -1);
   assert.equal(runner.indexOf("disposeFetchGuard", finallyAt), -1);
-  const armAt = runner.indexOf("await guard.armPage", runAt);
   const shotAt = runner.indexOf("takeAuthenticatedShot", runner.indexOf("async function shoot"));
-  assert.ok(discoverAt > runAt);
-  assert.ok(armAt > discoverAt);
-  assert.ok(loginAt > armAt);
   assert.ok(shotAt > runner.indexOf("async function shoot"));
   assert.equal(runner.includes("tracing.start"), false);
   assert.equal(runner.includes("screencast"), false);
@@ -1011,153 +1033,263 @@ test("fetch guard enables request-stage pauses, cancels auth, and disposes after
   assert.deepEqual(disposeFailed.calls.map((call) => call.method), ["Fetch.disable", "detach"]);
 });
 
-function protocolSession(options = {}) {
-  const calls = [];
-  const listeners = {};
-  return {
-    calls,
-    listeners,
-    on(event, handler) {
-      calls.push({ method: "on", event });
-      listeners[event] = handler;
-    },
-    async send(method, params) {
-      calls.push({ method, params });
-      if (method !== "Target.sendMessageToTarget") return;
-      const command = JSON.parse(params.message);
-      const body = options.failMethod === command.method
-        ? { id: command.id, error: { message: "failed" } }
-        : { id: command.id, result: {} };
+function flatTransport(options = {}) {
+  const sent = [];
+  let receive = () => {};
+  const connection = createFlatCdpConnection({
+    send(text) {
+      const envelope = JSON.parse(text);
+      sent.push(envelope);
       queueMicrotask(() => {
-        listeners["Target.receivedMessageFromTarget"]({
-          sessionId: params.sessionId,
-          message: JSON.stringify(body),
-        });
+        if (options.failMethod === envelope.method) {
+          receive(JSON.stringify({
+            id: envelope.id,
+            sessionId: envelope.sessionId,
+            error: { message: "ws://127.0.0.1/devtools/browser/secret-token" },
+          }));
+          return;
+        }
+        receive(JSON.stringify({ id: envelope.id, sessionId: envelope.sessionId, result: {} }));
       });
+    },
+  }, { commandTimeoutMs: 50 });
+  receive = (text) => connection.receive(text);
+  return { connection, sent };
+}
+
+function attachEvent(type, targetId, sessionId, waitingForDebugger = true) {
+  return JSON.stringify({
+    method: "Target.attachedToTarget",
+    sessionId: type === "page" ? undefined : "page-session",
+    params: {
+      sessionId,
+      waitingForDebugger,
+      targetInfo: { type, targetId },
+    },
+  });
+}
+
+test("flat attach resumes only the first page and closes every other target", async () => {
+  const { connection, sent } = flatTransport();
+  const gate = createFlatTargetGuard(connection);
+  await gate.enable();
+  assert.equal(sent[0].method, "Target.setAutoAttach");
+  assert.equal(Object.hasOwn(sent[0], "sessionId"), false);
+  assert.deepEqual(sent[0].params, {
+    autoAttach: true,
+    waitForDebuggerOnStart: true,
+    flatten: true,
+  });
+  connection.receive(attachEvent("page", "primary", "page-session"));
+  await gate.settled();
+  assert.deepEqual(sent.slice(1).map((entry) => entry.method), [
+    "Target.setAutoAttach",
+    "Runtime.runIfWaitingForDebugger",
+  ]);
+  assert.equal(sent[1].sessionId, "page-session");
+  assert.equal(sent[2].sessionId, "page-session");
+  assert.equal(Object.hasOwn(sent[1].params, "sessionId"), false);
+  assert.equal(sent[1].params.flatten, true);
+  assert.equal(gate.attachedPrimary(), "primary");
+  assert.equal(gate.compromised(), "");
+  assert.equal(sent.some((entry) => entry.method === "Fetch.enable"), false);
+  assert.equal(sent.some((entry) => entry.method === "Target.sendMessageToTarget"), false);
+
+  for (const [type, targetId, sessionId] of [
+    ["page", "popup", "popup-session"],
+    ["iframe", "frame-1", "frame-session"],
+    ["worker", "worker-1", "worker-session"],
+    ["shared_worker", "shared-1", "shared-session"],
+    ["service_worker", "sw-1", "sw-session"],
+  ]) {
+    connection.receive(attachEvent(type, targetId, sessionId));
+  }
+  await gate.settled();
+  const closed = sent.filter((entry) => entry.method === "Target.closeTarget").map((entry) => entry.params.targetId);
+  assert.deepEqual(closed, ["popup", "frame-1", "worker-1", "shared-1", "sw-1"]);
+  assert.equal(sent.filter((entry) => entry.method === "Runtime.runIfWaitingForDebugger").length, 1);
+  assert.equal(sent.filter((entry) => entry.method === "Target.closeTarget").every((entry) => !entry.sessionId), true);
+  assert.equal(JSON.stringify(sent).includes("secret"), false);
+
+  const unpaused = flatTransport();
+  const unpausedGate = createFlatTargetGuard(unpaused.connection);
+  await unpausedGate.enable();
+  unpaused.connection.receive(attachEvent("iframe", "already-running", "late", false));
+  await unpausedGate.settled();
+  assert.equal(unpausedGate.compromised(), "unpaused");
+  assert.equal(unpaused.sent.some((entry) => entry.method === "Runtime.runIfWaitingForDebugger"), false);
+  assert.equal(unpaused.sent.some((entry) => entry.method === "Target.closeTarget"), true);
+
+  const broken = flatTransport({ failMethod: "Runtime.runIfWaitingForDebugger" });
+  const brokenGate = createFlatTargetGuard(broken.connection);
+  await brokenGate.enable();
+  broken.connection.receive(attachEvent("page", "primary", "page-session"));
+  await brokenGate.settled();
+  assert.equal(brokenGate.compromised(), "primary");
+  assert.equal(broken.sent.some((entry) => entry.method === "Target.closeTarget" && entry.params.targetId === "primary"), true);
+  assert.equal(JSON.stringify(broken.sent).includes("secret-token"), false);
+  assert.equal(JSON.stringify(broken.sent).includes("devtools"), false);
+});
+
+test("the debugger endpoint stays on the reserved loopback port", async () => {
+  const port = await reserveLoopbackDebuggerPort();
+  assert.equal(Number.isInteger(port), true);
+  assert.ok(port > 0 && port < 65536);
+  const endpoint = debuggerWebSocketUrl(port, {
+    Browser: "Chrome/test",
+    webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/local-id`,
+  });
+  assert.equal(endpoint, `ws://127.0.0.1:${port}/devtools/browser/local-id`);
+  assert.throws(
+    () => debuggerWebSocketUrl(port, { Browser: "Chrome/test", webSocketDebuggerUrl: "ws://evil.example/devtools/browser/x" }),
+    /network-guard/,
+  );
+  assert.throws(
+    () => debuggerWebSocketUrl(port, {
+      Browser: "Chrome/test",
+      webSocketDebuggerUrl: `ws://user:secret@127.0.0.1:${port}/devtools/browser/local-id`,
+    }),
+    (error) => error instanceof LiveUiError && error.code === "network-guard" && !String(error.message).includes("secret"),
+  );
+  let constructed = false;
+  await assert.rejects(
+    connectFlatDebugger(port, {
+      fetch: async (url) => {
+        assert.equal(url, `http://127.0.0.1:${port}/json/version`);
+        return {
+          ok: true,
+          json: async () => ({ Browser: "Chrome/test", webSocketDebuggerUrl: "ws://evil.example/devtools/browser/x" }),
+        };
+      },
+      WebSocket: class {
+        constructor() {
+          constructed = true;
+        }
+      },
+    }),
+    (error) => error instanceof LiveUiError && error.message === "network-guard" && !String(error).includes("evil"),
+  );
+  assert.equal(constructed, false);
+  await assert.rejects(
+    connectFlatDebugger(port, {
+      fetch: async () => {
+        throw new Error("ws://127.0.0.1/devtools/browser/secret-token");
+      },
+      WebSocket: class {
+        constructor() {
+          constructed = true;
+        }
+      },
+    }),
+    (error) => error instanceof LiveUiError && error.message === "network-guard" && !error.message.includes("secret-token"),
+  );
+  assert.equal(constructed, false);
+});
+
+function frameRequest({ url, method = "GET", resourceType = "document", frame, throwFrame = false }) {
+  return {
+    url: () => url,
+    method: () => method,
+    resourceType: () => resourceType,
+    frame() {
+      if (throwFrame) throw new Error("Frame for this navigation request is not available");
+      return frame;
+    },
+    headers: () => ({ "sec-fetch-dest": "" }),
+    async allHeaders() {
+      throw new Error("destination metadata is not a control");
     },
   };
 }
 
-function childMethods(session) {
-  return session.calls
-    .filter((call) => call.method === "Target.sendMessageToTarget")
-    .map((call) => JSON.parse(call.params.message).method);
-}
+test("only the primary main frame can pass the route, and worker scripts use ordinary request policy", async () => {
+  const main = { id: "main" };
+  const page = { mainFrame: () => main };
+  const policy = { secrets: ["synthetic-only-secret"] };
+  const allowed = "https://pharos.barta.cm/pharos/hosts";
+  const primaryGet = primaryFrameDecision(frameRequest({ url: allowed, frame: main }), page, policy);
+  assert.equal(primaryGet.allow, true);
+  assert.equal(primaryGet.reason, "app-read");
+  const workerScript = primaryFrameDecision(
+    frameRequest({ url: `${allowed}/worker.js`, resourceType: "script", frame: main }),
+    page,
+    policy,
+  );
+  assert.equal(workerScript.allow, true);
+  assert.equal(workerScript.reason, "app-read");
+  const child = primaryFrameDecision(
+    frameRequest({ url: allowed, frame: { id: "child" } }),
+    page,
+    policy,
+  );
+  assert.equal(child.allow, false);
+  assert.equal(child.reason, "isolated-target");
+  const thrown = primaryFrameDecision(frameRequest({ url: allowed, throwFrame: true }), page, policy);
+  assert.equal(thrown.allow, false);
+  assert.equal(thrown.reason, "isolated-target");
+  const unbound = primaryFrameDecision(frameRequest({ url: allowed, frame: main }), null, policy);
+  assert.equal(unbound.allow, false);
+  const mutation = primaryFrameDecision(
+    frameRequest({ url: "https://pharos.barta.cm/pharos/agora/requests/host-preferences.json", method: "POST", frame: main }),
+    page,
+    policy,
+  );
+  assert.equal(mutation.allow, false);
+  assert.equal(mutation.reason, "app-mutation");
+  const leaked = primaryFrameDecision(
+    frameRequest({ url: "https://pharos.barta.cm/pharos/pre-synthetic-only-secret-post", frame: main }),
+    page,
+    policy,
+  );
+  assert.equal(leaked.allow, false);
+  assert.equal(leaked.reason, "secret-in-url");
+  assert.equal(leaked.path, "path-category");
+  assert.equal(JSON.stringify(leaked).includes("synthetic-only-secret"), false);
 
-test("paused targets install Fetch before resume and refused targets never resume", async () => {
-  assert.equal(pausedTargetPlan({ type: "page", targetId: "primary" }, ""), "guard");
-  assert.equal(pausedTargetPlan({ type: "page", targetId: "popup" }, "primary"), "refuse");
-  assert.equal(pausedTargetPlan({ type: "iframe", targetId: "frame" }, "primary"), "guard");
-  assert.equal(pausedTargetPlan({ type: "service_worker", targetId: "worker" }, "primary"), "refuse");
-  const session = protocolSession();
   const notes = [];
-  const gate = createTargetGate(session, { secrets: ["synthetic-only-secret"] }, (verdict) => {
-    notes.push(verdict);
-    if (verdict.reason === "serviceworker") throw new Error("evidence");
+  const actions = [];
+  const pageRef = { page: null };
+  const gate = { compromised: () => "" };
+  await installPrimaryFrameRoute({
+    async route(_pattern, handler) {
+      pageRef.handler = handler;
+    },
+  }, pageRef, policy, (verdict) => notes.push(verdict), gate);
+  pageRef.page = page;
+  await pageRef.handler({
+    request: () => frameRequest({ url: allowed, frame: { id: "popup" }, throwFrame: true }),
+    abort: async (reason) => actions.push(["abort", reason]),
+    continue: async () => actions.push(["continue"]),
   });
-  await gate.enable();
-  assert.equal(session.calls[0].method, "on");
-  assert.equal(session.calls[1].method, "on");
-  assert.equal(session.calls[2].method, "Target.setAutoAttach");
-  assert.deepEqual(session.calls[2].params, {
-    autoAttach: true,
-    waitForDebuggerOnStart: true,
-    flatten: false,
+  await pageRef.handler({
+    request: () => frameRequest({ url: `${allowed}/worker.js`, resourceType: "script", frame: main }),
+    abort: async (reason) => actions.push(["abort", reason]),
+    continue: async () => actions.push(["continue"]),
   });
-  await gate.onAttached({
-    sessionId: "page-session",
-    waitingForDebugger: true,
-    targetInfo: { type: "page", targetId: "primary", url: "https://user:secret@pharos.barta.cm/pharos/" },
-  });
-  assert.deepEqual(childMethods(session), [
-    "Fetch.enable",
-    "Target.setAutoAttach",
-    "Runtime.runIfWaitingForDebugger",
-  ]);
-  const enable = session.calls.find((call) => call.method === "Target.sendMessageToTarget");
-  assert.deepEqual(JSON.parse(enable.params.message).params.patterns, [{ urlPattern: "*", requestStage: "Request" }]);
-  assert.equal(JSON.stringify(session.calls).includes("secret"), false);
-  assert.equal(gate.compromised(), "");
-
-  await gate.onAttached({
-    sessionId: "popup-session",
-    waitingForDebugger: true,
-    targetInfo: { type: "page", targetId: "popup" },
-  });
-  await gate.onAttached({
-    sessionId: "worker-session",
-    waitingForDebugger: true,
-    targetInfo: { type: "service_worker", targetId: "worker" },
-  });
-  const closed = session.calls.filter((call) => call.method === "Target.closeTarget").map((call) => call.params.targetId);
-  assert.deepEqual(closed, ["popup", "worker"]);
-  assert.equal(notes.some((item) => item.reason === "popup"), true);
-  assert.equal(childMethods(session).filter((method) => method === "Runtime.runIfWaitingForDebugger").length, 1);
-
-  const beforeFrame = childMethods(session).length;
-  await gate.onMessage({
-    sessionId: "page-session",
-    message: JSON.stringify({
-      method: "Target.attachedToTarget",
-      params: {
-        sessionId: "frame-session",
-        waitingForDebugger: true,
-        targetInfo: { type: "iframe", targetId: "frame-1" },
-      },
+  await pageRef.handler({
+    request: () => frameRequest({
+      url: "https://pharos.barta.cm/pharos/agora/requests/host-preferences.json",
+      method: "POST",
+      frame: main,
     }),
+    abort: async (reason) => actions.push(["abort", reason]),
+    continue: async () => actions.push(["continue"]),
   });
-  assert.deepEqual(childMethods(session).slice(beforeFrame, beforeFrame + 3), [
-    "Fetch.enable",
-    "Target.setAutoAttach",
-    "Runtime.runIfWaitingForDebugger",
+  assert.deepEqual(actions, [
+    ["abort", "blockedbyclient"],
+    ["continue"],
+    ["abort", "blockedbyclient"],
   ]);
-  const frameCommands = session.calls.filter((call) => {
-    if (call.method !== "Target.sendMessageToTarget") return false;
-    return call.params.sessionId === "frame-session";
+  assert.equal(notes.some((item) => item.reason === "isolated-target"), true);
+  assert.equal(notes.some((item) => item.reason === "app-mutation"), true);
+  assert.equal(JSON.stringify(notes).includes("pharos.agm.ng"), false);
+  gate.compromised = () => "disconnected";
+  await pageRef.handler({
+    request: () => frameRequest({ url: allowed, frame: main }),
+    abort: async (reason) => actions.push(["abort", reason]),
+    continue: async () => actions.push(["continue"]),
   });
-  assert.equal(frameCommands[0].params.sessionId, "frame-session");
-  assert.ok(frameCommands.findIndex((call) => JSON.parse(call.params.message).method === "Fetch.enable")
-    < frameCommands.findIndex((call) => JSON.parse(call.params.message).method === "Runtime.runIfWaitingForDebugger"));
-
-  await gate.onMessage({
-    sessionId: "frame-session",
-    message: JSON.stringify({
-      method: "Fetch.requestPaused",
-      params: {
-        requestId: "iframe-post",
-        request: { method: "POST", url: "https://pharos.agm.ng/pharos/receive" },
-      },
-    }),
-  });
-  const frameTraffic = session.calls.filter((call) => call.method === "Target.sendMessageToTarget" && call.params.sessionId === "frame-session");
-  const frameMethods = frameTraffic.map((call) => JSON.parse(call.params.message).method);
-  assert.equal(frameMethods.includes("Fetch.failRequest"), true);
-  assert.equal(frameMethods.includes("Fetch.continueRequest"), false);
-  assert.equal(JSON.stringify(frameTraffic).includes("pharos.agm.ng"), false);
-
-  const unpaused = protocolSession();
-  const unpausedGate = createTargetGate(unpaused, {}, () => {});
-  await unpausedGate.enable();
-  await unpausedGate.onAttached({
-    sessionId: "late",
-    waitingForDebugger: false,
-    targetInfo: { type: "iframe", targetId: "already-running" },
-  });
-  assert.equal(unpausedGate.compromised(), "iframe");
-  assert.equal(childMethods(unpaused).includes("Runtime.runIfWaitingForDebugger"), false);
-  assert.equal(unpaused.calls.some((call) => call.method === "Target.closeTarget"), true);
-
-  const broken = protocolSession({ failMethod: "Fetch.enable" });
-  const brokenGate = createTargetGate(broken, {}, () => {});
-  await brokenGate.enable();
-  await brokenGate.onAttached({
-    sessionId: "page-session",
-    waitingForDebugger: true,
-    targetInfo: { type: "page", targetId: "primary" },
-  });
-  assert.equal(brokenGate.compromised(), "page");
-  assert.equal(childMethods(broken).includes("Runtime.runIfWaitingForDebugger"), false);
-  assert.equal(broken.calls.some((call) => call.method === "Target.closeTarget" && call.params.targetId === "primary"), true);
+  assert.deepEqual(actions.at(-1), ["abort", "blockedbyclient"]);
 });
 
 test("cleanup closes the browser before disabling Fetch or erasing secrets", async () => {

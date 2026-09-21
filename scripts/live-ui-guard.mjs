@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -134,8 +135,63 @@ export function assertSessionPrefix(steps) {
   }
 }
 
-export function browserLaunchOptions() {
-  return { headless: true };
+export function browserLaunchOptions(port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new LiveUiError("browser-launch");
+  const options = {
+    headless: true,
+    args: [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"],
+  };
+  if (Object.keys(options).length !== 2 || options.args.length !== 2) throw new LiveUiError("browser-launch");
+  if (options.args[1] !== "--remote-debugging-address=127.0.0.1") throw new LiveUiError("browser-launch");
+  return options;
+}
+
+export function reserveLoopbackDebuggerPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    const fail = () => {
+      server.close(() => {});
+      reject(new LiveUiError("network-guard"));
+    };
+    server.once("error", fail);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = address && typeof address === "object" ? address.port : 0;
+      server.close((error) => {
+        if (error || !Number.isInteger(port) || port < 1) fail();
+        else resolve(port);
+      });
+    });
+  });
+}
+
+export function debuggerWebSocketUrl(port, payload) {
+  if (!payload || typeof payload.Browser !== "string" || payload.Browser.length < 3) {
+    throw new LiveUiError("network-guard");
+  }
+  let url;
+  try {
+    url = new URL(String(payload.webSocketDebuggerUrl || ""));
+  } catch {
+    throw new LiveUiError("network-guard");
+  }
+  const browserId = url.pathname.startsWith("/devtools/browser/")
+    ? url.pathname.slice("/devtools/browser/".length)
+    : "";
+  if (
+    url.protocol !== "ws:" ||
+    url.hostname !== "127.0.0.1" ||
+    url.port !== String(port) ||
+    !browserId ||
+    browserId.includes("/") ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new LiveUiError("network-guard");
+  }
+  return url.href;
 }
 
 export function browserContextOptions() {
@@ -1155,130 +1211,358 @@ export async function disposeFetchGuard(session) {
   }
 }
 
-const PAUSED_ATTACH = Object.freeze({
+const FLAT_ATTACH = Object.freeze({
   autoAttach: true,
   waitForDebuggerOnStart: true,
-  flatten: false,
+  flatten: true,
 });
 
-export function pausedTargetPlan(info, primaryId) {
-  const type = String(info?.type || "");
-  if (type === "browser" || type === "tab") return "ignore";
-  if (type === "page" && !primaryId) return "guard";
-  if (type === "iframe" || type === "worker") return "guard";
-  return "refuse";
-}
-
-export function createTargetGate(session, policy = {}, rememberFn) {
-  if (!session || typeof session.on !== "function" || typeof session.send !== "function") {
-    throw new LiveUiError("network-guard");
-  }
-  let nextId = 1;
+export function createFlatCdpConnection(transport, options = {}) {
+  if (!transport || typeof transport.send !== "function") throw new LiveUiError("network-guard");
+  const commandTimeoutMs = Number.isInteger(options.commandTimeoutMs) ? options.commandTimeoutMs : 8000;
+  let nextId = 0;
+  let closed = false;
   const pending = new Map();
-  let primaryId = "";
-  let failure = "";
-  const fail = (reason) => {
-    if (!failure) failure = reason || "target";
-  };
-  const sendChild = async (sessionId, method, params) => {
-    const id = nextId;
-    nextId += 1;
-    const message = JSON.stringify({ id, method, params: params ?? {} });
-    let resolveResult;
-    let rejectResult;
-    const result = new Promise((resolve, reject) => {
-      resolveResult = resolve;
-      rejectResult = reject;
-    });
-    pending.set(id, { resolve: resolveResult, reject: rejectResult });
-    await session.send("Target.sendMessageToTarget", { sessionId, message });
-    return result;
-  };
-  const childApi = (sessionId) => ({
-    async send(method, params) {
-      await sendChild(sessionId, method, params);
-    },
-  });
-  const onAttached = async (event) => {
-    const info = event?.targetInfo || {};
-    const sessionId = event?.sessionId || "";
-    if (!event?.waitingForDebugger) {
-      fail(info.type || "unpaused");
-      if (info.targetId) await session.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
-      return;
+  const listeners = new Set();
+  const failAll = () => {
+    closed = true;
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new LiveUiError("network-guard"));
     }
-    const plan = pausedTargetPlan(info, primaryId);
-    if (plan === "ignore") return;
-    if (plan === "guard" && info.type === "page" && !primaryId) primaryId = info.targetId || "page";
-    if (plan === "refuse") {
-      if (typeof rememberFn === "function") {
-        try {
-          rememberFn(decideIncidental(info.type === "service_worker" ? "serviceworker" : "popup"));
-        } catch {
-          // The target stays paused whether or not evidence was recorded.
-        }
-      }
-      if (info.targetId) await session.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
-      return;
-    }
-    if (!sessionId) {
-      fail("session");
-      if (info.targetId) await session.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
-      return;
-    }
-    try {
-      await sendChild(sessionId, "Fetch.enable", {
-        patterns: fetchPausePatterns(),
-        handleAuthRequests: true,
-      });
-      await sendChild(sessionId, "Target.setAutoAttach", PAUSED_ATTACH);
-      await sendChild(sessionId, "Runtime.runIfWaitingForDebugger", {});
-    } catch {
-      fail(info.type || "guard");
-      if (info.targetId) await session.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
-    }
-  };
-  const onMessage = async (event) => {
-    let parsed;
-    try {
-      parsed = JSON.parse(String(event?.message || ""));
-    } catch {
-      fail("protocol");
-      return;
-    }
-    if (parsed.id && pending.has(parsed.id)) {
-      const waiter = pending.get(parsed.id);
-      pending.delete(parsed.id);
-      if (parsed.error) waiter.reject(new Error("child-command"));
-      else waiter.resolve(parsed.result ?? {});
-      return;
-    }
-    if (parsed.method === "Target.attachedToTarget") {
-      await onAttached(parsed.params || {});
-      return;
-    }
-    if (parsed.method === "Fetch.requestPaused") {
-      await settleFetchPause(childApi(event?.sessionId), parsed.params, policy, rememberFn);
-      return;
-    }
-    if (parsed.method === "Fetch.authRequired") {
-      await settleFetchAuth(childApi(event?.sessionId), parsed.params);
-    }
+    pending.clear();
   };
   return {
-    onAttached,
-    onMessage,
-    compromised: () => failure,
-    async enable() {
-      session.on("Target.attachedToTarget", (event) => {
-        onAttached(event).catch(() => fail("attach"));
+    onEvent(listener) {
+      listeners.add(listener);
+    },
+    failAll,
+    closed: () => closed,
+    receive(text) {
+      let message;
+      try {
+        message = JSON.parse(String(text));
+      } catch {
+        return false;
+      }
+      if (!message || typeof message !== "object") return false;
+      if (message.id && pending.has(message.id)) {
+        const waiter = pending.get(message.id);
+        pending.delete(message.id);
+        clearTimeout(waiter.timer);
+        if (message.error) waiter.reject(new LiveUiError("network-guard"));
+        else waiter.resolve(message.result ?? {});
+        return true;
+      }
+      if (typeof message.method === "string") {
+        for (const listener of listeners) listener(message.method, message.params || {}, message);
+      }
+      return true;
+    },
+    send(method, params, sessionId) {
+      if (closed) return Promise.reject(new LiveUiError("network-guard"));
+      const id = nextId + 1;
+      nextId = id;
+      const envelope = { id, method, params: params ?? {} };
+      if (sessionId) envelope.sessionId = sessionId;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (!pending.has(id)) return;
+          pending.delete(id);
+          reject(new LiveUiError("network-guard"));
+        }, commandTimeoutMs);
+        pending.set(id, { resolve, reject, timer });
+        try {
+          transport.send(JSON.stringify(envelope));
+        } catch {
+          clearTimeout(timer);
+          pending.delete(id);
+          reject(new LiveUiError("network-guard"));
+        }
       });
-      session.on("Target.receivedMessageFromTarget", (event) => {
-        onMessage(event).catch(() => fail("message"));
-      });
-      await session.send("Target.setAutoAttach", PAUSED_ATTACH);
     },
   };
+}
+
+export function createFlatTargetGuard(connection) {
+  if (!connection || typeof connection.send !== "function" || typeof connection.onEvent !== "function") {
+    throw new LiveUiError("network-guard");
+  }
+  let primaryId = "";
+  let failure = "";
+  let intentionalClose = false;
+  let settled = Promise.resolve();
+  const fail = (code) => {
+    if (!failure) failure = code || "target";
+  };
+  const closeTarget = async (targetId) => {
+    if (!targetId) {
+      fail("close");
+      return;
+    }
+    try {
+      await connection.send("Target.closeTarget", { targetId });
+    } catch {
+      fail("close");
+    }
+  };
+  const onAttached = async (event) => {
+    const info = event?.targetInfo || {};
+    const type = String(info.type || "");
+    if (type === "browser" || type === "tab") return;
+    if (!event?.waitingForDebugger) {
+      fail("unpaused");
+      await closeTarget(info.targetId);
+      return;
+    }
+    if (type === "page" && !primaryId) {
+      const sessionId = String(event.sessionId || "");
+      if (!sessionId || !info.targetId) {
+        fail("primary");
+        await closeTarget(info.targetId);
+        return;
+      }
+      primaryId = info.targetId;
+      try {
+        await connection.send("Target.setAutoAttach", FLAT_ATTACH, sessionId);
+        await connection.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
+      } catch {
+        fail("primary");
+        await closeTarget(info.targetId);
+      }
+      return;
+    }
+    await closeTarget(info.targetId);
+  };
+  connection.onEvent((method, params) => {
+    if (method !== "Target.attachedToTarget") return;
+    settled = settled.then(() => onAttached(params)).catch(() => fail("attach"));
+  });
+  return {
+    compromised: () => failure,
+    attachedPrimary: () => primaryId,
+    noteDisconnect() {
+      if (!intentionalClose) fail("disconnected");
+    },
+    settled: () => settled,
+    async enable() {
+      try {
+        await connection.send("Target.setAutoAttach", FLAT_ATTACH);
+      } catch {
+        fail("protocol");
+        throw new LiveUiError("network-guard");
+      }
+    },
+    close() {
+      intentionalClose = true;
+      if (typeof connection.failAll === "function") connection.failAll();
+      if (typeof connection.close === "function") {
+        try {
+          connection.close();
+        } catch {
+          // The browser close already owns the process lifetime.
+        }
+      }
+    },
+  };
+}
+
+async function socketMessageText(data) {
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data);
+  if (data && typeof data.text === "function") return data.text();
+  return "";
+}
+
+export async function connectFlatDebugger(port, deps = {}) {
+  const fetchImpl = deps.fetch || globalThis.fetch;
+  const Socket = deps.WebSocket || globalThis.WebSocket;
+  if (typeof fetchImpl !== "function" || typeof Socket !== "function") throw new LiveUiError("network-guard");
+  let payload;
+  try {
+    const response = await fetchImpl(`http://127.0.0.1:${port}/json/version`, {
+      redirect: "error",
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response || response.ok !== true) throw new LiveUiError("network-guard");
+    if (typeof response.text === "function") {
+      const text = await response.text();
+      if (typeof text !== "string" || text.length > 8192) throw new LiveUiError("network-guard");
+      payload = JSON.parse(text);
+    } else if (typeof response.json === "function") {
+      payload = await response.json();
+    } else {
+      throw new LiveUiError("network-guard");
+    }
+  } catch (error) {
+    if (error instanceof LiveUiError) throw error;
+    throw new LiveUiError("network-guard");
+  }
+  const endpoint = debuggerWebSocketUrl(port, payload);
+  const socket = new Socket(endpoint);
+  let opened = false;
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        try {
+          socket.close();
+        } catch {
+          // The socket never became usable.
+        }
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    const timer = setTimeout(() => finish(new LiveUiError("network-guard")), 5000);
+    if (typeof socket.addEventListener === "function") {
+      socket.addEventListener("open", () => {
+        opened = true;
+        finish();
+      });
+      socket.addEventListener("error", () => {
+        if (!opened) finish(new LiveUiError("network-guard"));
+      });
+    } else {
+      finish(new LiveUiError("network-guard"));
+    }
+  });
+  if (!opened) throw new LiveUiError("network-guard");
+  let transportSend = () => {
+    throw new LiveUiError("network-guard");
+  };
+  const connection = createFlatCdpConnection({
+    send(text) {
+      transportSend(text);
+    },
+  });
+  transportSend = (text) => {
+    socket.send(text);
+  };
+  const gate = createFlatTargetGuard(connection);
+  const onSocketData = (data) => {
+    socketMessageText(data).then((text) => {
+      if (!connection.receive(text)) gate.noteDisconnect();
+    }).catch(() => gate.noteDisconnect());
+  };
+  socket.addEventListener("message", (event) => onSocketData(event?.data));
+  socket.addEventListener("close", () => {
+    connection.failAll();
+    gate.noteDisconnect();
+  });
+  socket.addEventListener("error", () => gate.noteDisconnect());
+  connection.close = () => {
+    try {
+      socket.close();
+    } catch {
+      // Already closed.
+    }
+  };
+  return gate;
+}
+
+export async function openGuardedBrowser(launchBrowser, deps) {
+  if (typeof launchBrowser !== "function") throw new LiveUiError("browser-launch");
+  const port = await reserveLoopbackDebuggerPort();
+  const launch = browserLaunchOptions(port);
+  let browser;
+  try {
+    browser = await launchBrowser(launch);
+    const gate = await connectFlatDebugger(port, deps);
+    try {
+      await gate.enable();
+    } catch (error) {
+      gate.close();
+      throw error;
+    }
+    return { browser, gate };
+  } catch (error) {
+    if (browser && typeof browser.close === "function") await browser.close().catch(() => {});
+    if (error instanceof LiveUiError) throw error;
+    throw new LiveUiError("network-guard");
+  }
+}
+
+export function primaryFrameDecision(request, page, policy = {}) {
+  let method = "GET";
+  let url = "";
+  let resourceType = "";
+  let postData = null;
+  try {
+    method = String(typeof request?.method === "function" ? request.method() : request?.method || "GET");
+  } catch {
+    method = "GET";
+  }
+  try {
+    url = String(typeof request?.url === "function" ? request.url() : request?.url || "");
+  } catch {
+    url = "";
+  }
+  try {
+    resourceType = String(typeof request?.resourceType === "function" ? request.resourceType() : "");
+  } catch {
+    resourceType = "";
+  }
+  try {
+    postData = typeof request?.postData === "function" ? request.postData() : null;
+  } catch {
+    postData = null;
+  }
+  const verdict = decideRequest({ method, url, resourceType, postData }, policy);
+  let primary = false;
+  try {
+    const frame = typeof request?.frame === "function" ? request.frame() : null;
+    const main = page && typeof page.mainFrame === "function" ? page.mainFrame() : null;
+    primary = !!page && !!frame && frame === main;
+  } catch {
+    primary = false;
+  }
+  if (!primary) {
+    if (verdict.reason === "secret-in-url") return { ...verdict, allow: false };
+    return { ...verdict, allow: false, reason: "isolated-target" };
+  }
+  return verdict;
+}
+
+export async function installPrimaryFrameRoute(context, pageRef, policy, rememberFn, gate) {
+  if (!context || typeof context.route !== "function") throw new LiveUiError("network-guard");
+  await context.route("**/*", async (route) => {
+    let request;
+    try {
+      request = route.request();
+    } catch {
+      await route.abort("blockedbyclient").catch(() => {});
+      return;
+    }
+    let verdict;
+    try {
+      verdict = primaryFrameDecision(request, pageRef?.page ?? null, policy);
+    } catch {
+      verdict = decideIncidental("denied");
+    }
+    const lost = typeof gate?.compromised === "function" && gate.compromised();
+    const allow = !lost && verdict.allow === true;
+    if (!allow && typeof rememberFn === "function") {
+      const recorded = lost && verdict.reason !== "secret-in-url"
+        ? { ...verdict, allow: false, reason: "isolated-target" }
+        : { ...verdict, allow: false };
+      try {
+        rememberFn(recorded);
+      } catch {
+        // The request is still aborted.
+      }
+    }
+    if (!allow) {
+      await route.abort("blockedbyclient").catch(() => {});
+      return;
+    }
+    await route.continue().catch(() => {});
+  });
 }
 
 export async function shutdownLiveSession({ close, sessions = [], detach, secrets, drafts } = {}) {

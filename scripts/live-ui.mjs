@@ -16,8 +16,6 @@ import {
   assertRuntimeEnvironment,
   assertSessionPrefix,
   browserContextOptions,
-  browserLaunchOptions,
-  createTargetGate,
   classifyObservation,
   classifyProbeSurface,
   collectProbeSurface,
@@ -27,6 +25,8 @@ import {
   disposeFetchGuard,
   enableFetchGuard,
   hostNamesFromPayload,
+  installPrimaryFrameRoute,
+  openGuardedBrowser,
   isHostPath,
   isUnderBasePath,
   loadDraftFile,
@@ -78,7 +78,7 @@ function remember(blocked, result, secrets) {
   blocked.push({ method, path: pathName, reason });
 }
 
-async function installGuard(context, policy, blocked) {
+async function installGuard(context, policy, blocked, pageRef) {
   const secrets = Array.isArray(policy.secrets) ? policy.secrets : [];
   const sessions = [];
   if (typeof context.routeWebSocket !== "function") throw new LiveUiError("browser-context");
@@ -88,13 +88,20 @@ async function installGuard(context, policy, blocked) {
       socket.close({ code: 1008, reason: "policy" }).catch(() => {});
     },
   );
+  await installPrimaryFrameRoute(
+    context,
+    pageRef,
+    policy,
+    (verdict) => remember(blocked, verdict, secrets),
+    policy.gate,
+  );
   await context.addInitScript(() => {
     window.open = () => null;
   });
   context.on("serviceworker", () => {
     remember(blocked, decideIncidental("serviceworker"), secrets);
   });
-  return async function armPage(page) {
+  async function armPage(page) {
     if (!page || typeof page.context !== "function" || typeof page.context().newCDPSession !== "function") {
       throw new LiveUiError("network-guard");
     }
@@ -107,7 +114,7 @@ async function installGuard(context, policy, blocked) {
       throw new LiveUiError("network-guard");
     }
     return session;
-  };
+  }
   return { sessions, armPage };
 }
 
@@ -438,23 +445,17 @@ async function run(command) {
   const blocked = [];
   const routes = [];
   let browser;
-  let browserSession;
+  let gate;
   let fetchSessions = [];
   let overall = "broken-ui";
   let appOrigin = "";
   let clientDraft = draft ? "dom-only" : "none";
   try {
-    const launch = browserLaunchOptions();
-    if (launch.headless !== true || Object.keys(launch).length !== 1) {
-      throw new LiveUiError("browser-launch");
-    }
-    browser = await chromium.launch(launch);
-    if (browser.browserType().name() !== "chromium") throw new LiveUiError("browser-launch");
-    if (typeof browser.newBrowserCDPSession !== "function") throw new LiveUiError("network-guard");
-    browserSession = await browser.newBrowserCDPSession();
-    const gate = createTargetGate(browserSession, policy, (verdict) => remember(blocked, verdict, secrets));
+    const opened = await openGuardedBrowser((options) => chromium.launch(options));
+    browser = opened.browser;
+    gate = opened.gate;
     policy.gate = gate;
-    await gate.enable();
+    if (browser.browserType().name() !== "chromium") throw new LiveUiError("browser-launch");
     const options = browserContextOptions();
     if (["storageState", "recordVideo", "recordHar", "userDataDir"].some((key) => key in options)) {
       throw new LiveUiError("browser-context");
@@ -462,10 +463,12 @@ async function run(command) {
     const context = await browser.newContext(options);
     if (browser.contexts().length !== 1) throw new LiveUiError("browser-context");
     mark("install-request-guard");
-    const guard = await installGuard(context, policy, blocked);
+    const pageRef = { page: null };
+    const guard = await installGuard(context, policy, blocked, pageRef);
     fetchSessions = guard.sessions;
     const page = await context.newPage();
-    if (gate.compromised()) throw new LiveUiError("network-guard");
+    pageRef.page = page;
+    if (gate.compromised() || !gate.attachedPrimary()) throw new LiveUiError("network-guard");
     await guard.armPage(page);
     const watchSurface = (target) => {
       target.on("download", (download) => {
@@ -483,7 +486,6 @@ async function run(command) {
       watchSurface(popup);
       remember(blocked, decideIncidental("popup"), secrets);
       popup.close().catch(() => {});
-      guard.armPage(popup).catch(() => {});
     });
     mark("open-login");
     const signedIn = await signIn(page, secrets[0], secrets[1], policy);
@@ -602,9 +604,7 @@ async function run(command) {
       },
       sessions: fetchSessions,
       detach: async () => {
-        if (browserSession && typeof browserSession.detach === "function") {
-          await browserSession.detach();
-        }
+        if (gate && typeof gate.close === "function") gate.close();
       },
       secrets,
       drafts: draft ? draft.fields : [],
