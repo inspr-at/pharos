@@ -50,6 +50,8 @@ jobs:
           shfmt -d -i 2 -ci "${shfmt_files[@]}"
       - name: fleet browser lifecycle
         run: node --test tests/fleet-refresh.test.mjs
+      - name: live UI request guard
+        run: node --test tests/live-ui-guard.test.mjs
       - name: GitHub Actions Node runtime assurance
         run: |
           scripts/check-github-actions-node24.sh --self-test
