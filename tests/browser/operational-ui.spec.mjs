@@ -896,7 +896,12 @@ test("stale side nixpkgs is visible as neutral context without host attention", 
     .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
     .first();
   await expect(card).toBeVisible();
-  await expect(card.locator("[data-reason]")).toContainText("all clear");
+  const reason = card.locator("[data-reason]");
+  await expect(reason).toContainText("all clear");
+  await expect(reason).toBeHidden();
+  const rowReason = page.locator(`tr[data-host="${host}"]`).locator("[data-reason]");
+  await expect(rowReason).toContainText("all clear");
+  await expect(rowReason).toBeHidden();
   await expect(card.locator(".freshness-rail")).toHaveAttribute("hidden", "");
   await expect(
     card.locator(".freshness-rail .fresh-row-compact:not([hidden])"),
@@ -1325,8 +1330,19 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     await expect(healthyRail).toHaveAttribute("hidden", "");
     await expect(failedCardChip).toHaveCount(1);
     await expect(failedCardChip).not.toHaveAttribute("hidden", "");
-    await expect(failedRail).not.toHaveAttribute("hidden", "");
-    await expect(failedRailBackup).toBeVisible();
+    await expect(failedCardChip).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expect(failedCardChip).toHaveAttribute("aria-label", /Backup failed/);
+    const failedDaily = failedCard.locator("a[data-daily-backup]");
+    await expect(failedDaily).toBeVisible();
+    await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expect(failedDaily.locator("[data-daily-backup-label]")).toHaveText("Failed");
+    await expect(failedCard.locator("[data-health-disclosure]")).toContainText("Backup Failed");
+    await expect(failedCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
+      "Backup Failed",
+    );
+    await expect(failedRail).toHaveAttribute("hidden", "");
+    await expect(failedRailBackup).toHaveCount(1);
+    await expect(failedRailBackup).toBeHidden();
     await expect(failedRailBackup).toContainText("Backup failed");
 
     for (const width of [1440, 1024, 768, 390, 320]) {
@@ -1388,8 +1404,15 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     expect(await applyBackupSnapshot(failedBackupObservation())).toBe(true);
     await expect(failedCardChip).not.toHaveAttribute("hidden", "");
     await expect(failedCardChip).toHaveAttribute("data-backup-state", "failed");
-    await expect(failedRail).not.toHaveAttribute("hidden", "");
-    await expect(failedRailBackup).toBeVisible();
+    await expect(failedCardChip).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expect(failedDaily).toBeVisible();
+    await expect(failedDaily.locator("[data-daily-backup-label]")).toHaveText("Failed");
+    await expect(failedCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
+      "Backup Failed",
+    );
+    await expect(failedRail).toHaveAttribute("hidden", "");
+    await expect(failedRailBackup).toBeHidden();
+    await expect(failedRailBackup).toContainText("Backup failed");
 
     await page.locator("[data-view-button='list']").click();
     await expect(page.locator("main")).toHaveAttribute("data-view", "list");
@@ -1397,6 +1420,10 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     await expect(healthyRow.locator(".backup-chip")).toHaveAttribute("hidden", "");
     await expect(failedRow.locator(".backup-chip")).toHaveCount(1);
     await expect(failedRow.locator(".backup-chip")).not.toHaveAttribute("hidden", "");
+    await expect(failedRow.locator(".backup-chip")).toHaveAttribute(
+      "href",
+      `/backups?host=${failedHost}`,
+    );
     for (const width of [1440, 1024, 768, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
       await expect(healthyRow.locator("[data-host-actions-trigger]")).toBeVisible();
@@ -1524,11 +1551,28 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
     await expect(quietRail.locator(".fresh-row-compact:not([hidden])")).toHaveCount(0);
     await expect(faultRail).toBeVisible();
     await expect(faultRail).toHaveAttribute("role", "group");
-    await expect(visibleFaults).toHaveCount(5);
+    await expect(visibleFaults).toHaveCount(4);
     await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toBeVisible();
     await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toBeVisible();
     await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toBeVisible();
-    await expect(faultRail.locator('[data-fresh-kind="backup-fault"]')).toBeVisible();
+    const backupFault = faultRail.locator('[data-fresh-kind="backup-fault"]');
+    await expect(backupFault).toHaveCount(1);
+    await expect(backupFault).toBeHidden();
+    await expect(backupFault).toContainText("Backup failed");
+    await expect(faultCard.locator("a[data-daily-backup]")).toBeVisible();
+    await expect(faultCard.locator("[data-daily-backup-label]")).toHaveText("Failed");
+    await expect(faultCard.locator("a[data-daily-backup]")).toHaveAttribute(
+      "href",
+      `/backups?host=${faultHost}`,
+    );
+    await expect(faultCard.locator(".backup-chip")).toBeVisible();
+    await expect(faultCard.locator(".backup-chip")).toHaveAttribute(
+      "href",
+      `/backups?host=${faultHost}`,
+    );
+    await expect(faultCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
+      "Backup Failed",
+    );
     const failedBackupValue = faultRail.locator(
       '[data-fresh-kind="backup-fault"] [data-fresh-value]',
     );
@@ -1682,7 +1726,12 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
 
     expect(await page.evaluate((body) => applyFleetSnapshot(body), original)).toBe(true);
     await expect(faultRail).not.toHaveAttribute("hidden", "");
-    await expect(visibleFaults).toHaveCount(5);
+    await expect(visibleFaults).toHaveCount(4);
+    await expect(faultRail.locator('[data-fresh-kind="backup-fault"]')).toBeHidden();
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toBeVisible();
   } finally {
     for (const host of hosts) {
       const removal = await page.request.post(`/host-actions/${host}/remove`, {
