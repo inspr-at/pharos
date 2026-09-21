@@ -20,6 +20,9 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
   await page.goto("/");
 
   const stamp = await page.evaluate(() => {
+    const main = document.querySelector("main");
+    if (!main) throw new Error("fleet main is missing");
+    main.querySelector(".empty-state")?.remove();
     const fixture = document.createElement("section");
     fixture.className = "grid";
     fixture.dataset.hoverFixture = "true";
@@ -54,7 +57,7 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
           </div>
         </div>
       </article>
-      <table class="list"><tbody>
+      <table class="list" style="min-width:0;width:100%"><tbody>
         <tr data-host="demo-row" data-host-surface="runtime">
           <td class="list-seen">
             <span data-seen>last seen 2m ago</span>
@@ -81,12 +84,7 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
           </td>
         </tr>
       </tbody></table>`;
-    fixture.style.position = "relative";
-    fixture.style.zIndex = "5";
-    document.querySelectorAll(".empty-visual").forEach((node) => {
-      node.style.pointerEvents = "none";
-    });
-    document.body.append(fixture);
+    main.append(fixture);
     window.bindHistoryHints(fixture);
     return stamp;
   });
