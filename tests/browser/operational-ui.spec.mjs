@@ -4830,7 +4830,7 @@ test("settings guarded apply retains its parent run through linked confirmation 
   expect(applyPosts).toHaveLength(1);
 });
 
-test("Agora keeps guarded settings apply read-only without fleet operator access", async ({
+test("Agora keeps guarded settings apply read-only when operator access is lost before workflow render", async ({
   page,
 }, testInfo) => {
   const host = `settings-viewer-apply-${testInfo.project.name}`;
@@ -4840,8 +4840,19 @@ test("Agora keeps guarded settings apply read-only without fleet operator access
     preferences: { accent: "#111111" },
   });
   const applyPosts = [];
+  let preferencePosts = 0;
   await page.route("**/agora/requests/host-preferences.json", async (route) => {
-    if (route.request().method() !== "POST") return route.continue();
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    preferencePosts += 1;
+    // Access is still manager when Send starts. Revoke it before the
+    // ready-to-apply body is delivered, so workflow render sees a viewer.
+    await page.evaluate(() => {
+      const main = document.querySelector(".settings-main");
+      if (main) main.dataset.canManageFleet = "false";
+    });
     await route.fulfill({
       status: 202,
       contentType: "application/json",
@@ -4873,15 +4884,27 @@ test("Agora keeps guarded settings apply read-only without fleet operator access
   });
 
   await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
-  await page.locator(".settings-main").evaluate((main) => {
-    main.dataset.canManageFleet = "false";
-  });
+  await expect(page.locator(".settings-main")).toHaveAttribute(
+    "data-can-manage-fleet",
+    "true",
+  );
+  await expect(page.locator("[data-review-settings]")).toBeDisabled();
+  expect(preferencePosts).toBe(0);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#48b8a8";
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
-  await page.locator("[data-review-settings]").click();
-  await page.getByRole("button", { name: "Send settings request" }).click();
+  const review = page.locator("[data-review-settings]");
+  await expect(review).toBeEnabled();
+  await review.click();
+  const confirm = page.getByRole("dialog", { name: `Confirm changes for ${host}` });
+  await expect(confirm).toBeVisible();
+  await expect(page.locator(".settings-main")).toHaveAttribute(
+    "data-can-manage-fleet",
+    "true",
+  );
+  expect(preferencePosts).toBe(0);
+  await confirm.getByRole("button", { name: "Send settings request" }).click();
 
   const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
   const apply = dialog.getByRole("button", { name: `Apply on ${host}`, exact: true });
@@ -4896,6 +4919,7 @@ test("Agora keeps guarded settings apply read-only without fleet operator access
   );
   await apply.evaluate((button) => button.click());
   expect(applyPosts).toHaveLength(0);
+  expect(preferencePosts).toBe(1);
 });
 
 test("preference drift declared_not_applied sheet resolves in host settings", async ({
