@@ -306,7 +306,7 @@ pub(crate) async fn host_workspace_page(
         .iter()
         .find(|host| host.name == host_ref || host.slug == host_ref);
 
-    if !access.can_agora() || selected.is_none() {
+    if selected.is_none() {
         return Html(crate::public_mount::localize_document(
             &state.public_base_path,
             &crate::render_no_access_page(

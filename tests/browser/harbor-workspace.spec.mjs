@@ -208,7 +208,7 @@ test("fleet breadcrumb returns to the real fleet entry", async ({ page }, testIn
     await page.goto("/");
     await page.locator('[data-view-button="list"]').click();
     await page.locator("[data-sort]").selectOption("name");
-    await page.locator("[data-search]").fill(host);
+    await page.locator("input[data-search]").fill(host);
     await expect.poll(() => {
       const url = new URL(page.url());
       return url.searchParams.get("view") === "list"
