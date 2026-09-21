@@ -7,7 +7,7 @@
 - Preserve the existing shell, seven navigation entries, and lighthouse artwork. Aggregate host health reasons on a compact list, open the native host workspace from the host name, and keep Quick preview separate (PHAROS-290, PHAROS-296, PHAROS-300).
 - Keep heartbeat history on a stable time axis separate from the current arrival indicator, and continue the clock and refresh while a visible window is unfocused (PHAROS-291, PHAROS-293, PHAROS-297).
 - Default fleet heartbeat grace to 15 seconds after cadence. Omit a host override to inherit, accept zero as an override, and clear it with Use fleet default. Stale and down cutoffs stay authoritative (PHAROS-292).
-- Keep daily backup and selective restore independent. A restore of at least one file becomes overdue only strictly after 30 days, and unknown evidence stays unknown. A disabled backup is not an exemption (PHAROS-302).
+- Keep daily backup and selective restore independent. A restore of at least one file becomes overdue only strictly after 30 days, and unknown evidence stays unknown. A disabled backup is not an exemption (PHAROS-294).
 - Use "No pending changes" for idle lifecycle work, which is not a package-freshness claim. A deployable update is a proven nixcfg commit gap; a channel-tip difference alone is not one (PHAROS-306).
 - Add a guarded personal headless inspection that performs no application mutations. An enrollment prompt is recognized and not submitted (PHAROS-303).
 - Upgrade every reader of the shared host-preferences registry before publishing a populated host override (PHAROS-292).
