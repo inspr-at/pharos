@@ -6367,6 +6367,18 @@ mod tests {
         ));
         assert!(html.contains(r#"<button class="signal-window" type="button" data-signal-window"#));
         assert!(html.contains(r#"data-signal-window-key="10m""#));
+        assert!(html.contains(r#"data-signal-kind="delivery""#));
+        assert!(html.contains(r#"<span class="signal-label">delivery</span>"#));
+        assert!(!html.contains(r#"<span class="signal-label">availability</span>"#));
+        assert!(html.contains(
+            r#"title="Heartbeat delivery window 10m; click for 1h. Not measured uptime.""#
+        ));
+        assert!(html.contains(r#"title="Change delivery window""#));
+        assert!(html.contains(r#"aria-label="Change delivery window; currently 10m""#));
+        assert!(!html.contains("Change availability window"));
+        assert!(!html.contains("Signal over "));
+        assert!(html.contains("Heartbeat delivery over 10m:"));
+        assert!(html.contains("Not measured host or service uptime."));
         assert!(
             html.contains(r#"<div class="availability-head"><span class="signal availability""#)
         );
@@ -9314,10 +9326,84 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     fn heartbeat_signal_can_score_longer_windows() {
         let sparse = heartbeat_signal(&[0, 60, 120, 3600], Some(3600), 60, 3600, "1h", 3600);
 
-        assert_eq!(sparse.text, "7%");
+        assert_eq!(sparse.text, "5%");
         assert_eq!(sparse.level, "down");
         assert_eq!(sparse.window, "1h");
-        assert!(sparse.title.contains("longest gap"));
+        assert!(sparse.title.contains("Longest gap"));
+        assert!(sparse.title.contains("3 of 59"));
+        assert!(sparse.title.contains("Heartbeat delivery"));
+    }
+
+    #[test]
+    fn heartbeat_signal_delivery_edges_match_signal_info() {
+        let window = SIGNAL_DEFAULT_WINDOW_LABEL;
+        let secs = SIGNAL_DEFAULT_WINDOW_SECS;
+        let uptime = "Not measured host or service uptime.";
+
+        let empty = heartbeat_signal(&[0, -1], Some(0), 60, 1_000, window, secs);
+        assert_eq!(empty.text, "—");
+        assert_eq!(empty.level, "wait");
+        assert!(empty.title.contains("no reports yet."));
+        assert!(empty.title.contains(uptime));
+        assert!(!empty.title.contains("100%"));
+        assert!(!empty.title.contains("after duplicate collapse"));
+        let empty_markup = availability_markup(&empty);
+        assert!(empty_markup.contains(r#"data-signal-level="wait""#));
+        assert!(empty_markup.contains(r#"<span class="signal-label">delivery</span>"#));
+        assert!(empty_markup.contains("data-signal-kind=\"delivery\""));
+        assert!(!empty_markup.contains("100%"));
+        assert!(!empty_markup.contains("signal-label\">availability"));
+
+        let partial = heartbeat_signal(&[500], None, 60, 1_000, window, secs);
+        assert_eq!(partial.text, "11%");
+        assert_eq!(partial.level, "down");
+        assert!(partial
+            .title
+            .contains("1 of 9 expected reports after duplicate collapse."));
+        assert!(partial.title.contains("Partial retention from 00:08:20."));
+        assert!(partial.title.contains(uptime));
+        assert!(!partial.title.contains("1 of 10"));
+        assert!(!partial.title.contains("100%"));
+
+        let future = heartbeat_signal(&[1_010, 1_020], Some(1_020), 60, 1_000, window, secs);
+        assert_eq!(future.text, "—");
+        assert_eq!(future.level, "wait");
+        assert!(future
+            .title
+            .contains("reports are ahead of Pharos and were not counted."));
+        assert!(future.title.contains(uptime));
+        assert_ne!(future.level, "good");
+        assert!(!future.text.contains('1'));
+
+        let mixed = heartbeat_signal(&[940, 1_010, 1_020], Some(940), 60, 1_000, window, secs);
+        assert_eq!(mixed.text, "100%");
+        assert_eq!(mixed.level, "good");
+        assert!(mixed
+            .title
+            .contains("1 of 1 expected reports after duplicate collapse."));
+        assert!(mixed.title.contains("2 clock-skewed reports ignored."));
+        assert!(!mixed.title.contains("3 of"));
+
+        let duplicated =
+            heartbeat_signal(&[500, 500, 500, 560], Some(560), 60, 1_000, window, secs);
+        let unique = heartbeat_signal(&[500, 560], None, 60, 1_000, window, secs);
+        assert_eq!(duplicated.text, unique.text);
+        assert_eq!(duplicated.title, unique.title);
+        assert_eq!(duplicated.text, "22%");
+        assert!(duplicated
+            .title
+            .contains("2 of 9 expected reports after duplicate collapse."));
+        assert!(!duplicated.title.contains("4 of"));
+
+        let late = heartbeat_signal(&[400, 1_000], None, 60, 1_000, window, secs);
+        assert_eq!(late.text, "20%");
+        assert_eq!(late.level, "down");
+        assert!(late
+            .title
+            .contains("2 of 10 expected reports after duplicate collapse."));
+        assert!(late.title.contains("Longest gap 10m 00s."));
+        assert!(!late.title.contains("Partial retention"));
+        assert!(late.title.contains(uptime));
     }
 
     #[test]
@@ -15139,6 +15225,129 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .build()
             .unwrap();
         (format!("http://{address}"), client)
+    }
+
+    #[tokio::test]
+    async fn settings_entrypoints_redirect_to_the_prefixed_settings_section() {
+        let mut prefixed = report_test_state(false);
+        prefixed.public_base_path = PublicBasePath::parse("/pharos").unwrap();
+        prefixed
+            .store
+            .record(test_report("poseidon"), 1_000)
+            .expect("host recorded");
+        let (base, client) = serve_test_app(prefixed).await;
+
+        let agora = client
+            .get(format!("{base}/pharos/agora?host=poseidon"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(agora.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            agora
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("/pharos/hosts/poseidon?section=settings")
+        );
+
+        let encoded = client
+            .get(format!("{base}/pharos/agora?host=a%20b"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(encoded.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            encoded
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("/pharos/hosts/a%20b?section=settings")
+        );
+
+        let home = client
+            .get(format!("{base}/pharos/agora"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(home.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            home.headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("/pharos")
+        );
+
+        let legacy = client
+            .get(format!("{base}/pharos/hosts/poseidon/settings"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            legacy
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("/pharos/hosts/poseidon?section=settings")
+        );
+
+        let overview = client
+            .get(format!("{base}/pharos/hosts/poseidon"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(overview.status(), StatusCode::OK);
+        let overview_html = overview.text().await.unwrap();
+        assert!(overview_html
+            .contains(r#"data-host-section="settings" data-host-workspace-settings hidden"#));
+        assert!(overview_html.contains(r#"data-host-section="overview">"#));
+        assert!(overview_html.contains(r#"data-fleet-return href="/pharos""#));
+        assert!(overview_html.contains("history.length>1"));
+        assert!(!overview_html.contains("document.referrer"));
+        assert!(!overview_html.contains("sessionStorage"));
+
+        let settings = client
+            .get(format!("{base}/pharos/hosts/poseidon?section=settings"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(settings.status(), StatusCode::OK);
+        let settings_html = settings.text().await.unwrap();
+        assert!(
+            settings_html.contains(r#"data-host-section="settings" data-host-workspace-settings>"#)
+        );
+        assert!(settings_html.contains(r#"data-host-section="overview" hidden>"#));
+        assert!(!settings_html.contains("data-host-workspace-settings hidden"));
+
+        let draft = client
+            .get(format!(
+                "{base}/pharos/hosts/poseidon?draft=fleet-drawer&draft_accent=%23aabbcc"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(draft.status(), StatusCode::OK);
+        let draft_html = draft.text().await.unwrap();
+        assert!(
+            draft_html.contains(r#"data-host-section="settings" data-host-workspace-settings>"#)
+        );
+        assert!(!draft_html.contains("data-host-workspace-settings hidden"));
+
+        let (root_base, root_client) = serve_test_app(report_test_state(false)).await;
+        let root_legacy = root_client
+            .get(format!("{root_base}/hosts/poseidon/settings"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(root_legacy.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            root_legacy
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("/hosts/poseidon?section=settings")
+        );
     }
 
     #[tokio::test]

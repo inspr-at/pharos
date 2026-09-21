@@ -5885,6 +5885,43 @@ pub(super) struct HeartbeatSignal {
     pub(super) title: String,
 }
 
+fn delivery_samples(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
+    let mut samples: Vec<i64> = log.iter().copied().filter(|stamp| *stamp > 0).collect();
+    if let Some(last) = last_seen.filter(|stamp| *stamp > 0) {
+        samples.push(last);
+    }
+    samples.sort_unstable();
+    samples.dedup();
+    samples
+}
+
+fn delivery_gap_label(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 10 {
+        return format!("{seconds:.1}s");
+    }
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn delivery_window_tip(window_label: &str) -> String {
+    let next = match window_label {
+        "10m" => "1h",
+        "1h" => "24h",
+        _ => "10m",
+    };
+    format!("Heartbeat delivery window {window_label}; click for {next}. Not measured uptime.")
+}
+
+fn delivery_percent(received: usize, expected: usize) -> i64 {
+    let expected = (expected.max(1)) as i64;
+    let scaled = (received as i64).saturating_mul(100);
+    ((scaled + expected / 2) / expected).clamp(0, 100)
+}
+
 pub(super) fn heartbeat_signal(
     log: &[i64],
     last_seen: Option<i64>,
@@ -5893,37 +5930,46 @@ pub(super) fn heartbeat_signal(
     window_label: &'static str,
     window_secs: i64,
 ) -> HeartbeatSignal {
-    let samples = heartbeat_samples(log, last_seen);
+    const UPTIME: &str = " Not measured host or service uptime.";
+    let base = format!("Heartbeat delivery over {window_label}: ");
+    let samples = delivery_samples(log, last_seen);
     if samples.is_empty() {
         return HeartbeatSignal {
-            text: "new".to_string(),
+            text: "—".to_string(),
             level: "wait",
             window: window_label,
-            title: format!("Signal over {window_label}: waiting for first heartbeat"),
+            title: format!("{base}no reports yet.{UPTIME}"),
         };
-    };
+    }
 
-    let interval = interval.max(1);
-    let window_secs = window_secs.max(interval);
-    let requested_start = now - window_secs;
-    let retained_start = samples
-        .first()
-        .copied()
-        .map(|oldest| oldest.max(requested_start))
-        .unwrap_or(requested_start);
-    let span = (now - retained_start).max(interval).min(window_secs);
-    let expected = ((span + interval - 1) / interval).max(1) as usize;
-    let received = samples
+    let cadence = if interval > 0 { interval } else { 60 };
+    let window_secs = window_secs.max(cadence);
+    let requested_start = now.saturating_sub(window_secs);
+    let skew_limit = now.saturating_add(BACKUP_CLOCK_SKEW_SECS);
+    let future_count = samples.iter().filter(|stamp| **stamp > skew_limit).count();
+    let usable: Vec<i64> = samples
+        .into_iter()
+        .filter(|stamp| *stamp <= skew_limit)
+        .collect();
+    if usable.is_empty() {
+        return HeartbeatSignal {
+            text: "—".to_string(),
+            level: "wait",
+            window: window_label,
+            title: format!("{base}reports are ahead of Pharos and were not counted.{UPTIME}"),
+        };
+    }
+
+    let retained_start = requested_start.max(usable[0]);
+    let span = cadence.max(window_secs.min(now.saturating_sub(retained_start)));
+    let expected = ((span + cadence - 1) / cadence).max(1) as usize;
+    let received = usable
         .iter()
         .filter(|stamp| **stamp >= retained_start && **stamp <= now)
         .count();
     let mut previous = retained_start;
-    let mut longest_gap = samples
-        .last()
-        .copied()
-        .map(|latest| (now - latest).max(0).min(span))
-        .unwrap_or(span);
-    for stamp in samples
+    let mut longest_gap = 0;
+    for stamp in usable
         .iter()
         .copied()
         .filter(|stamp| *stamp >= retained_start && *stamp <= now)
@@ -5931,9 +5977,9 @@ pub(super) fn heartbeat_signal(
         longest_gap = longest_gap.max(stamp - previous);
         previous = stamp;
     }
-    longest_gap = longest_gap.max(now - previous);
+    longest_gap = longest_gap.max(now.saturating_sub(previous));
 
-    let percent = (((received * 100) + (expected / 2)) / expected).min(100);
+    let percent = delivery_percent(received, expected);
     let level = if percent >= 95 {
         "good"
     } else if percent >= 75 {
@@ -5941,26 +5987,37 @@ pub(super) fn heartbeat_signal(
     } else {
         "down"
     };
+    let partial = if usable[0] > requested_start + 1 {
+        format!(" Partial retention from {}.", clock_label(usable[0]))
+    } else {
+        String::new()
+    };
+    let skew = if future_count == 0 {
+        String::new()
+    } else {
+        let noun = if future_count == 1 {
+            "report"
+        } else {
+            "reports"
+        };
+        format!(" {future_count} clock-skewed {noun} ignored.")
+    };
     HeartbeatSignal {
         text: format!("{percent}%"),
         level,
         window: window_label,
         title: format!(
-            "Signal over {window_label}: {received} of {expected} expected heartbeats received · longest gap {}{}",
-            duration_label(longest_gap),
-            if retained_start > requested_start {
-                format!(" · retained {}", duration_label(span))
-            } else {
-                String::new()
-            }
+            "{base}{received} of {expected} expected reports after duplicate collapse.{partial}{skew} Longest gap {}.{UPTIME}",
+            delivery_gap_label(longest_gap),
         ),
     }
 }
 
 pub(super) fn signal_markup(signal: &HeartbeatSignal) -> String {
     let title = html_escape(&signal.title);
+    let window_tip = html_escape(&delivery_window_tip(signal.window));
     format!(
-        r#"<span class="signal" data-signal data-signal-level="{level}" data-signal-window-key="{window}" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-orb" aria-hidden="true"></span><button class="signal-window" type="button" data-signal-window title="{title}">{window}</button></span>"#,
+        r#"<span class="signal" data-signal data-signal-level="{level}" data-signal-window-key="{window}" data-signal-kind="delivery" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-orb" aria-hidden="true"></span><button class="signal-window" type="button" data-signal-window title="{window_tip}" aria-label="{window_tip}">{window}</button></span>"#,
         level = html_escape(signal.level),
         text = html_escape(&signal.text),
         window = html_escape(signal.window),
@@ -5970,7 +6027,7 @@ pub(super) fn signal_markup(signal: &HeartbeatSignal) -> String {
 pub(super) fn availability_markup(signal: &HeartbeatSignal) -> String {
     let title = html_escape(&signal.title);
     format!(
-        r#"<span class="signal availability" data-signal data-signal-level="{level}" data-signal-window-key="{window}" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-label">availability</span></span>"#,
+        r#"<span class="signal availability" data-signal data-signal-level="{level}" data-signal-window-key="{window}" data-signal-kind="delivery" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-label">delivery</span></span>"#,
         level = html_escape(signal.level),
         text = html_escape(&signal.text),
         window = html_escape(signal.window),
@@ -8763,7 +8820,7 @@ pub(super) fn heartbeat_card(card: HeartbeatCard<'_>) -> String {
     let history_window_label = html_escape(SIGNAL_DEFAULT_WINDOW_LABEL);
     let history_window_control = if window_control {
         format!(
-            r#"<button class="beat-window" type="button" data-signal-window data-history-window-label title="Change availability window" aria-label="Change availability window; currently {history_window_label}">{history_window_label}</button>"#,
+            r#"<button class="beat-window" type="button" data-signal-window data-history-window-label title="Change delivery window" aria-label="Change delivery window; currently {history_window_label}">{history_window_label}</button>"#,
         )
     } else {
         format!(r#"<span data-history-window-label>{history_window_label}</span>"#)

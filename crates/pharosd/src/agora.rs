@@ -108,6 +108,7 @@ pub(crate) struct AgoraPageQuery {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct HostWorkspaceQuery {
     section: Option<String>,
+    draft: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,14 +241,29 @@ pub(crate) async fn page(
         .map(str::trim)
         .filter(|host| !host.is_empty())
     {
-        Some(host) => Redirect::temporary(
-            &state
-                .public_base_path
-                .href(&format!("/hosts/{}", crate::url_query_escape(host))),
-        )
+        Some(host) => Redirect::temporary(&state.public_base_path.href(&format!(
+            "/hosts/{}?section=settings",
+            crate::url_query_escape(host),
+        )))
         .into_response(),
         None => Redirect::temporary(state.public_base_path.home()).into_response(),
     }
+}
+
+/// Legacy `/hosts/{host}/settings` entry. Native `/hosts/{host}` stays the overview.
+pub(crate) async fn host_settings_entry(
+    State(state): State<AppState>,
+    Path(host_ref): Path<String>,
+) -> Response {
+    let host = host_ref.trim();
+    if host.is_empty() {
+        return Redirect::temporary(state.public_base_path.home()).into_response();
+    }
+    Redirect::temporary(&state.public_base_path.href(&format!(
+        "/hosts/{}?section=settings",
+        crate::url_query_escape(host),
+    )))
+    .into_response()
 }
 
 /// Stable, host-scoped entry point for the durable operator workspace.
@@ -346,7 +362,7 @@ pub(crate) async fn host_workspace_page(
                         now: crate::now_unix(),
                         fleet_nixpkgs_warn_days,
                         fleet_grace_seconds,
-                        section: WorkspaceSection::parse(query.section.as_deref()),
+                        section: workspace_section(&query),
                     }),
                 },
             ),
@@ -380,7 +396,7 @@ struct PageContext<'a> {
     workspace: Option<HostWorkspaceContext<'a>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceSection {
     Overview,
     Backups,
@@ -405,6 +421,14 @@ impl WorkspaceSection {
             Self::Activity => "activity",
             Self::Settings => "settings",
         }
+    }
+}
+
+fn workspace_section(query: &HostWorkspaceQuery) -> WorkspaceSection {
+    if query.draft.as_deref().map(str::trim) == Some("fleet-drawer") {
+        WorkspaceSection::Settings
+    } else {
+        WorkspaceSection::parse(query.section.as_deref())
     }
 }
 
@@ -1343,13 +1367,7 @@ fn render_page_with_access(
 function appUrl(path){{return (typeof window.pharosPublicPath==='function')?window.pharosPublicPath(path):path}}
 document.querySelector('[data-fleet-return]')?.addEventListener('click',event=>{{
   if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;
-  let fleetReferrer=false;
-  try{{
-    const ref=new URL(document.referrer);
-    const home=new URL(appUrl('/'),location.origin);
-    fleetReferrer=ref.origin===location.origin&&ref.pathname===home.pathname;
-  }}catch(_){{}}
-  if(fleetReferrer){{event.preventDefault();history.back();}}
+  if(history.length>1){{event.preventDefault();history.back();}}
 }});
 document.querySelector('[data-host-workspace-primary]')?.addEventListener('click',event=>{{
   const href=event.currentTarget.getAttribute('href')||'';
@@ -1932,25 +1950,32 @@ if(root){{
   syncDownAlertPolicy();
   savedPreferences=draftPreferences();
   const incomingDraft=new URLSearchParams(window.location.search);
-  if(settingsCanManageFleet()&&incomingDraft.get('draft')==='fleet-drawer'){{
-    const incomingAccent=incomingDraft.get('draft_accent')||'';
-    const incomingKind=incomingDraft.get('draft_kind')||'';
-    const boolValue=name=>incomingDraft.get(name)==='true';
-    if(/^#[0-9a-fA-F]{{6}}$/.test(incomingAccent)&&['server','workstation'].includes(incomingKind)){{
-      applyPreferences({{
-        accent:incomingAccent,
-        kind:incomingKind,
-        alerts:{{
-          ...savedPreferences.alerts,
-          suppress_down:boolValue('draft_suppress_down'),
-          suppress_backup:boolValue('draft_suppress_backup'),
-          suppress_nix_freshness:boolValue('draft_suppress_nix'),
-        }},
-      }});
-      const cleanUrl=new URL(window.location.href);
-      ['draft','draft_accent','draft_kind','draft_suppress_down','draft_suppress_backup','draft_suppress_nix'].forEach(key=>cleanUrl.searchParams.delete(key));
-      window.history.replaceState(null,'',cleanUrl.pathname+(cleanUrl.searchParams.size?'?'+cleanUrl.searchParams.toString():''));
+  if(incomingDraft.get('draft')==='fleet-drawer'){{
+    document.querySelectorAll('[data-host-section]').forEach(section=>{{section.hidden=section.dataset.hostSection!=='settings';}});
+    document.querySelectorAll('[data-host-tab]').forEach(tab=>{{
+      if(tab.dataset.section==='settings')tab.setAttribute('aria-current','page');
+      else tab.removeAttribute('aria-current');
+    }});
+    if(settingsCanManageFleet()){{
+      const incomingAccent=incomingDraft.get('draft_accent')||'';
+      const incomingKind=incomingDraft.get('draft_kind')||'';
+      const boolValue=name=>incomingDraft.get(name)==='true';
+      if(/^#[0-9a-fA-F]{{6}}$/.test(incomingAccent)&&['server','workstation'].includes(incomingKind)){{
+        applyPreferences({{
+          accent:incomingAccent,
+          kind:incomingKind,
+          alerts:{{
+            ...savedPreferences.alerts,
+            suppress_down:boolValue('draft_suppress_down'),
+            suppress_backup:boolValue('draft_suppress_backup'),
+            suppress_nix_freshness:boolValue('draft_suppress_nix'),
+          }},
+        }});
+      }}
     }}
+    const cleanUrl=new URL(window.location.href);
+    ['draft','draft_accent','draft_kind','draft_suppress_down','draft_suppress_backup','draft_suppress_nix'].forEach(key=>cleanUrl.searchParams.delete(key));
+    window.history.replaceState(null,'',cleanUrl.pathname+(cleanUrl.searchParams.size?'?'+cleanUrl.searchParams.toString():''));
   }}
   updateDraftState();
   const initialWorkflowId=incomingDraft.get('workflow')||'';
@@ -3088,6 +3113,10 @@ mod tests {
         assert!(!html.contains("Access</button>"));
         assert!(!html.contains("stored-token-hash"));
         assert!(html.contains("[data-fleet-return]"));
+        assert!(html.contains("history.length>1"));
+        assert!(html.contains("history.back()"));
+        assert!(!html.contains("document.referrer"));
+        assert!(html.contains("section.dataset.hostSection!=='settings'"));
         assert!(html.contains("pharos.sidebar.still.v1"));
         assert!(html.contains(
             "localStorage.setItem(storageKey,JSON.stringify({version:1,value:preferStill,expiresAt:Date.now()+storageTtlMs}))"
@@ -3167,6 +3196,45 @@ mod tests {
         assert!(viewer_html.contains("Viewer access: settings and receipts stay visible"));
         assert!(viewer_html.contains(r#"data-review-settings disabled"#));
         assert!(viewer_html.contains(r#"data-host-workspace-receipts"#));
+    }
+
+    #[test]
+    fn fleet_drawer_draft_opens_settings_and_native_host_stays_overview() {
+        assert_eq!(
+            workspace_section(&HostWorkspaceQuery {
+                section: None,
+                draft: None,
+            }),
+            WorkspaceSection::Overview
+        );
+        assert_eq!(
+            workspace_section(&HostWorkspaceQuery {
+                section: Some("settings".to_string()),
+                draft: None,
+            }),
+            WorkspaceSection::Settings
+        );
+        assert_eq!(
+            workspace_section(&HostWorkspaceQuery {
+                section: None,
+                draft: Some("fleet-drawer".to_string()),
+            }),
+            WorkspaceSection::Settings
+        );
+        assert_eq!(
+            workspace_section(&HostWorkspaceQuery {
+                section: Some("backups".to_string()),
+                draft: Some(" fleet-drawer ".to_string()),
+            }),
+            WorkspaceSection::Settings
+        );
+        assert_eq!(
+            workspace_section(&HostWorkspaceQuery {
+                section: Some("backups".to_string()),
+                draft: Some("other".to_string()),
+            }),
+            WorkspaceSection::Backups
+        );
     }
 
     #[test]
