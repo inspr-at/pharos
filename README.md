@@ -51,7 +51,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v260920201529.0.0
+## What ships in v260921083754.0.0
 
 | Area                    | Current capability                                                                                                                                                                                                       |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -999,7 +999,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v260920201529.0.0**. It is already used as a real
+Pharos is an active early release at **v260921083754.0.0**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 
