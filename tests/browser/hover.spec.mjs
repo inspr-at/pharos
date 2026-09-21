@@ -20,6 +20,9 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
   await page.goto("/");
 
   const stamp = await page.evaluate(() => {
+    const main = document.querySelector("main");
+    if (!main) throw new Error("fleet main is missing");
+    main.querySelector(".empty-state")?.remove();
     const fixture = document.createElement("section");
     fixture.className = "grid";
     fixture.dataset.hoverFixture = "true";
@@ -47,13 +50,14 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
                 data-history-label="offline gap recovered"
                 data-history-detail="9 min after previous · 07:58"
                 aria-label="offline gap recovered · 9 min after previous · 07:58"
+                title="offline gap recovered · 9 min after previous · 07:58"
                 style="--mark-x:50%"
               ></span>
             </span>
           </div>
         </div>
       </article>
-      <table class="list"><tbody>
+      <table class="list" style="min-width:0;width:100%"><tbody>
         <tr data-host="demo-row" data-host-surface="runtime">
           <td class="list-seen">
             <span data-seen>last seen 2m ago</span>
@@ -71,6 +75,7 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
                     data-history-label="offline gap recovered"
                     data-history-detail="9 min after previous · 07:58 and a longer clause that must not stretch the row"
                     aria-label="offline gap recovered · 9 min after previous · 07:58 and a longer clause that must not stretch the row"
+                    title="offline gap recovered · 9 min after previous · 07:58 and a longer clause that must not stretch the row"
                     style="--mark-x:70%"
                   ></span>
                 </span>
@@ -79,7 +84,7 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
           </td>
         </tr>
       </tbody></table>`;
-    document.body.append(fixture);
+    main.append(fixture);
     window.bindHistoryHints(fixture);
     return stamp;
   });
