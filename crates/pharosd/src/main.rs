@@ -3609,14 +3609,16 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
         .filter(|host| host_janus_actions_ready(&state, &host.name))
         .map(|host| host.name.clone())
         .collect();
-    let mut payload = hosts_payload(
+    let fleet_settings = state.fleet_settings.get();
+    let mut payload = hosts_payload_with_grace(
         runtime_hosts,
         &manifests,
         &declared_preferences,
         &action_jobs,
         Some(&janus_action_hosts),
         now,
-        state.fleet_settings.get().nixpkgs_warn_after_days,
+        fleet_settings.nixpkgs_warn_after_days,
+        fleet_settings.heartbeat_grace_secs,
     );
     if let Some(hosts) = payload
         .get_mut("hosts")
@@ -3665,6 +3667,28 @@ fn hosts_payload(
     janus_action_hosts: Option<&BTreeSet<String>>,
     now: i64,
     fleet_threshold: u32,
+) -> serde_json::Value {
+    hosts_payload_with_grace(
+        runtime_hosts,
+        manifests,
+        declared_preferences,
+        action_jobs,
+        janus_action_hosts,
+        now,
+        fleet_threshold,
+        pharos_core::DEFAULT_HEARTBEAT_GRACE_SECS,
+    )
+}
+
+fn hosts_payload_with_grace(
+    runtime_hosts: Vec<Host>,
+    manifests: &[HostManifest],
+    declared_preferences: &BTreeMap<String, HostPreferences>,
+    action_jobs: &[HostActionJob],
+    janus_action_hosts: Option<&BTreeSet<String>>,
+    now: i64,
+    fleet_threshold: u32,
+    fleet_grace_secs: u64,
 ) -> serde_json::Value {
     let manifests = manifest_by_host(manifests);
     let hosts: Vec<_> = runtime_hosts
@@ -3723,6 +3747,10 @@ fn hosts_payload(
             let withdrawable_settings_change =
                 withdrawable_settings_change_for_host(action_jobs, &h.name);
             let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
+            let heartbeat_grace = h.preferences.heartbeat_grace_policy(
+                Some(fleet_grace_secs),
+                h.heartbeat_interval_secs,
+            );
             let freshness_tldr = h.freshness.tldr();
             let attention = attention_reason(
                 live,
@@ -3749,6 +3777,7 @@ fn hosts_payload(
                 "last_seen": h.last_seen,
                 "heartbeat_log": h.heartbeat_log,
                 "heartbeat_interval_secs": h.heartbeat_interval_secs,
+                "heartbeat_grace": heartbeat_grace,
                 "inbound_rtt": h.inbound_rtt,
                 "liveness": live,
                 "location": location_payload(&location),
@@ -3777,7 +3806,11 @@ fn hosts_payload(
             host
         })
         .collect();
-    json!({ "as_of": now, "hosts": hosts })
+    json!({
+        "as_of": now,
+        "fleet_heartbeat_grace_secs": fleet_grace_secs,
+        "hosts": hosts
+    })
 }
 
 async fn declared_hosts_json(
@@ -5039,7 +5072,7 @@ async fn test_hetzner_provider_connection(
 async fn update_fleet_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(settings): Json<fleet_settings::FleetSettings>,
+    Json(update): Json<fleet_settings::FleetSettingsUpdate>,
 ) -> impl IntoResponse {
     let access = access_for_headers(&state.auth, &headers);
     let (status, body) = if !action_request_header(&headers) || !access.can_manage_fleet() {
@@ -5047,13 +5080,14 @@ async fn update_fleet_settings(
             StatusCode::FORBIDDEN,
             json!({"error": "Fleet settings access is not granted"}),
         )
-    } else if !settings.valid() {
-        (
-            StatusCode::BAD_REQUEST,
-            json!({"error": "nixpkgs warning threshold must be between 1 and 3650 days"}),
-        )
-    } else if let Err(error) = state.fleet_settings.update(settings) {
-        (StatusCode::SERVICE_UNAVAILABLE, json!({"error": error}))
+    } else if let Err(error) = state.fleet_settings.apply(update) {
+        let status = match error {
+            fleet_settings::FleetSettingsWriteError::Invalid(_) => StatusCode::BAD_REQUEST,
+            fleet_settings::FleetSettingsWriteError::Unavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        };
+        (status, json!({"error": error.message()}))
     } else {
         (
             StatusCode::OK,
@@ -8035,6 +8069,7 @@ mod tests {
                 suppress_backup: true,
                 suppress_nix_freshness: true,
                 nixpkgs_warn_after_days: None,
+                heartbeat_grace_secs: None,
             },
             ..Default::default()
         };
@@ -14145,24 +14180,31 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             Arc::new(fleet_settings::FleetSettingsStore::new(Some(path.clone())).unwrap());
         let settings = fleet_settings::FleetSettings {
             nixpkgs_warn_after_days: 45,
+            heartbeat_grace_secs: 15,
+        };
+        let update = fleet_settings::FleetSettingsUpdate {
+            nixpkgs_warn_after_days: 45,
+            heartbeat_grace_secs: Some(15),
         };
         let no_header =
-            update_fleet_settings(State(state.clone()), HeaderMap::new(), Json(settings))
+            update_fleet_settings(State(state.clone()), HeaderMap::new(), Json(update))
                 .await
                 .into_response();
         assert_eq!(no_header.status(), StatusCode::FORBIDDEN);
         let invalid = update_fleet_settings(
             State(state.clone()),
             action_headers(),
-            Json(fleet_settings::FleetSettings {
+            Json(fleet_settings::FleetSettingsUpdate {
                 nixpkgs_warn_after_days: 0,
+                heartbeat_grace_secs: None,
             }),
         )
         .await
         .into_response();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
         assert_eq!(state.fleet_settings.get().nixpkgs_warn_after_days, 30);
-        let saved = update_fleet_settings(State(state.clone()), action_headers(), Json(settings))
+        assert_eq!(state.fleet_settings.get().heartbeat_grace_secs, 15);
+        let saved = update_fleet_settings(State(state.clone()), action_headers(), Json(update))
             .await
             .into_response();
         assert_eq!(saved.status(), StatusCode::OK);
@@ -14182,8 +14224,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let failed = update_fleet_settings(
             State(state.clone()),
             action_headers(),
-            Json(fleet_settings::FleetSettings {
+            Json(fleet_settings::FleetSettingsUpdate {
                 nixpkgs_warn_after_days: 60,
+                heartbeat_grace_secs: Some(15),
             }),
         )
         .await
@@ -14191,6 +14234,106 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.fleet_settings.get(), settings);
         std::fs::remove_dir(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fleet_grace_post_preserves_omitted_values_and_projects_inheritance() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-fleet-grace-api-{}-{}",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("settings.json");
+        let mut state = report_test_state(true);
+        state.fleet_settings =
+            Arc::new(fleet_settings::FleetSettingsStore::new(Some(path.clone())).unwrap());
+        let saved = update_fleet_settings(
+            State(state.clone()),
+            action_headers(),
+            Json(fleet_settings::FleetSettingsUpdate {
+                nixpkgs_warn_after_days: 30,
+                heartbeat_grace_secs: Some(0),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let preserved = update_fleet_settings(
+            State(state.clone()),
+            action_headers(),
+            Json(
+                serde_json::from_str::<fleet_settings::FleetSettingsUpdate>(
+                    r#"{"nixpkgs_warn_after_days":30}"#,
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(preserved.status(), StatusCode::OK);
+        assert_eq!(state.fleet_settings.get().heartbeat_grace_secs, 0);
+        let invalid_grace = update_fleet_settings(
+            State(state.clone()),
+            action_headers(),
+            Json(fleet_settings::FleetSettingsUpdate {
+                nixpkgs_warn_after_days: 30,
+                heartbeat_grace_secs: Some(3601),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(invalid_grace.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.fleet_settings.get().heartbeat_grace_secs, 0);
+
+        let mut inherited = host_with_backups("inherit-grace", 940, vec![]);
+        inherited.heartbeat_interval_secs = Some(60);
+        let mut overridden = host_with_backups("override-grace", 940, vec![]);
+        overridden.heartbeat_interval_secs = Some(60);
+        overridden.preferences.alerts.heartbeat_grace_secs = Some(20);
+        let payload = hosts_payload_with_grace(
+            vec![inherited, overridden],
+            &[],
+            &BTreeMap::new(),
+            &[],
+            None,
+            1000,
+            30,
+            state.fleet_settings.get().heartbeat_grace_secs,
+        );
+        assert_eq!(payload["fleet_heartbeat_grace_secs"], 0);
+        assert_eq!(payload["hosts"][0]["heartbeat_grace"]["source"], "fleet");
+        assert_eq!(payload["hosts"][0]["heartbeat_grace"]["effective_secs"], 0);
+        assert_eq!(payload["hosts"][0]["heartbeat_grace"]["override_secs"], json!(null));
+        assert_eq!(payload["hosts"][0]["heartbeat_grace"]["late_after_secs"], 60);
+        assert_eq!(payload["hosts"][0]["heartbeat_grace"]["stale_after_secs"], 120);
+        assert_eq!(payload["hosts"][0]["heartbeat_grace"]["down_after_secs"], 300);
+        assert_eq!(payload["hosts"][0]["liveness"], "live");
+        assert_eq!(payload["hosts"][1]["heartbeat_grace"]["source"], "host");
+        assert_eq!(payload["hosts"][1]["heartbeat_grace"]["effective_secs"], 20);
+        assert_eq!(payload["hosts"][1]["heartbeat_grace"]["override_secs"], 20);
+        assert_eq!(payload["hosts"][1]["heartbeat_grace"]["fleet_secs"], 0);
+        assert_eq!(payload["hosts"][1]["heartbeat_grace"]["late_after_secs"], 80);
+        assert_eq!(
+            payload["hosts"][1]["heartbeat_grace"]["on_time_through_secs"],
+            80
+        );
+        assert!(payload["hosts"][1]["preferences"]["alerts"]
+            .get("heartbeat_grace_secs")
+            .is_some());
+        let defaulted = hosts_payload(
+            vec![host_with_backups("default-grace", 940, vec![])],
+            &[],
+            &BTreeMap::new(),
+            &[],
+            None,
+            1000,
+            30,
+        );
+        assert_eq!(defaulted["fleet_heartbeat_grace_secs"], 15);
+        assert_eq!(defaulted["hosts"][0]["heartbeat_grace"]["late_after_secs"], 75);
+
+        std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -18830,6 +18973,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 suppress_backup: true,
                 suppress_nix_freshness: false,
                 nixpkgs_warn_after_days: None,
+                heartbeat_grace_secs: None,
             },
         };
         state

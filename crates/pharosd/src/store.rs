@@ -878,6 +878,7 @@ mod tests {
                 suppress_backup: false,
                 suppress_nix_freshness: true,
                 nixpkgs_warn_after_days: None,
+                heartbeat_grace_secs: Some(20),
             },
             ..Default::default()
         };
@@ -933,6 +934,18 @@ mod tests {
         assert!(matches!(
             store.request_preferences("missing", malformed),
             Err(StoreError::InvalidPreferences)
+        ));
+        let mut out_of_range = HostPreferences::default();
+        out_of_range.alerts.heartbeat_grace_secs = Some(3601);
+        assert!(matches!(
+            store.request_preferences("missing", out_of_range),
+            Err(StoreError::InvalidPreferences)
+        ));
+        let mut inherit = HostPreferences::default();
+        inherit.alerts.heartbeat_grace_secs = None;
+        assert!(matches!(
+            store.request_preferences("missing", inherit),
+            Err(StoreError::HostNotFound)
         ));
     }
 

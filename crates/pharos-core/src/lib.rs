@@ -101,13 +101,29 @@ pub struct HostAlertPreferences {
     /// so unchanged preferences remain readable by older beacons and servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nixpkgs_warn_after_days: Option<u32>,
+    /// Optional late-heartbeat grace, in seconds after the reported cadence.
+    /// Omitted on the wire until a host override is configured, so older
+    /// beacons and preference documents keep parsing. Null and absence both
+    /// inherit the fleet default. Zero is a real override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_grace_secs: Option<u64>,
 }
 
 pub const DEFAULT_NIXPKGS_WARN_AFTER_DAYS: u32 = 30;
 pub const MAX_NIXPKGS_WARN_AFTER_DAYS: u32 = 3650;
+/// Extra seconds after the reported heartbeat interval before a gap is late.
+/// PHAROS-292. This does not move the 2× stale or 5× down liveness cuts.
+pub const DEFAULT_HEARTBEAT_GRACE_SECS: u64 = 15;
+pub const MAX_HEARTBEAT_GRACE_SECS: u64 = MAX_HEARTBEAT_INTERVAL_SECS;
+pub const HEARTBEAT_GRACE_RANGE_ERROR: &str =
+    "heartbeat grace must be a whole number of seconds from 0 through 3600";
 
 pub fn valid_nixpkgs_warn_after_days(days: u32) -> bool {
     (1..=MAX_NIXPKGS_WARN_AFTER_DAYS).contains(&days)
+}
+
+pub fn valid_heartbeat_grace_secs(secs: u64) -> bool {
+    secs <= MAX_HEARTBEAT_GRACE_SECS
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +146,50 @@ impl HostPreferences {
             .unwrap_or(DEFAULT_NIXPKGS_WARN_AFTER_DAYS)
     }
 
+    /// Effective late-heartbeat grace: a valid host override, else a valid
+    /// fleet value, else [`DEFAULT_HEARTBEAT_GRACE_SECS`].
+    pub fn heartbeat_grace_secs(&self, fleet_default: Option<u64>) -> u64 {
+        self.heartbeat_grace_policy(fleet_default, None)
+            .effective_secs
+    }
+
+    /// Applied grace plus the interval it was combined with. `interval_secs`
+    /// `None` uses the dashboard's 60-second stand-in. The returned interval
+    /// is at least 1, matching historical mark rendering. [`liveness`] does
+    /// not use that floor and does not take grace.
+    pub fn heartbeat_grace_policy(
+        &self,
+        fleet_default: Option<u64>,
+        interval_secs: Option<u64>,
+    ) -> HeartbeatGracePolicy {
+        let override_secs = self
+            .alerts
+            .heartbeat_grace_secs
+            .filter(|secs| valid_heartbeat_grace_secs(*secs));
+        let fleet_secs = fleet_default
+            .filter(|secs| valid_heartbeat_grace_secs(*secs))
+            .unwrap_or(DEFAULT_HEARTBEAT_GRACE_SECS);
+        let (effective_secs, source) = match override_secs {
+            Some(secs) => (secs, HeartbeatGraceSource::Host),
+            None => (fleet_secs, HeartbeatGraceSource::Fleet),
+        };
+        let interval_secs = interval_secs.unwrap_or(60).max(1);
+        let late_after_secs = heartbeat_late_after_secs(interval_secs, effective_secs);
+        let stale_after_secs = interval_secs.saturating_mul(2);
+        let down_after_secs = interval_secs.saturating_mul(5);
+        HeartbeatGracePolicy {
+            effective_secs,
+            source,
+            override_secs,
+            fleet_secs,
+            interval_secs,
+            late_after_secs,
+            on_time_through_secs: late_after_secs.min(stale_after_secs),
+            stale_after_secs,
+            down_after_secs,
+        }
+    }
+
     pub fn suppresses_down_alerts(&self) -> bool {
         self.kind == HostKind::Workstation || self.alerts.suppress_down
     }
@@ -141,6 +201,13 @@ impl HostPreferences {
             .is_some_and(|days| !valid_nixpkgs_warn_after_days(days))
         {
             return Err("nixpkgs warning threshold must be between 1 and 3650 days".to_string());
+        }
+        if self
+            .alerts
+            .heartbeat_grace_secs
+            .is_some_and(|secs| !valid_heartbeat_grace_secs(secs))
+        {
+            return Err(HEARTBEAT_GRACE_RANGE_ERROR.to_string());
         }
         if let Some(accent) = self.accent.as_deref() {
             let bytes = accent.as_bytes();
@@ -3538,7 +3605,8 @@ impl Liveness {
 
 /// Derive liveness from the heartbeat cadence: `Live` within 2× the interval,
 /// `Stale` within 5×, `Down` beyond; `AwaitingFirstHeartbeat` if never seen.
-/// `now` and `last_seen` are both server-stamped (PHAROS-9).
+/// `now` and `last_seen` are both server-stamped (PHAROS-9). Late-heartbeat
+/// grace does not change these cuts (PHAROS-292).
 pub fn liveness(
     last_seen: Option<UnixSeconds>,
     interval_secs: Option<u64>,
@@ -3556,6 +3624,208 @@ pub fn liveness(
     } else {
         Liveness::Down
     }
+}
+
+/// Where a host's effective late-heartbeat grace came from. Fleet includes the
+/// built-in 15 seconds when no saved fleet value is available.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HeartbeatGraceSource {
+    Host,
+    Fleet,
+}
+
+impl HeartbeatGraceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Fleet => "fleet",
+        }
+    }
+}
+
+pub fn heartbeat_grace_source_label(source: HeartbeatGraceSource) -> &'static str {
+    match source {
+        HeartbeatGraceSource::Host => "host override",
+        HeartbeatGraceSource::Fleet => "fleet default",
+    }
+}
+
+/// Applied grace and the thresholds it produces for one reported cadence.
+/// `late_after_secs` is the policy cut (`interval + grace`). Stale and down
+/// stay at 2× and 5×. `on_time_through_secs` is the last second that is still
+/// on time after those older cuts outrank grace.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeartbeatGracePolicy {
+    pub effective_secs: u64,
+    pub source: HeartbeatGraceSource,
+    pub override_secs: Option<u64>,
+    pub fleet_secs: u64,
+    pub interval_secs: u64,
+    pub late_after_secs: u64,
+    pub on_time_through_secs: u64,
+    pub stale_after_secs: u64,
+    pub down_after_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HeartbeatTiming {
+    OnTime,
+    Late,
+    Stale,
+    Down,
+}
+
+impl HeartbeatTiming {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OnTime => "on_time",
+            Self::Late => "late",
+            Self::Stale => "stale",
+            Self::Down => "down",
+        }
+    }
+}
+
+pub fn heartbeat_timing_label(timing: HeartbeatTiming) -> &'static str {
+    match timing {
+        HeartbeatTiming::OnTime => "on time",
+        HeartbeatTiming::Late => "late",
+        HeartbeatTiming::Stale => "stale",
+        HeartbeatTiming::Down => "down",
+    }
+}
+
+/// Historical mark level. `OnTime` serializes as `ok` so existing beat marks
+/// keep their level key.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HeartbeatHistoryLevel {
+    #[serde(rename = "first")]
+    First,
+    #[serde(rename = "ok")]
+    OnTime,
+    #[serde(rename = "late")]
+    Late,
+    #[serde(rename = "stale")]
+    Stale,
+    #[serde(rename = "down")]
+    Down,
+}
+
+pub fn heartbeat_history_label(level: HeartbeatHistoryLevel) -> &'static str {
+    match level {
+        HeartbeatHistoryLevel::First => "first heartbeat",
+        HeartbeatHistoryLevel::OnTime => "on cadence",
+        HeartbeatHistoryLevel::Late => "late heartbeat",
+        HeartbeatHistoryLevel::Stale => "stale gap recovered",
+        HeartbeatHistoryLevel::Down => "offline gap recovered",
+    }
+}
+
+pub fn heartbeat_history_level_key(level: HeartbeatHistoryLevel) -> &'static str {
+    match level {
+        HeartbeatHistoryLevel::First => "first",
+        HeartbeatHistoryLevel::OnTime => "ok",
+        HeartbeatHistoryLevel::Late => "late",
+        HeartbeatHistoryLevel::Stale => "stale",
+        HeartbeatHistoryLevel::Down => "down",
+    }
+}
+
+pub fn heartbeat_policy_interval(interval_secs: u64) -> u64 {
+    interval_secs.max(1)
+}
+
+pub fn heartbeat_late_after_secs(interval_secs: u64, grace_secs: u64) -> u64 {
+    heartbeat_policy_interval(interval_secs).saturating_add(grace_secs)
+}
+
+pub fn heartbeat_gap_is_late(gap_secs: u64, interval_secs: u64, grace_secs: u64) -> bool {
+    heartbeat_timing(gap_secs, interval_secs, grace_secs) == HeartbeatTiming::Late
+}
+
+/// Classifies one gap. Stale starts strictly after 2× the interval and down
+/// strictly after 5×. Grace moves only the on-time/late cut, and only while
+/// that cut is still inside the live window.
+pub fn heartbeat_timing(gap_secs: u64, interval_secs: u64, grace_secs: u64) -> HeartbeatTiming {
+    let interval = heartbeat_policy_interval(interval_secs);
+    let stale_after = interval.saturating_mul(2);
+    let down_after = interval.saturating_mul(5);
+    if gap_secs > down_after {
+        HeartbeatTiming::Down
+    } else if gap_secs > stale_after {
+        HeartbeatTiming::Stale
+    } else if gap_secs > heartbeat_late_after_secs(interval, grace_secs) {
+        HeartbeatTiming::Late
+    } else {
+        HeartbeatTiming::OnTime
+    }
+}
+
+/// `gap_secs` `None` is the first stored heartbeat, which has no previous gap.
+pub fn heartbeat_history_level(
+    gap_secs: Option<u64>,
+    interval_secs: u64,
+    grace_secs: u64,
+) -> HeartbeatHistoryLevel {
+    let Some(gap_secs) = gap_secs else {
+        return HeartbeatHistoryLevel::First;
+    };
+    match heartbeat_timing(gap_secs, interval_secs, grace_secs) {
+        HeartbeatTiming::OnTime => HeartbeatHistoryLevel::OnTime,
+        HeartbeatTiming::Late => HeartbeatHistoryLevel::Late,
+        HeartbeatTiming::Stale => HeartbeatHistoryLevel::Stale,
+        HeartbeatTiming::Down => HeartbeatHistoryLevel::Down,
+    }
+}
+
+pub fn heartbeat_late_rule_copy(interval_secs: u64, grace_secs: u64) -> String {
+    let interval = heartbeat_policy_interval(interval_secs);
+    let late_after = heartbeat_late_after_secs(interval, grace_secs);
+    let stale_after = interval.saturating_mul(2);
+    let on_time_through = late_after.min(stale_after);
+    if on_time_through == late_after {
+        format!("{interval}s + {grace_secs}s grace → late after {late_after}s")
+    } else {
+        format!(
+            "{interval}s + {grace_secs}s grace → late after {late_after}s. Stale still begins after {stale_after}s; grace does not extend stale or down."
+        )
+    }
+}
+
+/// Horizontal beat position, 0 through 100. `expect_x` and `stale_x` are the
+/// existing widget markers (64 and 82). Grace 0 keeps the old interval splits.
+pub fn heartbeat_timeline_x(
+    age_secs: u64,
+    interval_secs: u64,
+    grace_secs: u64,
+    expect_x: f64,
+    stale_x: f64,
+) -> f64 {
+    let interval = heartbeat_policy_interval(interval_secs) as f64;
+    let age = age_secs as f64;
+    let on_time_through = (interval + grace_secs as f64).min(interval * 2.0);
+    let stale_after = interval * 2.0;
+    let down_after = interval * 5.0;
+    if on_time_through > 0.0 && age <= on_time_through {
+        return (age / on_time_through) * expect_x;
+    }
+    if age <= stale_after {
+        let span = stale_after - on_time_through;
+        if span <= 0.0 {
+            return expect_x;
+        }
+        return expect_x + ((age - on_time_through) / span) * (stale_x - expect_x);
+    }
+    if age <= down_after {
+        let span = down_after - stale_after;
+        if span <= 0.0 {
+            return stale_x;
+        }
+        return stale_x + ((age - stale_after) / span) * (100.0 - stale_x);
+    }
+    100.0
 }
 
 // PHAROS-206 moved the contract to v6 by adding optional measured deployed
@@ -4946,6 +5216,163 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_grace_inherits_overrides_and_stays_off_old_wires() {
+        let mut preferences: HostPreferences = serde_json::from_str(
+            r#"{"kind":"server","alerts":{"suppress_down":false,"suppress_backup":false,"suppress_nix_freshness":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(preferences.alerts.heartbeat_grace_secs, None);
+        assert_eq!(preferences.heartbeat_grace_secs(None), 15);
+        assert_eq!(preferences.heartbeat_grace_secs(Some(40)), 40);
+        let inherited = preferences.heartbeat_grace_policy(Some(40), Some(60));
+        assert_eq!(inherited.source, HeartbeatGraceSource::Fleet);
+        assert_eq!(inherited.override_secs, None);
+        assert_eq!(inherited.fleet_secs, 40);
+        assert_eq!(inherited.effective_secs, 40);
+        assert_eq!(inherited.late_after_secs, 100);
+        assert_eq!(inherited.on_time_through_secs, 100);
+        assert!(!serde_json::to_string(&preferences)
+            .unwrap()
+            .contains("heartbeat_grace_secs"));
+
+        preferences.alerts.heartbeat_grace_secs = Some(0);
+        assert_eq!(preferences.heartbeat_grace_secs(Some(40)), 0);
+        assert_eq!(
+            preferences
+                .heartbeat_grace_policy(Some(40), Some(60))
+                .source,
+            HeartbeatGraceSource::Host
+        );
+        let wire = serde_json::to_string(&preferences).unwrap();
+        assert!(wire.contains("\"heartbeat_grace_secs\":0"));
+        assert_eq!(
+            serde_json::from_str::<HostPreferences>(&wire).unwrap(),
+            preferences
+        );
+
+        let cleared: HostPreferences = serde_json::from_str(
+            r#"{"alerts":{"heartbeat_grace_secs":null,"suppress_down":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(cleared.alerts.heartbeat_grace_secs, None);
+        assert_eq!(
+            cleared.heartbeat_grace_policy(Some(40), None).source,
+            HeartbeatGraceSource::Fleet
+        );
+
+        for secs in [0, 15, 3600] {
+            preferences.alerts.heartbeat_grace_secs = Some(secs);
+            assert!(preferences.validate_contract().is_ok(), "{secs}");
+        }
+        preferences.alerts.heartbeat_grace_secs = Some(3601);
+        assert_eq!(
+            preferences.validate_contract(),
+            Err(HEARTBEAT_GRACE_RANGE_ERROR.to_string())
+        );
+        assert!(HEARTBEAT_GRACE_RANGE_ERROR.contains(&MAX_HEARTBEAT_GRACE_SECS.to_string()));
+        preferences.alerts.heartbeat_grace_secs = Some(u64::MAX);
+        assert!(preferences.validate_contract().is_err());
+        // A corrupt override does not become the effective policy.
+        assert_eq!(preferences.heartbeat_grace_secs(Some(40)), 40);
+
+        for invalid in ["-1", "1.5", "\"15\""] {
+            let raw = format!(r#"{{"alerts":{{"heartbeat_grace_secs":{invalid}}}}}"#);
+            assert!(serde_json::from_str::<HostPreferences>(&raw).is_err());
+        }
+    }
+
+    #[test]
+    fn heartbeat_grace_is_strict_and_does_not_move_stale_or_down() {
+        assert!(!heartbeat_gap_is_late(60, 60, 0));
+        assert!(heartbeat_gap_is_late(61, 60, 0));
+        assert_eq!(heartbeat_timing(75, 60, 15), HeartbeatTiming::OnTime);
+        assert_eq!(heartbeat_timing(76, 60, 15), HeartbeatTiming::Late);
+        assert_eq!(heartbeat_timing(120, 60, 15), HeartbeatTiming::Late);
+        assert_eq!(heartbeat_timing(121, 60, 15), HeartbeatTiming::Stale);
+        assert_eq!(heartbeat_timing(300, 60, 15), HeartbeatTiming::Stale);
+        assert_eq!(heartbeat_timing(301, 60, 15), HeartbeatTiming::Down);
+        assert_eq!(
+            liveness(Some(1_000), Some(60), 1_075),
+            Liveness::Live,
+            "75s is inside the unchanged live window"
+        );
+        assert_eq!(liveness(Some(1_000), Some(60), 1_121), Liveness::Stale);
+        assert_eq!(liveness(Some(1_000), Some(60), 1_301), Liveness::Down);
+
+        // Grace past the stale cut does not keep those seconds on time.
+        assert_eq!(heartbeat_timing(20, 10, 15), HeartbeatTiming::OnTime);
+        assert_eq!(heartbeat_timing(21, 10, 15), HeartbeatTiming::Stale);
+        assert_eq!(heartbeat_timing(25, 10, 15), HeartbeatTiming::Stale);
+        assert_eq!(heartbeat_timing(50, 10, 15), HeartbeatTiming::Stale);
+        assert_eq!(heartbeat_timing(51, 10, 15), HeartbeatTiming::Down);
+        assert_eq!(liveness(Some(1_000), Some(10), 1_025), Liveness::Stale);
+        assert_eq!(liveness(Some(1_000), Some(10), 1_051), Liveness::Down);
+
+        assert_eq!(
+            heartbeat_history_level(None, 60, 15),
+            HeartbeatHistoryLevel::First
+        );
+        assert_eq!(
+            heartbeat_history_level_key(heartbeat_history_level(Some(75), 60, 15)),
+            "ok"
+        );
+        assert_eq!(
+            heartbeat_history_label(heartbeat_history_level(Some(76), 60, 15)),
+            "late heartbeat"
+        );
+        assert_eq!(
+            heartbeat_history_level_key(heartbeat_history_level(Some(301), 60, 15)),
+            "down"
+        );
+        assert_eq!(
+            heartbeat_late_rule_copy(60, 15),
+            "60s + 15s grace → late after 75s"
+        );
+        assert!(heartbeat_late_rule_copy(10, 15).contains("Stale still begins after 20s"));
+        assert_eq!(heartbeat_grace_source_label(HeartbeatGraceSource::Host), "host override");
+        assert_eq!(heartbeat_timing_label(HeartbeatTiming::OnTime), "on time");
+
+        // Grace 0 keeps the previous expected/late/stale marker math.
+        assert_eq!(heartbeat_timeline_x(60, 60, 0, 64.0, 82.0), 64.0);
+        assert_eq!(heartbeat_timeline_x(0, 60, 0, 64.0, 82.0), 0.0);
+        let late_x = heartbeat_timeline_x(90, 60, 0, 64.0, 82.0);
+        assert!((late_x - 73.0).abs() < 0.001, "{late_x}");
+        assert_eq!(heartbeat_timeline_x(301, 60, 15, 64.0, 82.0), 100.0);
+        // 75s of a 60+15 policy is the end of the on-time track, not halfway.
+        assert_eq!(heartbeat_timeline_x(75, 60, 15, 64.0, 82.0), 64.0);
+        assert!(heartbeat_timeline_x(76, 60, 15, 64.0, 82.0) > 64.0);
+
+        let policy = HostPreferences::default().heartbeat_grace_policy(None, None);
+        assert_eq!(policy.interval_secs, 60);
+        assert_eq!(policy.effective_secs, DEFAULT_HEARTBEAT_GRACE_SECS);
+        assert_eq!(policy.source.as_str(), "fleet");
+        assert_eq!(
+            HostPreferences::default()
+                .heartbeat_grace_policy(Some(15), Some(0))
+                .interval_secs,
+            1,
+            "mark rendering floors a zero cadence to 1; liveness does not"
+        );
+        let short = HostPreferences::default().heartbeat_grace_policy(Some(15), Some(10));
+        assert_eq!(short.late_after_secs, 25);
+        assert_eq!(short.on_time_through_secs, 20);
+        assert_eq!(short.stale_after_secs, 20);
+        assert_eq!(short.down_after_secs, 50);
+
+        // Extreme inputs stay total. A saturating grace does not move down.
+        assert_eq!(
+            heartbeat_timing(u64::MAX, 60, u64::MAX),
+            HeartbeatTiming::Down
+        );
+        assert_eq!(heartbeat_late_after_secs(u64::MAX, 15), u64::MAX);
+        assert_eq!(
+            heartbeat_timing(u64::MAX, u64::MAX, u64::MAX),
+            HeartbeatTiming::OnTime,
+            "a saturated 5× cut is not strictly less than u64::MAX"
+        );
+    }
+
+    #[test]
     fn nixpkgs_age_warning_uses_strict_server_clock_boundary_and_requires_proof() {
         let mut freshness = proven_current_freshness("nixos-unstable");
         let modified = freshness
@@ -5484,6 +5911,7 @@ mod tests {
                 suppress_backup: true,
                 suppress_nix_freshness: false,
                 nixpkgs_warn_after_days: None,
+                heartbeat_grace_secs: None,
             },
         };
         let response = HostReportResponse::pending("gpc0", preferences.clone())
