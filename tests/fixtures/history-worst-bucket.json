@@ -1,0 +1,106 @@
+{
+  "algorithm": "Keep every gap event when the window holds at most 12. Above that, divide the window into 12 equal buckets and keep the worst event in each bucket. Severity, worse first: down, stale, late, unknown, first, ok. Tie-break: larger gap, then earlier stamp, then lower index. The first sample has no previous gap and is not a mark. Stamps more than 2 seconds ahead of now are excluded. Duplicate stamps collapse before selection. Axis now and start stay at 100. An open gap until now is arrival, not a history mark. Unobserved time is not painted as an on-cadence mark.",
+  "dots": 12,
+  "clockSkewSecs": 2,
+  "cases": [
+    {
+      "name": "worst-in-bucket",
+      "now": 1000000,
+      "windowSecs": 600,
+      "interval": 60,
+      "grace": 15,
+      "samples": [999400, 999420, 999820, 999820, 999835, 999845, 999860, 999870, 999880, 999900, 999910, 999930, 999950, 999960, 999980, 999995],
+      "expect": {
+        "partial": false,
+        "marks": [
+          {"stamp": 999420, "level": "ok", "label": "on cadence", "x": 3.3},
+          {"stamp": 999820, "level": "down", "label": "offline gap recovered", "x": 70},
+          {"stamp": 999860, "level": "ok", "label": "on cadence", "x": 76.7},
+          {"stamp": 999900, "level": "ok", "label": "on cadence", "x": 83.3},
+          {"stamp": 999950, "level": "ok", "label": "on cadence", "x": 91.7}
+        ],
+        "hiddenStamps": [999835, 999845, 999870, 999880, 999910, 999930, 999960, 999980, 999995]
+      }
+    },
+    {
+      "name": "empty",
+      "now": 1000000,
+      "windowSecs": 600,
+      "interval": 60,
+      "grace": 15,
+      "samples": [],
+      "expect": {"partial": false, "marks": [], "hiddenStamps": []}
+    },
+    {
+      "name": "first-observation",
+      "now": 1000000,
+      "windowSecs": 600,
+      "interval": 60,
+      "grace": 15,
+      "samples": [999990],
+      "expect": {"partial": false, "marks": [], "hiddenStamps": [999990]}
+    },
+    {
+      "name": "duplicate-burst",
+      "now": 1000000,
+      "windowSecs": 600,
+      "interval": 60,
+      "grace": 15,
+      "samples": [999900, 999900, 999900, 999960],
+      "expect": {
+        "partial": true,
+        "marks": [
+          {"stamp": 999960, "level": "ok", "label": "on cadence", "x": 93.3}
+        ],
+        "hiddenStamps": []
+      }
+    },
+    {
+      "name": "future-skew",
+      "now": 1000000,
+      "windowSecs": 600,
+      "interval": 60,
+      "grace": 15,
+      "samples": [999900, 999960, 1000030],
+      "expect": {
+        "partial": true,
+        "marks": [
+          {"stamp": 999960, "level": "ok", "label": "on cadence", "x": 93.3}
+        ],
+        "hiddenStamps": [1000030]
+      }
+    },
+    {
+      "name": "partial-retention",
+      "now": 1000000,
+      "windowSecs": 600,
+      "interval": 60,
+      "grace": 15,
+      "samples": [999960, 999990],
+      "expect": {
+        "partial": true,
+        "minX": 90,
+        "marks": [
+          {"stamp": 999990, "level": "ok", "label": "on cadence", "x": 98.3}
+        ],
+        "hiddenStamps": [999960]
+      }
+    },
+    {
+      "name": "current-gap",
+      "now": 1000000,
+      "windowSecs": 600,
+      "interval": 60,
+      "grace": 15,
+      "samples": [999600, 999660],
+      "arrival": {"last": 999660, "state": "down"},
+      "expect": {
+        "partial": true,
+        "marks": [
+          {"stamp": 999660, "level": "ok", "label": "on cadence", "x": 43.3}
+        ],
+        "hiddenStamps": [1000000, 999600]
+      }
+    }
+  ]
+}

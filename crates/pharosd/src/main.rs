@@ -9267,7 +9267,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     fn first_heartbeat_without_previous_sample_has_no_history_dot() {
         let (marks, history_start_x) = heartbeat_marks(&[100], 60, SIGNAL_DEFAULT_WINDOW_SECS);
         assert!(marks.is_empty());
-        assert_eq!(history_start_x, 0.0);
+        assert_eq!(history_start_x, 100.0);
     }
 
     #[test]
@@ -15303,7 +15303,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .contains(r#"data-host-section="settings" data-host-workspace-settings hidden"#));
         assert!(overview_html.contains(r#"data-host-section="overview">"#));
         assert!(overview_html.contains(r#"data-fleet-return href="/pharos""#));
-        assert!(overview_html.contains("history.length>1"));
+        assert!(overview_html.contains("window.navigation"));
+        assert!(overview_html.contains("nav.entries()"));
+        assert!(overview_html.contains("nav.traverseTo"));
+        assert!(!overview_html.contains("history.back()"));
         assert!(!overview_html.contains("document.referrer"));
         assert!(!overview_html.contains("sessionStorage"));
 

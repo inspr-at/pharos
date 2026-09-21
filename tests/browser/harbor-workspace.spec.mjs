@@ -195,3 +195,83 @@ test("host workspace uses fleet protection, real grace, and private fleet return
     await retireHost(page, unknownHost);
   }
 });
+
+test("fleet breadcrumb returns to the real fleet entry", async ({ page }, testInfo) => {
+  const host = `harbor-return-${testInfo.project.name}`;
+  const serverNow = (await (await page.request.get("/hosts.json")).json()).as_of;
+  try {
+    await reportHost(page, host, backup("restore-sample", serverNow - 60, serverNow - 60));
+    await page.setViewportSize({ width: 1100, height: 280 });
+    await page.goto(`/?view=list&q=${encodeURIComponent(host)}&sort=name`);
+    const navigationApi = await page.evaluate(() => {
+      const nav = window.navigation;
+      if (!nav || typeof nav.entries !== "function" || typeof nav.traverseTo !== "function") return false;
+      const entries = nav.entries();
+      return Array.isArray(entries) && entries.length > 0 && entries.every((entry) => typeof entry.key === "string" && "url" in entry);
+    });
+    expect(navigationApi).toBe(true);
+    const name = page.locator(`a.host-name[href="/hosts/${host}"]`).first();
+    await expect(name).toHaveAttribute("href", `/hosts/${host}`);
+    const scrolled = await page.evaluate((href) => {
+      const max = document.documentElement.scrollHeight - window.innerHeight;
+      const target = Math.min(180, Math.max(0, max));
+      window.scrollTo(0, target);
+      return { y: window.scrollY, max, href: document.querySelector(`a.host-name[href="${href}"]`)?.getAttribute("href") || "" };
+    }, `/hosts/${host}`);
+    expect(scrolled.href).toBe(`/hosts/${host}`);
+    expect(scrolled.href).not.toContain("from=");
+    expect(scrolled.max).toBeGreaterThan(0);
+    expect(scrolled.y).toBeGreaterThan(0);
+    await Promise.all([
+      page.waitForURL((url) => url.pathname === `/hosts/${host}`),
+      page.evaluate((href) => {
+        document.querySelector(`a.host-name[href="${href}"]`).click();
+      }, `/hosts/${host}`),
+    ]);
+    for (const section of ["backups", "activity", "settings"]) {
+      await page.locator(`[data-host-tab][data-section="${section}"]`).click();
+      await expect(page).toHaveURL(new RegExp(`[?&]section=${section}(?:&|$)`));
+    }
+    await expect(page.locator("[data-fleet-return]")).toHaveAttribute("href", "/");
+    const beforeReturn = await page.evaluate(() => ({ session: sessionStorage.length, name: window.name }));
+    expect(beforeReturn.session).toBe(0);
+    expect(beforeReturn.name).not.toContain("view=");
+    expect(beforeReturn.name).not.toContain(host);
+    await page.locator("[data-fleet-return]").click();
+    await expect.poll(() => {
+      const url = new URL(page.url());
+      return url.pathname === "/" && url.searchParams.get("q") === host && url.searchParams.get("view") === "list";
+    }).toBe(true);
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
+    expect(await page.evaluate(() => sessionStorage.length)).toBe(0);
+    expect(await page.evaluate(() => window.name)).not.toContain("q=");
+
+    const fromAlerts = await page.context().newPage();
+    try {
+      await fromAlerts.goto("/alerts");
+      const alertsPath = new URL(fromAlerts.url()).pathname;
+      await fromAlerts.goto(`/hosts/${host}?section=activity`);
+      await fromAlerts.locator("[data-fleet-return]").click();
+      await expect.poll(() => new URL(fromAlerts.url()).pathname).toBe("/");
+      expect(new URL(fromAlerts.url()).pathname).not.toBe(alertsPath);
+      expect(fromAlerts.url()).not.toContain("/hosts/");
+      expect(await fromAlerts.evaluate(() => sessionStorage.length)).toBe(0);
+    } finally {
+      await fromAlerts.close();
+    }
+
+    const direct = await page.context().newPage();
+    try {
+      await direct.goto(`/hosts/${host}?section=settings`);
+      await expect(direct.locator("[data-fleet-return]")).toHaveAttribute("href", "/");
+      await direct.locator("[data-fleet-return]").click();
+      await expect.poll(() => new URL(direct.url()).pathname).toBe("/");
+      expect(direct.url()).not.toContain("section=");
+      expect(direct.url()).not.toContain("/hosts/");
+    } finally {
+      await direct.close();
+    }
+  } finally {
+    await retireHost(page, host);
+  }
+});

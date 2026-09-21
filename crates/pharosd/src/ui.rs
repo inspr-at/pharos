@@ -1035,6 +1035,152 @@ mod module_tests {
     }
 
     #[test]
+    fn same_host_restore_from_another_job_does_not_make_daily_green() {
+        let now = 2_000_000_000;
+        let mut failed = backup_observation(
+            BackupPostureState::Failed,
+            Some("daily"),
+            Some(now - 3 * 86_400),
+            None,
+        );
+        failed.id = "job-a".to_string();
+        failed.repository_id = Some("repo-a".to_string());
+        let mut restored = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now - 10),
+            Some(restore_sample(
+                pharos_core::BackupValidationState::Passed,
+                Some(now - 10),
+            )),
+        );
+        restored.id = "job-b".to_string();
+        restored.repository_id = Some("repo-b".to_string());
+        let view = fleet_protection_view(&[failed, restored], now);
+        assert_eq!(view.run.state, "failed");
+        assert_eq!(view.run.tone, "bad");
+        assert_ne!(view.run.label, "Daily OK");
+        assert_eq!(view.restore.state, "passed");
+        assert_eq!(view.restore.tone, "good");
+
+        let only_failed = backup_observation(
+            BackupPostureState::Failed,
+            Some("daily"),
+            Some(now - 3 * 86_400),
+            None,
+        );
+        let alone = fleet_protection_view(std::slice::from_ref(&only_failed), now);
+        assert_eq!(alone.restore.state, "unknown");
+        assert_ne!(alone.restore.tone, "good");
+    }
+
+    fn attr_value<'a>(tag: &'a str, name: &str) -> &'a str {
+        let key = format!("{name}=\"");
+        let start = tag
+            .find(&key)
+            .unwrap_or_else(|| panic!("missing {name} in {tag}"));
+        let rest = &tag[start + key.len()..];
+        let end = rest.find('"').unwrap_or_else(|| panic!("unclosed {name}"));
+        &rest[..end]
+    }
+
+    fn rendered_history_marks(html: &str) -> Vec<(i64, String, String, f64)> {
+        let mut marks = Vec::new();
+        let mut rest = html;
+        while let Some(start) = rest.find("<span class=\"beat-mark\"") {
+            let tag = &rest[start..];
+            let end = tag
+                .find("</span>")
+                .unwrap_or_else(|| panic!("unclosed mark in {tag}"));
+            let tag = &tag[..end];
+            let stamp: i64 = attr_value(tag, "data-history-stamp")
+                .parse()
+                .expect("stamp");
+            let key = attr_value(tag, "data-history-key");
+            assert_eq!(key, format!("sample:{stamp}"));
+            let level = attr_value(tag, "data-history-level").to_string();
+            let label = attr_value(tag, "data-history-label").to_string();
+            let style = attr_value(tag, "style");
+            let x = style
+                .split("--mark-x:")
+                .nth(1)
+                .and_then(|value| value.trim_end_matches('%').parse::<f64>().ok())
+                .expect("mark x");
+            assert!(tag.contains("after previous") || level == "first");
+            marks.push((stamp, level, label, x));
+            rest = &rest[start + end..];
+        }
+        marks
+    }
+
+    #[test]
+    fn history_buckets_keep_the_worst_event_from_the_shared_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/history-worst-bucket.json"
+        ))
+        .expect("history fixture");
+        let empty = heartbeat_card(HeartbeatCard {
+            last_seen: None,
+            heartbeat_log: &[],
+            interval_secs: Some(60),
+            now: 1_000_000,
+            is_self: false,
+            window_control: false,
+            grace_secs: 15,
+            grace_source: "default",
+            late_after_secs: 75,
+        });
+        assert!(empty.contains("--now-x:100%"));
+        assert!(empty.contains("--history-start-x:100.0%"));
+        assert!(!empty.contains("class=\"beat-mark\""));
+
+        for case in fixture["cases"].as_array().expect("cases") {
+            let name = case["name"].as_str().unwrap_or("case");
+            let samples = case["samples"]
+                .as_array()
+                .expect(name)
+                .iter()
+                .map(|stamp| stamp.as_i64().expect(name))
+                .collect::<Vec<_>>();
+            let (html, start_x) = heartbeat_marks_with_grace(
+                &samples,
+                case["interval"].as_i64().expect(name),
+                case["windowSecs"].as_i64().expect(name),
+                case["grace"].as_u64().expect(name),
+                case["now"].as_i64().expect(name),
+            );
+            assert!((start_x - 100.0).abs() < f64::EPSILON, "{name}");
+            let rendered = rendered_history_marks(&html);
+            let expected = case["expect"]["marks"].as_array().expect(name);
+            assert_eq!(rendered.len(), expected.len(), "{name}");
+            for (got, want) in rendered.iter().zip(expected) {
+                let stamp = want["stamp"].as_i64().expect(name);
+                assert_eq!(got.0, stamp, "{name}");
+                assert_eq!(got.1, want["level"].as_str().expect(name), "{name}");
+                assert_eq!(got.2, want["label"].as_str().expect(name), "{name}");
+                let x = want["x"].as_f64().expect(name);
+                assert!(
+                    (got.3 - x).abs() < 0.051,
+                    "{name} stamp {stamp} x {} expected {x}",
+                    got.3
+                );
+                assert!(html.contains(&format!("data-history-key=\"sample:{stamp}\"")));
+            }
+            for hidden in case["expect"]["hiddenStamps"].as_array().expect(name) {
+                let stamp = hidden.as_i64().expect(name);
+                assert!(
+                    !html.contains(&format!("data-history-stamp=\"{stamp}\"")),
+                    "{name} hid {stamp}"
+                );
+            }
+            if name == "worst-in-bucket" {
+                assert!(html.contains("offline gap recovered"));
+                assert!(html.contains("after previous"));
+            }
+        }
+    }
+
+    #[test]
     fn observed_time_uses_utc_civil_date() {
         let (iso, visible) = utc_stamp(1_700_000_000).expect("civil date");
         assert_eq!(iso, "2023-11-14T22:13:20Z");
@@ -8582,10 +8728,12 @@ pub(super) fn render_map(
     )
 }
 
+#[cfg(test)]
 pub(super) struct HeartbeatHistoryView {
     visible: Vec<usize>,
 }
 
+#[cfg(test)]
 pub(super) fn heartbeat_history_view(log: &[i64], window_secs: i64) -> HeartbeatHistoryView {
     if log.len() < 2 {
         return HeartbeatHistoryView {
@@ -8627,6 +8775,7 @@ pub(super) fn heartbeat_history_view(log: &[i64], window_secs: i64) -> Heartbeat
     }
 }
 
+#[cfg(test)]
 pub(super) fn heartbeat_visible_log(log: &[i64], window_secs: i64) -> Vec<i64> {
     let view = heartbeat_history_view(log, window_secs);
     view.visible.into_iter().map(|idx| log[idx]).collect()
@@ -8663,7 +8812,53 @@ pub(super) fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> (
     heartbeat_marks_with_grace(log, interval, window_secs, 0, now)
 }
 
-fn time_axis_mark_indexes(log: &[i64], window_secs: i64, now: i64) -> Vec<usize> {
+fn collapsed_history_log(log: &[i64]) -> Vec<i64> {
+    let mut samples: Vec<i64> = log.iter().copied().filter(|stamp| *stamp > 0).collect();
+    samples.sort_unstable();
+    samples.dedup();
+    samples
+}
+
+fn history_event_rank(level: &str) -> u8 {
+    match level {
+        "down" => 0,
+        "stale" => 1,
+        "late" => 2,
+        "unknown" => 3,
+        "first" => 4,
+        _ => 5,
+    }
+}
+
+struct HistoryBucketChoice {
+    index: usize,
+    rank: u8,
+    gap: i64,
+    stamp: i64,
+}
+
+/// Worst event wins. Equal severity keeps the larger gap, then the earlier
+/// stamp, then the lower index.
+fn history_choice_is_worse(candidate: &HistoryBucketChoice, current: &HistoryBucketChoice) -> bool {
+    if candidate.rank != current.rank {
+        return candidate.rank < current.rank;
+    }
+    if candidate.gap != current.gap {
+        return candidate.gap > current.gap;
+    }
+    if candidate.stamp != current.stamp {
+        return candidate.stamp < current.stamp;
+    }
+    candidate.index < current.index
+}
+
+fn time_axis_mark_indexes(
+    log: &[i64],
+    interval: i64,
+    window_secs: i64,
+    grace_secs: u64,
+    now: i64,
+) -> Vec<usize> {
     if log.len() < 2 {
         return Vec::new();
     }
@@ -8676,15 +8871,35 @@ fn time_axis_mark_indexes(log: &[i64], window_secs: i64, now: i64) -> Vec<usize>
     if candidates.len() <= HEARTBEAT_HISTORY_DOTS {
         return candidates;
     }
-    let mut buckets = vec![None; HEARTBEAT_HISTORY_DOTS];
+    let mut buckets: Vec<Option<HistoryBucketChoice>> =
+        (0..HEARTBEAT_HISTORY_DOTS).map(|_| None).collect();
     for idx in candidates {
-        let raw_bucket = (((log[idx] - start).max(0) as f64 / window as f64)
+        let stamp = log[idx];
+        let gap = stamp.saturating_sub(log[idx - 1]);
+        let (level, _, _) = heartbeat_history(log, idx, interval, grace_secs);
+        let raw_bucket = (((stamp - start).max(0) as f64 / window as f64)
             * HEARTBEAT_HISTORY_DOTS as f64)
             .floor() as usize;
         let bucket = raw_bucket.min(HEARTBEAT_HISTORY_DOTS - 1);
-        buckets[bucket] = Some(idx);
+        let choice = HistoryBucketChoice {
+            index: idx,
+            rank: history_event_rank(level),
+            gap,
+            stamp,
+        };
+        let replace = match &buckets[bucket] {
+            None => true,
+            Some(current) => history_choice_is_worse(&choice, current),
+        };
+        if replace {
+            buckets[bucket] = Some(choice);
+        }
     }
-    buckets.into_iter().flatten().collect()
+    buckets
+        .into_iter()
+        .flatten()
+        .map(|choice| choice.index)
+        .collect()
 }
 
 pub(super) fn heartbeat_marks_with_grace(
@@ -8694,29 +8909,26 @@ pub(super) fn heartbeat_marks_with_grace(
     grace_secs: u64,
     now: i64,
 ) -> (String, f64) {
+    let log = collapsed_history_log(log);
     let interval = interval.max(1);
     let window = window_secs.max(1);
     let start = now.saturating_sub(window);
     let mut marks = String::new();
-    for idx in time_axis_mark_indexes(log, window, now) {
+    for idx in time_axis_mark_indexes(&log, interval, window, grace_secs, now) {
         let stamp = log[idx];
         let x = ((stamp - start).max(0) as f64 / window as f64) * 100.0;
         let x = x.clamp(0.0, 100.0);
-        let (level, label, detail) = heartbeat_history(log, idx, interval, grace_secs);
+        let (level, label, detail) = heartbeat_history(&log, idx, interval, grace_secs);
         let title = format!("{label} · {detail}");
         marks.push_str(&format!(
-            r#"<span class="beat-mark" role="img" tabindex="0" data-history-level="{level}" data-history-label="{label}" data-history-detail="{detail}" title="{title}" aria-label="{title}" style="--mark-x:{x:.1}%"></span>"#,
+            r#"<span class="beat-mark" role="img" tabindex="0" data-history-key="sample:{stamp}" data-history-stamp="{stamp}" data-history-level="{level}" data-history-label="{label}" data-history-detail="{detail}" title="{title}" aria-label="{title}" style="--mark-x:{x:.1}%"></span>"#,
             level = html_escape(level),
             label = html_escape(&label),
             detail = html_escape(&detail),
             title = html_escape(&title)
         ));
     }
-    if marks.is_empty() {
-        (marks, 0.0)
-    } else {
-        (marks, 100.0)
-    }
+    (marks, 100.0)
 }
 
 pub(super) fn heartbeat_x_with_grace(age: i64, interval: i64, grace_secs: u64) -> f64 {
@@ -8757,8 +8969,18 @@ pub(super) fn heartbeat_card(card: HeartbeatCard<'_>) -> String {
         .unwrap_or(60)
         .max(1);
     let all_beats = heartbeat_samples(heartbeat_log, last_seen);
-    let visible_beats = heartbeat_visible_log(&all_beats, SIGNAL_DEFAULT_WINDOW_SECS);
-    let beats_attr = visible_beats
+    let history_log = collapsed_history_log(&all_beats);
+    let mark_beats: Vec<i64> = time_axis_mark_indexes(
+        &history_log,
+        interval,
+        SIGNAL_DEFAULT_WINDOW_SECS,
+        grace_secs,
+        now,
+    )
+    .into_iter()
+    .map(|idx| history_log[idx])
+    .collect();
+    let beats_attr = mark_beats
         .iter()
         .map(i64::to_string)
         .collect::<Vec<_>>()
@@ -8834,7 +9056,7 @@ pub(super) fn heartbeat_card(card: HeartbeatCard<'_>) -> String {
     };
     format!(
         r#"<div class="beat" data-history-axis="time" data-beat="{beat_state}" data-heartbeat-timing="{timing}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-grace="{grace_secs}" data-grace-source="{grace_source}" data-late-after="{late_after_secs}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window_label}" style="--now-x:100%;--history-start-x:{history_start_x:.1}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="arrival" data-arrival data-arrival-state="{timing}"><span data-arrival-label>{arrival_label}</span><span class="arrival-track" aria-hidden="true"><span data-arrival-fill style="--arrival-x:{arrival_x:.2}%"></span></span></div><div class="beat-stage" aria-label="{history_window_label} heartbeat history by time"><span class="beat-floor"></span><span class="beat-fill" hidden></span><span class="beat-current" hidden></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected" hidden></span><span class="beat-threshold stale" hidden></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones">{history_window_control}<span>start</span><span>now</span></span></div></div>"#,
-        count = visible_beats.len(),
+        count = mark_beats.len(),
         arrival_x = now_x,
         arrival_label = arrival_label,
     )

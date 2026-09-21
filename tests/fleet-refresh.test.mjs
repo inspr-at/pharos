@@ -410,12 +410,26 @@ test("grace, restore, and history projections follow the shared contracts", () =
   assert.equal(recentRestore.tone, "good");
   assert.equal(recentRestore.state, "passed");
   assert.equal(recentRestore.overdue, false);
-  const borrowed = api.projectRestoreStatus([
+  const sameHostJobs = [
     { repository_id: "repo-a", state: "failed", schedule: "daily", last_success_at: now - 3 * 24 * 60 * 60 },
-    { repository_id: "repo-b", state: "healthy", schedule: "daily", last_success_at: now - 10, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 } },
+    { repository_id: "repo-b", state: "healthy", schedule: "daily", last_success_at: now - 10, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, files_restored: 1 } },
+  ];
+  const sameHostRestore = api.projectRestoreStatus(sameHostJobs, now);
+  assert.equal(sameHostRestore.state, "passed");
+  assert.equal(sameHostRestore.tone, "good");
+  assert.equal(sameHostRestore.overdue, false);
+  const sameHostDaily = api.projectDailyBackup(sameHostJobs, now);
+  assert.equal(sameHostDaily.label, "Failed");
+  assert.equal(sameHostDaily.tone, "bad");
+  const noCrossHost = api.projectRestoreStatus([sameHostJobs[0]], now);
+  assert.equal(noCrossHost.state, "unknown");
+  assert.notEqual(noCrossHost.tone, "good");
+  const zeroFromOtherJob = api.projectRestoreStatus([
+    { repository_id: "repo-a", state: "failed", schedule: "daily", last_success_at: now - 100 },
+    { repository_id: "repo-b", state: "healthy", schedule: "daily", restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, files_restored: 0 } },
   ], now);
-  assert.notEqual(borrowed.tone, "good");
-  assert.equal(borrowed.state, "unknown");
+  assert.equal(zeroFromOtherJob.state, "unknown");
+  assert.notEqual(zeroFromOtherJob.tone, "good");
   const ownedRestore = api.projectRestoreStatus([
     { repository_id: "repo-a", state: "healthy", schedule: "daily", last_success_at: now - 50, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 } },
   ], now);
@@ -485,9 +499,185 @@ test("grace, restore, and history projections follow the shared contracts", () =
   assert.ok(downMark);
   assert.ok(Math.abs(downMark.x - (400 / 600) * 100) < 0.2);
   assert.equal(api.historyInfo([now + 30], 0, 60, 15, now).level, "unknown");
-  assert.deepEqual(vmPlain(api.aggregateHistory([now - 10], windowDef, now, 60, 15).marks), []);
-  assert.deepEqual(vmPlain(api.aggregateHistory([now + 30], windowDef, now, 60, 15).marks), []);
-  assert.deepEqual(vmPlain(api.aggregateHistory([], windowDef, now, 60, 15).marks), []);
+  const first = api.aggregateHistory([now - 10], windowDef, now, 60, 15);
+  const futureOnly = api.aggregateHistory([now + 30], windowDef, now, 60, 15);
+  const empty = api.aggregateHistory([], windowDef, now, 60, 15);
+  assert.deepEqual(vmPlain(first.marks), []);
+  assert.deepEqual(vmPlain(futureOnly.marks), []);
+  assert.deepEqual(vmPlain(empty.marks), []);
+  for (const view of [first, futureOnly, empty, gapped]) {
+    assert.equal(view.axisNowX, 100);
+    assert.equal(view.axisStartX, 100);
+  }
+});
+
+test("shared history fixture keeps the worst bucket event in both projections", () => {
+  const api = loadPure();
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/history-worst-bucket.json", import.meta.url), "utf8"));
+  assert.ok(fixture.cases.find((item) => item.name === "worst-in-bucket").samples.length > 12);
+  for (const item of fixture.cases) {
+    const view = api.aggregateHistory(item.samples, { secs: item.windowSecs }, item.now, item.interval, item.grace);
+    assert.equal(view.axisNowX, 100, item.name);
+    assert.equal(view.axisStartX, 100, item.name);
+    assert.equal(view.partial, item.expect.partial, item.name);
+    assert.deepEqual(vmPlain(view.marks).map((mark) => ({
+      stamp: mark.stamp,
+      level: mark.level,
+      label: mark.label,
+    })), item.expect.marks.map((mark) => ({
+      stamp: mark.stamp,
+      level: mark.level,
+      label: mark.label,
+    })), item.name);
+    for (const mark of view.marks) {
+      assert.equal(mark.key, `sample:${mark.stamp}`, item.name);
+      assert.match(mark.detail, /after previous/, item.name);
+      assert.ok(mark.label && mark.detail, item.name);
+      const expected = item.expect.marks.find((candidate) => candidate.stamp === mark.stamp);
+      assert.ok(Math.abs(mark.x - expected.x) < 0.06, `${item.name} ${mark.stamp}`);
+      if (item.expect.minX != null) assert.ok(mark.x >= item.expect.minX, item.name);
+    }
+    for (const hidden of item.expect.hiddenStamps || []) {
+      assert.equal(view.marks.some((mark) => mark.stamp === hidden), false, `${item.name} ${hidden}`);
+    }
+    if (item.arrival) {
+      const arrival = api.arrivalPresentation(item.arrival.last, item.interval, item.grace, item.now);
+      assert.equal(arrival.state, item.arrival.state, item.name);
+      assert.equal(view.marks.some((mark) => mark.stamp === item.now), false, item.name);
+    }
+  }
+});
+
+test("history refresh leaves an ordered mark attached", () => {
+  const sourceStart = fleetRuntimeSource.indexOf("let activeHistoryMark=null;");
+  const sourceEnd = fleetRuntimeSource.indexOf("function updateHistoryEvents");
+  const reconcileBody = fleetRuntimeSource.slice(
+    fleetRuntimeSource.indexOf("function reconcileHistoryMarks"),
+    sourceEnd,
+  );
+  assert.equal(reconcileBody.includes("appendChild"), false);
+  assert.match(reconcileBody, /insertBefore/);
+
+  function linkChildren(parent) {
+    parent.childNodes.forEach((node, index) => {
+      node.parentNode = parent;
+      node.nextSibling = parent.childNodes[index + 1] || null;
+    });
+  }
+  function element(tag) {
+    return {
+      tag,
+      className: "",
+      dataset: {},
+      attributes: {},
+      title: "",
+      tabIndex: 0,
+      childNodes: [],
+      parentNode: null,
+      nextSibling: null,
+      inserts: [],
+      get firstChild() {
+        return this.childNodes[0] || null;
+      },
+      style: { setProperty() {} },
+      setAttribute(name, value) { this.attributes[name] = String(value); },
+      getAttribute(name) { return this.attributes[name]; },
+      removeAttribute(name) { delete this.attributes[name]; },
+      blur() {
+        if (document.activeElement === this) document.activeElement = document.body;
+      },
+      remove() {
+        if (!this.parentNode) return;
+        const parent = this.parentNode;
+        parent.childNodes = parent.childNodes.filter((node) => node !== this);
+        linkChildren(parent);
+        this.parentNode = null;
+        this.nextSibling = null;
+      },
+      insertBefore(child, ref) {
+        if (child.parentNode) {
+          child.parentNode.childNodes = child.parentNode.childNodes.filter((node) => node !== child);
+          linkChildren(child.parentNode);
+        }
+        const at = ref == null ? this.childNodes.length : this.childNodes.indexOf(ref);
+        this.childNodes.splice(at, 0, child);
+        linkChildren(this);
+        this.inserts.push(child);
+        return child;
+      },
+      querySelectorAll(selector) {
+        if (selector !== ".beat-mark") return [];
+        return this.childNodes.filter((node) => String(node.className).split(/\s+/).includes("beat-mark"));
+      },
+    };
+  }
+  const document = {
+    body: element("body"),
+    activeElement: null,
+    getElementById() { return null; },
+    createElement: element,
+  };
+  const context = vm.createContext({ console, document });
+  vm.runInContext(`${fleetRuntimeSource.slice(sourceStart, sourceEnd)}
+globalThis.__history = { reconcileHistoryMarks };
+`, context);
+  const container = element("span");
+  const kept = element("span");
+  kept.className = "beat-mark";
+  kept.dataset.historyKey = "sample:50";
+  container.insertBefore(kept, null);
+  container.inserts = [];
+  document.activeElement = kept;
+  context.__history.reconcileHistoryMarks(container, [{
+    key: "sample:50",
+    x: 40,
+    stamp: 50,
+    level: "late",
+    label: "late heartbeat",
+    detail: "90s after previous · 08:00",
+  }]);
+  assert.equal(container.inserts.length, 0);
+  assert.equal(document.activeElement, kept);
+  assert.equal(kept.parentNode, container);
+  assert.equal(kept.dataset.historyLabel, "late heartbeat");
+  assert.match(kept.getAttribute("aria-label"), /after previous/);
+
+  const added = element("span");
+  context.__history.reconcileHistoryMarks(container, [
+    {
+      key: "sample:50",
+      x: 40,
+      stamp: 50,
+      level: "late",
+      label: "late heartbeat",
+      detail: "90s after previous · 08:00",
+    },
+    {
+      key: "sample:80",
+      x: 70,
+      stamp: 80,
+      level: "ok",
+      label: "on cadence",
+      detail: "30s after previous · 08:01",
+    },
+  ]);
+  assert.equal(document.activeElement, kept);
+  assert.equal(container.inserts.length, 1);
+  assert.equal(container.inserts[0], container.childNodes[1]);
+  assert.notEqual(container.inserts[0], kept);
+  assert.equal(container.childNodes[0], kept);
+
+  context.__history.reconcileHistoryMarks(container, [{
+    key: "sample:80",
+    x: 70,
+    stamp: 80,
+    level: "ok",
+    label: "on cadence",
+    detail: "30s after previous · 08:01",
+  }]);
+  assert.equal(kept.parentNode, null);
+  assert.equal(document.activeElement, document.body);
+  assert.equal(container.childNodes.some((node) => node.dataset.historyKey === "sample:50"), false);
 });
 
 test("down-alert suppression and exact times follow the scan contract", () => {
