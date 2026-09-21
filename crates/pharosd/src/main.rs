@@ -6340,7 +6340,10 @@ mod tests {
         assert!(html.contains("window.addEventListener('focus'"));
         assert!(html.contains("window.addEventListener('pageshow'"));
         assert!(html.contains("window.addEventListener('online'"));
-        assert!(html.contains("scheduleRefresh(3000);"));
+        assert!(html.contains(
+            "scheduleRefresh(document.body?.dataset.hostActionDialogOpen==='true'?DIALOG_REFRESH_MS:3000);"
+        ));
+        assert!(!html.contains("scheduleRefresh(3000);"));
         assert!(!html.contains("setInterval(refresh,10000)"));
         assert!(html.contains(r#"data-host="csb1" data-live="live""#));
         assert!(html.contains(r#"data-self="true""#));
@@ -15225,6 +15228,134 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .build()
             .unwrap();
         (format!("http://{address}"), client)
+    }
+
+    #[tokio::test]
+    async fn authorized_host_viewer_reads_the_workspace_and_mutations_stay_denied() {
+        let record = |access: AccessGrant| {
+            let mut state = report_test_state(false);
+            state
+                .store
+                .record(test_report("poseidon"), 1_000)
+                .expect("host recorded");
+            state.auth = AuthState::for_test_access(access);
+            state
+        };
+        let (viewer_base, viewer) = serve_test_app(record(AccessGrant::fleet_read())).await;
+        let workspace = viewer
+            .get(format!("{viewer_base}/hosts/poseidon?section=settings"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(workspace.status(), StatusCode::OK);
+        let workspace_html = workspace.text().await.unwrap();
+        assert!(workspace_html.contains(r#"data-host-workspace data-host="poseidon""#));
+        assert!(workspace_html.contains(
+            "Viewer access: settings and receipts stay visible, while guarded actions remain with a fleet manager."
+        ));
+        assert!(workspace_html
+            .contains(r#"data-grace-source aria-label="Heartbeat grace source" disabled"#));
+        assert!(workspace_html.contains(r#"data-grace-seconds"#));
+        assert!(workspace_html.contains(r#"data-review-settings disabled"#));
+        assert!(!workspace_html.contains("No access yet"));
+
+        let scoped = serve_test_app(record(AccessGrant::limited(["poseidon"], false))).await;
+        let scoped_html = scoped
+            .1
+            .get(format!("{}/hosts/poseidon?section=settings", scoped.0))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(scoped_html.contains(r#"data-host-workspace data-host="poseidon""#));
+        assert!(scoped_html
+            .contains(r#"data-grace-source aria-label="Heartbeat grace source" disabled"#));
+
+        for access in [
+            AccessGrant::empty(),
+            AccessGrant::limited(["other-host"], false),
+            AccessGrant::fleet_read(),
+        ] {
+            let host = if access == AccessGrant::fleet_read() {
+                "missing-host"
+            } else {
+                "poseidon"
+            };
+            let denied = serve_test_app(record(access)).await;
+            let denied_html = denied
+                .1
+                .get(format!("{}/hosts/{host}?section=settings", denied.0))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(denied_html.contains("No access yet"), "{denied_html}");
+            assert!(!denied_html.contains("data-host-workspace"));
+        }
+
+        let preferences = viewer
+            .post(format!(
+                "{viewer_base}/agora/requests/host-preferences.json"
+            ))
+            .header("X-Pharos-Action", "1")
+            .json(&json!({ "host": "poseidon", "preferences": {} }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preferences.status(), StatusCode::FORBIDDEN);
+        assert!(preferences
+            .text()
+            .await
+            .unwrap()
+            .contains("Host settings access is not granted for this host"));
+
+        let update = viewer
+            .post(format!("{viewer_base}/host-actions/system-update"))
+            .header("X-Pharos-Action", "1")
+            .json(&json!({ "host": "poseidon" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::FORBIDDEN);
+        assert!(update
+            .text()
+            .await
+            .unwrap()
+            .contains("Fleet update review access is not granted"));
+
+        let proposal = viewer
+            .get(format!(
+                "{viewer_base}/agora/proposals/host-palette.json?host=poseidon&accent=%23224466"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(proposal.status(), StatusCode::FORBIDDEN);
+        assert!(proposal
+            .text()
+            .await
+            .unwrap()
+            .contains("Agora access is not granted for this host"));
+
+        let (manager_base, manager) = serve_test_app(record(AccessGrant::full())).await;
+        let manager_html = manager
+            .get(format!("{manager_base}/hosts/poseidon?section=settings"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(manager_html.contains(r#"data-host-workspace data-host="poseidon""#));
+        assert!(manager_html
+            .contains(r#"data-grace-source aria-label="Heartbeat grace source"><option"#));
+        assert!(!manager_html.contains(
+            "Viewer access: settings and receipts stay visible, while guarded actions remain with a fleet manager."
+        ));
     }
 
     #[tokio::test]
