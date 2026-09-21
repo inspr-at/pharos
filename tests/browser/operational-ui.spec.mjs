@@ -896,7 +896,12 @@ test("stale side nixpkgs is visible as neutral context without host attention", 
     .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
     .first();
   await expect(card).toBeVisible();
-  await expect(card.locator("[data-reason]")).toContainText("all clear");
+  const reason = card.locator("[data-reason]");
+  await expect(reason).toContainText("all clear");
+  await expect(reason).toBeHidden();
+  const rowReason = page.locator(`tr[data-host="${host}"]`).locator("[data-reason]");
+  await expect(rowReason).toContainText("all clear");
+  await expect(rowReason).toBeHidden();
   await expect(card.locator(".freshness-rail")).toHaveAttribute("hidden", "");
   await expect(
     card.locator(".freshness-rail .fresh-row-compact:not([hidden])"),
@@ -1325,8 +1330,19 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     await expect(healthyRail).toHaveAttribute("hidden", "");
     await expect(failedCardChip).toHaveCount(1);
     await expect(failedCardChip).not.toHaveAttribute("hidden", "");
-    await expect(failedRail).not.toHaveAttribute("hidden", "");
-    await expect(failedRailBackup).toBeVisible();
+    await expect(failedCardChip).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expect(failedCardChip).toHaveAttribute("aria-label", /Backup failed/);
+    const failedDaily = failedCard.locator("a[data-daily-backup]");
+    await expect(failedDaily).toBeVisible();
+    await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expect(failedDaily.locator("[data-daily-backup-label]")).toHaveText("Failed");
+    await expect(failedCard.locator("[data-health-disclosure]")).toContainText("Backup Failed");
+    await expect(failedCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
+      "Backup Failed",
+    );
+    await expect(failedRail).toHaveAttribute("hidden", "");
+    await expect(failedRailBackup).toHaveCount(1);
+    await expect(failedRailBackup).toBeHidden();
     await expect(failedRailBackup).toContainText("Backup failed");
 
     for (const width of [1440, 1024, 768, 390, 320]) {
@@ -1388,8 +1404,15 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     expect(await applyBackupSnapshot(failedBackupObservation())).toBe(true);
     await expect(failedCardChip).not.toHaveAttribute("hidden", "");
     await expect(failedCardChip).toHaveAttribute("data-backup-state", "failed");
-    await expect(failedRail).not.toHaveAttribute("hidden", "");
-    await expect(failedRailBackup).toBeVisible();
+    await expect(failedCardChip).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expect(failedDaily).toBeVisible();
+    await expect(failedDaily.locator("[data-daily-backup-label]")).toHaveText("Failed");
+    await expect(failedCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
+      "Backup Failed",
+    );
+    await expect(failedRail).toHaveAttribute("hidden", "");
+    await expect(failedRailBackup).toBeHidden();
+    await expect(failedRailBackup).toContainText("Backup failed");
 
     await page.locator("[data-view-button='list']").click();
     await expect(page.locator("main")).toHaveAttribute("data-view", "list");
@@ -1397,6 +1420,10 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     await expect(healthyRow.locator(".backup-chip")).toHaveAttribute("hidden", "");
     await expect(failedRow.locator(".backup-chip")).toHaveCount(1);
     await expect(failedRow.locator(".backup-chip")).not.toHaveAttribute("hidden", "");
+    await expect(failedRow.locator(".backup-chip")).toHaveAttribute(
+      "href",
+      `/backups?host=${failedHost}`,
+    );
     for (const width of [1440, 1024, 768, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
       await expect(healthyRow.locator("[data-host-actions-trigger]")).toBeVisible();
@@ -1524,11 +1551,28 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
     await expect(quietRail.locator(".fresh-row-compact:not([hidden])")).toHaveCount(0);
     await expect(faultRail).toBeVisible();
     await expect(faultRail).toHaveAttribute("role", "group");
-    await expect(visibleFaults).toHaveCount(5);
+    await expect(visibleFaults).toHaveCount(4);
     await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toBeVisible();
     await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toBeVisible();
     await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toBeVisible();
-    await expect(faultRail.locator('[data-fresh-kind="backup-fault"]')).toBeVisible();
+    const backupFault = faultRail.locator('[data-fresh-kind="backup-fault"]');
+    await expect(backupFault).toHaveCount(1);
+    await expect(backupFault).toBeHidden();
+    await expect(backupFault).toContainText("Backup failed");
+    await expect(faultCard.locator("a[data-daily-backup]")).toBeVisible();
+    await expect(faultCard.locator("[data-daily-backup-label]")).toHaveText("Failed");
+    await expect(faultCard.locator("a[data-daily-backup]")).toHaveAttribute(
+      "href",
+      `/backups?host=${faultHost}`,
+    );
+    await expect(faultCard.locator(".backup-chip")).toBeVisible();
+    await expect(faultCard.locator(".backup-chip")).toHaveAttribute(
+      "href",
+      `/backups?host=${faultHost}`,
+    );
+    await expect(faultCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
+      "Backup Failed",
+    );
     const failedBackupValue = faultRail.locator(
       '[data-fresh-kind="backup-fault"] [data-fresh-value]',
     );
@@ -1682,7 +1726,12 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
 
     expect(await page.evaluate((body) => applyFleetSnapshot(body), original)).toBe(true);
     await expect(faultRail).not.toHaveAttribute("hidden", "");
-    await expect(visibleFaults).toHaveCount(5);
+    await expect(visibleFaults).toHaveCount(4);
+    await expect(faultRail.locator('[data-fresh-kind="backup-fault"]')).toBeHidden();
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toBeVisible();
   } finally {
     for (const host of hosts) {
       const removal = await page.request.post(`/host-actions/${host}/remove`, {
@@ -1773,7 +1822,7 @@ test("nixpkgs age threshold persists in Settings and controls server and refresh
     await expect(warning("age-above")).toBeHidden();
     await expect(warning("age-override")).toBeVisible();
 
-    await settingsPage.goto("/hosts/age-override");
+    await settingsPage.goto("/hosts/age-override?section=settings");
     await settingsPage.getByText("Alert preferences", { exact: true }).click();
     const override = settingsPage.getByRole("spinbutton", { name: "Host nixpkgs warning threshold (days)" });
     await expect(override).toHaveValue("7");
@@ -1870,7 +1919,7 @@ async function reportRuntimeHost(page, name, extra = {}) {
   expect(response.status()).toBe(204);
 }
 
-test("host workspace is a durable manager task rail that becomes in-flow on mobile", async ({
+test("host workspace keeps receipts and sections and stacks on mobile", async ({
   page,
 }, testInfo) => {
   const host = `host-workspace-${testInfo.project.name}`;
@@ -1973,12 +2022,14 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
     "data-can-manage-fleet",
     "true",
   );
-  await expect(page.locator("[data-host-task-rail]")).toContainText("Up to date");
+  await expect(page.locator("[data-host-task-rail]")).toHaveCount(0);
+  await expect(page.locator("[data-host-section='overview']")).toBeVisible();
+  await expect(page.locator("[data-host-section='settings']")).toBeHidden();
   await expect(page.locator("[data-host-workspace-primary]")).toHaveAttribute(
     "href",
     "#host-settings-editor",
   );
-  await expect(page.locator("[data-host-workspace-settings]")).toBeVisible();
+  await expect(page.locator("[data-host-workspace-primary]")).toBeVisible();
   await expect(page.locator("[data-color-root]")).toHaveAttribute("data-host", host);
   await expect(page.locator("[data-host-workspace-receipts]")).toBeVisible();
   const receipt = page.locator(`[data-workflow-receipt="receipt-${host}"]`);
@@ -2018,23 +2069,16 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   await expect(page.locator("[data-host-workspace-services]")).toBeVisible();
   await expect(page.locator("[data-host-workspace-activity]")).toBeVisible();
   await expect(page.locator("[data-host-workspace-technical]")).toBeVisible();
-  await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "sticky");
-  const desktopGeometry = await page.locator("[data-host-workspace]").evaluate((workspace) => {
-    const rail = workspace.querySelector("[data-host-task-rail]");
-    const main = workspace.querySelector(".host-workspace-main");
-    return {
-      railWidth: rail?.getBoundingClientRect().width ?? 0,
-      mainWidth: main?.getBoundingClientRect().width ?? 0,
-    };
-  });
-  expect(desktopGeometry.railWidth).toBeGreaterThanOrEqual(300);
-  expect(desktopGeometry.railWidth).toBeLessThanOrEqual(312);
-  expect(desktopGeometry.mainWidth).toBeGreaterThan(desktopGeometry.railWidth * 2);
+  const columnTracks = () => page.locator("[data-host-section='overview'] .host-columns").evaluate((columns) => (
+    getComputedStyle(columns).gridTemplateColumns.split(" ").filter(Boolean).length
+  ));
+  expect(await columnTracks()).toBe(2);
 
   await page.reload();
   await expect(page.locator("[data-host-workspace-primary]")).toBeVisible();
+  await expect(page.locator("[data-host-section='settings']")).toBeHidden();
   await page.setViewportSize({ width: 640, height: 900 });
-  await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "static");
+  expect(await columnTracks()).toBe(1);
 });
 
 test("legacy Agora links hand host context to the host workspace and never dead-end", async ({
@@ -2045,9 +2089,11 @@ test("legacy Agora links hand host context to the host workspace and never dead-
 
   const selected = await page.goto(`/agora?host=${encodeURIComponent(host)}`);
   expect(selected?.status()).toBe(200);
-  await expect(page).toHaveURL(new RegExp(`/hosts/${host}$`));
+  await expect(page).toHaveURL(new RegExp(`/hosts/${host}\\?section=settings$`));
   await expect(page.locator("[data-host-workspace]")).toHaveAttribute("data-host", host);
   await expect(page.locator("[data-color-root]")).toHaveAttribute("data-host", host);
+  await expect(page.locator("[data-host-section='settings']")).toBeVisible();
+  await expect(page.locator("[data-host-section='overview']")).toBeHidden();
 
   await page.goto("/agora");
   await expect(page).toHaveURL(/\/$/);
@@ -2199,10 +2245,24 @@ test("fleet host drawer keeps context and hands a local draft to guarded setting
   await expect(review).toBeEnabled();
   expect(settingsDispatches).toBe(0);
   await drawer.locator(".host-drawer-close").focus();
+  const focusOrder = await drawer.evaluate((panel) => Array.from(panel.querySelectorAll("a[href],button:not([disabled]),input:not([disabled]),select:not([disabled])"))
+    .filter((node) => !node.hidden && node.getClientRects().length > 0)
+    .map((node) => {
+      if (node.classList.contains("host-drawer-close")) return "close";
+      if (node.hasAttribute("data-host-drawer-review")) return "review";
+      if (node.hasAttribute("data-grace-reset")) return "grace-reset";
+      return node.tagName.toLowerCase();
+    }));
+  expect(focusOrder[0]).toBe("close");
+  expect(focusOrder.at(-1)).toBe("grace-reset");
+  expect(focusOrder.indexOf("review")).toBeGreaterThan(0);
+  expect(focusOrder.indexOf("review")).toBeLessThan(focusOrder.length - 1);
   await page.keyboard.press("Shift+Tab");
-  await expect(review).toBeFocused();
+  await expect(drawer.locator("[data-grace-reset]")).toBeFocused();
   await page.keyboard.press("Tab");
   await expect(drawer.locator(".host-drawer-close")).toBeFocused();
+  await review.focus();
+  await expect(review).toBeFocused();
   await page.screenshot({
     path: testInfo.outputPath("host-drawer-desktop.png"),
   });
@@ -2237,7 +2297,7 @@ test("fleet host drawer keeps context and hands a local draft to guarded setting
 
   await color.fill("#48b8a8");
   await review.click();
-  await expect(page).toHaveURL(new RegExp(`/hosts/${host}$`));
+  await expect(page).toHaveURL(new RegExp(`/hosts/${host}(?:\\?|$)`));
   const settings = page.locator("[data-color-root]");
   await expect(settings).toHaveAttribute("data-host", host);
   await expect(settings.locator("[data-color]")).toHaveValue("#48b8a8");
@@ -2659,7 +2719,7 @@ test("fleet refresh kernel chip follows server lifecycle transitions", async ({ 
     },
   });
   expect(await applyServerFleetSnapshot(page)).toBe(true);
-  await expect(card.locator("[data-host-lifecycle-chip-copy]")).toContainText("Up to date");
+  await expect(card.locator("[data-host-lifecycle-chip-copy]")).toContainText("No pending changes");
 
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },
@@ -2766,14 +2826,14 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await page.locator("[data-view-button='list']").click();
   await expect(page.locator("main")).toHaveAttribute("data-view", "list");
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await page.locator("[data-view-button='grid']").click();
 
@@ -2888,7 +2948,7 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
     "data-lifecycle-level",
@@ -2898,7 +2958,7 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await expect(row.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
     "data-lifecycle-level",
@@ -3717,7 +3777,7 @@ test("settings no-run-on-single-field keeps color and host type as drafts", asyn
     }
   });
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#48b8a8";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -3762,7 +3822,7 @@ test("settings discard-is-clean closes review without a request", async ({
     }
   });
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#48b8a8";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -3796,7 +3856,7 @@ test("settings confirm-creates-one-run and opens the workflow sheet", async ({
     }
   });
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#48b8a8";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -3970,7 +4030,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
   const requestedUrls = [];
   page.on("request", (request) => requestedUrls.push(request.url()));
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#48b8a8";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -4208,7 +4268,7 @@ test("settings dispatch uncertainty stays recoverable after page reload", async 
   );
   const uncertainJobId = uncertainPayload.job.id;
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#d45d5d";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -4770,7 +4830,7 @@ test("settings guarded apply retains its parent run through linked confirmation 
   expect(applyPosts).toHaveLength(1);
 });
 
-test("Agora keeps guarded settings apply read-only without fleet operator access", async ({
+test("Agora keeps guarded settings apply read-only when operator access is lost before workflow render", async ({
   page,
 }, testInfo) => {
   const host = `settings-viewer-apply-${testInfo.project.name}`;
@@ -4780,8 +4840,19 @@ test("Agora keeps guarded settings apply read-only without fleet operator access
     preferences: { accent: "#111111" },
   });
   const applyPosts = [];
+  let preferencePosts = 0;
   await page.route("**/agora/requests/host-preferences.json", async (route) => {
-    if (route.request().method() !== "POST") return route.continue();
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    preferencePosts += 1;
+    // Access is still manager when Send starts. Revoke it before the
+    // ready-to-apply body is delivered, so workflow render sees a viewer.
+    await page.evaluate(() => {
+      const main = document.querySelector(".settings-main");
+      if (main) main.dataset.canManageFleet = "false";
+    });
     await route.fulfill({
       status: 202,
       contentType: "application/json",
@@ -4812,16 +4883,28 @@ test("Agora keeps guarded settings apply read-only without fleet operator access
     await route.fulfill({ status: 403, contentType: "application/json", body: '{"error":"forbidden"}' });
   });
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
-  await page.locator(".settings-main").evaluate((main) => {
-    main.dataset.canManageFleet = "false";
-  });
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
+  await expect(page.locator(".settings-main")).toHaveAttribute(
+    "data-can-manage-fleet",
+    "true",
+  );
+  await expect(page.locator("[data-review-settings]")).toBeDisabled();
+  expect(preferencePosts).toBe(0);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#48b8a8";
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
-  await page.locator("[data-review-settings]").click();
-  await page.getByRole("button", { name: "Send settings request" }).click();
+  const review = page.locator("[data-review-settings]");
+  await expect(review).toBeEnabled();
+  await review.click();
+  const confirm = page.getByRole("dialog", { name: `Confirm changes for ${host}` });
+  await expect(confirm).toBeVisible();
+  await expect(page.locator(".settings-main")).toHaveAttribute(
+    "data-can-manage-fleet",
+    "true",
+  );
+  expect(preferencePosts).toBe(0);
+  await confirm.getByRole("button", { name: "Send settings request" }).click();
 
   const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
   const apply = dialog.getByRole("button", { name: `Apply on ${host}`, exact: true });
@@ -4836,6 +4919,7 @@ test("Agora keeps guarded settings apply read-only without fleet operator access
   );
   await apply.evaluate((button) => button.click());
   expect(applyPosts).toHaveLength(0);
+  expect(preferencePosts).toBe(1);
 });
 
 test("preference drift declared_not_applied sheet resolves in host settings", async ({

@@ -4282,12 +4282,25 @@ mod tests {
         assert!(preferences.alerts.suppress_down);
         assert!(preferences.alerts.suppress_nix_freshness);
         assert_eq!(preferences.alerts.nixpkgs_warn_after_days, None);
+        assert_eq!(preferences.alerts.heartbeat_grace_secs, None);
+        assert!(!serde_json::to_string(&preferences)
+            .expect("preferences serialize")
+            .contains("heartbeat_grace_secs"));
         let mut registry: serde_json::Value = serde_json::from_str(raw).unwrap();
         registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
         let overridden = parse_host_preferences(&registry.to_string(), "gpc0").unwrap();
         assert_eq!(overridden.alerts.nixpkgs_warn_after_days, Some(7));
         registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(0);
         assert!(parse_host_preferences(&registry.to_string(), "gpc0").is_err());
+        registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
+        registry["hosts"]["gpc0"]["alerts"]["heartbeat_grace_secs"] = serde_json::json!(0);
+        let grace = parse_host_preferences(&registry.to_string(), "gpc0").unwrap();
+        assert_eq!(grace.alerts.heartbeat_grace_secs, Some(0));
+        registry["hosts"]["gpc0"]["alerts"]["heartbeat_grace_secs"] = serde_json::json!(3601);
+        assert!(parse_host_preferences(&registry.to_string(), "gpc0").is_err());
+        registry["hosts"]["gpc0"]["alerts"]["heartbeat_grace_secs"] = serde_json::Value::Null;
+        let cleared = parse_host_preferences(&registry.to_string(), "gpc0").unwrap();
+        assert_eq!(cleared.alerts.heartbeat_grace_secs, None);
     }
 
     #[test]
@@ -4332,6 +4345,7 @@ mod tests {
                 suppress_backup: true,
                 suppress_nix_freshness: false,
                 nixpkgs_warn_after_days: None,
+                heartbeat_grace_secs: None,
             },
         };
         let response = HostReportResponse::pending("gpc0", preferences.clone())

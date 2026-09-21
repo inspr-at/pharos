@@ -13,6 +13,388 @@ function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);r
 function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 const ESC={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
 function esc(v){return String(v ?? '').replace(/[&<>"']/g,ch=>ESC[ch])}
+/* TIMELINE_PURE_START */
+const DEFAULT_HEARTBEAT_GRACE_SECS=15;
+const CLOCK_SKEW_SECS=2;
+const SELECTIVE_RESTORE_OVERDUE_SECS=30*24*60*60;
+const DAILY_SUCCESS_STALE_SECS=129600;
+const HISTORY_LEVEL_RANK={down:0,stale:1,late:2,unknown:3,first:4,ok:5};
+const DAILY_FACT_RANK={failed:0,missing:1,stale:2,warning:3,disabled:3,unknown:4,'not-configured':5,ok:6,'not-required':7};
+function wholeGrace(grace){
+  const extra=Number(grace);
+  if(!Number.isInteger(extra)||extra<0||extra>3600)return null;
+  return extra;
+}
+function cadenceBounds(interval,grace){
+  const raw=Number(interval);
+  const cadence=Math.max(1,Number.isFinite(raw)&&raw>0?raw:60);
+  const parsed=wholeGrace(grace);
+  const graceSecs=parsed==null?DEFAULT_HEARTBEAT_GRACE_SECS:parsed;
+  const lateAfter=cadence+graceSecs;
+  const staleAfter=cadence*2;
+  const downAfter=cadence*5;
+  return {cadence,grace:graceSecs,lateAfter,onTimeThrough:Math.min(lateAfter,staleAfter),staleAfter,downAfter};
+}
+function heartbeatTiming(gap,interval,grace){
+  const bounds=cadenceBounds(interval,grace);
+  if(gap>bounds.downAfter)return 'down';
+  if(gap>bounds.staleAfter)return 'stale';
+  if(gap>bounds.lateAfter)return 'late';
+  return 'on-time';
+}
+function heartbeatTimelineX(age,interval,grace){
+  const bounds=cadenceBounds(interval,grace);
+  const span=Math.max(0,Number(age)||0);
+  if(span<=bounds.onTimeThrough)return bounds.onTimeThrough<=0?0:(span/bounds.onTimeThrough)*EXPECT_X;
+  if(span<=bounds.staleAfter){
+    const lateSpan=bounds.staleAfter-bounds.onTimeThrough;
+    if(lateSpan<=0)return STALE_X;
+    return EXPECT_X+((span-bounds.onTimeThrough)/lateSpan)*(STALE_X-EXPECT_X);
+  }
+  if(span<=bounds.downAfter)return STALE_X+((span-bounds.staleAfter)/(bounds.downAfter-bounds.staleAfter))*(100-STALE_X);
+  return 100;
+}
+function resolveHeartbeatGrace(host,fleetGrace){
+  const policy=host?.heartbeat_grace;
+  const policySecs=Number(policy?.effective_secs);
+  if(policy&&Number.isInteger(policySecs)&&policySecs>=0&&policySecs<=3600){
+    const lateAfter=Number(policy.late_after_secs);
+    return {secs:policySecs,source:policy.source==='host'?'host':'fleet',lateAfter:Number.isInteger(lateAfter)?lateAfter:null};
+  }
+  const override=host?.preferences?.alerts?.heartbeat_grace_secs;
+  const overrideSecs=Number(override);
+  if(override!=null&&override!==''&&Number.isInteger(overrideSecs)&&overrideSecs>=0&&overrideSecs<=3600)return {secs:overrideSecs,source:'host',lateAfter:null};
+  const fleetSecs=Number(fleetGrace);
+  if(fleetGrace!=null&&fleetGrace!==''&&Number.isInteger(fleetSecs)&&fleetSecs>=0&&fleetSecs<=3600)return {secs:fleetSecs,source:'fleet',lateAfter:null};
+  return {secs:DEFAULT_HEARTBEAT_GRACE_SECS,source:'default',lateAfter:null};
+}
+function evidenceAge(seconds){
+  const span=Math.max(0,Math.floor(Number(seconds)||0));
+  const days=Math.floor(span/86400);
+  if(days<=0)return dur(span);
+  const rest=span-days*86400;
+  return days+'d'+(rest?' '+dur(rest):'');
+}
+function dedupeHeartbeats(values){
+  const sorted=Array.from(new Set((Array.isArray(values)?values:[]).map(Number).filter(stamp=>Number.isFinite(stamp)&&stamp>0))).sort((a,b)=>a-b);
+  const kept=[];
+  for(const stamp of sorted){
+    const previous=kept[kept.length-1];
+    if(previous!=null&&stamp-previous<1)continue;
+    kept.push(stamp);
+  }
+  return kept;
+}
+function historyInfo(beats,index,interval,grace,now){
+  const stamp=Number(beats[index]);
+  if(!Number.isFinite(stamp)||stamp<=0)return {level:'unknown',label:'unknown sample',detail:'timestamp missing'};
+  if(Number.isFinite(Number(now))&&stamp>Number(now)+CLOCK_SKEW_SECS)return {level:'unknown',label:'clock skew',detail:'reported '+dur(stamp-Number(now))+' ahead of Pharos · '+clock(stamp)};
+  const previous=index>0?Number(beats[index-1]):null;
+  if(previous==null||!Number.isFinite(previous))return {level:'first',label:'first heartbeat',detail:'at '+clock(stamp)};
+  const gap=stamp-previous;
+  if(gap<0)return {level:'unknown',label:'clock skew',detail:'sample is earlier than the previous report · '+clock(stamp)};
+  const timing=heartbeatTiming(gap,interval,grace);
+  const detail=dur(gap)+' after previous · '+clock(stamp);
+  if(timing==='on-time')return {level:'ok',label:'on cadence',detail};
+  if(timing==='late')return {level:'late',label:'late heartbeat',detail};
+  if(timing==='stale')return {level:'stale',label:'stale gap recovered',detail};
+  return {level:'down',label:'offline gap recovered',detail};
+}
+function gapInfo(gap,interval,grace){
+  const timing=heartbeatTiming(gap,interval,grace);
+  if(timing==='on-time')return null;
+  const detail=dur(gap)+' between reports';
+  if(timing==='late')return {level:'late',label:'late heartbeat',detail};
+  if(timing==='stale')return {level:'stale',label:'stale gap recovered',detail};
+  return {level:'down',label:'offline gap recovered',detail};
+}
+function historyEventRank(level){
+  const rank=HISTORY_LEVEL_RANK[level];
+  return Number.isInteger(rank)?rank:5;
+}
+function preferHistoryEvent(candidate,current){
+  if(candidate.rank!==current.rank)return candidate.rank<current.rank;
+  if(candidate.gap!==current.gap)return candidate.gap>current.gap;
+  if(candidate.stamp!==current.stamp)return candidate.stamp<current.stamp;
+  return candidate.index<current.index;
+}
+function aggregateHistory(samples,windowDef,now,interval,grace){
+  const kept=dedupeHeartbeats(samples);
+  const end=Number(now);
+  const windowSecs=Math.max(1,Number(windowDef?.secs)||1);
+  const start=end-windowSecs;
+  const axisNowX=100;
+  const axisStartX=100;
+  if(!Number.isFinite(end)||kept.length<2)return {marks:[],partial:false,retainedStart:kept[0]??null,start,end,empty:'unobserved',axisNowX,axisStartX};
+  const limit=end+CLOCK_SKEW_SECS;
+  const candidates=[];
+  for(let index=1;index<kept.length;index++){
+    const stamp=kept[index];
+    if(stamp>=start&&stamp<=limit)candidates.push(index);
+  }
+  let indexes=candidates;
+  if(candidates.length>HISTORY_DOTS){
+    const buckets=Array.from({length:HISTORY_DOTS},()=>null);
+    candidates.forEach(index=>{
+      const stamp=kept[index];
+      const previous=Number(kept[index-1]);
+      const gap=Number.isFinite(previous)?Math.max(0,stamp-previous):0;
+      const info=historyInfo(kept,index,interval,grace,end);
+      const raw=Math.floor((Math.max(0,stamp-start)/windowSecs)*HISTORY_DOTS);
+      const bucket=Math.min(HISTORY_DOTS-1,Math.max(0,raw));
+      const choice={index,rank:historyEventRank(info.level),gap,stamp};
+      const current=buckets[bucket];
+      if(!current||preferHistoryEvent(choice,current))buckets[bucket]=choice;
+    });
+    indexes=buckets.filter(choice=>choice).map(choice=>choice.index);
+  }
+  const marks=indexes.map(index=>{
+    const stamp=kept[index];
+    const info=historyInfo(kept,index,interval,grace,end);
+    const x=Math.max(0,Math.min(100,((stamp-start)/windowSecs)*100));
+    return {key:'sample:'+stamp,x,stamp,level:info.level,label:info.label,detail:info.detail,kind:'sample'};
+  });
+  return {marks,partial:kept[0]>start+1,retainedStart:kept[0],start,end,empty:marks.length?'observed':'quiet',axisNowX,axisStartX};
+}
+function signalInfo(beats,last,interval,now,windowDef=signalWindow,grace){
+  const bounds=cadenceBounds(interval,grace);
+  const windowLabel=windowDef?.label||'window';
+  const windowSecs=Math.max(bounds.cadence,Number(windowDef?.secs)||bounds.cadence);
+  const samples=dedupeHeartbeats([].concat(beats||[],Number.isFinite(Number(last))&&Number(last)>0?[Number(last)]:[]));
+  const base='Heartbeat delivery over '+windowLabel+': ';
+  const uptime=' Not measured host or service uptime.';
+  if(!samples.length)return {text:'—',level:'wait',window:windowLabel,kind:'delivery',title:base+'no reports yet.'+uptime,coverage:'none'};
+  const requestedStart=Number(now)-windowSecs;
+  const future=samples.filter(stamp=>stamp>Number(now)+CLOCK_SKEW_SECS);
+  const usable=samples.filter(stamp=>stamp<=Number(now)+CLOCK_SKEW_SECS);
+  if(!usable.length)return {text:'—',level:'wait',window:windowLabel,kind:'delivery',title:base+'reports are ahead of Pharos and were not counted.'+uptime,coverage:'none'};
+  const retainedStart=Math.max(requestedStart,usable[0]);
+  const span=Math.max(bounds.cadence,Math.min(windowSecs,Number(now)-retainedStart));
+  const expected=Math.max(1,Math.ceil(span/bounds.cadence));
+  const received=usable.filter(stamp=>stamp>=retainedStart&&stamp<=Number(now)).length;
+  let longest=0;
+  let previous=retainedStart;
+  for(const stamp of usable){
+    if(stamp<retainedStart||stamp>Number(now))continue;
+    longest=Math.max(longest,stamp-previous);
+    previous=stamp;
+  }
+  longest=Math.max(longest,Number(now)-previous);
+  const percent=Math.max(0,Math.min(100,Math.round((received/expected)*100)));
+  const level=percent>=95?'good':percent>=75?'warn':'down';
+  const partialWindow=usable[0]>requestedStart+1;
+  const partial=partialWindow?' Partial retention from '+clock(usable[0])+'.':'';
+  const skew=future.length?' '+future.length+' clock-skewed report'+(future.length===1?'':'s')+' ignored.':'';
+  return {text:percent+'%',level,window:windowLabel,kind:'delivery',title:base+received+' of '+expected+' expected reports after duplicate collapse.'+partial+skew+' Longest gap '+dur(longest)+'.'+uptime,coverage:partialWindow?'partial':'full'};
+}
+function arrivalPresentation(last,interval,grace,now){
+  const bounds=cadenceBounds(interval,grace);
+  const at=Number(last);
+  const current=Number(now);
+  if(!Number.isFinite(at)||at<=0)return {state:'waiting',label:'No heartbeat yet',detail:'Awaiting first report. Late after '+bounds.lateAfter+'s.',x:0};
+  if(!Number.isFinite(current)||at>current+CLOCK_SKEW_SECS)return {state:'unknown',label:'Clock skew',detail:'Last report is ahead of Pharos',x:0};
+  const age=Math.max(0,current-at);
+  const x=heartbeatTimelineX(age,interval,grace);
+  const timing=heartbeatTiming(age,interval,grace);
+  if(timing==='on-time')return {state:'on-time',label:'On time',detail:'Late after '+dur(bounds.lateAfter-age)+'.',x,age};
+  if(timing==='late')return {state:'late',label:'Late',detail:dur(age-bounds.lateAfter)+' past grace.',x,age};
+  if(timing==='stale')return {state:'stale',label:'Stale',detail:dur(age)+' since last report.',x,age};
+  return {state:'down',label:'Down',detail:dur(age)+' since last report.',x,age};
+}
+function backupLevelKey(value){return String(value||'').trim().toLowerCase().replace(/_/g,'-')}
+function selectiveRestoreFileCount(restore){
+  const raw=restore?.restored_files??restore?.restored_file_count??restore?.files_restored;
+  if(raw==null||raw==='')return null;
+  const count=Number(raw);
+  return Number.isFinite(count)?count:null;
+}
+function qualifyingSelectiveRestore(restore){
+  if(!restore||backupLevelKey(restore.state)!=='passed'||backupLevelKey(restore.level)!=='restore-sample')return null;
+  const files=selectiveRestoreFileCount(restore);
+  if(files!=null&&files<1)return null;
+  const at=Number(restore.checked_at);
+  if(!Number.isFinite(at)||at<=0)return null;
+  return {at,files};
+}
+function dailyLabel(schedule){
+  const text=String(schedule||'').trim();
+  if(/^(daily|day|nightly)$/i.test(text)||/24h|every day/i.test(text))return 'Daily OK';
+  return 'Successful';
+}
+function backupAgeText(at,now){
+  const stamp=Number(at);
+  const current=Number(now);
+  if(!Number.isFinite(stamp)||!Number.isFinite(current))return 'time unknown';
+  if(stamp>current+CLOCK_SKEW_SECS)return 'time is in the future';
+  const seconds=Math.max(0,Math.floor(current-stamp));
+  if(seconds>=86400)return Math.floor(seconds/86400)+'d ago';
+  if(seconds<60)return seconds+'s ago';
+  if(seconds<3600)return Math.floor(seconds/60)+'m '+String(seconds%60).padStart(2,'0')+'s ago';
+  return Math.floor(seconds/3600)+'h '+String(Math.floor((seconds%3600)/60)).padStart(2,'0')+'m ago';
+}
+function agoNote(at,now,prefix){
+  const stamp=Number(at);
+  if(!Number.isFinite(stamp)||stamp<=0)return prefix+' not recorded';
+  return prefix+' '+backupAgeText(stamp,now);
+}
+function eligibleRestoreAt(at,now){
+  if(typeof at==='boolean'||at==null||at==='')return null;
+  const stamp=Number(at);
+  if(!Number.isSafeInteger(stamp)||stamp<=0||stamp>=253402300800)return null;
+  const current=Number(now);
+  if(!Number.isFinite(current)||stamp>current+CLOCK_SKEW_SECS)return null;
+  return stamp;
+}
+function projectDailyJob(job,now){
+  let state=backupLevelKey(job.state);
+  const at=Number(job.last_success_at);
+  const hasSuccess=Number.isFinite(at)&&at>0;
+  const current=Number(now);
+  if((state==='healthy'||state==='warning')&&hasSuccess&&(at>current+CLOCK_SKEW_SECS||current-at>DAILY_SUCCESS_STALE_SECS))state='stale';
+  if(backupLevelKey(job.configured)==='disabled'&&state!=='failed'&&state!=='missing'&&state!=='stale'&&state!=='warning'){
+    return {tone:'amber',state:'disabled',label:'Disabled',detail:'Backup is disabled and is not an exemption from backup policy',at:hasSuccess?at:null};
+  }
+  if(state==='healthy'&&!hasSuccess)return {tone:'neutral',state:'unknown',label:'Success time unknown',detail:'No successful-run time was recorded',at:null};
+  if(state==='healthy'){
+    const schedule=String(job.schedule||'').trim()||'schedule not declared';
+    return {tone:'good',state:'ok',label:dailyLabel(job.schedule),detail:'last success '+backupAgeText(at,current)+' · '+schedule,at};
+  }
+  if(state==='failed')return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
+  if(state==='missing')return {tone:'bad',state:'missing',label:'Missing',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
+  if(state==='stale')return {tone:'amber',state:'stale',label:'Stale',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
+  if(state==='warning')return {tone:'amber',state:'warning',label:'Review',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
+  if(state==='not-configured')return {tone:'neutral',state:'not-configured',label:'Not configured',detail:'No backup is configured',at:hasSuccess?at:null};
+  if(state==='not-required')return {tone:'neutral',state:'not-required',label:'Not required',detail:String(job.summary||'No backup is required'),at:hasSuccess?at:null};
+  return {tone:'neutral',state:state||'unknown',label:state==='unknown'?'Unknown':'Not observed',detail:state==='unknown'?'Backup evidence is unknown':String(job.summary||'No backup evidence'),at:hasSuccess?at:null};
+}
+function dailyProjectedRank(fact){
+  const rank=DAILY_FACT_RANK[fact?.state];
+  return Number.isInteger(rank)?rank:4;
+}
+function projectDailyBackup(observations,now){
+  const jobs=(Array.isArray(observations)?observations:[]).filter(job=>job&&typeof job==='object');
+  if(!jobs.length)return {tone:'neutral',state:'unknown',label:'Not observed',detail:'No backup signal yet',at:null};
+  let worst=null;
+  let worstRank=DAILY_FACT_RANK['not-required']+1;
+  for(const job of jobs){
+    const fact=projectDailyJob(job,now);
+    const rank=dailyProjectedRank(fact);
+    if(!worst||rank<worstRank){
+      worst=fact;
+      worstRank=rank;
+    }
+  }
+  return worst;
+}
+function projectRestoreStatus(observations,now){
+  const jobs=(Array.isArray(observations)?observations:[]).filter(job=>job&&typeof job==='object');
+  if(projectDailyBackup(jobs,now).state==='not-required')return {tone:'neutral',state:'not-required',label:'Not required',detail:'No selective restore is required',at:null,overdue:false,producer:''};
+  const current=Number(now);
+  let passed=null;
+  let latestAt=null;
+  let latestFailed=false;
+  let latestAdverse=false;
+  let sawRestore=false;
+  for(const job of jobs){
+    const restore=job?.restore_validation;
+    if(backupLevelKey(restore?.level)!=='restore-sample')continue;
+    sawRestore=true;
+    const at=eligibleRestoreAt(restore.checked_at,current);
+    if(at==null)continue;
+    const state=backupLevelKey(restore.state);
+    const failed=state==='failed';
+    const adverse=state!=='passed';
+    if(latestAt==null||at>latestAt){
+      latestAt=at;
+      latestFailed=failed;
+      latestAdverse=adverse;
+    }else if(at===latestAt){
+      if(failed)latestFailed=true;
+      if(adverse)latestAdverse=true;
+    }
+    if(state!=='passed')continue;
+    const qualified=qualifyingSelectiveRestore(restore);
+    if(qualified&&qualified.at===at&&(!passed||at>passed.at))passed={at,files:qualified.files};
+  }
+  if(latestFailed&&(!passed||latestAt>passed.at)){
+    return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(passed?passed.at:null,current,'last successful selective restore'),at:passed?passed.at:null,overdue:false,producer:'failed'};
+  }
+  if(!passed){
+    return {tone:'neutral',state:'unknown',label:'Not observed',detail:sawRestore?'No successful selective restore is recorded':'No selective restore evidence from the backup source',at:null,overdue:false,producer:''};
+  }
+  const age=Math.max(0,current-passed.at);
+  if(age>SELECTIVE_RESTORE_OVERDUE_SECS)return {tone:'amber',state:'overdue',label:'Overdue',detail:agoNote(passed.at,current,'last successful selective restore'),at:passed.at,overdue:true,producer:'passed'};
+  if(latestAt===passed.at&&!latestAdverse)return {tone:'good',state:'passed',label:'Passed',detail:agoNote(passed.at,current,'selective restore'),at:passed.at,overdue:false,producer:'passed'};
+  return {tone:'neutral',state:'unknown',label:'Unknown',detail:agoNote(passed.at,current,'last successful selective restore'),at:passed.at,overdue:false,producer:''};
+}
+function projectBackupCheck(observations,now){
+  const jobs=Array.isArray(observations)?observations:[];
+  let best=null;
+  const consider=(state,at,summary)=>{
+    const stamp=Number(at);
+    const when=Number.isFinite(stamp)&&stamp>0?stamp:null;
+    if(!best||(when!=null&&(best.at==null||when>best.at)))best={state:backupLevelKey(state)||'unknown',at:when,summary:String(summary||'')};
+  };
+  jobs.forEach(job=>{
+    const restore=job?.restore_validation;
+    const level=backupLevelKey(restore?.level);
+    if(restore&&level&&level!=='restore-sample')consider(restore.state,restore.checked_at,restore.summary||restore.evidence_label||'');
+  });
+  if(!best)jobs.forEach(job=>{if(job?.last_check_state)consider(job.last_check_state,job.last_check_at,'');});
+  if(!best)return null;
+  const tone=best.state==='passed'?'good':best.state==='failed'?'bad':best.state==='stale'?'amber':'neutral';
+  const label=best.state==='passed'?'Check passed':best.state==='failed'?'Check failed':best.state==='stale'?'Check stale':'Check unknown';
+  const age=best.at==null?'time unknown':dur(Math.max(0,Number(now)-best.at))+' ago';
+  return {tone,state:best.state,label,detail:(best.summary?best.summary+' · ':'')+age,at:best.at};
+}
+function projectHealth(facts){
+  const reasons=[];
+  const add=(tone,label,at)=>reasons.push({tone,label,at:at==null?'':at});
+  const backup=facts?.backup;
+  const restore=facts?.restore;
+  const check=facts?.check;
+  if(facts?.liveness==='down'&&facts?.expectedOffline)add('good','Offline as expected',null);
+  else if(facts?.liveness==='down')add('bad','Not reporting',facts.lastSeen);
+  else if(facts?.liveness==='stale')add('amber','Stale heartbeat',facts.lastSeen);
+  else if(facts?.liveness==='awaiting_first_heartbeat')add('neutral','Awaiting first heartbeat','');
+  if(backup&&backup.tone!=='good'&&backup.state!=='not-required')add(backup.tone||'neutral','Backup '+backup.label,backup.at);
+  if(check&&check.tone!=='good')add(check.tone||'neutral',check.label,check.at);
+  if(restore&&restore.tone!=='good'&&restore.state!=='not-required')add(restore.tone||'neutral','Restore '+restore.label,restore.at);
+  let warnings=0;
+  let staleServices=0;
+  let unknownServices=0;
+  (Array.isArray(facts?.services)?facts.services:[]).forEach(service=>{
+    const id=String(service?.id||'');
+    if(id==='nix-freshness'||id==='appliance-convergence')return;
+    const state=backupLevelKey(service?.state);
+    if(state==='warning')warnings+=1;
+    else if(state==='stale')staleServices+=1;
+    else if(state==='unknown')unknownServices+=1;
+  });
+  if(warnings)add('amber',warnings+' service warning'+(warnings===1?'':'s'),'');
+  if(staleServices)add('amber',staleServices+' service stale'+(staleServices===1?'':'s'),'');
+  if(unknownServices)add('neutral','Service state unknown','');
+  if(facts?.kernelRestart)add('amber','Restart needed','');
+  if(facts?.freshness?.level==='warn')add('amber',facts.freshness.label,'');
+  if(facts?.freshness?.level==='wait')add('neutral',facts.freshness.label,'');
+  const rank={bad:0,amber:1,neutral:2,good:3};
+  let tone='good';
+  reasons.forEach(reason=>{if((rank[reason.tone]??2)<rank[tone])tone=reason.tone});
+  const problems=reasons.filter(reason=>reason.tone!=='good');
+  const summary=problems.find(reason=>reason.tone==='bad')?.label||problems.find(reason=>reason.tone==='amber')?.label||problems.find(reason=>reason.tone==='neutral')?.label||'No action needed';
+  const down=reasons.some(reason=>reason.label==='Not reporting');
+  const labels={bad:down?'Not reporting':'Problem',amber:'Needs attention',neutral:'Unknown',good:'Healthy'};
+  return {tone,count:problems.length,label:labels[tone]||'Unknown',summary,reasons:problems};
+}
+function projectProtection(observations,now){
+  return {daily:projectDailyBackup(observations,now),restore:projectRestoreStatus(observations,now),check:projectBackupCheck(observations,now)};
+}
+function fleetRecoveryModel(kind){
+  if(kind==='auth')return {kind:'auth',action:'sign-in',label:'Sign in'};
+  if(kind==='offline'||kind==='abort'||kind==='unavailable'||kind==='invalid'||kind==='stale')return {kind,action:'retry',label:'Retry'};
+  return null;
+}
+/* TIMELINE_PURE_END */
 const LEGACY_UI_COOKIES=['pharos_sort','pharos_view','pharos_search','pharos_live_filter','pharos_signal_window'];
 const UI_PREFERENCE_TTL_MS=180*24*60*60*1000;
 function clearLegacyUiCookies(){
@@ -98,17 +480,28 @@ function updateHostDrawerDraftState(){
   if(discard)discard.disabled=!canManage||!dirty;
   if(review)review.disabled=!canManage||!dirty;
 }
-function updateOpenHostDrawer(host){
+function updateOpenHostDrawer(host,now){
   if(!host||host.name!==hostDrawerContext.host)return;
   const lifecycle=host.lifecycle||{};
   setHostDrawerText('[data-host-drawer-state]',String(host.liveness||'unknown').replaceAll('_',' '));
   const state=hostDrawerField('[data-host-drawer-state]');
   if(state)state.dataset.level=String(lifecycle.level||host.liveness||'');
   setHostDrawerText('[data-host-drawer-attention]',String(host.attention?.label||'all clear'));
-  setHostDrawerText('[data-host-drawer-guidance]',String(lifecycle.detail||'No host lifecycle work is waiting.'));
+  setHostDrawerText('[data-host-drawer-guidance]',String(lifecycle.detail||'No pending work is waiting.'));
   setHostDrawerText('[data-host-drawer-owner]',hostDrawerOwner(lifecycle,''));
   setHostDrawerText('[data-host-drawer-next]',hostDrawerNext(lifecycle,''));
   setHostDrawerText('[data-host-drawer-settings-state]',String(host.preferences_state||'applied').replaceAll('_',' '));
+  const assurance=projectHostAssurance(host,Number.isFinite(Number(now))?Number(now):Date.now()/1000);
+  updateDrawerAssurance(assurance.protection,assurance.health);
+}
+function updateDrawerAssurance(protection,health){
+  setHostDrawerText('[data-host-drawer-health]',health?.label||'');
+  setHostDrawerText('[data-host-drawer-backup]',protection?.daily?(protection.daily.label+' · '+protection.daily.detail):'');
+  setHostDrawerText('[data-host-drawer-restore]',protection?.restore?(protection.restore.label+' · '+protection.restore.detail):'');
+  const full=hostDrawerField('[data-host-drawer-full-page]');
+  const workspace=hostDrawerField('[data-host-drawer-workspace]');
+  const href=workspace?.getAttribute?.('href')||workspace?.href||'';
+  if(full&&href)full.setAttribute('href',href);
 }
 function populateHostDrawer(surface){
   const host=surface.dataset.host||'';
@@ -127,12 +520,19 @@ function populateHostDrawer(surface){
   const state=hostDrawerField('[data-host-drawer-state]');
   if(state)state.dataset.level=String(lifecycle?.level||surface.dataset.live||'');
   setHostDrawerText('[data-host-drawer-attention]',attention);
-  setHostDrawerText('[data-host-drawer-guidance]',String(lifecycle?.detail||surface.dataset.drawerLifecycleDetail||'No host lifecycle work is waiting.'));
+  setHostDrawerText('[data-host-drawer-guidance]',String(lifecycle?.detail||surface.dataset.drawerLifecycleDetail||'No pending work is waiting.'));
   setHostDrawerText('[data-host-drawer-owner]',hostDrawerOwner(lifecycle,surface.dataset.drawerLifecycleOwner));
   setHostDrawerText('[data-host-drawer-next]',hostDrawerNext(lifecycle,surface.dataset.drawerNextAction));
   setHostDrawerText('[data-host-drawer-settings-state]',String(surface.dataset.drawerSettingsState||'applied').replaceAll('_',' '));
   const workspace=hostDrawerField('[data-host-drawer-workspace]');
   if(workspace)workspace.href=surface.dataset.drawerWorkspaceHref||appUrl('/hosts/'+encodeURIComponent(host));
+  const fullPage=hostDrawerField('[data-host-drawer-full-page]');
+  if(fullPage&&workspace)fullPage.setAttribute('href',workspace.getAttribute('href')||workspace.href||'');
+  const openHost=fleetHostsByName.get(host);
+  if(openHost){
+    const assurance=projectHostAssurance(openHost,Date.now()/1000);
+    updateDrawerAssurance(assurance.protection,assurance.health);
+  }
   applyHostDrawerDraft(hostDrawerContext.base);
   updateHostDrawerDraftState();
 }
@@ -801,6 +1201,17 @@ async function withdrawSettingsChange(actionItem,root){
     }
   }
 }
+function activeHostActionJobId(root){
+  if(document.body?.dataset.hostActionDialogOpen!=='true')return '';
+  if(!hostActionContext||hostActionContext.root!==root||!hostActionContext.jobId)return '';
+  return String(hostActionContext.jobId);
+}
+function hostActionReportIsChild(job,parentId){
+  if(!parentId||!job)return false;
+  const id=String(job.id||'');
+  if(!id||id===parentId)return false;
+  return [job.settings_change_id,job.workflow?.settings_change_id,job.workflow?.parent_run_id].some(value=>String(value||'')===parentId);
+}
 function updateHostActionState(surface,host,backup){
   const root=surface.querySelector('[data-host-actions]');
   if(!root)return;
@@ -808,9 +1219,7 @@ function updateHostActionState(surface,host,backup){
   const kernel=host.kernel||{};
   const kernelState=String(kernel.state||'unknown');
   const nixcfgComparison=host.freshness?.nixcfg_comparison;
-  const nixpkgsComparison=host.freshness?.nixpkgs_comparison;
   const provenGitUpdate=nixcfgComparison?.relation==='behind'&&Number(nixcfgComparison.commits_behind)>0;
-  const provenNixpkgsUpdate=nixpkgsComparison?.relation==='different';
   const canManage=root.dataset.canManage==='true';
   const systemUpdateAvailable=root.dataset.systemUpdateAvailable==='true';
   const hostRemovalAvailable=root.dataset.hostRemovalAvailable==='true';
@@ -829,8 +1238,18 @@ function updateHostActionState(surface,host,backup){
   root.dataset.retirementSuccessor=String(retirement?.successor||'');
   root.dataset.retirementDeclarationPending=retirement?.declaration_pending===true?'true':'false';
   root.dataset.retirementCredentialPending=retirement?.credential_retirement_pending===true?'true':'false';
-  if(job){root.dataset.actionJobId=String(job.id||'');root.dataset.actionKind=String(workflow?.kind||job.kind||'');root.dataset.actionState=String(job.state||'')}
-  else{delete root.dataset.actionJobId;delete root.dataset.actionKind;delete root.dataset.actionState}
+  const openParentId=activeHostActionJobId(root);
+  if(job&&!hostActionReportIsChild(job,openParentId)){
+    root.dataset.actionJobId=String(job.id||'');
+    root.dataset.actionKind=String(workflow?.kind||job.kind||'');
+    root.dataset.actionState=String(job.state||'');
+  }else if(openParentId){
+    root.dataset.actionJobId=openParentId;
+  }else{
+    delete root.dataset.actionJobId;
+    delete root.dataset.actionKind;
+    delete root.dataset.actionState;
+  }
   if(backup){root.dataset.backupState=String(backup.state||'unknown');root.dataset.backupLabel=String(backup.label||'Not observed')}
   const update=root.querySelector('[data-host-action="system-update"]');
   const restart=root.querySelector('[data-host-action="update-restart"]');
@@ -839,7 +1258,7 @@ function updateHostActionState(surface,host,backup){
   const primarySeparator=root.querySelector('[data-primary-separator]');
   const removeSeparator=root.querySelector('[data-remove-separator]');
   const updateJobActive=host.update_restart_active===true;
-  const updatePending=kernelState==='reboot_required'||provenGitUpdate||provenNixpkgsUpdate;
+  const updatePending=kernelState==='reboot_required'||provenGitUpdate;
   const lifecycle=host.lifecycle||{};
   root.dataset.updatePending=updatePending?'true':'false';
   root.dataset.updateRestartActive=host.update_restart_active===true?'true':'false';
@@ -995,34 +1414,6 @@ function openRequestedWorkflow(){
 }
 function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
 function signalWindowByKey(key){return SIGNAL_WINDOWS.find(w=>w.key===key)||SIGNAL_WINDOWS[0]}
-function historyWindowMeta(samples,windowDef){
-  if(samples.length<2)return {start:0,latest:0,span:1,candidates:[]};
-  const latest=samples[samples.length-1];
-  const start=Math.max(latest-windowDef.secs,samples[0]);
-  const span=Math.max(1,latest-start);
-  const candidates=samples.map((stamp,index)=>({stamp,index})).filter(item=>item.index>0&&item.stamp>=start&&item.stamp<=latest);
-  return {start,latest,span,candidates};
-}
-function visibleHistory(samples,windowDef){
-  const meta=historyWindowMeta(samples,windowDef);
-  if(meta.candidates.length<=HISTORY_DOTS)return {...meta,visible:meta.candidates};
-  const buckets=Array(HISTORY_DOTS).fill(null);
-  for(const item of meta.candidates){
-    const bucket=Math.min(HISTORY_DOTS-1,Math.max(0,Math.floor(((item.stamp-meta.start)/meta.span)*HISTORY_DOTS)));
-    buckets[bucket]=item;
-  }
-  return {...meta,visible:buckets.filter(Boolean)};
-}
-function historyInfo(beats,index,interval){
-  const stamp=beats[index];
-  const previous=index>0?beats[index-1]:null;
-  if(previous==null)return {level:'first',label:'first heartbeat',detail:'at '+clock(stamp)};
-  const gap=Math.max(0,stamp-previous);
-  if(gap<=interval)return {level:'ok',label:'on cadence',detail:dur(gap)+' after previous · '+clock(stamp)};
-  if(gap<=interval*2)return {level:'late',label:'late heartbeat',detail:dur(gap)+' after previous · '+clock(stamp)};
-  if(gap<=interval*5)return {level:'stale',label:'stale gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
-  return {level:'down',label:'offline gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
-}
 function setFreshRow(surface,kind,state){
   const row=surface.querySelector('[data-fresh-kind="'+kind+'"]');
   if(!row)return;
@@ -1094,6 +1485,7 @@ function updateFreshness(surface,f,now,threshold=30){
       label:'nixcfg',
       visible:Boolean(evidence&&nixcfg?.relation!=='current')
     });
+    updateConfigEvidence(surface,f);
     return;
   }
   if(!f||f.applicable===false){
@@ -1101,6 +1493,7 @@ function updateFreshness(surface,f,now,threshold=30){
     setFreshRow(surface,'commits-behind',{value:'n/a',klass:'na'});
     setFreshRow(surface,'deployment-evidence',{value:'n/a',klass:'na',label:'Active generation'});
     setFreshRow(surface,'secondary-nixpkgs',{value:'n/a',klass:'na',label:'Other root nixpkgs'});
+    updateConfigEvidence(surface,f);
     return;
   }
   const evidence=f.deployment_evidence;
@@ -1156,6 +1549,33 @@ function updateFreshness(surface,f,now,threshold=30){
   }else{
     setFreshRow(surface,'secondary-nixpkgs',{value:'not reported',klass:'na',label:'Other root nixpkgs'});
   }
+  updateConfigEvidence(surface,f);
+}
+function shortRevision(value){
+  const text=String(value??'').trim();
+  if(!text||text==='null'||text==='undefined')return '';
+  return text.length>12?text.slice(0,12):text;
+}
+function updateConfigEvidence(surface,freshness){
+  if(!surface)return;
+  const applicable=Boolean(freshness&&freshness.applicable!==false);
+  const evidence=applicable?freshness.deployment_evidence:null;
+  const nixcfg=applicable?freshness.nixcfg_comparison:null;
+  const nixpkgs=applicable?freshness.nixpkgs_comparison:null;
+  const write=(selector,value)=>{
+    const node=surface.querySelector(selector);
+    if(!node)return;
+    node.textContent=value||'Not observed';
+  };
+  write('[data-deployed-sha]',evidence?shortRevision(evidence.source_revision):'');
+  write('[data-nixcfg-sha]',nixcfg?shortRevision(nixcfg.upstream_revision):'');
+  write('[data-nixpkgs-sha]',evidence?shortRevision(evidence.nixpkgs_revision):'');
+  const summary=surface.querySelector('[data-config-summary]');
+  if(!summary)return;
+  if(!evidence&&!nixcfg)summary.textContent='Not observed';
+  else if(nixcfg?.relation==='current')summary.textContent=nixpkgs?.relation==='different'?'nixcfg current · nixpkgs differs':'Exact match';
+  else if(nixcfg?.relation)summary.textContent='nixcfg '+nixcfg.relation;
+  else summary.textContent='Not observed';
 }
 function kernelNeedsRestart(kernel){
   return kernel?.state==='reboot_required'&&typeof kernel.running_version==='string'&&typeof kernel.expected_version==='string';
@@ -1183,13 +1603,34 @@ function freshnessAttention(f,now,threshold=30){
 function downAlertsSuppressed(preferences){
   return preferences?.kind==='workstation'||Boolean(preferences?.alerts?.suppress_down);
 }
+function expectedOfflineHost(host){
+  if(host?.preferences?.kind==='workstation')return true;
+  const services=Array.isArray(host?.service_observations)?host.service_observations:[];
+  return services.some(service=>service?.id==='appliance-convergence'&&service.summary==='powered off as expected');
+}
+function projectHostAssurance(host,now){
+  const observations=Array.isArray(host?.backup_observations)?host.backup_observations:[];
+  const protection=projectProtection(observations,now);
+  const health=projectHealth({
+    liveness:host?.liveness,
+    expectedOffline:host?.liveness==='down'&&expectedOfflineHost(host),
+    lastSeen:host?.last_seen,
+    backup:protection.daily,
+    restore:protection.restore,
+    check:protection.check,
+    services:host?.service_observations,
+    kernelRestart:kernelNeedsRestart(host?.kernel),
+    freshness:freshnessAttention(host?.freshness,now,host?.nixpkgs_warn_after_days)
+  });
+  return {protection,health};
+}
 function attentionFor(live,f,preferences,now,threshold=30){
-  if(live==='down'&&!downAlertsSuppressed(preferences))return {label:'silent heartbeat',level:'down',rank:0};
+  if(live==='down'&&preferences?.kind!=='workstation')return {label:'silent heartbeat',level:'down',rank:0};
   if(live==='stale')return {label:'stale heartbeat',level:'warn',rank:1};
   if(live==='awaiting_first_heartbeat')return {label:'awaiting first beat',level:'wait',rank:2};
   const freshness=preferences?.alerts?.suppress_nix_freshness?null:freshnessAttention(f,now,threshold);
   if(freshness)return freshness;
-  if(live==='down')return {label:preferences?.kind==='workstation'?'offline as expected':'down alerts muted',level:'ok',rank:4};
+  if(live==='down')return {label:'offline as expected',level:'ok',rank:4};
   return {label:'all clear',level:'ok',rank:4};
 }
 const BACKUP_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
@@ -1206,7 +1647,8 @@ function backupDetail(obs,now){
 }
 function backupInfo(host,now){
   const observations=Array.isArray(host.backup_observations)?host.backup_observations:[];
-  if(!observations.length)return {state:'unknown',level:'watch',label:'Not observed',detail:'No backup signal yet',search:'',total:0};
+  const protection=projectProtection(observations,now);
+  if(!observations.length)return {state:'unknown',level:'watch',label:'Not observed',detail:'No backup signal yet',search:'',total:0,protection};
   const primary=[...observations].sort((a,b)=>(BACKUP_RANK[a.state]??4)-(BACKUP_RANK[b.state]??4))[0];
   const state=primary.state||'unknown';
   const label=BACKUP_LABEL[state]||'Backup pending';
@@ -1214,7 +1656,247 @@ function backupInfo(host,now){
   const last=Number.isFinite(Number(primary.last_success_at))?dur(now-Number(primary.last_success_at))+' ago':'not yet';
   const schedule=String(primary.schedule||'not declared');
   const target=String(primary.target_label||'not declared');
-  return {state,level:BACKUP_LEVEL[state]||'watch',label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' ')};
+  return {state,level:BACKUP_LEVEL[state]||'watch',label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' '),protection};
+}
+function setFactText(root,selector,value){
+  const node=root?.querySelector(selector);
+  if(node)node.textContent=value==null?'':String(value);
+}
+const UTC_STAMP_EXCLUSIVE_END=253402300800;
+function recordedUnix(at){
+  if(typeof at==='boolean'||at==null||at==='')return null;
+  const stamp=Number(at);
+  if(!Number.isSafeInteger(stamp)||stamp<=0||stamp>=UTC_STAMP_EXCLUSIVE_END)return null;
+  return stamp;
+}
+function utcObservedStamp(at){
+  const stamp=recordedUnix(at);
+  if(stamp==null)return null;
+  const iso=new Date(stamp*1000).toISOString().replace(/\.\d{3}Z$/,'Z');
+  if(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(iso))return null;
+  return {iso,visible:iso.slice(0,10)+' '+iso.slice(11,19)+' UTC'};
+}
+function evidenceCaption(hook){
+  if(hook==='daily-backup')return 'Backup last success';
+  if(hook==='restore')return 'Selective restore last success';
+  return '';
+}
+function upsertObservedTime(parent,at,hook){
+  if(!parent||typeof parent.querySelector!=='function'||typeof document.createElement!=='function')return;
+  const selector='[data-'+hook+'-date]';
+  let time=parent.querySelector(selector);
+  const stamp=utcObservedStamp(at);
+  if(!stamp){
+    if(time&&typeof time.remove==='function')time.remove();
+    return;
+  }
+  if(!time){
+    time=document.createElement('time');
+    time.setAttribute('data-'+hook+'-date','');
+    parent.appendChild(time);
+  }
+  time.setAttribute('datetime',stamp.iso);
+  if(time.textContent!==stamp.visible)time.textContent=stamp.visible;
+}
+function upsertEvidenceTime(parent,at,hook){
+  if(!parent||typeof parent.querySelector!=='function'||typeof document.createElement!=='function')return;
+  const caption=evidenceCaption(hook);
+  const instantName='data-'+hook+'-instant';
+  let instant=parent.querySelector('['+instantName+']');
+  const stamp=caption?utcObservedStamp(at):null;
+  if(!stamp){
+    if(instant&&typeof instant.remove==='function')instant.remove();
+    else{
+      const bare=parent.querySelector('[data-'+hook+'-date]');
+      if(bare&&typeof bare.remove==='function')bare.remove();
+    }
+    return;
+  }
+  if(!instant){
+    instant=document.createElement('span');
+    instant.className='protection-instant';
+    instant.setAttribute(instantName,'');
+    const label=document.createElement('span');
+    label.className='protection-instant-label';
+    label.setAttribute('data-'+hook+'-instant-label','');
+    label.textContent=caption+' ';
+    instant.appendChild(label);
+    parent.appendChild(instant);
+  }else{
+    const label=instant.querySelector('[data-'+hook+'-instant-label]');
+    if(label&&label.textContent!==caption+' ')label.textContent=caption+' ';
+  }
+  let time=instant.querySelector('[data-'+hook+'-date]');
+  if(!time){
+    time=document.createElement('time');
+    time.setAttribute('data-'+hook+'-date','');
+    instant.appendChild(time);
+  }
+  time.setAttribute('datetime',stamp.iso);
+  if(time.textContent!==stamp.visible)time.textContent=stamp.visible;
+}
+function placeHealthScan(line,icon,summary,count){
+  if(!line)return;
+  if(icon&&icon.parentElement!==line&&typeof line.prepend==='function')line.prepend(icon);
+  if(summary&&summary.parentElement!==line)line.appendChild(summary);
+  if(count&&count.parentElement!==line)line.appendChild(count);
+}
+function ensureHealthScan(surface,health){
+  const block=surface.querySelector('[data-health-block]');
+  if(!block||typeof document.createElement!=='function')return;
+  const problems=(health.reasons||[]).filter(reason=>reason&&reason.tone&&reason.tone!=='good');
+  const summaryText=health.summary||problems[0]?.label||'No action needed';
+  const countLabel=problems.length===1?'1 reason':problems.length+' reasons';
+  surface.dataset.healthCount=String(health.count!=null?health.count:problems.length);
+  block.dataset.healthTone=health.tone||'';
+  const icon=block.querySelector('.attention-icon');
+  let summary=block.querySelector('[data-health-summary]');
+  if(!summary){
+    summary=document.createElement('span');
+    summary.setAttribute('data-health-summary','');
+  }
+  summary.textContent=summaryText;
+  let count=block.querySelector('[data-health-count]');
+  if(!count){
+    count=document.createElement('span');
+    count.setAttribute('data-health-count','');
+  }
+  count.textContent=problems.length?countLabel:'0';
+  count.hidden=problems.length===0;
+  let list=block.querySelector('[data-health-reasons]');
+  if(!list){
+    list=document.createElement('ul');
+    list.className='health-reasons';
+    list.setAttribute('data-health-reasons','');
+  }
+  if(typeof list.replaceChildren==='function')list.replaceChildren();
+  else list.textContent='';
+  problems.forEach(reason=>{
+    const item=document.createElement('li');
+    item.setAttribute('data-health-reason','');
+    item.dataset.healthTone=reason.tone;
+    const reasonAt=recordedUnix(reason.at);
+    if(reasonAt!=null)item.dataset.healthAt=String(reasonAt);
+    item.textContent=reason.label;
+    upsertObservedTime(item,reasonAt,'health');
+    list.appendChild(item);
+  });
+  list.hidden=problems.length===0;
+  block.querySelectorAll('details.health-more').forEach(node=>{
+    if(!node.hasAttribute('data-health-disclosure')&&typeof node.remove==='function')node.remove();
+  });
+  if(!problems.length){
+    const details=block.querySelector('[data-health-disclosure]');
+    let line=Array.from(block.querySelectorAll('.attention-line')).find(node=>node.tagName!=='SUMMARY')||null;
+    if(!line){
+      line=document.createElement('div');
+      line.className='attention-line';
+      if(details&&typeof details.replaceWith==='function')details.replaceWith(line);
+      else block.appendChild(line);
+    }
+    if(details&&details.isConnected&&typeof details.remove==='function')details.remove();
+    placeHealthScan(line,icon,summary,count);
+    if(list.parentElement!==block)block.appendChild(list);
+    return;
+  }
+  let details=block.querySelector('[data-health-disclosure]');
+  if(!details){
+    details=document.createElement('details');
+    details.className='health-disclosure';
+    details.setAttribute('data-health-disclosure','');
+    const existing=block.querySelector('.attention-line');
+    if(existing&&typeof existing.replaceWith==='function')existing.replaceWith(details);
+    else block.appendChild(details);
+  }
+  let sum=details.querySelector('summary');
+  if(!sum){
+    sum=document.createElement('summary');
+    sum.className='attention-line';
+    if(typeof details.prepend==='function')details.prepend(sum);
+    else details.appendChild(sum);
+  }
+  if(!sum.classList.contains('attention-line'))sum.classList.add('attention-line');
+  placeHealthScan(sum,icon,summary,count);
+  if(list.parentElement!==details)details.appendChild(list);
+}
+function placeObservedTime(surface,node,at,hook){
+  const recorded=recordedUnix(at);
+  const evidence=surface?.querySelector?.('[data-protection-evidence]')||null;
+  if(evidence&&node&&evidence!==node&&typeof node.querySelectorAll==='function'){
+    node.querySelectorAll('[data-'+hook+'-date]').forEach(time=>{
+      if(typeof evidence.contains==='function'&&evidence.contains(time))return;
+      if(typeof time.remove==='function')time.remove();
+    });
+  }
+  if(evidence)upsertEvidenceTime(evidence,recorded,hook);
+  else upsertObservedTime(node,recorded,hook);
+  if(evidence)evidence.hidden=!(evidence.querySelector('[data-daily-backup-date]')||evidence.querySelector('[data-restore-date]'));
+}
+function updateBackupStatus(surface,protection){
+  if(!surface||!protection)return;
+  const daily=protection.daily;
+  const restore=protection.restore;
+  const check=protection.check;
+  const protectionNode=surface.querySelector('[data-protection]');
+  if(protectionNode){
+    protectionNode.hidden=false;
+    protectionNode.dataset.selectiveRestoreOverdueAfterSecs=String(SELECTIVE_RESTORE_OVERDUE_SECS);
+  }
+  const dailyNode=surface.querySelector('[data-daily-backup]');
+  if(dailyNode&&daily){
+    dailyNode.hidden=false;
+    dailyNode.dataset.dailyBackupState=daily.state;
+    dailyNode.dataset.dailyBackupTone=daily.tone;
+    const dailyAt=recordedUnix(daily.at);
+    if(dailyAt!=null)dailyNode.dataset.dailyBackupAt=String(dailyAt);
+    else delete dailyNode.dataset.dailyBackupAt;
+    const host=surface.dataset.host||'';
+    if(typeof dailyNode.setAttribute==='function')dailyNode.setAttribute('href',appUrl('/backups?host='+encodeURIComponent(host)));
+    setFactText(dailyNode,'[data-daily-backup-label]',daily.label);
+    setFactText(dailyNode,'[data-daily-backup-note]',daily.detail);
+    dailyNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
+    placeObservedTime(surface,dailyNode,dailyAt,'daily-backup');
+  }
+  const more=surface.querySelector('[data-protection-more]');
+  if(more)more.hidden=!check;
+  const checkNode=surface.querySelector('[data-backup-check]');
+  if(checkNode){
+    checkNode.hidden=!check;
+    if(check){
+      checkNode.dataset.backupCheckState=check.state;
+      checkNode.dataset.backupCheckTone=check.tone;
+      const checkAt=recordedUnix(check.at);
+      if(checkAt!=null)checkNode.dataset.backupCheckAt=String(checkAt);
+      else delete checkNode.dataset.backupCheckAt;
+      setFactText(checkNode,'[data-backup-check-label]',check.label);
+      setFactText(checkNode,'[data-backup-check-note]',check.detail);
+      checkNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
+      upsertObservedTime(checkNode,checkAt,'backup-check');
+    }
+  }
+  const restoreNode=surface.querySelector('[data-restore]');
+  if(restoreNode&&restore){
+    restoreNode.hidden=false;
+    restoreNode.dataset.restoreState=restore.state;
+    restoreNode.dataset.restoreTone=restore.tone;
+    restoreNode.dataset.restoreOverdue=restore.overdue?'true':'false';
+    restoreNode.dataset.restoreProducer=restore.producer||'';
+    const restoreAt=recordedUnix(restore.at);
+    if(restoreAt!=null)restoreNode.dataset.restoreAt=String(restoreAt);
+    else delete restoreNode.dataset.restoreAt;
+    setFactText(restoreNode,'[data-restore-label]',restore.label);
+    setFactText(restoreNode,'[data-restore-note]',restore.detail);
+    restoreNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
+    placeObservedTime(surface,restoreNode,restoreAt,'restore');
+  }
+}
+function updateHealthProjection(surface,health){
+  if(!surface||!health)return;
+  surface.dataset.health=health.tone;
+  const badge=surface.querySelector('[data-health-badge]');
+  if(badge)badge.dataset.healthTone=health.tone;
+  setFactText(surface,'[data-health-label]',health.label);
+  ensureHealthScan(surface,health);
 }
 function updateBackup(surface,info){
   const el=surface.querySelector('.backup-chip[data-backup-state]');
@@ -1237,9 +1919,10 @@ function updateBackup(surface,info){
     value:info.label,
     klass:info.level==='critical'?'down':info.level==='warning'?'warn':'na',
     label:'Backup',
-    visible:info.state!=='healthy'
+    visible:false
   });
   syncFreshnessRail(surface);
+  updateBackupStatus(surface,info.protection);
 }
 function setReason(surface,reason){
   const el=surface.querySelector('[data-reason]');
@@ -1256,10 +1939,6 @@ function updateReasonVisibility(surface,reason,freshness,kernel,now,lifecycle,th
     return;
   }
   const restart=kernelNeedsRestart(kernel);
-  if(!surface.matches('.card')){
-    el.hidden=restart;
-    return;
-  }
   const freshnessReason=freshnessAttention(freshness,now,threshold);
   const duplicateFreshness=freshnessReason?.label===reason?.label;
   el.hidden=restart||duplicateFreshness||reason?.label==='all clear';
@@ -1444,8 +2123,8 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
       setHostActionFact('scope',resolver.title,true);
     }
   }else{
-    if(title)title.textContent=String(lifecycle.label||'Up to date');
-    if(copy)copy.textContent=String(lifecycle.detail||'No host lifecycle work is waiting.');
+    if(title)title.textContent=String(lifecycle.label||'No pending changes');
+    if(copy)copy.textContent=String(lifecycle.detail||'No pending work is waiting.');
     if(infoTitle)infoTitle.textContent='No drift';
     if(infoCopy)infoCopy.textContent='Pharos has no saved workflow or drift waiting on this host.';
     setHostActionFact('scope','No lifecycle work',true);
@@ -1546,188 +2225,461 @@ function updatePreferenceState(surface,host){
   if(validColor(pendingColor))surface.style.setProperty('--pending-color',pendingColor);
   else surface.style.removeProperty('--pending-color');
 }
-function markHtml(beats,interval,windowDef=signalWindow){
-  const kept=Array.from(new Set(beats)).sort((a,b)=>a-b);
-  if(kept.length<2)return '';
-  const cadence=Math.max(1,Number(interval)||60);
-  const newestX=EXPECT_X-HISTORY_STEP;
-  const view=visibleHistory(kept,windowDef);
-  return view.visible.map(item=>{
-    const x=((item.stamp-view.start)/view.span)*newestX;
-    const info=historyInfo(kept,item.index,cadence);
-    const title=info.label+' · '+info.detail;
-    return '<span class="beat-mark" role="img" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
-  }).join('');
-}
 function syncHistoryStart(beat){
-  const first=beat.querySelector('.beat-mark');
-  const start=first?.style.getPropertyValue('--mark-x').trim()||'0%';
-  beat.style.setProperty('--history-start-x',start);
-}
-function signalInfo(beats,last,interval,now,windowDef=signalWindow){
-  const cadence=Math.max(1,Number(interval)||60);
-  const samples=Array.from(new Set(beats.concat(Number.isFinite(last)&&last>0?[last]:[]))).filter(Number.isFinite).filter(n=>n>0).sort((a,b)=>a-b);
-  if(!samples.length)return {text:'new',level:'wait',window:windowDef.label,title:'Signal over '+windowDef.label+': waiting for first heartbeat'};
-  const requestedStart=now-windowDef.secs;
-  const retainedStart=Math.max(requestedStart,samples[0]);
-  const span=Math.max(cadence,Math.min(windowDef.secs,now-retainedStart));
-  const expected=Math.max(1,Math.ceil(span/cadence));
-  const received=samples.filter(stamp=>stamp>=retainedStart&&stamp<=now).length;
-  let longestGap=Math.max(0,Math.min(now-samples[samples.length-1],span));
-  let previous=retainedStart;
-  for(const stamp of samples){
-    if(stamp<retainedStart||stamp>now)continue;
-    longestGap=Math.max(longestGap,stamp-previous);
-    previous=stamp;
-  }
-  longestGap=Math.max(longestGap,now-previous);
-  const percent=Math.max(0,Math.min(100,Math.round((received/expected)*100)));
-  const level=percent>=95?'good':percent>=75?'warn':'down';
-  const coverage=retainedStart>requestedStart?' · retained '+dur(span):'';
-  return {text:percent+'%',level,window:windowDef.label,title:'Signal over '+windowDef.label+': '+received+' of '+expected+' expected heartbeats received · longest gap '+dur(longestGap)+coverage};
+  beat.style.setProperty('--history-start-x','100%');
+  beat.style.setProperty('--now-x','100%');
 }
 function updateSignal(surface,info){
   const signal=surface?.querySelector('[data-signal]');
-  if(!signal)return;
+  if(!signal||!info)return;
   signal.dataset.signalLevel=info.level;
+  signal.dataset.signalKind=info.kind||'delivery';
   signal.dataset.signalWindowKey=info.window;
   signal.title=info.title;
   signal.setAttribute('aria-label',info.title);
   const text=signal.querySelector('[data-signal-percent]');
   if(text)text.textContent=info.text;
+  const coverage=info.coverage||'full';
+  let coverageNode=signal.querySelector('[data-signal-coverage]');
+  if(!coverageNode&&typeof document.createElement==='function'){
+    coverageNode=document.createElement('span');
+    coverageNode.className='signal-coverage';
+    const percent=signal.querySelector('[data-signal-percent]');
+    if(percent&&typeof percent.insertAdjacentElement==='function')percent.insertAdjacentElement('afterend',coverageNode);
+    else signal.appendChild(coverageNode);
+  }
+  if(coverageNode){
+    coverageNode.setAttribute('data-signal-coverage',coverage);
+    coverageNode.hidden=coverage!=='partial';
+    coverageNode.textContent=coverage==='partial'?'partial':'';
+  }
+  const kind=signal.querySelector('.signal-label');
+  if(kind)kind.textContent='delivery';
   const windowLabel=signal.querySelector('[data-signal-window]');
   if(windowLabel){
     const next=SIGNAL_WINDOWS[(SIGNAL_WINDOWS.findIndex(w=>w.label===info.window)+1)%SIGNAL_WINDOWS.length]||SIGNAL_WINDOWS[0];
     windowLabel.textContent=info.window;
-    windowLabel.title=info.title+'; click for '+next.label;
-    windowLabel.setAttribute('aria-label',info.title+'; click for '+next.label);
+    const tip='Heartbeat delivery window '+info.window+'; click for '+next.label+'. Not measured uptime.';
+    windowLabel.title=tip;
+    windowLabel.setAttribute('aria-label',tip);
   }
 }
-function setHistoryHint(mark,show){
-  const surface=mark.closest('[data-host]');
-  if(!surface)return;
-  const seen=surface.querySelector('[data-seen]');
-  const asof=surface.querySelector('[data-card-asof]');
-  if(!seen)return;
-  if(show){
-    surface.dataset.historyHint='true';
-    seen.textContent=mark.dataset.historyLabel||'historic heartbeat';
-    if(asof)asof.textContent=mark.dataset.historyDetail||'';
-  }else{
-    delete surface.dataset.historyHint;
-    seen.textContent=seen.dataset.defaultText||seen.textContent;
-    if(asof)asof.textContent=asof.dataset.defaultText||asof.textContent;
-  }
+let activeHistoryMark=null;
+let historyPin=null;
+function historyHintText(mark){
+  const label=mark?.dataset?.historyLabel||'Heartbeat';
+  const detail=mark?.dataset?.historyDetail||'';
+  return detail?label+' · '+detail:label;
 }
-function bindHistoryHints(root=document){
-  root.querySelectorAll('.beat-mark').forEach(mark=>{
-    if(mark.dataset.hintBound==='true')return;
-    mark.dataset.hintBound='true';
-    mark.addEventListener('mouseenter',()=>setHistoryHint(mark,true));
-    mark.addEventListener('mouseleave',()=>setHistoryHint(mark,false));
-    mark.addEventListener('focus',()=>setHistoryHint(mark,true));
-    mark.addEventListener('blur',()=>setHistoryHint(mark,false));
+function installHistoryChrome(){}
+function ensureHistoryOverlay(){
+  let overlay=document.getElementById('history-hint');
+  if(overlay)return overlay;
+  overlay=document.createElement('div');
+  overlay.id='history-hint';
+  overlay.className='history-hint';
+  overlay.dataset.historyHintOverlay='true';
+  overlay.setAttribute('role','tooltip');
+  overlay.hidden=true;
+  document.body.appendChild(overlay);
+  return overlay;
+}
+function ensureHistoryReadout(beat){
+  return beat?.querySelector?.('[data-history-readout]')||null;
+}
+function positionHistoryOverlay(mark,overlay){
+  const rect=mark.getBoundingClientRect();
+  const width=overlay.offsetWidth||180;
+  const height=overlay.offsetHeight||28;
+  const left=Math.max(8,Math.min(window.innerWidth-width-8,rect.left));
+  let top=rect.top-height-8;
+  if(top<8)top=Math.min(window.innerHeight-height-8,rect.bottom+8);
+  overlay.style.left=left+'px';
+  overlay.style.top=top+'px';
+}
+function showHistoryHint(mark,mode){
+  if(!mark)return;
+  activeHistoryMark=mark;
+  const full=mode==='full';
+  const text=historyHintText(mark);
+  const overlay=ensureHistoryOverlay();
+  overlay.hidden=false;
+  overlay.dataset.historyHintMode=full?'full':'line';
+  overlay.textContent=text;
+  overlay.title=text;
+  mark.setAttribute('aria-describedby','history-hint');
+  positionHistoryOverlay(mark,overlay);
+}
+function hideHistoryHint(force){
+  if(!force&&historyPin)return;
+  const mark=activeHistoryMark;
+  const overlay=document.getElementById('history-hint');
+  if(overlay)overlay.hidden=true;
+  if(mark)mark.removeAttribute('aria-describedby');
+  activeHistoryMark=null;
+  if(force)historyPin=null;
+}
+function setHistoryHint(mark,show,mode){
+  if(!mark)return;
+  if(show)showHistoryHint(mark,mode||(historyPin?'full':'line'));
+  else hideHistoryHint(false);
+}
+function dismissHistoryHint(){
+  const mark=activeHistoryMark;
+  historyPin=null;
+  hideHistoryHint(true);
+  if(mark&&document.activeElement===mark)mark.blur();
+}
+function bindHistoryHints(){
+  installHistoryChrome();
+  if(document.documentElement?.dataset?.historyHints==='true')return;
+  if(document.documentElement)document.documentElement.dataset.historyHints='true';
+  document.addEventListener('pointerover',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark||(event.pointerType&&event.pointerType!=='mouse'&&event.pointerType!=='pen'))return;
+    if(historyPin)return;
+    showHistoryHint(mark,'line');
+  });
+  document.addEventListener('pointerout',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark||mark!==activeHistoryMark||historyPin)return;
+    if(event.pointerType&&event.pointerType!=='mouse'&&event.pointerType!=='pen')return;
+    if(event.relatedTarget&&mark.contains(event.relatedTarget))return;
+    hideHistoryHint(false);
+  });
+  document.addEventListener('focusin',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark)return;
+    historyPin='keyboard';
+    showHistoryHint(mark,'full');
+  });
+  document.addEventListener('focusout',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark||historyPin!=='keyboard')return;
+    historyPin=null;
+    hideHistoryHint(true);
+  });
+  document.addEventListener('pointerup',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark||event.pointerType!=='touch')return;
+    if(historyPin==='touch'&&activeHistoryMark===mark){historyPin=null;hideHistoryHint(true);return}
+    historyPin='touch';
+    showHistoryHint(mark,'full');
+  });
+  document.addEventListener('click',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark||event.pointerType==='touch')return;
+    historyPin='keyboard';
+    showHistoryHint(mark,'full');
+  });
+  document.addEventListener('keydown',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(mark&&(event.key==='Enter'||event.key===' ')){event.preventDefault();historyPin='keyboard';showHistoryHint(mark,'full')}
+    if(event.key==='Escape'&&activeHistoryMark){event.preventDefault();dismissHistoryHint()}
   });
 }
-function setBeatHistory(beat,beats,interval){
-  const all=Array.from(new Set(beats)).sort((a,b)=>a-b);
-  const view=visibleHistory(all,signalWindow);
-  const kept=view.visible.map(item=>item.stamp);
+function paintHistoryMark(mark,spec){
+  mark.className='beat-mark';
+  mark.setAttribute('role','img');
+  mark.tabIndex=0;
+  mark.dataset.historyKey=spec.key;
+  mark.dataset.historyLevel=spec.level;
+  mark.dataset.historyLabel=spec.label;
+  mark.dataset.historyDetail=spec.detail;
+  if(spec.stamp!=null)mark.dataset.historyStamp=String(spec.stamp);
+  else delete mark.dataset.historyStamp;
+  const title=spec.label+' · '+spec.detail;
+  mark.title=title;
+  mark.setAttribute('aria-label',title);
+  mark.style.setProperty('--mark-x',Math.max(0,Math.min(100,Number(spec.x)||0)).toFixed(1)+'%');
+}
+function releaseHistoryMark(mark){
+  if(!mark)return;
+  const focused=typeof document!=='undefined'&&document.activeElement===mark;
+  if(activeHistoryMark===mark)dismissHistoryHint();
+  else if(focused&&typeof mark.blur==='function')mark.blur();
+}
+function historyBounds(container){
+  const start=Number(container?.dataset?.historyStart);
+  const end=Number(container?.dataset?.historyEnd);
+  if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start)return null;
+  return {start,end};
+}
+function historyStampInBounds(mark,bounds){
+  if(!bounds)return false;
+  const stamp=Number(mark?.dataset?.historyStamp);
+  return Number.isFinite(stamp)&&stamp>=bounds.start&&stamp<=bounds.end+CLOCK_SKEW_SECS;
+}
+function historyMarkEngaged(mark){
+  if(!mark)return false;
+  if(typeof document!=='undefined'&&document.activeElement===mark)return true;
+  return activeHistoryMark===mark;
+}
+function historyMarkStamp(mark){
+  const stamp=Number(mark?.dataset?.historyStamp);
+  return Number.isFinite(stamp)?stamp:0;
+}
+function paintRetainedHistoryGeometry(mark,bounds){
+  const stamp=Number(mark?.dataset?.historyStamp);
+  if(!bounds||!Number.isFinite(stamp))return;
+  const span=bounds.end-bounds.start;
+  if(!(span>0))return;
+  const x=Math.max(0,Math.min(100,((stamp-bounds.start)/span)*100));
+  mark.style.setProperty('--mark-x',x.toFixed(1)+'%');
+}
+function reconcileHistoryMarks(container,specs){
+  const bounds=historyBounds(container);
+  const existing=new Map();
+  Array.from(container.querySelectorAll('.beat-mark')).forEach(mark=>{
+    const key=mark.dataset.historyKey;
+    if(!key||existing.has(key)){
+      releaseHistoryMark(mark);
+      mark.remove();
+      return;
+    }
+    existing.set(key,mark);
+  });
+  const seen=new Set();
+  const desired=[];
+  specs.forEach(spec=>{
+    seen.add(spec.key);
+    let mark=existing.get(spec.key);
+    if(!mark)mark=document.createElement('span');
+    paintHistoryMark(mark,spec);
+    desired.push(mark);
+  });
+  const retained=[];
+  existing.forEach((mark,key)=>{
+    if(seen.has(key))return;
+    if(historyMarkEngaged(mark)&&historyStampInBounds(mark,bounds)){
+      paintRetainedHistoryGeometry(mark,bounds);
+      retained.push(mark);
+      return;
+    }
+    releaseHistoryMark(mark);
+    mark.remove();
+  });
+  retained.forEach(mark=>{
+    const stamp=historyMarkStamp(mark);
+    let index=desired.findIndex(node=>historyMarkStamp(node)>stamp);
+    if(index<0)index=desired.length;
+    desired.splice(index,0,mark);
+  });
+  let previous=null;
+  desired.forEach(mark=>{
+    const next=previous?previous.nextSibling:container.firstChild;
+    placeHistoryMark(container,mark,next);
+    previous=mark;
+  });
+}
+function placeHistoryMark(container,mark,next){
+  if(!container||!mark||next===mark)return;
+  const focused=typeof document!=='undefined'&&document.activeElement===mark;
+  const pin=historyPin;
+  container.insertBefore(mark,next);
+  if(!focused||typeof document==='undefined'||document.activeElement===mark||typeof mark.focus!=='function')return;
+  try{mark.focus({preventScroll:true})}catch(_){try{mark.focus()}catch(__){}}
+  historyPin=pin;
+}
+function updateHistoryEvents(surface,marks){
+  const list=surface?.querySelector('[data-history-events]');
+  if(!list)return;
+  const existing=new Map();
+  list.querySelectorAll('[data-history-key]').forEach(row=>existing.set(row.dataset.historyKey,row));
+  const seen=new Set();
+  marks.forEach(mark=>{
+    seen.add(mark.key);
+    let row=existing.get(mark.key);
+    if(!row){
+      row=document.createElement('div');
+      row.dataset.historyKey=mark.key;
+      const time=document.createElement('time');
+      const text=document.createElement('span');
+      row.append(time,text);
+      list.appendChild(row);
+    }
+    const time=row.querySelector('time');
+    const text=row.querySelector('span');
+    if(time)time.textContent=mark.label;
+    if(text)text.textContent=mark.detail;
+    row.dataset.historyLevel=mark.level;
+  });
+  existing.forEach((row,key)=>{if(!seen.has(key))row.remove()});
+}
+function beatGraceSecs(beat){
+  const raw=Number(beat?.dataset?.grace);
+  return Number.isInteger(raw)&&raw>=0&&raw<=3600?raw:DEFAULT_HEARTBEAT_GRACE_SECS;
+}
+function updateArrival(beat,last,interval,grace,now){
+  const presentation=arrivalPresentation(last,interval,grace,now);
+  let arrival=beat.querySelector('[data-arrival]');
+  if(!arrival){
+    arrival=document.createElement('div');
+    arrival.className='arrival';
+    arrival.dataset.arrival='true';
+    const label=document.createElement('span');
+    label.dataset.arrivalLabel='true';
+    const track=document.createElement('span');
+    track.className='arrival-track';
+    track.setAttribute('aria-hidden','true');
+    const fill=document.createElement('span');
+    fill.dataset.arrivalFill='true';
+    track.appendChild(fill);
+    arrival.append(label,track);
+    const stage=beat.querySelector('.beat-stage');
+    if(stage&&typeof beat.insertBefore==='function')beat.insertBefore(arrival,stage);
+    else beat.appendChild(arrival);
+  }
+  arrival.dataset.arrivalState=presentation.state==='on-time'?'on_time':presentation.state;
+  const label=arrival.querySelector('[data-arrival-label]');
+  const detail=arrival.querySelector('[data-arrival-detail]');
+  const fill=arrival.querySelector('[data-arrival-fill]');
+  if(label)label.textContent=presentation.label;
+  if(detail){detail.textContent='';detail.hidden=true;detail.removeAttribute('title')}
+  if(fill)fill.style.setProperty('--arrival-x',presentation.x.toFixed(2)+'%');
+  return presentation;
+}
+function setBeatHistory(beat,beats,interval,now,grace){
+  if(!beat)return;
   const cadence=Math.max(1,Number(interval)||Number(beat.dataset.interval)||60);
+  const graceSecs=grace==null?beatGraceSecs(beat):Number(grace);
+  const at=Number.isFinite(Number(now))?Number(now):Date.now()/1000;
+  const all=dedupeHeartbeats(beats);
+  const view=aggregateHistory(all,signalWindow,at,cadence,graceSecs);
+  beat.dataset.historyAxis='time';
   beat.dataset.signalBeats=all.join(',');
-  beat.dataset.beats=kept.join(',');
-  beat.dataset.count=String(kept.length);
+  beat.dataset.beats=view.marks.filter(mark=>mark.stamp!=null).map(mark=>mark.stamp).join(',');
+  beat.dataset.count=String(view.marks.length);
   beat.dataset.historyWindow=signalWindow.label;
+  syncHistoryStart(beat);
   const windowLabel=beat.querySelector('[data-history-window-label]');
-  if(windowLabel)windowLabel.textContent=signalWindow.label;
+  if(windowLabel){
+    windowLabel.textContent=signalWindow.label;
+    if(windowLabel.matches('button')){
+      windowLabel.title='Change delivery window';
+      windowLabel.setAttribute('aria-label','Change delivery window; currently '+signalWindow.label);
+    }
+  }
+  const zones=beat.querySelector('.beat-zones');
+  if(zones)Array.from(zones.children).forEach(node=>{
+    if(node.hasAttribute('data-history-window-label')||node.hasAttribute('data-signal-window'))return;
+    const text=node.textContent.trim();
+    if(text==='expected'||text==='start'||node.dataset.historyAnchor==='ago'){
+      node.hidden=true;
+      return;
+    }
+    if(text==='late'||text==='now'||node.dataset.historyAnchor==='now'){
+      node.hidden=false;
+      node.textContent='now';
+    }
+  });
+  beat.querySelectorAll('.beat-threshold,.beat-fill,.beat-current').forEach(node=>{node.hidden=true});
+  const stage=beat.querySelector('.beat-stage');
+  if(stage)stage.setAttribute('aria-label',signalWindow.label+' heartbeat history by time');
   const marks=beat.querySelector('.beat-marks');
   if(marks){
-    marks.innerHTML=markHtml(all,cadence,signalWindow);
-    syncHistoryStart(beat);
-    bindHistoryHints(marks);
+    marks.dataset.historyStart=String(view.start);
+    marks.dataset.historyEnd=String(view.end);
+    reconcileHistoryMarks(marks,view.marks);
   }
+  const readout=beat.querySelector('[data-history-readout]');
+  if(readout){readout.textContent='';readout.hidden=true;readout.removeAttribute('title')}
+  if(activeHistoryMark&&beat.contains(activeHistoryMark))showHistoryHint(activeHistoryMark,historyPin?'full':'line');
+  updateHistoryEvents(beat.closest('[data-host]'),view.marks);
+  bindHistoryHints();
 }
 function flashBeat(beat){
+  if(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)return;
   beat.dataset.flash='true';
   window.setTimeout(()=>{delete beat.dataset.flash},950);
 }
-function heartbeatX(age,interval){
-  if(age<=interval)return (age/interval)*EXPECT_X;
-  if(age<=interval*2)return EXPECT_X+((age-interval)/interval)*(STALE_X-EXPECT_X);
-  if(age<=interval*5)return STALE_X+((age-interval*2)/(interval*3))*(100-STALE_X);
-  return 100;
+function heartbeatX(age,interval,grace){
+  return heartbeatTimelineX(age,interval,grace);
 }
 function updateBeatClock(beat,now){
   const last=Number(beat.dataset.last);
   const interval=Math.max(1,Number(beat.dataset.interval)||60);
+  const grace=beatGraceSecs(beat);
+  const bounds=cadenceBounds(interval,grace);
   const surface=beat.closest('[data-host]');
-  if(!Number.isFinite(last)||last<=0){
-    beat.style.setProperty('--expect-alpha','.22');
-    beat.style.setProperty('--now-x','0%');
+  const presentation=updateArrival(beat,last,interval,grace,now);
+  syncHistoryStart(beat);
+  const age=Number.isFinite(last)&&last>0?Math.max(0,now-last):0;
+  const onTime=bounds.onTimeThrough>0?Math.max(0,Math.min(1,age/bounds.onTimeThrough)):0;
+  beat.style.setProperty('--expect-fill',(onTime*360).toFixed(1)+'deg');
+  if(!Number.isFinite(last)||last<=0||presentation.state==='waiting'||presentation.state==='unknown'){
     beat.style.setProperty('--fill-color','var(--wait)');
-    beat.style.setProperty('--expect-fill','0deg');
-    beat.style.setProperty('--target-ring','3px');
-    beat.style.setProperty('--late-alpha','.3');
     beat.dataset.beat='waiting';
-    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats),last,interval,now));
-    return;
-  }
-  const age=Math.max(0,now-last);
-  const expect=Math.max(0,Math.min(1,age/interval));
-  const x=heartbeatX(age,interval);
-  beat.style.setProperty('--now-x',x.toFixed(2)+'%');
-  beat.style.setProperty('--expect-alpha',(.34+expect*.45).toFixed(3));
-  beat.style.setProperty('--expect-fill',(expect*360).toFixed(1)+'deg');
-  beat.style.setProperty('--target-ring',(3+expect*5).toFixed(1)+'px');
-  if(age<=interval){
+  }else if(presentation.state==='on-time'){
     beat.style.setProperty('--fill-color',beat.dataset.self==='true'?'var(--sun)':'var(--sea)');
     beat.dataset.beat=beat.dataset.self==='true'?'lit':'tracking';
-  }else if(age<=interval*2){
+  }else if(presentation.state==='late'){
     beat.style.setProperty('--fill-color','var(--sun)');
-    beat.style.setProperty('--expect-alpha','.79');
     beat.style.setProperty('--expect-fill','360deg');
-    beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='late';
-  }else if(age<=interval*5){
+  }else if(presentation.state==='stale'){
     beat.style.setProperty('--fill-color','var(--stale)');
-    beat.style.setProperty('--expect-alpha','.86');
     beat.style.setProperty('--expect-fill','360deg');
-    beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='stale';
   }else{
     beat.style.setProperty('--fill-color','var(--down)');
-    beat.style.setProperty('--expect-alpha','.86');
     beat.style.setProperty('--expect-fill','360deg');
-    beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='down';
   }
-  updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,now));
+  updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,now,signalWindow,grace));
 }
 let beatClockTimer=null;
+let fleetWatchdogTimer=null;
 function stopBeatClock(){
   if(beatClockTimer!=null)clearTimeout(beatClockTimer);
   beatClockTimer=null;
 }
 function frame(){
   stopBeatClock();
-  if(document.hidden||document.body.dataset.hostActionDialogOpen==='true')return;
-  if(!fleetSnapshotFresh()){
-    setFleetSyncState('stale');
-    if(typeof document.hasFocus!=='function'||document.hasFocus())recoverFleet('watchdog');
+  if(pageFrozen()||document.body.dataset.hostActionDialogOpen==='true')return;
+  if(fleetMain()?.dataset.fleetSyncState!=='current'||!fleetSnapshotFresh()){
+    if(!fleetSnapshotFresh())setFleetSyncState('stale');
+    if(recoveryPromise==null&&refreshPromise==null)recoverFleet('watchdog');
     return;
   }
   const now=Date.now()/1000;
-  document.querySelectorAll('.beat').forEach(beat=>{
-    updateBeatClock(beat,now);
-  });
+  document.querySelectorAll('.beat').forEach(beat=>updateBeatClock(beat,now));
   beatClockTimer=setTimeout(frame,1000);
 }
 function resumeBeatClock(){
   stopBeatClock();
   const main=fleetMain();
-  if(main?.dataset.fleetSyncState!=='current')return;
-  if(!document.hidden&&(typeof document.hasFocus!=='function'||document.hasFocus())&&document.body.dataset.hostActionDialogOpen!=='true')frame();
+  if(!main||main.dataset.fleetSyncState!=='current')return;
+  if(pageFrozen()||document.body.dataset.hostActionDialogOpen==='true')return;
+  frame();
 }
+function armFleetWatchdog(){
+  if(fleetWatchdogTimer!=null||pageFrozen())return;
+  const tick=()=>{
+    fleetWatchdogTimer=null;
+    if(pageFrozen()||!fleetMain())return;
+    fleetWatchdogTimer=setTimeout(tick,5000);
+    if(document.body.dataset.hostActionDialogOpen==='true'){
+      if(refreshTimer==null&&refreshPromise==null)scheduleRefresh();
+      return;
+    }
+    const main=fleetMain();
+    const stranded=beatClockTimer==null||(refreshTimer==null&&refreshPromise==null);
+    if(stranded||!fleetSnapshotFresh()||main.dataset.fleetSyncState!=='current'){
+      if(recoveryPromise==null&&refreshPromise==null)recoverFleet('watchdog');
+    }
+  };
+  fleetWatchdogTimer=setTimeout(tick,5000);
+}
+function onFleetFocus(){
+  if(document.documentElement)document.documentElement.dataset.fleetFocus='focused';
+  if(pageFrozen())return;
+  const main=fleetMain();
+  const stranded=beatClockTimer==null||(refreshTimer==null&&refreshPromise==null);
+  const unhealthy=!main||main.dataset.fleetSyncState!=='current'||!fleetSnapshotFresh();
+  if(stranded||unhealthy)recoverFleet('focus');
+}
+/* TIMELINE_CLOCK_END */
 function setSeen(card,last,now){
   const seen=card.querySelector('[data-seen]');
   if(!seen)return;
@@ -1927,8 +2879,10 @@ function applySignalWindow(key,write=true){
     const surface=beat.closest('[data-host]');
     const last=Number(beat.dataset.last);
     const interval=Math.max(1,Number(beat.dataset.interval)||60);
-    setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),interval);
-    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,Date.now()/1000,signalWindow));
+    const at=Date.now()/1000;
+    const grace=beatGraceSecs(beat);
+    setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),interval,at,grace);
+    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,at,signalWindow,grace));
   });
 }
 function cycleSignalWindow(){
@@ -2069,7 +3023,7 @@ function writeAssistantUrl(open,path='',provider='',template='',stage='choose'){
     params.delete(ASSISTANT_JOB_PARAM);
   }
   const query=params.toString();
-  history.replaceState(null,'',location.pathname+(query?'?'+query:''));
+  replaceDocumentUrl(location.pathname+(query?'?'+query:''));
 }
 function syncAssistantNext(overlay){
   const {path,provider,stage}=assistantState(overlay);
@@ -3866,6 +4820,50 @@ function initProviderConnection(){
     runProviderAction(event.currentTarget,'/settings/providers/hetzner-cloud/disconnect',{confirm:true});
   });
 }
+/* FLEET_MARKER_START */
+function fleetDocumentPath(){
+  if(typeof document==='undefined'||typeof document.querySelector!=='function')return '';
+  if(!document.querySelector('main[data-fleet-sync-state]'))return '';
+  const path=String(typeof location==='undefined'?'':location.pathname||'');
+  return path.startsWith('/')?path:'';
+}
+function navigationApi(){
+  const scope=typeof globalThis==='undefined'?null:globalThis;
+  return scope&&scope.navigation?scope.navigation:null;
+}
+function readNavigationState(){
+  const entry=navigationApi()?.currentEntry;
+  if(!entry||typeof entry.getState!=='function')return null;
+  try{return entry.getState()}catch(_){return null}
+}
+function withFleetMarker(existing){
+  const path=fleetDocumentPath();
+  if(!path)return null;
+  const state=existing&&typeof existing==='object'&&!Array.isArray(existing)?{...existing}:{};
+  state.pharosFleet={path};
+  return state;
+}
+function applyFleetMarker(state){
+  const nav=navigationApi();
+  if(!state||!nav||typeof nav.updateCurrentEntry!=='function')return false;
+  try{nav.updateCurrentEntry({state});return true}catch(_){return false}
+}
+function markFleetEntry(){
+  const existing=readNavigationState();
+  const prior=existing&&typeof existing==='object'?existing:(typeof history==='undefined'?null:history.state);
+  return applyFleetMarker(withFleetMarker(prior));
+}
+function fleetSearchText(){
+  const state=readNavigationState()??(typeof history==='undefined'?null:history.state);
+  if(!state||typeof state!=='object'||Array.isArray(state)||typeof state.pharosSearch!=='string')return null;
+  return state.pharosSearch;
+}
+function replaceDocumentUrl(url){
+  const prior=readNavigationState()??(typeof history==='undefined'?null:history.state);
+  const state=withFleetMarker(prior);
+  history.replaceState(state,'',url);
+  if(state)applyFleetMarker(state);
+}
 function updateUrlState(){
   const main=document.querySelector('main');
   const sort=document.querySelector('[data-sort]')?.value||'attention';
@@ -3874,15 +4872,32 @@ function updateUrlState(){
   params.set('sort',sort);
   params.set('filter',activeLiveFilter);
   params.set('signal',signalWindow.key);
-  const url=location.pathname+'?'+params.toString();
-  history.replaceState(null,'',url);
+  const search=document.querySelector('input[data-search]')?.value||'';
+  if(fleetDocumentPath())params.delete('q');
+  else if(search)params.set('q',search);
+  else params.delete('q');
+  const query=params.toString();
+  const url=location.pathname+(query?'?'+query:'');
+  const prior=readNavigationState()??(typeof history==='undefined'?null:history.state);
+  const state=withFleetMarker(prior);
+  if(!state){
+    replaceDocumentUrl(url);
+    return;
+  }
+  if(search)state.pharosSearch=search;
+  else delete state.pharosSearch;
+  history.replaceState(state,'',url);
+  applyFleetMarker(state);
 }
+/* FLEET_MARKER_END */
 function initControls(){
   clearLegacyUiCookies();
   const params=new URLSearchParams(location.search);
   const view=params.get('view')||'grid';
   const sort=params.get('sort')||'attention';
-  const search='';
+  const onFleet=Boolean(fleetDocumentPath());
+  const remembered=onFleet?fleetSearchText():null;
+  const search=onFleet?(remembered??''):(params.get('q')||'');
   const liveFilter=params.get('filter')||'all';
   const selectedSignalWindow=params.get('signal')||SIGNAL_WINDOWS[0].key;
   applyView(view,false);
@@ -3890,9 +4905,14 @@ function initControls(){
   applyFilter(search,false);
   applyLiveFilter(liveFilter,false);
   applySignalWindow(selectedSignalWindow,false);
+  if(onFleet&&params.has('q')){
+    params.delete('q');
+    const query=params.toString();
+    replaceDocumentUrl(location.pathname+(query?'?'+query:''));
+  }
   document.querySelectorAll('[data-view-button]').forEach(btn=>btn.addEventListener('click',()=>{applyView(btn.dataset.viewButton);updateUrlState()}));
   document.querySelector('[data-sort]')?.addEventListener('change',e=>{applySort(e.target.value);updateUrlState()});
-  document.querySelector('[data-search]')?.addEventListener('input',e=>applyFilter(e.target.value));
+  document.querySelector('[data-search]')?.addEventListener('input',e=>{applyFilter(e.target.value);updateUrlState()});
   document.querySelectorAll('[data-live-filter]').forEach(btn=>btn.addEventListener('click',()=>{applyLiveFilter(btn.dataset.liveFilter);updateUrlState()}));
   document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
   bindFreeformDrag();
@@ -3909,6 +4929,7 @@ let refreshPromise=null;
 let refreshAbort=null;
 let refreshGeneration=0;
 let recoveryPromise=null;
+let lastFleetFailureKind='';
 let lastSuccessfulRefreshAt=Date.now();
 function fleetMain(){return document.querySelector('main[data-fleet-sync-state]')}
 function fleetSnapshotFresh(at=Date.now()){
@@ -3918,17 +4939,64 @@ function fleetSnapshotLabel(asof){
   const label=asof?.dataset.snapshotLabel||asof?.textContent||'last update unavailable';
   return label.startsWith('as of ')?'last update '+label.slice(6):label;
 }
-function setFleetSyncState(state){
+function pageFrozen(){
+  if(document.body?.dataset?.fleetLifecycleFrozen==='true')return true;
+  if(document.hidden)return true;
+  const state=document.visibilityState;
+  if(state==null||state==='')return false;
+  return state==='hidden'||state==='prerender';
+}
+function ensureFleetRecovery(kind){
+  if(typeof document.createElement!=='function'||!document.body)return;
+  const model=fleetRecoveryModel(kind);
+  let box=document.querySelector('[data-fleet-recovery]');
+  if(!box){
+    box=document.createElement('div');
+    box.className='fleet-recovery';
+    box.dataset.fleetRecovery='true';
+    box.hidden=true;
+    const retry=document.createElement('button');
+    retry.type='button';
+    retry.dataset.fleetRetry='true';
+    retry.textContent='Retry';
+    retry.addEventListener('click',()=>{if(!pageFrozen())recoverFleet('retry')});
+    const signIn=document.createElement('a');
+    signIn.dataset.fleetSignIn='true';
+    signIn.textContent='Sign in';
+    box.append(retry,signIn);
+    const asof=fleetMain()?.querySelector('[data-as-of]');
+    if(asof&&typeof asof.insertAdjacentElement==='function')asof.insertAdjacentElement('afterend',box);
+    else document.body.appendChild(box);
+  }
+  const retry=box.querySelector('[data-fleet-retry]');
+  const signIn=box.querySelector('[data-fleet-sign-in]');
+  if(!model){box.hidden=true;return}
+  box.hidden=false;
+  if(retry)retry.hidden=model.action!=='retry';
+  if(signIn){
+    signIn.hidden=model.action!=='sign-in';
+    if(model.action==='sign-in'){
+      const path=(window.location?.pathname||'/')+(window.location?.search||'');
+      signIn.href=appUrl('/auth/login?return_to='+encodeURIComponent(path));
+    }
+  }
+}
+function setFleetSyncState(state,reason){
   const main=fleetMain();
   if(!main)return;
   main.dataset.fleetSyncState=state;
+  if(state==='current')lastFleetFailureKind='';
+  else if(reason)lastFleetFailureKind=reason;
   const asof=main.querySelector('[data-as-of]');
-  if(!asof)return;
-  if(!asof.dataset.snapshotLabel)asof.dataset.snapshotLabel=asof.textContent||'';
-  asof.dataset.refreshState=state;
-  if(state==='syncing')asof.textContent='Syncing\u2026 \u00b7 '+fleetSnapshotLabel(asof);
-  else if(state==='stale')asof.textContent='Data out of date \u00b7 '+fleetSnapshotLabel(asof);
-  else asof.textContent=asof.dataset.snapshotLabel;
+  if(asof){
+    if(!asof.dataset.snapshotLabel)asof.dataset.snapshotLabel=asof.textContent||'';
+    asof.dataset.refreshState=state;
+    if(state==='syncing')asof.textContent='Syncing\u2026 \u00b7 '+fleetSnapshotLabel(asof);
+    else if(state==='stale')asof.textContent='Data out of date \u00b7 '+fleetSnapshotLabel(asof);
+    else asof.textContent=asof.dataset.snapshotLabel;
+  }
+  if(state==='stale')ensureFleetRecovery(reason||lastFleetFailureKind||'unavailable');
+  else ensureFleetRecovery('');
 }
 function setFleetSnapshotLabel(now){
   const asof=fleetMain()?.querySelector('[data-as-of]');
@@ -3966,6 +5034,7 @@ function applyFleetSnapshot(data){
   const now=Number(data.as_of);
   for(const h of hosts){
     const surfaces=hostSurfaces(h.name);
+    const assurance=projectHostAssurance(h,now);
     for(const card of surfaces){
       const live=h.liveness;
       card.dataset.live=live;
@@ -3986,6 +5055,7 @@ function applyFleetSnapshot(data){
       updateKernelFault(card,h);
       updateFreshness(card,h.freshness,now,h.nixpkgs_warn_after_days);
       updateBackup(card,backup);
+      updateHealthProjection(card,assurance.health);
       setSeen(card,h.last_seen,now);
       setCardAsOf(card,now);
       const beat=card.querySelector('.beat');
@@ -3995,19 +5065,24 @@ function applyFleetSnapshot(data){
         const interval=h.heartbeat_interval_secs || 60;
         const incoming=Array.isArray(h.heartbeat_log)?h.heartbeat_log.map(Number).filter(Number.isFinite):[];
         const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
+        const grace=resolveHeartbeatGrace(h,data.fleet_heartbeat_grace_secs);
+        const bounds=cadenceBounds(interval,grace.secs);
         beat.dataset.interval=interval;
-        setBeatHistory(beat,beats,interval);
-        updateSignal(card,signalInfo(beats,last,interval,now));
+        beat.dataset.grace=String(grace.secs);
+        beat.dataset.graceSource=grace.source;
+        beat.dataset.lateAfter=String(grace.lateAfter==null?bounds.lateAfter:grace.lateAfter);
+        beat.dataset.last=Number.isFinite(last)?String(last):'';
+        beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
+        setBeatHistory(beat,beats,interval,now,grace.secs);
+        updateBeatClock(beat,now);
         if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous){
-          beat.style.setProperty('--hit-x',heartbeatX(Math.max(0,last-previous),Math.max(1,Number(interval)||60)).toFixed(2)+'%');
+          beat.style.setProperty('--hit-x','100%');
           flashBeat(beat);
         }
         beat.dataset.ready='true';
-        beat.dataset.last=Number.isFinite(last)?String(last):'';
-        beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
       }
     }
-    updateOpenHostDrawer(h);
+    updateOpenHostDrawer(h,now);
   }
   updateFleetSummary(hosts);
   applySort(document.querySelector('[data-sort]')?.value||'attention',false);
@@ -4026,8 +5101,15 @@ function nextRefreshDelay(){
 }
 function scheduleRefresh(delay=nextRefreshDelay()){
   clearRefreshTimer();
-  if(!fleetMain()||document.hidden||(typeof document.hasFocus==='function'&&!document.hasFocus()))return;
+  if(!fleetMain()||pageFrozen())return;
   refreshTimer=setTimeout(()=>refresh('timer'),delay);
+}
+function classifyFleetResponse(res){
+  const status=Number(res?.status);
+  const type=String(res?.headers?.get?.('content-type')||'').toLowerCase();
+  if(res?.redirected||status===401||status===403||type.includes('text/html'))return 'auth';
+  if(!res?.ok||!type.includes('application/json'))return 'unavailable';
+  return '';
 }
 function abandonRefresh(){
   clearRefreshTimer();
@@ -4048,18 +5130,31 @@ async function refresh(reason='manual',options={}){
   refreshPromise=(async()=>{
   try{
     const res=await fetch(appUrl('/hosts.json?refresh='+Date.now()),{headers:{Accept:'application/json'},cache:'no-store',credentials:'same-origin',signal:controller.signal});
-    const contentType=String(res.headers.get('content-type')||'').toLowerCase();
-    if(!res.ok||res.redirected||!contentType.includes('application/json'))throw new Error('fleet snapshot unavailable');
+    const failure=classifyFleetResponse(res);
+    if(failure){
+      const error=new Error('fleet snapshot unavailable');
+      error.fleetKind=failure;
+      throw error;
+    }
     const data=await res.json();
     if(generation!==refreshGeneration)return false;
-    if(!validFleetSnapshot(data))throw new Error('fleet snapshot invalid');
+    if(!validFleetSnapshot(data)){
+      const error=new Error('fleet snapshot invalid');
+      error.fleetKind='invalid';
+      throw error;
+    }
     if(!applyFleetSnapshot(data))return false;
     lastSuccessfulRefreshAt=Date.now();
     setFleetSyncState('current');
     resumeBeatClock();
     return true;
   }catch(error){
-    if(generation===refreshGeneration&&(options.recovery===true||!fleetSnapshotFresh()))setFleetSyncState('stale');
+    if(generation!==refreshGeneration)return false;
+    const kind=error?.name==='AbortError'?'abort':(error?.fleetKind||(typeof navigator!=='undefined'&&navigator.onLine===false?'offline':'unavailable'));
+    if(kind==='auth'||options.recovery===true||!fleetSnapshotFresh()){
+      if(kind==='auth'&&options.recovery!==true)stopBeatClock();
+      setFleetSyncState('stale',kind);
+    }
     return false;
   }
   finally{
@@ -4077,9 +5172,10 @@ function suspendFleet(){
   stopBeatClock();
   abandonRefresh();
   recoveryPromise=null;
+  if(typeof fleetWatchdogTimer!=='undefined'&&fleetWatchdogTimer!=null){clearTimeout(fleetWatchdogTimer);fleetWatchdogTimer=null}
 }
 function recoverFleet(reason='foreground'){
-  if(!fleetMain()||document.hidden)return Promise.resolve(false);
+  if(!fleetMain()||pageFrozen())return Promise.resolve(false);
   if(recoveryPromise)return recoveryPromise;
   stopBeatClock();
   setFleetSyncState('syncing');
@@ -4089,7 +5185,7 @@ function recoverFleet(reason='foreground'){
   return recoveryPromise;
 }
 function resumeRefresh(reason){
-  if(document.hidden){
+  if(pageFrozen()){
     suspendFleet();
     return Promise.resolve(false);
   }
@@ -4249,19 +5345,57 @@ function initFreshnessChipScroll(){
     if(event.key==='Escape'&&activeFreshPopover?.classList.contains('visible'))hideFreshPopover();
   });
 }
-document.addEventListener('visibilitychange',()=>{if(document.hidden)suspendFleet();else recoverFleet('visible')});
-window.addEventListener('blur',suspendFleet);
-window.addEventListener('focus',()=>recoverFleet('focus'));
-window.addEventListener('pageshow',event=>{if(event.persisted||!fleetSnapshotFresh())recoverFleet('pageshow')});
-window.addEventListener('online',()=>recoverFleet('online'));
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden)suspendFleet();
+  else{
+    if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+    armFleetWatchdog();
+    recoverFleet('visible');
+  }
+});
+window.addEventListener('blur',()=>{
+  if(document.documentElement)document.documentElement.dataset.fleetFocus='unfocused';
+});
+window.addEventListener('focus',onFleetFocus);
+window.addEventListener('pageshow',event=>{
+  if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+  armFleetWatchdog();
+  if(fleetDocumentPath()){
+    const remembered=fleetSearchText();
+    if(remembered!=null)applyFilter(remembered,false);
+  }
+  if(event.persisted||!fleetSnapshotFresh()||beatClockTimer==null||refreshTimer==null)recoverFleet('pageshow');
+});
+window.addEventListener('pagehide',()=>{
+  if(document.body)document.body.dataset.fleetLifecycleFrozen='true';
+  suspendFleet();
+});
+window.addEventListener('freeze',()=>{
+  if(document.body)document.body.dataset.fleetLifecycleFrozen='true';
+  suspendFleet();
+});
+window.addEventListener('resume',()=>{
+  if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+  armFleetWatchdog();
+  recoverFleet('resume');
+});
+window.addEventListener('online',()=>{if(!pageFrozen())recoverFleet('online')});
+/* FLEET_LISTENERS_END */
 document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
-document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
+document.querySelectorAll('.beat').forEach(beat=>{
+  const grace=beatGraceSecs(beat);
+  setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60,Date.now()/1000,grace);
+  beat.dataset.ready='true';
+});
+bindHistoryHints();
+armFleetWatchdog();
 initFreshnessChipScroll();
 initHostDrawer();
 initControls();
+markFleetEntry();
 initProviderConnection();
 initProviderSetupGuide();
 setFleetSyncState('current');
 resumeBeatClock();
-scheduleRefresh(3000);
+scheduleRefresh(document.body?.dataset.hostActionDialogOpen==='true'?DIALOG_REFRESH_MS:3000);
 </script></body></html>

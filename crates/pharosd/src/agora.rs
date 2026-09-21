@@ -30,7 +30,7 @@ const DEFAULT_ACCENT: &str = "#1f7fb5";
 const TARGET_PATH: &str = "modules/pharos-host-preferences.json";
 const LOCATION_TARGET_PATH: &str = "modules/uzumaki/hosts/host-settings.nix";
 
-const AGORA_CSS: &str = r#"<style>
+const AGORA_CSS: &str = r#"<style data-pharos-page-style="agora">
 .settings-main{width:min(1280px,100%)}
 .preset-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .preset{width:28px;height:28px;border:1px solid rgba(210,226,234,.92);border-radius:50%;background:var(--preset-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--preset-color) 10%,transparent);cursor:pointer}
@@ -68,6 +68,20 @@ const AGORA_CSS: &str = r#"<style>
 .settings-draft-review{display:grid;gap:12px;padding:13px 0;border-top:1px solid rgba(214,226,234,.72);border-bottom:1px solid rgba(214,226,234,.72)}.settings-draft-review h3,.settings-draft-review p{margin:0}.settings-draft-review h3{font-size:13px}.settings-draft-review p{color:var(--muted);font-size:11px;line-height:1.45}.settings-draft-review ul{display:grid;gap:7px;margin:0;padding:0;list-style:none}.settings-draft-review li{padding:8px 10px;border:1px solid rgba(210,226,234,.76);border-radius:7px;background:rgba(247,252,253,.72);font-size:11px}.settings-draft-review dl{display:grid;grid-template-columns:54px minmax(0,1fr);gap:5px 9px;margin:0;font-size:10px}.settings-draft-review dt{color:var(--muted)}.settings-draft-review dd{margin:0;color:#294761}
 .empty-settings{width:min(840px,100%);margin:26px auto 0;box-shadow:none}
 @media (max-width:640px){.host-picker{grid-template-columns:1fr;gap:6px}.host-settings-surface{margin-top:18px}.host-settings-identity,.host-color-task,.settings-disclosure>summary,.settings-disclosure-body,.settings-draft-actions{padding-left:4px;padding-right:4px}.host-color-choice{gap:13px}.host-advanced-meta,.host-kind-row{grid-template-columns:1fr}.settings-draft-actions,.settings-draft-buttons{align-items:stretch;flex-direction:column}.settings-draft-buttons{width:100%}.settings-draft-buttons button{width:100%}}
+.host-breadcrumb{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 16px;color:var(--muted);font-size:13px}.host-breadcrumb a{display:inline-flex;align-items:center;gap:6px;color:#1e668f;font-weight:680;text-decoration:none}.host-breadcrumb a:focus-visible,.host-tabs a:focus-visible,.host-disclosure>summary:focus-visible,.host-color-well:focus-visible,.grace-select:focus-visible,.grace-input:focus-visible,.grace-reset:focus-visible,.host-issue a:focus-visible,.host-settings-surface input:focus-visible,.host-settings-surface select:focus-visible,.host-settings-surface button:focus-visible{outline:2px solid rgba(31,127,181,.55);outline-offset:3px}
+.host-profile{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin-bottom:8px}.os-badge,.os-health-badge{display:grid;place-items:center;width:48px;height:48px;flex:0 0 auto;border-radius:50%;background:#5c7384;color:#fff}.os-badge .ico,.os-badge-icon .ico,.os-health-badge .ico{width:24px;height:24px;color:#fff}.os-badge[data-health-tone="good"],.os-health-badge[data-health-tone="good"]{background:#1f8a4c}.os-badge[data-health-tone="amber"],.os-health-badge[data-health-tone="amber"]{background:#b26a00}.os-badge[data-health-tone="bad"],.os-health-badge[data-health-tone="bad"]{background:#c62828}.os-badge[data-health-tone="neutral"],.os-health-badge[data-health-tone="neutral"]{background:#5c7384}.harbor-health{margin-top:8px}.health-reasons{margin:8px 0 0;padding-left:18px}.fact-value.good{color:#1f8a4c}.fact-value.amber{color:#9a5b00}.fact-value.bad{color:#c62828}.fact-value.neutral{color:#526d82}.protection-pair{display:grid;gap:0;margin-top:8px}.protection-fact{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 8px;min-width:0;padding:12px 0;border-top:1px solid rgba(214,226,234,.7);color:inherit;line-height:1.45;text-decoration:none}.protection-fact .fact-label,.protection-fact .fact-value,.protection-fact .fact-note{min-width:0;overflow-wrap:anywhere}
+.host-profile-copy{min-width:0;flex:1 1 220px}.host-profile-copy strong,.host-profile-copy p{display:block;overflow-wrap:anywhere}.host-profile-copy strong{font-size:18px}.host-profile-copy p{margin:4px 0 0;color:var(--muted);font-size:13px;line-height:1.45}
+.host-accent-identity{display:inline-flex;align-items:center;gap:8px;margin-left:auto;color:var(--muted);font-size:12px}.host-accent-swatch{width:14px;height:14px;border:1px solid rgba(210,226,234,.92);border-radius:50%;background:var(--host-accent,#1f7fb5)}
+.host-tabs{display:flex;flex-wrap:wrap;gap:8px 22px;margin:8px 0 18px;border-bottom:1px solid rgba(210,226,234,.92)}.host-tabs a{padding:0 0 10px;border-bottom:2px solid transparent;color:var(--muted);font-size:14px;font-weight:650;text-decoration:none}.host-tabs a[aria-current="page"]{border-color:#1f7fb5;color:#176b98}
+.host-columns{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr);gap:16px;align-items:start}.host-panel,.host-next-action{min-width:0;padding:18px;border:1px solid rgba(210,226,234,.92);border-radius:10px;background:rgba(255,255,255,.9);box-shadow:0 10px 30px rgba(45,75,95,.05)}.host-panel+.host-panel,.host-stack{display:grid;gap:16px}.host-panel h2,.host-next-action h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500}.host-panel h3{margin:0;font-size:14px}.host-panel p,.host-next-action p{margin:6px 0 0;color:var(--muted);font-size:13px;line-height:1.5}
+.host-fact{margin-top:14px;padding-top:12px;border-top:1px solid rgba(214,226,234,.7)}.host-fact strong{display:block;margin-top:3px;font-size:15px;overflow-wrap:anywhere}.host-fact[data-daily-tone="green"] strong,.host-fact[data-restore-tone="green"] strong,.host-fact[data-heartbeat-tone="green"] strong{color:#1f8a4c}.host-fact[data-daily-tone="amber"] strong,.host-fact[data-restore-tone="amber"] strong,.host-fact[data-heartbeat-tone="amber"] strong{color:#9a5b00}.host-fact[data-daily-tone="red"] strong,.host-fact[data-restore-tone="red"] strong,.host-fact[data-heartbeat-tone="red"] strong{color:#c62828}
+.host-issue-list{display:grid;gap:10px;margin:14px 0 0;padding:0;list-style:none}.host-issue{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px;padding:10px 0;border-top:1px solid rgba(214,226,234,.7)}.host-issue strong,.host-issue span{display:block}.host-issue span{margin-top:3px;color:var(--muted);font-size:12px;line-height:1.45}.host-issue a{color:#1e668f;font-size:13px;font-weight:700}
+.host-receipt-slot{margin-top:12px}.host-receipt-slot>strong,.host-receipt-empty{display:block}.host-receipt-empty{margin-top:3px;color:#526d82;font-size:12px;line-height:1.45}.host-receipt-list{display:grid;gap:8px;margin:10px 0 0;padding:0;list-style:none}.host-receipt{padding:9px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:#f7fcfd}.host-receipt strong,.host-receipt span{display:block}.host-receipt strong{font-size:12px}.host-receipt span{margin-top:2px;color:#526d82;font-size:11px;line-height:1.35}.host-receipt-links{display:flex;gap:8px;flex-wrap:wrap;margin-top:7px}.host-receipt-links a{color:#1e668f;font-size:12px;font-weight:720}a.primary-action{display:inline-flex;align-items:center;justify-content:center;width:fit-content;max-width:100%;margin-top:14px;text-align:center;text-decoration:none}.host-workspace-link{color:#1e668f;font-weight:700}.task-note{font-size:12px;line-height:1.45}
+.host-disclosure{margin-top:16px;border-top:1px solid rgba(210,226,234,.86)}.host-disclosure>summary{min-height:48px;padding:12px 0;cursor:pointer;font-weight:700}.host-history{display:grid;gap:8px;margin:12px 0 0;padding:0;list-style:none}.host-history li{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;padding:8px 0;border-top:1px solid rgba(214,226,234,.62);font-size:12px}.host-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:12px}.host-meta div{min-width:0;padding:10px;border-radius:7px;background:#f7fcfd}.host-meta span,.host-meta strong{display:block;overflow-wrap:anywhere}.host-meta span{color:#526d82;font-size:11px}.host-meta strong{margin-top:3px;font-size:13px}
+.host-workspace-settings .host-settings-surface{width:100%;margin:0}.host-workspace-settings .host-settings-identity{display:none}
+.grace-form{display:grid;gap:14px;margin-bottom:8px}.grace-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,240px);gap:12px;align-items:center}.grace-row p{margin:4px 0 0;color:var(--muted);font-size:12px}.grace-select,.grace-input{width:100%;height:38px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px}.grace-seconds{display:flex;align-items:center;gap:8px}.grace-note,.grace-rule{color:var(--muted);font-size:12px;line-height:1.45}.grace-actions{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}.grace-reset,.grace-actions .secondary-action{min-height:38px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:680;padding:0 13px;cursor:pointer}.grace-reset:disabled,.grace-actions button:disabled{opacity:.48;cursor:not-allowed}
+.grace-review{display:grid;gap:8px;padding:12px 0;border-top:1px solid rgba(214,226,234,.72)}.host-section[hidden]{display:none}
+@media (max-width:900px){.host-columns,.grace-row,.host-meta{grid-template-columns:1fr}.host-accent-identity{margin-left:0}.host-profile-copy strong{font-size:16px}.grace-actions,.grace-actions span{width:100%}.grace-actions button{width:100%}}
 </style>"#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +103,12 @@ struct AgoraHostView {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct AgoraPageQuery {
     host: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct HostWorkspaceQuery {
+    section: Option<String>,
+    draft: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,14 +241,29 @@ pub(crate) async fn page(
         .map(str::trim)
         .filter(|host| !host.is_empty())
     {
-        Some(host) => Redirect::temporary(
-            &state
-                .public_base_path
-                .href(&format!("/hosts/{}", crate::url_query_escape(host))),
-        )
+        Some(host) => Redirect::temporary(&state.public_base_path.href(&format!(
+            "/hosts/{}?section=settings",
+            crate::url_query_escape(host),
+        )))
         .into_response(),
         None => Redirect::temporary(state.public_base_path.home()).into_response(),
     }
+}
+
+/// Legacy `/hosts/{host}/settings` entry. Native `/hosts/{host}` stays the overview.
+pub(crate) async fn host_settings_entry(
+    State(state): State<AppState>,
+    Path(host_ref): Path<String>,
+) -> Response {
+    let host = host_ref.trim();
+    if host.is_empty() {
+        return Redirect::temporary(state.public_base_path.home()).into_response();
+    }
+    Redirect::temporary(&state.public_base_path.href(&format!(
+        "/hosts/{}?section=settings",
+        crate::url_query_escape(host),
+    )))
+    .into_response()
 }
 
 /// Stable, host-scoped entry point for the durable operator workspace.
@@ -240,6 +275,7 @@ pub(crate) async fn host_workspace_page(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(host_ref): Path<String>,
+    Query(query): Query<HostWorkspaceQuery>,
 ) -> Html<String> {
     let user_label = crate::sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
@@ -270,7 +306,7 @@ pub(crate) async fn host_workspace_page(
         .iter()
         .find(|host| host.name == host_ref || host.slug == host_ref);
 
-    if !access.can_agora() || selected.is_none() {
+    if selected.is_none() {
         return Html(crate::public_mount::localize_document(
             &state.public_base_path,
             &crate::render_no_access_page(
@@ -301,6 +337,9 @@ pub(crate) async fn host_workspace_page(
         .filter(|job| job.host == selected.name)
         .collect();
     let lifecycle = host_lifecycle(&action_jobs, &selected.name, settings_state, false);
+    let fleet_settings = state.fleet_settings.get();
+    let fleet_nixpkgs_warn_days = fleet_settings.nixpkgs_warn_after_days;
+    let fleet_grace_seconds = fleet_settings.heartbeat_grace_secs;
 
     Html(crate::public_mount::localize_document(
         &state.public_base_path,
@@ -315,10 +354,15 @@ pub(crate) async fn host_workspace_page(
                     logout_enabled: state.auth.is_some(),
                     public_base_path: &state.public_base_path,
                     can_manage_fleet: access.can_manage_fleet(),
+                    fleet_heartbeat_grace_secs: fleet_grace_seconds,
                     workspace: Some(HostWorkspaceContext {
                         runtime,
                         lifecycle: &lifecycle,
                         settings_state,
+                        now: crate::now_unix(),
+                        fleet_nixpkgs_warn_days,
+                        fleet_grace_seconds,
+                        section: workspace_section(&query),
                     }),
                 },
             ),
@@ -335,6 +379,10 @@ struct HostWorkspaceContext<'a> {
     runtime: Option<&'a Host>,
     lifecycle: &'a crate::HostLifecycle,
     settings_state: crate::HostPreferencesState,
+    now: i64,
+    fleet_nixpkgs_warn_days: u32,
+    fleet_grace_seconds: u64,
+    section: WorkspaceSection,
 }
 
 #[derive(Clone, Copy)]
@@ -344,7 +392,134 @@ struct PageContext<'a> {
     logout_enabled: bool,
     public_base_path: &'a pharos_core::PublicBasePath,
     can_manage_fleet: bool,
+    fleet_heartbeat_grace_secs: u64,
     workspace: Option<HostWorkspaceContext<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceSection {
+    Overview,
+    Backups,
+    Activity,
+    Settings,
+}
+
+impl WorkspaceSection {
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("backups") => Self::Backups,
+            Some("activity") => Self::Activity,
+            Some("settings") => Self::Settings,
+            _ => Self::Overview,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Backups => "backups",
+            Self::Activity => "activity",
+            Self::Settings => "settings",
+        }
+    }
+}
+
+fn workspace_section(query: &HostWorkspaceQuery) -> WorkspaceSection {
+    if query.draft.as_deref().map(str::trim) == Some("fleet-drawer") {
+        WorkspaceSection::Settings
+    } else {
+        WorkspaceSection::parse(query.section.as_deref())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WorkspaceExtras {
+    now: i64,
+    fleet_nixpkgs_warn_days: u32,
+    fleet_grace_seconds: u64,
+    section: WorkspaceSection,
+    can_manage_fleet: bool,
+}
+
+fn workspace_tab_href(
+    base: &pharos_core::PublicBasePath,
+    host_path: &str,
+    section: WorkspaceSection,
+) -> String {
+    let endpoint = match section {
+        WorkspaceSection::Overview => format!("/hosts/{host_path}"),
+        WorkspaceSection::Backups => format!("/hosts/{host_path}?section=backups"),
+        WorkspaceSection::Activity => format!("/hosts/{host_path}?section=activity"),
+        WorkspaceSection::Settings => format!("/hosts/{host_path}?section=settings"),
+    };
+    crate::app_href(base, &endpoint)
+}
+
+fn workspace_tab(
+    base: &pharos_core::PublicBasePath,
+    host_path: &str,
+    section: WorkspaceSection,
+    label: &str,
+    active: WorkspaceSection,
+) -> String {
+    let current = if active == section {
+        " aria-current=\"page\""
+    } else {
+        ""
+    };
+    format!(
+        r#"<a data-host-tab data-section="{key}" href="{href}"{current}>{label}</a>"#,
+        key = section.key(),
+        href = workspace_tab_href(base, host_path, section),
+        label = html_escape(label),
+    )
+}
+
+fn hidden_unless(active: WorkspaceSection, section: WorkspaceSection) -> &'static str {
+    if active == section {
+        ""
+    } else {
+        " hidden"
+    }
+}
+
+fn render_heartbeat_history(log: &[i64], now: i64, interval_secs: u64, grace_secs: u64) -> String {
+    let mut beats: Vec<i64> = log.iter().copied().filter(|at| *at >= 0).collect();
+    beats.sort_unstable();
+    beats.dedup();
+    if beats.is_empty() {
+        return r#"<p data-heartbeat-history-empty>No heartbeat history yet.</p>"#.to_string();
+    }
+    let mut rows = Vec::new();
+    for (index, at) in beats.iter().copied().enumerate() {
+        let gap = if index == 0 {
+            None
+        } else {
+            u64::try_from(at.saturating_sub(beats[index - 1])).ok()
+        };
+        rows.push((at, gap));
+    }
+    let items = rows
+        .iter()
+        .rev()
+        .take(12)
+        .map(|(at, gap)| {
+            let level = pharos_core::heartbeat_history_level(*gap, interval_secs, grace_secs);
+            format!(
+                r#"<li data-heartbeat-history data-heartbeat-level="{key}" data-heartbeat-at="{at}"><span>{label}</span><span>{age} ago</span></li>"#,
+                key = pharos_core::heartbeat_history_level_key(level),
+                at = at,
+                label = html_escape(pharos_core::heartbeat_history_label(level)),
+                age = html_escape(&crate::duration_label(now.saturating_sub(*at))),
+            )
+        })
+        .collect::<String>();
+    format!(r#"<ol class="host-history" data-heartbeat-history-list>{items}</ol>"#)
+}
+
+fn workspace_protection_facts(html: String) -> String {
+    html.replace("</span><strong", "</span> <strong")
+        .replace("</strong><span", "</strong> <span")
 }
 
 fn render_host_workspace(
@@ -353,24 +528,106 @@ fn render_host_workspace(
     runtime: Option<&Host>,
     lifecycle: &crate::HostLifecycle,
     settings_state: crate::HostPreferencesState,
-    can_manage_fleet: bool,
     settings_editor: &str,
+    extras: WorkspaceExtras,
 ) -> String {
-    let extra_css = format!(
-        r#"<style>
-.host-workspace{{width:100%;display:grid;grid-template-columns:310px minmax(0,1fr);gap:22px;align-items:start}}
-.host-workspace-main{{display:grid;gap:16px}}.host-workspace-identity,.host-workspace-section,.host-task-rail{{border:1px solid rgba(210,226,234,.92);border-radius:10px;background:rgba(255,255,255,.9);box-shadow:0 10px 30px rgba(45,75,95,.05)}}
-.host-workspace-identity{{padding:22px;display:flex;gap:15px;align-items:center}}.host-workspace-identity h2,.host-workspace-section h2,.host-task-rail h2{{margin:0;font-family:Georgia,"Times New Roman",serif;font-weight:500}}.host-workspace-identity p,.host-workspace-section p,.host-task-rail p{{margin:5px 0 0;color:var(--muted)}}
-.host-workspace-mark{{display:grid;place-items:center;width:48px;height:48px;border:3px solid {accent};border-radius:50%;color:var(--accent);background:#fff;box-shadow:0 0 0 7px color-mix(in srgb,{accent} 13%,transparent)}}
-.host-workspace-section{{padding:18px}}.host-workspace-section h2{{font-size:18px}}.host-workspace-facts{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:14px}}.host-workspace-facts div{{padding:10px;border-radius:7px;background:#f7fcfd}}.host-workspace-facts span,.host-workspace-facts strong{{display:block}}.host-workspace-facts span{{font-size:11px;color:#526d82}}.host-workspace-facts strong{{margin-top:3px;font-size:13px;overflow-wrap:anywhere}}
-.host-task-rail{{position:sticky;top:18px;padding:18px}}.host-task-rail[data-manager="false"]{{border-style:dashed}}.host-task-rail .primary-action{{display:flex;align-items:center;justify-content:center;text-decoration:none;margin-top:16px;text-align:center}}.host-task-rail .task-kind{{display:inline-block;margin-top:11px;color:var(--muted);font-size:12px}}.host-task-rail .task-note{{font-size:12px;line-height:1.45}}.host-workspace-link{{color:#1e668f;font-weight:700}}.host-workspace-settings{{padding:0;overflow:hidden}}.host-workspace-settings>.host-workspace-section-head{{padding:18px 18px 0}}.host-workspace-settings .host-settings-surface{{width:100%;margin:14px 0 0}}.host-workspace-settings .host-settings-identity{{display:none}}.host-receipt-slot{{margin-top:16px;padding-top:14px;border-top:1px solid rgba(210,226,234,.86)}}.host-receipt-slot>strong,.host-receipt-empty{{display:block}}.host-receipt-empty{{margin-top:3px;color:#526d82;font-size:11px;line-height:1.45}}.host-receipt-list{{display:grid;gap:8px;margin:10px 0 0;padding:0;list-style:none}}.host-receipt{{padding:9px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:#f7fcfd}}.host-receipt strong,.host-receipt span{{display:block}}.host-receipt strong{{font-size:11px}}.host-receipt span{{margin-top:2px;color:#526d82;font-size:10px;line-height:1.35}}.host-receipt-links{{display:flex;gap:8px;flex-wrap:wrap;margin-top:7px}}.host-receipt-links a{{color:#1e668f;font-size:10px;font-weight:720}}
-@media(max-width:780px){{.host-workspace{{grid-template-columns:1fr}}.host-task-rail{{position:static;order:0}}.host-workspace-main{{order:1}}.host-workspace-facts{{grid-template-columns:1fr}}}}
-</style>"#,
-        accent = html_escape(&host.declared_accent),
-    );
+    let can_manage_fleet = extras.can_manage_fleet;
+    let now = extras.now;
+    let observations = runtime
+        .map(|host| host.backup_observations.as_slice())
+        .unwrap_or(&[]);
+    let protection = crate::fleet_protection_view(observations, now);
+    let empty_freshness = pharos_core::NixFreshness::default();
+    let freshness = runtime
+        .map(|host| &host.freshness)
+        .unwrap_or(&empty_freshness);
+    let services = runtime
+        .map(|host| host.service_observations.as_slice())
+        .unwrap_or(&[]);
+    let applied = runtime
+        .map(|host| &host.preferences)
+        .unwrap_or(&host.preferences);
+    let last_seen = runtime.and_then(|host| host.last_seen);
+    let interval = runtime.and_then(|host| host.heartbeat_interval_secs);
+    let live = pharos_core::liveness(last_seen, interval, now);
+    let health = crate::host_health_view(crate::HostHealthQuery {
+        live,
+        preferences: applied,
+        freshness,
+        kernel: runtime.and_then(|host| host.kernel.as_ref()),
+        services,
+        protection: &protection,
+        now,
+        nixpkgs_threshold: applied.nixpkgs_warn_after_days(Some(extras.fleet_nixpkgs_warn_days)),
+    });
+    let grace = applied.heartbeat_grace_policy(Some(extras.fleet_grace_seconds), interval);
     let host_path = crate::url_query_escape(&host.name);
-    let settings_href = "#host-settings-editor".to_string();
-    let (primary_href, primary_label, task_kind, workflow_handler) =
+    let accent = displayed_preferences(host)
+        .and_then(|preferences| preferences.accent.as_deref())
+        .unwrap_or(&host.declared_accent);
+    let icon = if host.is_nix {
+        crate::icons::SNOWFLAKE
+    } else {
+        crate::icons::SERVER
+    };
+    let badge = crate::os_badge_markup(icon, &health);
+    let protection_body =
+        workspace_protection_facts(crate::protection_markup(&protection, &host.name, base));
+    let daily_sentence = "";
+    let service_items = services
+        .iter()
+        .filter(|observation| !crate::is_nix_freshness_observation(observation))
+        .map(|observation| {
+            format!(
+                r#"<li class="host-issue" data-host-service="{id}"><div><strong>{label}</strong><span>{state} · {summary}</span></div></li>"#,
+                id = html_escape(&observation.id),
+                label = html_escape(&observation.label),
+                state = html_escape(observation.state.label()),
+                summary = html_escape(&observation.summary),
+            )
+        })
+        .collect::<String>();
+    let services_body = if service_items.is_empty() {
+        r#"<p data-host-services-empty>No service observations yet.</p>"#.to_string()
+    } else {
+        format!(r#"<ul class="host-issue-list" data-host-service-list>{service_items}</ul>"#)
+    };
+    let evidence = runtime.and_then(|host| host.freshness.deployment_evidence.as_ref());
+    let revision = |value: Option<&str>| match value {
+        Some(value) if !value.is_empty() => html_escape(value),
+        _ => "Not observed".to_string(),
+    };
+    let report = match last_seen {
+        Some(seen) => format!("{} ago", crate::duration_label(now.saturating_sub(seen))),
+        None => "No host report yet".to_string(),
+    };
+    let report_at = last_seen.map(|seen| seen.to_string()).unwrap_or_default();
+    let reachability = live.badge().1;
+    let timing_sentence = match last_seen {
+        Some(seen) => {
+            let gap = u64::try_from(now.saturating_sub(seen)).unwrap_or(u64::MAX);
+            let timing =
+                pharos_core::heartbeat_timing(gap, interval.unwrap_or(60), grace.effective_secs);
+            format!(
+                "Latest gap is {gap}s · {}.",
+                pharos_core::heartbeat_timing_label(timing)
+            )
+        }
+        None => {
+            "No host report yet. Late classification starts after the first heartbeat.".to_string()
+        }
+    };
+    let rule = pharos_core::heartbeat_late_rule_copy(grace.interval_secs, grace.effective_secs);
+    let history = render_heartbeat_history(
+        runtime
+            .map(|host| host.heartbeat_log.as_slice())
+            .unwrap_or(&[]),
+        now,
+        grace.interval_secs,
+        grace.effective_secs,
+    );
+    let quiet = lifecycle.run_id.is_none() && lifecycle.slot == crate::HostLifecycleSlot::Quiet;
+    let (primary_href, primary_label, workflow_handler) =
         if let Some(run_id) = lifecycle.run_id.as_deref() {
             let settings_workflow = lifecycle.slot == crate::HostLifecycleSlot::SettingsChange;
             (
@@ -388,9 +645,8 @@ fn render_host_workspace(
                 lifecycle
                     .primary_action
                     .as_ref()
-                    .map(|action| action.label.as_str())
-                    .unwrap_or("Open saved workflow"),
-                "Saved workflow",
+                    .map(|action| action.label.clone())
+                    .unwrap_or_else(|| "Open saved workflow".to_string()),
                 if settings_workflow {
                     "settings"
                 } else {
@@ -399,60 +655,120 @@ fn render_host_workspace(
             )
         } else {
             (
-                settings_href.clone(),
-                "Review host settings",
-                "Settings task",
+                "#host-settings-editor".to_string(),
+                "Review host settings".to_string(),
                 "settings",
             )
         };
-    let report = runtime
-        .and_then(|host| host.last_seen)
-        .map(|seen| seen.to_string())
-        .unwrap_or_else(|| "No host report yet".to_string());
-    let services = runtime
-        .map(|host| host.service_observations.len().to_string())
-        .unwrap_or_else(|| "No observation yet".to_string());
-    let protection = runtime
-        .map(|host| host.backup_observations.len().to_string())
-        .unwrap_or_else(|| "No protection observation yet".to_string());
     let manager_note = if can_manage_fleet {
         "Review opens an unsent draft. Nothing applies until confirmation and matching host evidence."
     } else {
         "Viewer access: settings and receipts stay visible, while guarded actions remain with a fleet manager."
     };
-    let blocked_by = if lifecycle.blocked_by.is_empty() {
-        "Nothing recorded".to_string()
+    let lifecycle_copy = if quiet {
+        String::new()
     } else {
-        lifecycle.blocked_by.join(", ")
-    };
-    format!(
-        r#"{extra_css}<div class="host-workspace" data-host-workspace data-host="{host_name}" data-can-manage-fleet="{can_manage}"><aside class="host-task-rail" data-host-task-rail data-manager="{can_manage}" aria-label="Next safe action"><span class="task-kind">{task_kind}</span><h2>{lifecycle_label}</h2><p>{lifecycle_detail}</p><a class="primary-action" data-host-workspace-primary data-workflow-handler="{workflow_handler}" href="{primary_href}">{primary_label}</a><p class="task-note">{manager_note}</p><a class="host-workspace-link" href="{settings_href}">Edit settings in this workspace</a><div class="host-receipt-slot" data-host-workspace-receipts><strong>Workflow receipts</strong><span class="host-receipt-empty" data-host-receipt-empty>Loading saved receipts…</span><ol class="host-receipt-list" data-host-receipt-list></ol></div></aside><div class="host-workspace-main"><header class="host-workspace-identity"><span class="host-workspace-mark">{badge}</span><div><h1>{host_name}</h1><p>{role} · host workspace</p></div></header><section class="host-workspace-section" data-host-workspace-lifecycle><h2>Lifecycle</h2><p>{lifecycle_detail}</p><div class="host-workspace-facts"><div><span>State</span><strong>{lifecycle_label}</strong></div><div><span>Blocked by</span><strong>{blocked_by}</strong></div></div></section><section class="host-workspace-section host-workspace-settings" id="host-settings-editor" data-host-workspace-settings><div class="host-workspace-section-head"><h2>Settings</h2><p>Color, host type, alerts, declarative details, review, execution, and evidence stay attached to this host.</p><div class="host-workspace-facts"><div><span>Settings state</span><strong>{settings_state}</strong></div><div><span>Target</span><strong>{target}</strong></div></div></div>{settings_editor}</section><section class="host-workspace-section" data-host-workspace-protection><h2>Protection</h2><p>Backup evidence remains host-reported; observation does not claim progress.</p><div class="host-workspace-facts"><div><span>Backup observations</span><strong>{protection}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="{backups_href}">Open backup evidence</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-services><h2>Services</h2><p>Non-secret service observations stay linked to this host.</p><div class="host-workspace-facts"><div><span>Observed services</span><strong>{services}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="{services_href}">Open services</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-activity><h2>Activity</h2><p>The recorded host report is evidence, not an action.</p><div class="host-workspace-facts"><div><span>Last report</span><strong>{report}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="{activity_href}">Open activity</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-technical><h2>Technical context</h2><div class="host-workspace-facts"><div><span>Host reference</span><strong>{host_name}</strong></div><div><span>Configuration target</span><strong>{target}</strong></div></div></section></div></div>"#,
-        extra_css = extra_css,
-        host_name = html_escape(&host.name),
-        role = html_escape(&host.role),
-        badge = if host.is_nix {
-            crate::icons::SNOWFLAKE
+        let blocked = if lifecycle.blocked_by.is_empty() {
+            String::new()
         } else {
-            crate::icons::SERVER
-        },
+            format!(
+                r#"<p data-host-lifecycle-blocked>Blocked by {blocked}</p>"#,
+                blocked = html_escape(&lifecycle.blocked_by.join(", "))
+            )
+        };
+        format!(
+            r#"<h2>{label}</h2><p>{detail}</p>{blocked}"#,
+            label = html_escape(&lifecycle.label),
+            detail = html_escape(&lifecycle.detail),
+        )
+    };
+    let next_heading = if quiet { "<h2>Next action</h2>" } else { "" };
+    let tabs = [
+        workspace_tab(
+            base,
+            &host_path,
+            WorkspaceSection::Overview,
+            "Overview",
+            extras.section,
+        ),
+        workspace_tab(
+            base,
+            &host_path,
+            WorkspaceSection::Backups,
+            "Backups",
+            extras.section,
+        ),
+        workspace_tab(
+            base,
+            &host_path,
+            WorkspaceSection::Activity,
+            "Activity",
+            extras.section,
+        ),
+        workspace_tab(
+            base,
+            &host_path,
+            WorkspaceSection::Settings,
+            "Settings",
+            extras.section,
+        ),
+    ]
+    .concat();
+    let fleet_home = crate::app_href(base, "/");
+    let open = format!(
+        r#"<div class="host-workspace" data-host-workspace data-host="{host_name}" data-can-manage-fleet="{can_manage}">"#,
+        host_name = html_escape(&host.name),
         can_manage = can_manage_fleet,
-        task_kind = task_kind,
-        lifecycle_label = html_escape(&lifecycle.label),
-        lifecycle_detail = html_escape(&lifecycle.detail),
+    );
+    format!(
+        r#"{open}<nav class="host-breadcrumb" aria-label="Breadcrumb"><a data-fleet-return href="{fleet_home}">Fleet</a><span aria-hidden="true">/</span><span>{crumb_host}</span></nav><header class="host-profile">{badge}<div class="host-profile-copy"><strong>{profile_host}</strong><p>{role}</p></div><span class="host-accent-identity"><span class="host-accent-swatch" style="--host-accent:{accent}"></span>Host color</span></header><nav class="host-tabs" aria-label="Host workspace sections">{tabs}</nav><section class="host-section" data-host-section="overview"{overview_hidden}><div class="host-columns"><div class="host-stack"><section class="host-panel" data-host-health><h2>Health</h2>{health}</section><section class="host-panel" data-host-heartbeat data-grace="{grace_secs}" data-grace-source="{grace_source}" data-late-after="{late_after}" data-interval="{interval_secs}"><h2>Heartbeat</h2><p data-heartbeat-reachability>Reachability is {reachability}. Grace does not move stale or down.</p><p data-heartbeat-timing>{timing}</p><p data-grace-rule>{rule}</p><p>Source: {grace_source_label}.</p></section><section class="host-panel" data-host-workspace-services><h2>Services</h2>{services_body}<a class="host-workspace-link" href="{services_href}">Open services</a></section><details class="host-disclosure" data-host-workspace-technical><summary>Technical context</summary><div class="host-meta"><div><span>Configuration target</span><strong>{target}</strong></div><div><span>Target path</span><strong>{target_path}</strong></div><div><span>Source revision</span><strong>{source_revision}</strong></div><div><span>nixpkgs revision</span><strong>{nixpkgs_revision}</strong></div></div></details></div><div class="host-stack"><section class="host-next-action" data-host-next-action data-manager="{can_manage}">{next_heading}{lifecycle_copy}<a class="primary-action" data-host-workspace-primary data-workflow-handler="{workflow_handler}" href="{primary_href}">{primary_label}</a><p class="task-note">{manager_note}</p><div class="host-receipt-slot" data-host-workspace-receipts><strong>Workflow receipts</strong><span class="host-receipt-empty" data-host-receipt-empty>Loading saved receipts…</span><ol class="host-receipt-list" data-host-receipt-list></ol></div></section><section class="host-panel" data-host-workspace-protection><h2>Protection</h2>{daily_overview}{protection_overview}</section><section class="host-panel" data-host-workspace-activity><h2>Activity</h2><p data-last-report data-last-seen="{report_at_overview}">Last report: {report_overview}</p><a class="host-workspace-link" href="{activity_overview}">{activity_overview_label}</a></section></div></div></section><section class="host-section" data-host-section="backups"{backups_hidden}><section class="host-panel"><h2>Backups</h2>{daily_backups}{protection_backups}</section></section><section class="host-section" data-host-section="activity"{activity_hidden}><section class="host-panel"><h2>Activity</h2><p data-last-report data-last-seen="{report_at_activity}">Last report: {report_activity}</p>{history}<a class="host-workspace-link" href="{activity_tab_href}">Open activity</a></section></section><section class="host-section host-workspace-settings" id="host-settings-editor" data-host-section="settings" data-host-workspace-settings{settings_hidden}><p data-host-settings-state>Settings state: {settings_state}</p>{settings_editor}</section></div>"#,
+        open = open,
+        fleet_home = fleet_home,
+        crumb_host = html_escape(&host.name),
+        profile_host = html_escape(&host.name),
+        role = html_escape(&host.role),
+        badge = badge,
+        accent = html_escape(accent),
+        tabs = tabs,
+        overview_hidden = hidden_unless(extras.section, WorkspaceSection::Overview),
+        health = crate::health_markup(&health),
+        grace_secs = grace.effective_secs,
+        grace_source = grace.source.as_str(),
+        late_after = grace.late_after_secs,
+        interval_secs = grace.interval_secs,
+        reachability = reachability,
+        timing = html_escape(&timing_sentence),
+        rule = html_escape(&rule),
+        grace_source_label = html_escape(pharos_core::heartbeat_grace_source_label(grace.source)),
+        services_body = services_body,
+        services_href = crate::app_href(base, "/services"),
+        target = html_escape(&host.target_attribute),
+        target_path = html_escape(&host.target_path),
+        source_revision = revision(evidence.map(|item| item.source_revision.as_str())),
+        nixpkgs_revision = revision(evidence.map(|item| item.nixpkgs_revision.as_str())),
+        can_manage = can_manage_fleet,
+        next_heading = next_heading,
+        lifecycle_copy = lifecycle_copy,
         primary_href = html_escape(&primary_href),
-        primary_label = html_escape(primary_label),
+        primary_label = html_escape(&primary_label),
         workflow_handler = workflow_handler,
         manager_note = html_escape(manager_note),
-        settings_href = html_escape(&settings_href),
-        backups_href = crate::app_href(base, &format!("/backups?host={host_path}")),
-        services_href = crate::app_href(base, "/services"),
-        activity_href = crate::app_href(base, "/activity"),
-        blocked_by = html_escape(&blocked_by),
+        daily_overview = daily_sentence,
+        protection_overview = &protection_body,
+        report_at_overview = html_escape(&report_at),
+        report_overview = html_escape(&report),
+        activity_overview = crate::app_href(base, &format!("/activity?host={host_path}")),
+        activity_overview_label = "Open activity",
+        backups_hidden = hidden_unless(extras.section, WorkspaceSection::Backups),
+        daily_backups = daily_sentence,
+        protection_backups = &protection_body,
+        activity_hidden = hidden_unless(extras.section, WorkspaceSection::Activity),
+        report_at_activity = html_escape(&report_at),
+        report_activity = html_escape(&report),
+        history = history,
+        activity_tab_href = crate::app_href(base, &format!("/activity?host={host_path}")),
+        settings_hidden = hidden_unless(extras.section, WorkspaceSection::Settings),
         settings_state = settings_state.key(),
-        target = html_escape(&host.target_attribute),
-        protection = html_escape(&protection),
-        services = html_escape(&services),
-        report = html_escape(&report),
         settings_editor = settings_editor,
     )
 }
@@ -919,6 +1235,7 @@ fn render_page(
             logout_enabled,
             public_base_path: &pharos_core::PublicBasePath::ROOT,
             can_manage_fleet: true,
+            fleet_heartbeat_grace_secs: pharos_core::DEFAULT_HEARTBEAT_GRACE_SECS,
             workspace: None,
         },
     )
@@ -936,6 +1253,7 @@ fn render_page_with_access(
         logout_enabled,
         public_base_path,
         can_manage_fleet,
+        fleet_heartbeat_grace_secs,
         workspace,
     } = page;
     let mut hosts = host_views(manifests, declared_preferences, runtime_hosts);
@@ -995,17 +1313,31 @@ fn render_page_with_access(
     }
 
     let selected = &hosts[selected_index];
+    let interval_secs = runtime_hosts
+        .iter()
+        .find(|host| host.name == selected.name)
+        .and_then(|host| host.heartbeat_interval_secs);
     let editor = if selected.settings_ready {
-        render_ready_content(selected, can_manage_fleet)
+        render_ready_content(
+            selected,
+            can_manage_fleet,
+            fleet_heartbeat_grace_secs,
+            interval_secs,
+        )
     } else {
-        render_setup_content(selected, can_manage_fleet)
+        render_setup_content(
+            selected,
+            can_manage_fleet,
+            fleet_heartbeat_grace_secs,
+            interval_secs,
+        )
     };
     let (header, host_table, content) = if let Some(workspace) = workspace {
         (
             crate::page_header(
-                "Host workspace",
-                "One host, its next action, settings, and evidence",
-                crate::now_unix(),
+                &selected.name,
+                &format!("{} · Host workspace", selected.role),
+                workspace.now,
             ),
             String::new(),
             render_host_workspace(
@@ -1014,8 +1346,14 @@ fn render_page_with_access(
                 workspace.runtime,
                 workspace.lifecycle,
                 workspace.settings_state,
-                can_manage_fleet,
                 &editor,
+                WorkspaceExtras {
+                    now: workspace.now,
+                    fleet_nixpkgs_warn_days: workspace.fleet_nixpkgs_warn_days,
+                    fleet_grace_seconds: workspace.fleet_grace_seconds,
+                    section: workspace.section,
+                    can_manage_fleet,
+                },
             ),
         )
     } else {
@@ -1033,6 +1371,85 @@ fn render_page_with_access(
     format!(
         r##"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}{access_path}{host_table}{content}</main>{action_dialog}<script>
 function appUrl(path){{return (typeof window.pharosPublicPath==='function')?window.pharosPublicPath(path):path}}
+function fleetPathname(value){{
+  if(typeof value!=='string'||!value.startsWith('/'))return '';
+  try{{
+    const url=new URL(value,location.origin);
+    if(url.origin!==location.origin)return '';
+    return url.pathname.replace(/\/+$/,'')||'/';
+  }}catch(_error){{return ''}}
+}}
+function fleetMarkerPath(entry){{
+  if(!entry||typeof entry.getState!=='function')return '';
+  let state=null;
+  try{{state=entry.getState()}}catch(_error){{return ''}}
+  const path=state&&state.pharosFleet&&state.pharosFleet.path;
+  return fleetPathname(path);
+}}
+function fleetEntryMatches(entry,fleetHref){{
+  if(!entry||!entry.key)return false;
+  const expected=fleetPathname(fleetHref);
+  if(!expected||fleetMarkerPath(entry)!==expected)return false;
+  if(typeof entry.url!=='string'||!entry.url)return true;
+  try{{
+    const url=new URL(entry.url,location.origin);
+    return url.origin===location.origin&&fleetPathname(url.pathname)===expected;
+  }}catch(_error){{return false}}
+}}
+function followFleetTraversal(result,fallback){{
+  const fail=()=>{{location.assign(fallback)}};
+  const committed=result&&result.committed;
+  const finished=result&&result.finished;
+  const watchFinished=()=>{{
+    if(finished&&typeof finished.then==='function')finished.catch(fail);
+    else if(!(committed&&typeof committed.then==='function'))fail();
+  }};
+  if(committed&&typeof committed.then==='function')committed.then(watchFinished,fail);
+  else watchFinished();
+}}
+document.querySelector('[data-fleet-return]')?.addEventListener('click',event=>{{
+  if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;
+  const link=event.currentTarget;
+  const fleetHref=link.getAttribute('href')||'/';
+  const nav=window.navigation;
+  if(!nav||typeof nav.entries!=='function'||typeof nav.traverseTo!=='function')return;
+  let entries=[];
+  try{{entries=nav.entries()||[]}}catch(_error){{return}}
+  if(!Array.isArray(entries)||!entries.length)return;
+  const current=nav.currentEntry;
+  let currentIndex=entries.length-1;
+  if(current&&Number.isInteger(current.index)&&current.index>=0&&current.index<entries.length)currentIndex=current.index;
+  else if(current&&current.key){{
+    const found=entries.findIndex(entry=>entry&&entry.key===current.key);
+    if(found>=0)currentIndex=found;
+  }}
+  for(let index=currentIndex-1;index>=0;index-=1){{
+    const entry=entries[index];
+    if(!fleetEntryMatches(entry,fleetHref))continue;
+    event.preventDefault();
+    let result=null;
+    try{{result=nav.traverseTo(entry.key)}}catch(_error){{location.assign(fleetHref);return}}
+    followFleetTraversal(result,fleetHref);
+    return;
+  }}
+}});
+document.querySelector('[data-host-workspace-primary]')?.addEventListener('click',event=>{{
+  const href=event.currentTarget.getAttribute('href')||'';
+  if(!href.startsWith('#')||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;
+  const panel=document.getElementById(href.slice(1));
+  if(!panel||panel.dataset.hostSection!=='settings')return;
+  event.preventDefault();
+  document.querySelectorAll('[data-host-section]').forEach(section=>{{section.hidden=section!==panel;}});
+  document.querySelectorAll('[data-host-tab]').forEach(tab=>{{
+    if(tab.dataset.section===panel.dataset.hostSection)tab.setAttribute('aria-current','page');
+    else tab.removeAttribute('aria-current');
+  }});
+  const url=new URL(location.href);
+  url.searchParams.delete('section');
+  url.searchParams.set('section','settings');
+  url.hash=href.slice(1);
+  history.replaceState(history.state,'',url);
+}});
 document.querySelector('[data-host-picker]')?.addEventListener('change',event=>{{
   window.location.assign(appUrl('/hosts/'+encodeURIComponent(event.target.value)));
 }});
@@ -1318,13 +1735,80 @@ if(root){{
     const enabled=[down,backup,nix].filter(input=>input?.checked).length;
     if(alertSummary)alertSummary.textContent=enabled+' on';
   }}
+  function settingsControlsEnabled(){{return settingsCanManageFleet()&&root.dataset.hostReported==='true'}}
+  function graceForm(){{return root.querySelector('[data-heartbeat-grace]')}}
+  function graceControlsEnabled(){{return settingsControlsEnabled()}}
+  function enforceSettingsControlAccess(){{
+    if(settingsControlsEnabled())return;
+    if(color)color.disabled=true;
+    root.querySelectorAll('[data-preset]').forEach(button=>{{button.disabled=true}});
+    if(kind)kind.disabled=true;
+    if(down)down.disabled=true;
+    if(backup)backup.disabled=true;
+    if(nix)nix.disabled=true;
+    if(nixAge)nixAge.disabled=true;
+    const grace=graceForm();
+    if(grace){{
+      const source=grace.querySelector('[data-grace-source]');
+      const seconds=grace.querySelector('[data-grace-seconds]');
+      const reset=grace.querySelector('[data-grace-reset]');
+      if(source)source.disabled=true;
+      if(seconds)seconds.disabled=true;
+      if(reset)reset.disabled=true;
+    }}
+    const review=root.querySelector('[data-review-settings]');
+    const discard=root.querySelector('[data-discard-settings]');
+    if(review)review.disabled=true;
+    if(discard)discard.disabled=true;
+  }}
   function syncDownAlertPolicy(){{
-    if(!down)return;
-    const workstation=(kind?.value||root.dataset.kind)==='workstation';
-    down.disabled=root.dataset.hostReported!=='true'||workstation;
-    down.checked=workstation?false:!manualDownSuppressed;
-    if(downCopy)downCopy.textContent=workstation?'Off automatically for workstations.':'Warn when this host stops reporting.';
-    updateAlertSummary();
+    if(down){{
+      const workstation=(kind?.value||root.dataset.kind)==='workstation';
+      down.disabled=!settingsControlsEnabled()||workstation;
+      down.checked=workstation?false:!manualDownSuppressed;
+      if(downCopy)downCopy.textContent=workstation?'Off automatically for workstations.':'Warn when this host stops reporting.';
+      updateAlertSummary();
+    }}
+    enforceSettingsControlAccess();
+  }}
+  function refreshGraceRule(){{
+    const form=graceForm();
+    if(!form)return;
+    const source=form.querySelector('[data-grace-source]');
+    const seconds=form.querySelector('[data-grace-seconds]');
+    const rule=form.querySelector('[data-grace-rule]');
+    const interval=Math.max(1,Number(form.dataset.intervalSeconds||60));
+    const fleet=Number(form.dataset.fleetGraceSeconds||0);
+    const grace=source?.value==='host'?Number(seconds?.value):fleet;
+    if(!rule||!Number.isFinite(grace))return;
+    const late=interval+grace;
+    const stale=interval*2;
+    const through=Math.min(late,stale);
+    let text=interval+'s + '+grace+'s grace → late after '+late+'s';
+    if(through<late)text+='. Stale still begins after '+stale+'s; grace does not extend stale or down.';
+    rule.textContent=text;
+  }}
+  function graceDraftValid(){{
+    const form=graceForm();
+    if(!form)return true;
+    const source=form.querySelector('[data-grace-source]');
+    const seconds=form.querySelector('[data-grace-seconds]');
+    if(!seconds||source?.value!=='host'){{seconds?.setCustomValidity('');return true}}
+    const value=Number(seconds.value);
+    const min=Number(seconds.min||0);
+    const max=Number(seconds.max||3600);
+    const ok=seconds.value!==''&&Number.isInteger(value)&&value>=min&&value<=max;
+    const error=form.querySelector('[data-grace-error]')?.textContent||'heartbeat grace must be a whole number of seconds from 0 through 3600';
+    seconds.setCustomValidity(ok?'':error);
+    return ok;
+  }}
+  function graceDraftValue(){{
+    const form=graceForm();
+    if(!form)return null;
+    const source=form.querySelector('[data-grace-source]');
+    const seconds=form.querySelector('[data-grace-seconds]');
+    if(source?.value!=='host')return null;
+    return Number(seconds?.value);
   }}
   function draftPreferences(){{
     return {{
@@ -1335,6 +1819,7 @@ if(root){{
         suppress_backup:!backup?.checked,
         suppress_nix_freshness:!nix?.checked,
         ...(nixAge?.value!==''?{{nixpkgs_warn_after_days:Number(nixAge.value)}}:{{}}),
+        heartbeat_grace_secs:graceDraftValue(),
       }},
     }};
   }}
@@ -1347,20 +1832,28 @@ if(root){{
       if(before.alerts[key]!==after.alerts[key])changes.push(label+': '+(after.alerts[key]?'off':'on'));
     }});
     if((before.alerts.nixpkgs_warn_after_days??null)!==(after.alerts.nixpkgs_warn_after_days??null))changes.push('nixpkgs warning threshold: '+(before.alerts.nixpkgs_warn_after_days??'fleet default')+' → '+(after.alerts.nixpkgs_warn_after_days??'fleet default'));
+    const beforeGrace=before.alerts.heartbeat_grace_secs??null;
+    const afterGrace=after.alerts.heartbeat_grace_secs??null;
+    if(beforeGrace!==afterGrace){{
+      const text=value=>value===null?'fleet default':value+' seconds';
+      changes.push('Heartbeat grace: '+text(beforeGrace)+' → '+text(afterGrace));
+    }}
     return changes;
   }}
   function updateDraftState(){{
-    if(!savedPreferences)return;
+    if(!savedPreferences){{enforceSettingsControlAccess();return}}
     const changes=preferenceChanges(savedPreferences,draftPreferences());
     const dirty=changes.length>0;
     const summary=root.querySelector('[data-draft-summary]');
     const review=root.querySelector('[data-review-settings]');
     const discard=root.querySelector('[data-discard-settings]');
-    if(summary)summary.textContent=dirty?(changes.length+' unsent '+(changes.length===1?'change':'changes')):'Change a setting to prepare a review.';
-    if(review)review.disabled=!dirty||settingsWorkflow.confirming||!nixAge?.checkValidity();
-    if(discard)discard.disabled=!dirty||settingsWorkflow.confirming;
-    if(dirty)setStatus('draft','Draft only — no request sent.');
+    const editable=settingsControlsEnabled();
+    if(summary)summary.textContent=dirty&&editable?(changes.length+' unsent '+(changes.length===1?'change':'changes')):'Change a setting to prepare a review.';
+    if(review)review.disabled=!editable||!dirty||settingsWorkflow.confirming||!nixAge?.checkValidity()||!graceDraftValid();
+    if(discard)discard.disabled=!editable||!dirty||settingsWorkflow.confirming;
+    if(dirty&&editable)setStatus('draft','Draft only — no request sent.');
     else setStatus(persistedStatusState,persistedStatusText);
+    enforceSettingsControlAccess();
   }}
   function applyPreferences(preferences){{
     setPicked(preferences.accent||'{accent}');
@@ -1369,6 +1862,19 @@ if(root){{
     if(backup)backup.checked=preferences.alerts?.suppress_backup!==true;
     if(nix)nix.checked=preferences.alerts?.suppress_nix_freshness!==true;
     if(nixAge)nixAge.value=preferences.alerts?.nixpkgs_warn_after_days??'';
+    const grace=graceForm();
+    if(grace){{
+      const source=grace.querySelector('[data-grace-source]');
+      const seconds=grace.querySelector('[data-grace-seconds]');
+      const override=preferences.alerts?.heartbeat_grace_secs;
+      const inherited=override===undefined||override===null;
+      if(source)source.value=inherited?'fleet':'host';
+      if(seconds){{
+        seconds.disabled=inherited||!graceControlsEnabled();
+        seconds.value=inherited?(grace.dataset.fleetGraceSeconds||''):String(override);
+      }}
+      refreshGraceRule();
+    }}
     syncDownAlertPolicy();
     updateAlertSummary();
   }}
@@ -1393,6 +1899,7 @@ if(root){{
     return section;
   }}
   function openDraftConfirmation(){{
+    if(!settingsControlsEnabled())return;
     if(!nixAge?.reportValidity())return;
     const changes=preferenceChanges(savedPreferences,draftPreferences());
     if(!changes.length)return;
@@ -1433,8 +1940,8 @@ if(root){{
     if(confirmationInput)confirmationInput.value='';
     if(attended)attended.hidden=true;
     if(attendedInput)attendedInput.checked=false;
-    if(primary){{primary.hidden=false;primary.disabled=false;primary.dataset.workflowAction='confirm-settings';primary.textContent='Send settings request'}}
-    if(discard){{discard.hidden=false;discard.disabled=false;discard.textContent='Discard draft'}}
+    if(primary){{primary.hidden=false;primary.disabled=!settingsControlsEnabled();primary.dataset.workflowAction='confirm-settings';primary.textContent='Send settings request'}}
+    if(discard){{discard.hidden=false;discard.disabled=!settingsControlsEnabled();discard.textContent='Discard draft'}}
     if(close)close.textContent='Keep editing';
     if(sheetStatus)sheetStatus.textContent='Send creates one saved request; applying still requires the recorded workflow and host evidence.';
     if(safe){{safe.dataset.workflowLive='false';safe.textContent='Draft only — confirmation required'}}
@@ -1458,7 +1965,7 @@ if(root){{
     }}catch(_){{output.textContent='Details unavailable'}}
   }}
   async function confirmSettingsDraft(button){{
-    if(settingsWorkflow.mode!=='confirm'||settingsWorkflow.confirming)return;
+    if(!settingsControlsEnabled()||settingsWorkflow.mode!=='confirm'||settingsWorkflow.confirming)return;
     settingsWorkflow.confirming=true;
     button.disabled=true;
     root.querySelector('[data-discard-settings]')?.setAttribute('disabled','');
@@ -1493,19 +2000,64 @@ if(root){{
       settingsWorkflow.confirming=false;
       setStatus('error',error.message||'Request failed');
       if(sheetStatus)sheetStatus.textContent=error.message||'Request failed';
-      button.disabled=false;
-      if(discard)discard.disabled=false;
+      enforceSettingsControlAccess();
+      if(settingsControlsEnabled()){{
+        button.disabled=false;
+        if(discard)discard.disabled=false;
+      }}
       updateDraftState();
     }}
   }}
-  color?.addEventListener('input',event=>{{setPicked(event.target.value);updateDraftState()}});
-  root.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>{{setPicked(button.dataset.preset);updateDraftState()}}));
+  color?.addEventListener('input',event=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    setPicked(event.target.value);updateDraftState()
+  }});
+  root.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    setPicked(button.dataset.preset);updateDraftState()
+  }}));
   root.querySelector('[data-review-settings]')?.addEventListener('click',openDraftConfirmation);
-  root.querySelector('[data-discard-settings]')?.addEventListener('click',discardDraft);
-  down?.addEventListener('change',()=>{{manualDownSuppressed=!down.checked;updateAlertSummary();updateDraftState()}});
-  nixAge?.addEventListener('input',updateDraftState);
-  [backup,nix].forEach(input=>input?.addEventListener('change',()=>{{updateAlertSummary();updateDraftState()}}));
-  kind?.addEventListener('change',()=>{{syncDownAlertPolicy();updateDraftState()}});
+  root.querySelector('[data-discard-settings]')?.addEventListener('click',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    discardDraft()
+  }});
+  down?.addEventListener('change',()=>{{
+    if(!settingsControlsEnabled()||down.disabled){{enforceSettingsControlAccess();return}}
+    manualDownSuppressed=!down.checked;updateAlertSummary();updateDraftState()
+  }});
+  nixAge?.addEventListener('input',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    updateDraftState()
+  }});
+  const grace=graceForm();
+  const graceSource=grace?.querySelector('[data-grace-source]');
+  const graceSeconds=grace?.querySelector('[data-grace-seconds]');
+  graceSource?.addEventListener('change',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    if(!grace||!graceSeconds)return;
+    const hostOverride=graceSource.value==='host';
+    graceSeconds.disabled=!hostOverride||!graceControlsEnabled();
+    if(!hostOverride)graceSeconds.value=grace.dataset.fleetGraceSeconds||'';
+    refreshGraceRule();
+    updateDraftState();
+  }});
+  graceSeconds?.addEventListener('input',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    refreshGraceRule();updateDraftState()
+  }});
+  grace?.querySelector('[data-grace-reset]')?.addEventListener('click',()=>{{
+    if(!graceControlsEnabled()){{enforceSettingsControlAccess();return}}
+    if(graceSource)graceSource.value='fleet';
+    if(graceSeconds){{graceSeconds.value=grace.dataset.fleetGraceSeconds||'';graceSeconds.disabled=true}}
+    refreshGraceRule();
+    updateDraftState();
+  }});
+  refreshGraceRule();
+  [backup,nix].forEach(input=>input?.addEventListener('change',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    updateAlertSummary();updateDraftState()
+  }}));
+  kind?.addEventListener('change',()=>{{syncDownAlertPolicy();if(settingsControlsEnabled())updateDraftState()}});
   document.querySelector('[data-host-action-overlay]')?.addEventListener('click',event=>{{
     const primary=event.target.closest('[data-host-action-primary]');
     if(primary&&settingsWorkflow.mode==='confirm'){{event.preventDefault();confirmSettingsDraft(primary);return}}
@@ -1516,25 +2068,32 @@ if(root){{
   syncDownAlertPolicy();
   savedPreferences=draftPreferences();
   const incomingDraft=new URLSearchParams(window.location.search);
-  if(settingsCanManageFleet()&&incomingDraft.get('draft')==='fleet-drawer'){{
-    const incomingAccent=incomingDraft.get('draft_accent')||'';
-    const incomingKind=incomingDraft.get('draft_kind')||'';
-    const boolValue=name=>incomingDraft.get(name)==='true';
-    if(/^#[0-9a-fA-F]{{6}}$/.test(incomingAccent)&&['server','workstation'].includes(incomingKind)){{
-      applyPreferences({{
-        accent:incomingAccent,
-        kind:incomingKind,
-        alerts:{{
-          ...savedPreferences.alerts,
-          suppress_down:boolValue('draft_suppress_down'),
-          suppress_backup:boolValue('draft_suppress_backup'),
-          suppress_nix_freshness:boolValue('draft_suppress_nix'),
-        }},
-      }});
-      const cleanUrl=new URL(window.location.href);
-      ['draft','draft_accent','draft_kind','draft_suppress_down','draft_suppress_backup','draft_suppress_nix'].forEach(key=>cleanUrl.searchParams.delete(key));
-      window.history.replaceState(null,'',cleanUrl.pathname+(cleanUrl.searchParams.size?'?'+cleanUrl.searchParams.toString():''));
+  if(incomingDraft.get('draft')==='fleet-drawer'){{
+    document.querySelectorAll('[data-host-section]').forEach(section=>{{section.hidden=section.dataset.hostSection!=='settings';}});
+    document.querySelectorAll('[data-host-tab]').forEach(tab=>{{
+      if(tab.dataset.section==='settings')tab.setAttribute('aria-current','page');
+      else tab.removeAttribute('aria-current');
+    }});
+    if(settingsCanManageFleet()){{
+      const incomingAccent=incomingDraft.get('draft_accent')||'';
+      const incomingKind=incomingDraft.get('draft_kind')||'';
+      const boolValue=name=>incomingDraft.get(name)==='true';
+      if(/^#[0-9a-fA-F]{{6}}$/.test(incomingAccent)&&['server','workstation'].includes(incomingKind)){{
+        applyPreferences({{
+          accent:incomingAccent,
+          kind:incomingKind,
+          alerts:{{
+            ...savedPreferences.alerts,
+            suppress_down:boolValue('draft_suppress_down'),
+            suppress_backup:boolValue('draft_suppress_backup'),
+            suppress_nix_freshness:boolValue('draft_suppress_nix'),
+          }},
+        }});
+      }}
     }}
+    const cleanUrl=new URL(window.location.href);
+    ['draft','draft_accent','draft_kind','draft_suppress_down','draft_suppress_backup','draft_suppress_nix'].forEach(key=>cleanUrl.searchParams.delete(key));
+    window.history.replaceState(null,'',cleanUrl.pathname+(cleanUrl.searchParams.size?'?'+cleanUrl.searchParams.toString():''));
   }}
   updateDraftState();
   const initialWorkflowId=incomingDraft.get('workflow')||'';
@@ -1619,12 +2178,34 @@ if(receiptSlot&&root){{
     )
 }
 
-fn render_ready_content(host: &AgoraHostView, can_manage_fleet: bool) -> String {
-    render_color_panel(host, true, can_manage_fleet)
+fn render_ready_content(
+    host: &AgoraHostView,
+    can_manage_fleet: bool,
+    fleet_grace_secs: u64,
+    interval_secs: Option<u64>,
+) -> String {
+    render_color_panel(
+        host,
+        true,
+        can_manage_fleet,
+        fleet_grace_secs,
+        interval_secs,
+    )
 }
 
-fn render_setup_content(host: &AgoraHostView, can_manage_fleet: bool) -> String {
-    render_color_panel(host, false, can_manage_fleet)
+fn render_setup_content(
+    host: &AgoraHostView,
+    can_manage_fleet: bool,
+    fleet_grace_secs: u64,
+    interval_secs: Option<u64>,
+) -> String {
+    render_color_panel(
+        host,
+        false,
+        can_manage_fleet,
+        fleet_grace_secs,
+        interval_secs,
+    )
 }
 
 fn render_host_table(hosts: &[AgoraHostView], selected_index: usize) -> String {
@@ -1670,7 +2251,92 @@ fn displayed_preferences(host: &AgoraHostView) -> Option<&HostPreferences> {
         .or(Some(&host.preferences))
 }
 
-fn render_color_panel(host: &AgoraHostView, ready: bool, can_manage_fleet: bool) -> String {
+fn render_grace_controls(
+    host: &AgoraHostView,
+    shown: &HostPreferences,
+    can_manage_fleet: bool,
+    fleet_grace_secs: u64,
+    interval_secs: Option<u64>,
+) -> String {
+    let enabled = host.has_reported && can_manage_fleet;
+    let disabled = if enabled { "" } else { " disabled" };
+    let applied = host
+        .preferences
+        .heartbeat_grace_policy(Some(fleet_grace_secs), interval_secs);
+    let shown_policy = shown.heartbeat_grace_policy(Some(fleet_grace_secs), interval_secs);
+    let host_override = matches!(shown_policy.source, pharos_core::HeartbeatGraceSource::Host);
+    let input_value = if host_override {
+        shown_policy.effective_secs
+    } else {
+        fleet_grace_secs
+    };
+    let seconds_disabled = if enabled && host_override {
+        ""
+    } else {
+        " disabled"
+    };
+    let fleet_selected = if host_override { "" } else { " selected" };
+    let host_selected = if host_override { " selected" } else { "" };
+    let source = if host_override { "host" } else { "fleet" };
+    let rule = pharos_core::heartbeat_late_rule_copy(
+        shown_policy.interval_secs,
+        shown_policy.effective_secs,
+    );
+    let applied_copy = format!(
+        "Live threshold uses the applied host report: {} · {}.",
+        pharos_core::heartbeat_grace_source_label(applied.source),
+        pharos_core::heartbeat_late_rule_copy(applied.interval_secs, applied.effective_secs)
+    );
+    let pending = host.requested_preferences.as_ref().and_then(|requested| {
+        let requested_grace = requested.alerts.heartbeat_grace_secs;
+        let applied_grace = host.preferences.alerts.heartbeat_grace_secs;
+        if requested_grace == applied_grace {
+            return None;
+        }
+        let text = match requested_grace {
+            Some(secs) => format!(
+                "Requested override: {secs} seconds. The live threshold stays on the applied report until the host applies it."
+            ),
+            None => "Requested: use fleet default. The live threshold stays on the applied report until the host applies it.".to_string(),
+        };
+        Some(format!(
+            r#"<p class="grace-note" data-grace-pending>{}</p>"#,
+            html_escape(&text)
+        ))
+    });
+    format!(
+        r#"<section class="grace-form" data-heartbeat-grace data-grace-binding="alerts.heartbeat_grace_secs" data-fleet-grace-seconds="{fleet_grace}" data-interval-seconds="{interval}" data-applied-source="{applied_source}" data-applied-secs="{applied_secs}" data-grace-source="{source}"><div class="grace-row"><div><strong>Extra grace after expected heartbeat</strong><p>{source_line}</p></div><label><span class="grace-note">Source</span><select class="grace-select" data-grace-source aria-label="Heartbeat grace source"{disabled_select}><option value="fleet"{fleet_selected}>Fleet default</option><option value="host"{host_selected}>Override for this host</option></select></label></div><div class="grace-row"><div><p class="grace-rule" data-grace-rule>{rule}</p><p class="grace-note" data-grace-applied>{applied_copy}</p>{pending}<p class="grace-note" data-grace-error hidden>{range_error}</p></div><div class="grace-seconds"><input class="grace-input" data-grace-seconds type="number" min="0" max="{max_grace}" step="1" inputmode="numeric" value="{input_value}" aria-label="Heartbeat grace seconds"{seconds_disabled}><span>seconds</span></div></div><div class="grace-actions"><button type="button" class="grace-reset" data-grace-reset{disabled_reset}>Use fleet default</button><span class="grace-note">Review still sends this with the other host settings. Nothing is saved until you confirm.</span></div></section>"#,
+        fleet_grace = fleet_grace_secs,
+        interval = shown_policy.interval_secs,
+        applied_source = applied.source.as_str(),
+        applied_secs = applied.effective_secs,
+        source = source,
+        disabled_select = disabled,
+        disabled_reset = disabled,
+        source_line = if host_override {
+            "Override for this host".to_string()
+        } else {
+            format!("Fleet default · {fleet_grace_secs} seconds")
+        },
+        fleet_selected = fleet_selected,
+        host_selected = host_selected,
+        rule = html_escape(&rule),
+        applied_copy = html_escape(&applied_copy),
+        pending = pending.unwrap_or_default(),
+        range_error = html_escape(pharos_core::HEARTBEAT_GRACE_RANGE_ERROR),
+        max_grace = pharos_core::MAX_HEARTBEAT_GRACE_SECS,
+        input_value = input_value,
+        seconds_disabled = seconds_disabled,
+    )
+}
+
+fn render_color_panel(
+    host: &AgoraHostView,
+    ready: bool,
+    can_manage_fleet: bool,
+    fleet_grace_secs: u64,
+    interval_secs: Option<u64>,
+) -> String {
     let shown_preferences = displayed_preferences(host).unwrap_or(&host.preferences);
     let accent = shown_preferences
         .accent
@@ -1753,8 +2419,15 @@ fn render_color_panel(host: &AgoraHostView, ready: bool, can_manage_fleet: bool)
     } else {
         ""
     };
+    let grace_markup = render_grace_controls(
+        host,
+        shown_preferences,
+        can_manage_fleet,
+        fleet_grace_secs,
+        interval_secs,
+    );
     format!(
-        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-is-nix="{is_nix}" data-kind="{kind}" data-manual-down-suppressed="{manual_down_suppressed}" data-target-path="{target_path}" data-target-attribute="{target_attribute}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section><section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span data-alert-down-copy>{down_copy}</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{down_disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>nixpkgs warning threshold (days)</strong><span>Leave empty to use the fleet default.</span></span><input data-nixpkgs-warn-after-days aria-label="Host nixpkgs warning threshold (days)" type="number" min="1" max="3650" step="1" value="{nix_age}" placeholder="Fleet default"{disabled}></label></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-kind-row"><span class="host-kind-copy"><strong>Host type</strong><span>Controls whether continuous availability is expected.</span></span><select data-host-kind aria-label="Host type"{disabled}><option value="server"{server_selected}>Server</option><option value="workstation"{workstation_selected}>Workstation</option></select></div><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section><footer class="settings-draft-actions"><span class="settings-draft-copy"><strong>Draft changes</strong><span data-draft-summary>Change a setting to prepare a review.</span></span><span class="settings-draft-buttons"><button class="secondary-action" type="button" data-discard-settings disabled>Discard draft</button><button class="primary-action" type="button" data-review-settings disabled{disabled}>Review changes</button></span></footer></section>"##,
+        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-is-nix="{is_nix}" data-kind="{kind}" data-manual-down-suppressed="{manual_down_suppressed}" data-target-path="{target_path}" data-target-attribute="{target_attribute}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos. It does not describe health.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section>{grace_markup}<section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span data-alert-down-copy>{down_copy}</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{down_disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>nixpkgs warning threshold (days)</strong><span>Leave empty to use the fleet default.</span></span><input data-nixpkgs-warn-after-days aria-label="Host nixpkgs warning threshold (days)" type="number" min="1" max="3650" step="1" value="{nix_age}" placeholder="Fleet default"{disabled}></label></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-kind-row"><span class="host-kind-copy"><strong>Host type</strong><span>Controls whether continuous availability is expected.</span></span><select data-host-kind aria-label="Host type"{disabled}><option value="server"{server_selected}>Server</option><option value="workstation"{workstation_selected}>Workstation</option></select></div><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section><footer class="settings-draft-actions"><span class="settings-draft-copy"><strong>Draft changes</strong><span data-draft-summary>Change a setting to prepare a review.</span></span><span class="settings-draft-buttons"><button class="secondary-action" type="button" data-discard-settings disabled>Discard draft</button><button class="primary-action" type="button" data-review-settings disabled{disabled}>Review changes</button></span></footer></section>"##,
         host_name = html_escape(&host.name),
         ready = if ready { "true" } else { "false" },
         has_reported = if host.has_reported { "true" } else { "false" },
@@ -1808,6 +2481,7 @@ fn render_color_panel(host: &AgoraHostView, ready: bool, can_manage_fleet: bool)
         } else {
             "Host preparation has not been delivered yet."
         },
+        grace_markup = grace_markup,
     )
 }
 
@@ -2301,9 +2975,11 @@ mod tests {
     use super::*;
     use crate::host_actions::{HostLifecycleInvoke, HostWorkflowAction, HostWorkflowActionKind};
     use pharos_core::{
-        Host, HostAlertPreferences, HostKind, ManifestHost, ManifestLocationMode, ManifestPalette,
-        ManifestPolicy, NixFreshness, PrivilegedActionMode, PrivilegedActions, PublicBasePath,
-        RuntimeStateOwner, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+        GitRevisionRelation, Host, HostAlertPreferences, HostKind, ManifestHost,
+        ManifestLocationMode, ManifestPalette, ManifestPolicy, NixDeploymentEvidence, NixFreshness,
+        NixcfgGitComparison, NixpkgsGitComparison, NixpkgsRevisionRelation, PrivilegedActionMode,
+        PrivilegedActions, PublicBasePath, RuntimeStateOwner, HOST_MANIFEST_SCHEMA,
+        HOST_MANIFEST_VERSION, NIX_DEPLOYMENT_EVIDENCE_SCHEMA, NIX_DEPLOYMENT_EVIDENCE_VERSION,
     };
 
     fn manifest() -> HostManifest {
@@ -2353,6 +3029,16 @@ mod tests {
         }
     }
 
+    fn shown_workspace_extras() -> WorkspaceExtras {
+        WorkspaceExtras {
+            now: crate::now_unix(),
+            fleet_nixpkgs_warn_days: 14,
+            fleet_grace_seconds: 45,
+            section: WorkspaceSection::Overview,
+            can_manage_fleet: true,
+        }
+    }
+
     fn runtime_host(name: &str) -> Host {
         Host {
             name: name.to_string(),
@@ -2383,6 +3069,152 @@ mod tests {
             requested_preferences: None,
             deployed_artifact: None,
         }
+    }
+
+    fn differing_nixpkgs(now: i64) -> NixFreshness {
+        let source = "1".repeat(40);
+        let deployed = "2".repeat(40);
+        let upstream = "4".repeat(40);
+        NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(10),
+            nixpkgs_channel: Some("nixos-unstable".to_string()),
+            secondary_nixpkgs: None,
+            deployment_evidence: Some(NixDeploymentEvidence {
+                schema: NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+                version: NIX_DEPLOYMENT_EVIDENCE_VERSION,
+                source_revision: source.clone(),
+                flake_lock_sha256: "3".repeat(64),
+                nixpkgs_revision: deployed,
+                nixpkgs_last_modified: now - 10 * 86_400,
+                nixpkgs_channel: "nixos-unstable".to_string(),
+            }),
+            nixcfg_comparison: Some(NixcfgGitComparison {
+                upstream_revision: source,
+                relation: GitRevisionRelation::Current,
+                commits_behind: Some(0),
+            }),
+            nixpkgs_comparison: Some(NixpkgsGitComparison {
+                upstream_revision: upstream,
+                relation: NixpkgsRevisionRelation::Different,
+            }),
+        }
+    }
+
+    fn workspace_with_freshness(runtime: &Host, now: i64, fleet_days: u32) -> String {
+        let manifests = [manifest()];
+        let runtime_hosts = [runtime.clone()];
+        let views = host_views(&manifests, &BTreeMap::new(), &runtime_hosts);
+        let host = views
+            .iter()
+            .find(|view| view.name == runtime.name)
+            .expect("host view");
+        let settings_state = crate::HostPreferencesState::Applied;
+        let lifecycle = host_lifecycle(&[], &host.name, settings_state, false);
+        let editor = render_ready_content(host, true, 45, Some(60));
+        render_host_workspace(
+            PublicBasePath::ROOT_REF,
+            host,
+            Some(runtime),
+            &lifecycle,
+            settings_state,
+            &editor,
+            WorkspaceExtras {
+                now,
+                fleet_nixpkgs_warn_days: fleet_days,
+                fleet_grace_seconds: 45,
+                section: WorkspaceSection::Overview,
+                can_manage_fleet: true,
+            },
+        )
+    }
+
+    fn fleet_warns_for_applied_threshold(runtime: &Host, now: i64, fleet_days: u32) -> bool {
+        let protection = crate::fleet_protection_view(&runtime.backup_observations, now);
+        let health = crate::host_health_view(crate::HostHealthQuery {
+            live: pharos_core::liveness(runtime.last_seen, runtime.heartbeat_interval_secs, now),
+            preferences: &runtime.preferences,
+            freshness: &runtime.freshness,
+            kernel: runtime.kernel.as_ref(),
+            services: &runtime.service_observations,
+            protection: &protection,
+            now,
+            nixpkgs_threshold: runtime
+                .preferences
+                .nixpkgs_warn_after_days(Some(fleet_days)),
+        });
+        health
+            .reasons
+            .iter()
+            .any(|reason| reason.label == "nixpkgs differs from nixos-unstable")
+    }
+
+    #[test]
+    fn workspace_health_follows_applied_nixpkgs_threshold() {
+        let now = 1_700_000_000;
+        let fleet_days = 30;
+        let warning = "nixpkgs differs from nixos-unstable";
+        let mut runtime = runtime_host("hsb8");
+        runtime.last_seen = Some(now);
+        runtime.freshness = differing_nixpkgs(now);
+
+        runtime.preferences.alerts.nixpkgs_warn_after_days = Some(7);
+        runtime.requested_preferences = None;
+        assert_eq!(
+            runtime
+                .preferences
+                .nixpkgs_warn_after_days(Some(fleet_days)),
+            7
+        );
+        let override_html = workspace_with_freshness(&runtime, now, fleet_days);
+        assert!(fleet_warns_for_applied_threshold(&runtime, now, fleet_days));
+        assert!(override_html.contains(warning), "{override_html}");
+        assert!(override_html.contains(r#"data-health-tone="amber""#));
+
+        runtime.preferences.alerts.nixpkgs_warn_after_days = None;
+        assert_eq!(
+            runtime
+                .preferences
+                .nixpkgs_warn_after_days(Some(fleet_days)),
+            fleet_days
+        );
+        let inherited_html = workspace_with_freshness(&runtime, now, fleet_days);
+        assert!(!fleet_warns_for_applied_threshold(
+            &runtime, now, fleet_days
+        ));
+        assert!(!inherited_html.contains(warning), "{inherited_html}");
+        assert!(!inherited_html.contains(r#"data-health-tone="amber""#));
+        assert!(inherited_html.contains(r#"data-health-tone="neutral""#));
+
+        runtime.requested_preferences = Some(HostPreferences {
+            alerts: HostAlertPreferences {
+                nixpkgs_warn_after_days: Some(7),
+                ..HostAlertPreferences::default()
+            },
+            ..HostPreferences::default()
+        });
+        let draft_html = workspace_with_freshness(&runtime, now, fleet_days);
+        assert!(!draft_html.contains(warning), "{draft_html}");
+        assert!(draft_html.contains(
+            r#"data-nixpkgs-warn-after-days aria-label="Host nixpkgs warning threshold (days)" type="number" min="1" max="3650" step="1" value="7""#
+        ));
+
+        runtime.preferences.alerts.nixpkgs_warn_after_days = Some(7);
+        runtime.requested_preferences = Some(HostPreferences {
+            alerts: HostAlertPreferences {
+                nixpkgs_warn_after_days: None,
+                ..HostAlertPreferences::default()
+            },
+            ..HostPreferences::default()
+        });
+        let applied_html = workspace_with_freshness(&runtime, now, fleet_days);
+        assert!(fleet_warns_for_applied_threshold(&runtime, now, fleet_days));
+        assert!(applied_html.contains(warning), "{applied_html}");
+        assert!(applied_html.contains(
+            r#"data-nixpkgs-warn-after-days aria-label="Host nixpkgs warning threshold (days)" type="number" min="1" max="3650" step="1" value="" placeholder="Fleet default""#
+        ));
     }
 
     #[test]
@@ -2546,6 +3378,31 @@ mod tests {
         assert!(!html.contains("Services</button>"));
         assert!(!html.contains("Access</button>"));
         assert!(!html.contains("stored-token-hash"));
+        assert!(html.contains("[data-fleet-return]"));
+        assert!(html.contains("window.navigation"));
+        assert!(html.contains("nav.entries()"));
+        assert!(html.contains("nav.traverseTo"));
+        assert!(html.contains("pharosFleet"));
+        assert!(html.contains("result.committed"));
+        assert!(html.contains("result.finished"));
+        assert!(!html.contains("Promise.resolve(nav.traverseTo"));
+        assert!(!html.contains("history.back()"));
+        assert!(!html.contains("history.length"));
+        assert!(!html.contains("document.referrer"));
+        assert!(html.contains("section.dataset.hostSection!=='settings'"));
+        assert!(html.contains("pharos.sidebar.still.v1"));
+        assert!(html.contains(
+            "localStorage.setItem(storageKey,JSON.stringify({version:1,value:preferStill,expiresAt:Date.now()+storageTtlMs}))"
+        ));
+        assert!(!html.contains("sessionStorage"));
+        assert_eq!(html.matches(r#"data-pharos-page-style="agora""#).count(), 1);
+        let head_end = html.find("</head>").expect("document head");
+        let head = &html[..head_end];
+        assert!(head.contains(r#"data-pharos-page-style="agora""#));
+        assert!(head.contains(".host-color-well"));
+        assert!(head.contains(
+            ".protection-fact{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 8px"
+        ));
     }
 
     #[test]
@@ -2557,15 +3414,15 @@ mod tests {
         let host = &views[0];
         let settings_state = crate::HostPreferencesState::Applied;
         let lifecycle = host_lifecycle(&[], &host.name, settings_state, false);
-        let editor = render_ready_content(host, true);
+        let editor = render_ready_content(host, true, 45, Some(60));
         let html = render_host_workspace(
             PublicBasePath::ROOT_REF,
             host,
             Some(&runtime_hosts[0]),
             &lifecycle,
             settings_state,
-            true,
             &editor,
+            shown_workspace_extras(),
         );
 
         assert!(html.contains(r#"data-host-workspace data-host="hsb8""#));
@@ -2577,21 +3434,87 @@ mod tests {
         assert!(html.contains("Review changes"));
         assert!(html.contains(r#"data-host-workspace-receipts"#));
         assert!(!html.contains("/agora?host="));
+        assert!(!html.contains("host-task-rail"));
+        assert!(!html.contains("sessionStorage"));
+        assert!(!html.contains("localStorage"));
+        assert!(!html.contains("return_q"));
+        assert!(!html.contains("No pending changes"));
+        assert!(!html.contains("No pending work is waiting"));
+        assert!(html.contains(r#"data-fleet-return"#));
+        assert!(html.contains(r#"data-host-tab"#));
+        assert!(html.contains("?section=backups"));
+        assert!(html.contains(r#"data-host-workspace-primary"#));
+        assert!(html.contains("href=\"#host-settings-editor\""));
+        assert!(html.contains(r#"data-grace-binding="alerts.heartbeat_grace_secs""#));
+        assert!(html.contains(r#"data-fleet-grace-seconds="45""#));
+        assert!(html.contains("60s + 45s grace → late after 105s"));
+        assert!(html.contains(r#"data-selective-restore-overdue-after-secs="2592000""#));
+        assert!(html.contains(r#"data-restore-producer="missing""#));
+        assert!(html.contains(r#">Backup run</span> <strong"#));
+        assert!(html.contains(r#">Not observed</strong> <span"#));
+        assert!(html.contains(r#">Selective restore</span> <strong"#));
+        assert!(!html.contains(r#">Backup run</span><strong"#));
+        assert!(html.contains(r#"data-health-tone="neutral""#));
+        assert!(!html.contains("Daily OK"));
+        assert!(!html.contains("heartbeat-grace.json"));
+        assert_eq!(html.matches(r#"class="preference-switch""#).count(), 3);
 
-        let viewer_editor = render_ready_content(host, false);
+        let viewer_editor = render_ready_content(host, false, 45, Some(60));
         let viewer_html = render_host_workspace(
             PublicBasePath::ROOT_REF,
             host,
             Some(&runtime_hosts[0]),
             &lifecycle,
             settings_state,
-            false,
             &viewer_editor,
+            WorkspaceExtras {
+                can_manage_fleet: false,
+                ..shown_workspace_extras()
+            },
         );
         assert!(viewer_html.contains(r#"data-manager="false""#));
         assert!(viewer_html.contains("Viewer access: settings and receipts stay visible"));
         assert!(viewer_html.contains(r#"data-review-settings disabled"#));
         assert!(viewer_html.contains(r#"data-host-workspace-receipts"#));
+    }
+
+    #[test]
+    fn fleet_drawer_draft_opens_settings_and_native_host_stays_overview() {
+        assert_eq!(
+            workspace_section(&HostWorkspaceQuery {
+                section: None,
+                draft: None,
+            }),
+            WorkspaceSection::Overview
+        );
+        assert_eq!(
+            workspace_section(&HostWorkspaceQuery {
+                section: Some("settings".to_string()),
+                draft: None,
+            }),
+            WorkspaceSection::Settings
+        );
+        assert_eq!(
+            workspace_section(&HostWorkspaceQuery {
+                section: None,
+                draft: Some("fleet-drawer".to_string()),
+            }),
+            WorkspaceSection::Settings
+        );
+        assert_eq!(
+            workspace_section(&HostWorkspaceQuery {
+                section: Some("backups".to_string()),
+                draft: Some(" fleet-drawer ".to_string()),
+            }),
+            WorkspaceSection::Settings
+        );
+        assert_eq!(
+            workspace_section(&HostWorkspaceQuery {
+                section: Some("backups".to_string()),
+                draft: Some("other".to_string()),
+            }),
+            WorkspaceSection::Backups
+        );
     }
 
     #[test]
@@ -2601,7 +3524,7 @@ mod tests {
         let runtime_hosts = [runtime];
         let views = host_views(&manifests, &BTreeMap::new(), &runtime_hosts);
         let host = &views[0];
-        let editor = render_ready_content(host, true);
+        let editor = render_ready_content(host, true, 45, Some(60));
         let action = |kind, label: &str| HostWorkflowAction {
             kind,
             label: label.to_string(),
@@ -2633,8 +3556,8 @@ mod tests {
             Some(&runtime_hosts[0]),
             &settings,
             crate::HostPreferencesState::RequestPending,
-            true,
             &editor,
+            shown_workspace_extras(),
         );
         assert!(settings_html.contains(
             r#"data-workflow-handler="settings" href="/hosts/hsb8?workflow=action-settings-change-hsb8-1""#
@@ -2655,8 +3578,8 @@ mod tests {
             Some(&runtime_hosts[0]),
             &update,
             crate::HostPreferencesState::Applied,
-            true,
             &editor,
+            shown_workspace_extras(),
         );
         assert!(update_html.contains(
             r#"data-workflow-handler="host-actions" href="/?host=hsb8&amp;workflow=action-update-restart-hsb8-2""#
@@ -2674,8 +3597,8 @@ mod tests {
             Some(&runtime_hosts[0]),
             &removal,
             crate::HostPreferencesState::Applied,
-            true,
             &editor,
+            shown_workspace_extras(),
         );
         assert!(removal_html.contains(
             r#"data-workflow-handler="host-actions" href="/?host=hsb8&amp;workflow=action-remove-host-hsb8-3""#
@@ -2725,7 +3648,7 @@ mod tests {
         );
         assert!(html.contains("suppress_down:manualDownSuppressed"));
         assert!(html.contains(
-            "kind?.addEventListener('change',()=>{syncDownAlertPolicy();updateDraftState()})"
+            "kind?.addEventListener('change',()=>{syncDownAlertPolicy();if(settingsControlsEnabled())updateDraftState()})"
         ));
 
         let server_html = render_page(
@@ -2839,6 +3762,7 @@ mod tests {
                 logout_enabled: true,
                 public_base_path: &pharos_core::PublicBasePath::ROOT,
                 can_manage_fleet: false,
+                fleet_heartbeat_grace_secs: pharos_core::DEFAULT_HEARTBEAT_GRACE_SECS,
                 workspace: None,
             },
         );
@@ -2853,6 +3777,23 @@ mod tests {
         assert!(html.contains(
             r##"data-color type="color" value="#e09051" aria-label="Choose a custom host color" disabled"##
         ));
+        assert!(html.contains(
+            "function settingsControlsEnabled(){return settingsCanManageFleet()&&root.dataset.hostReported==='true'}"
+        ));
+        assert!(html.contains("down.disabled=!settingsControlsEnabled()||workstation"));
+        assert!(!html.contains("down.disabled=root.dataset.hostReported!=='true'||workstation"));
+        assert!(html.contains("function enforceSettingsControlAccess()"));
+        assert!(html.contains(
+            "if(review)review.disabled=!editable||!dirty||settingsWorkflow.confirming||!nixAge?.checkValidity()||!graceDraftValid()"
+        ));
+        assert!(html.contains("if(!settingsControlsEnabled())return"));
+        assert!(html.contains(
+            "if(!settingsControlsEnabled()||settingsWorkflow.mode!=='confirm'||settingsWorkflow.confirming)return"
+        ));
+        assert!(html.contains(r#"<select data-host-kind aria-label="Host type" disabled>"#));
+        assert!(html.contains(r#"data-alert-down type="checkbox" checked disabled>"#));
+        assert!(html.contains(r#"data-alert-backup type="checkbox" checked disabled>"#));
+        assert!(html.contains(r#"data-review-settings disabled"#));
         assert!(html.contains(r##"data-preset="#1f7fb5""##));
         assert!(html.contains(r##"style="--preset-color:#1f7fb5" disabled"##));
     }

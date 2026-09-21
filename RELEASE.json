@@ -2,11 +2,11 @@
   "schema": "inspr.release-coordinate.v2",
   "schema_version": 2,
   "version_scheme": "inspr-calendar-v2",
-  "version": "260921161439.0.0",
+  "version": "260921221314.0.0",
   "release_channel": "stable",
-  "release_sequence": 20,
+  "release_sequence": 21,
   "ecosystem_versions": {
-    "cargo_semver": "260921161439.0.0"
+    "cargo_semver": "260921221314.0.0"
   },
   "migration_anchor": {
     "last_legacy_version": "0.2.0",

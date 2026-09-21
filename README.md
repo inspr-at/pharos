@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-260921161439.0.0-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-260921221314.0.0-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -51,15 +51,15 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v260921161439.0.0
+## What ships in v260921221314.0.0
 
 | Area                    | Current capability                                                                                                                                                                                                       |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Fleet**               | Grid and list views, search, sorting, host liveness, heartbeat history, Nix freshness, kernel posture and service observations                                                                                           |
+| **Fleet**               | Grid and list views, search, sorting, and host liveness on the existing shell. The seven navigation entries and lighthouse artwork stay. A host name opens the workspace; Quick preview is separate. Heartbeat history is a time axis whose percentage is delivery, not uptime |
 | **Map**                 | Optional host location and reachability signals without turning location into a control channel                                                                                                                          |
-| **Backups**             | Per-host backup posture from beacon observations, including protected, stale, failed and unreported states                                                                                                               |
+| **Backups**             | Independent daily-backup and selective-restore facts. Overdue restore is strictly more than 30 days after the last successful test. Unknown evidence stays unknown. Disabled backup is not an exemption. The server uses the 36-hour daily stale default. No selective-restore producer ships here |
 | **Alerts and activity** | Actionable fleet attention, value-free workflow history and optional outbound silent-heartbeat notifications                                                                                                             |
-| **Host settings**       | Durable per-host workspace and task rail for color, server/workstation kind and alert preferences, with requested, declared and applied state shown separately                                                           |
+| **Host settings**       | Durable per-host workspace for color, server/workstation kind and alert preferences, with requested, declared and applied state shown separately. Quiet lifecycle copy is “No pending changes”. Fleet heartbeat grace defaults to 15 seconds after cadence                                |
 | **Onboarding**          | Existing-host preflight, native beacon or NixOS handoff, first-heartbeat tracking and explicit backup/location decisions                                                                                                 |
 | **Providers**           | English/German Hetzner portal guidance with Fish-safe commands and exact destination paths, read-only provider checks, exact paid-plan review, attended authorization, single-use creation and ownership-checked cleanup |
 | **Guarded actions**     | Fixed review/apply/restart, fleet-update, host-retirement and managed-service workflows with durable next-action ownership, idempotent handoffs, leases, confirmation and recovery evidence                              |
@@ -67,6 +67,45 @@ operation.
 
 The UI is server-rendered HTML with a focused vanilla-JavaScript interaction
 layer. There is no separate frontend build or client framework.
+
+The fleet shell is unchanged: seven entries (Fleet, Map, Alerts, Backups,
+Services, Activity, Settings) and the lighthouse artwork. A host name opens
+that host's workspace at `/hosts/{name}`. **Quick preview** is a separate
+control.
+
+The health badge aggregates problem reasons. Daily backup and selective
+restore stay independent, so a current daily success remains current when
+restore is overdue, and overdue restore still marks overall health. A
+successful selective restore is a test that restored at least one file. For
+the host, that success is current until it is strictly more than 30 days old. Unknown or
+missing evidence stays unknown and is not shown as healthy. A disabled backup
+is not an exemption and does not make restore unnecessary. The server's daily
+projection uses the existing 36-hour stale default: a recorded success
+strictly older than 36 hours is stale, and a success time more than two
+seconds in the future is not treated as fresh. Repository checks, snapshot
+existence, and similar observations are not a successful selective restore.
+No producer of that restore ships with Pharos; NIX-562 tracks it. A history
+that keeps the last success distinct from the latest attempt is not shipped;
+PHAROS-304 tracks it. Whether several repositories on one host each need a
+test is still open. The rule in force is the host-level restore above, not a
+per-repository requirement, and the posture is not full-system recoverability.
+
+A quiet lifecycle says **No pending changes**. That means no pending work, not
+that packages are fresh. A channel-tip difference alone is not a deployable
+update.
+
+Fleet heartbeat grace defaults to 15 seconds after the reported cadence. A
+host override is optional: omitted or null inherits the fleet value, and zero
+is a valid override. **Use fleet default** clears the override in one click
+on the draft. Declared, requested, and applied settings stay distinct; the
+live clock follows the grace the beacon has applied. Stale and down remain
+twice and five times the cadence. Publishing a populated host override is
+safe only after every reader of the shared preferences registry has been
+upgraded.
+
+Heartbeat history is a time axis over the retained window, separate from the
+current arrival indicator. The percentage is heartbeat delivery, not host or
+service uptime, and partial retention is qualified.
 
 ## Architecture
 
@@ -125,7 +164,7 @@ the HTTPS channel document and permits only its single documented redirect to
 full lowercase Git object ID. Custom Git remotes retain the exact fail-closed
 Git comparison. Age is context only: Pharos claims current only when the active
 generation, authoritative nixcfg revision, and nixpkgs channel revision all
-match exactly.
+match exactly. A channel-tip difference alone is not a deployable update.
 
 The control plane still applies the release calendar, so an end-of-life channel
 outranks revision age. Another root nixpkgs-family input may be shown separately
@@ -162,8 +201,10 @@ This is intentionally a small-fleet design:
 - the data volume still needs ordinary host-level backup.
 
 Heartbeat history is bounded to the latest 24 hours and at most 3,000 samples
-per host. Liveness is stamped by the server when a report arrives; an agent
-cannot declare itself recently seen.
+per host. Those samples are a time axis, separate from the current arrival
+indicator. The percentage measures heartbeat delivery, not host or service
+uptime, and partial retention is qualified. Liveness is stamped by the server
+when a report arrives; an agent cannot declare itself recently seen.
 
 ## Quick start
 
@@ -730,6 +771,14 @@ Pharos can coordinate changes without becoming a free-form command bus.
 
 ### Host update and restart
 
+When nothing is pending, the lifecycle chip says **No pending changes**. That
+is workflow idle copy, not a statement that Nix packages are current. A
+nixpkgs channel tip that differs from the deployed revision does not, by
+itself, make an update deployable. An update is deployable when the host is
+behind the authoritative nixcfg revision by at least one commit. Declared
+preference drift and a kernel that needs a restart stay actionable on their
+own.
+
 The current workflow persists a typed `update`, `apply_declared`, or
 `restart_only` intent. Existing records without an intent remain `update`;
 `restart_only` is reserved and is not offered in the first UI. A declared
@@ -785,24 +834,38 @@ quiet. Missing generation evidence remains unverified; an unknown age cannot
 prove staleness. EOL channels, missing comparisons, nixcfg drift, and alert
 suppression retain their separate rules. Detail views can still report the
 revision difference neutrally below the limit. Map attention and the
-freshness entries in Alerts/Activity use the same threshold. Factual `tldr()`,
-`has_proven_deployable_update`, and guarded update/proposal eligibility remain
-independent of this attention policy. The beacon's coarse `nix-freshness`
+freshness entries in Alerts/Activity use the same threshold. That age warning
+stays independent of deployability. `has_proven_deployable_update` is true
+only when nixcfg is behind by at least one commit. A channel-tip difference
+alone is not a deployable update. The beacon's coarse `nix-freshness`
 service observation remains factual and is excluded from service attention
 counts because the server's dedicated freshness policy owns that signal.
+
+Fleet Settings stores heartbeat grace beside the nixpkgs threshold: extra
+whole seconds after the reported cadence, default 15, range 0 through 3600.
+The host field is `alerts.heartbeat_grace_secs` on the same
+`inspr.pharos.host-preferences.v1` registry. Omit it, or send null, to
+inherit. Zero is serialized when it is the override; sending the fleet number
+does not mean inherit. **Use fleet default** clears the override in the draft
+in one click and does not itself move the live clock. The clock uses applied
+preferences, the value the beacon last reported. The fleet setting has no
+inherit: saving 15 is how the fleet default returns to 15. Stale and down
+stay at twice and five times the cadence. The nixcfg workflow accepts an
+optional `heartbeat_grace_secs` input (NIX-561). Empty or omitted inherits.
+Zero is an override only when it is the value sent. A populated host override
+is still withheld until every beacon that reads the shared registry has been
+upgraded.
 
 Rollout: upgrade pharosd and **every beacon reading the registry before
 publishing any override**. Old binaries reject unknown preference fields,
 including fields belonging to another host in a shared registry. With the
 field omitted, old/new preferences and the existing report versions remain
-compatible; populating it before the readers upgrade is not safe. Before
-enabling overrides, nixcfg must extend the strict registry validator and
-writer in `scripts/update-pharos-host-settings.sh` and the T08 contract test,
-and its `pharos-host-settings.yml`
-workflow must accept the optional `nixpkgs_warn_after_days` input (string
-integer 1–3650; empty/omitted removes the override). Pharos omits that workflow
-input when inheriting. An older workflow can still accept ordinary settings
-requests; an override request requires the updated workflow. For rollback to
+compatible; populating it before the readers upgrade is not safe. The nixcfg
+workflow accepts optional `nixpkgs_warn_after_days` (a string integer 1–3650;
+empty or omitted removes that override) and optional `heartbeat_grace_secs`
+(NIX-561; empty or omitted removes that override). Pharos omits a field when
+inheriting. A populated override still waits until every registry reader
+accepts that field. For rollback to
 old binaries, first remove overrides from declarations and reports, drain
 pending preference requests/workflows, and verify value-free persisted state
 contains no new preference field. The fleet settings sidecar itself is ignored
@@ -1044,7 +1107,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v260921161439.0.0**. It is already used as a real
+Pharos is an active early release at **v260921221314.0.0**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 
@@ -1064,7 +1127,12 @@ Not provided today:
 - automatic reconciliation of every declared change;
 - broad cloud-provider lifecycle management;
 - a replacement for a secret manager, backup engine or infrastructure source
-  of truth.
+  of truth;
+- a selective file-restore producer (NIX-562 tracks that work);
+- separate last-success and latest-attempt history for a selective restore
+  (PHAROS-304; not shipped);
+- a per-repository restore requirement, or full-system recoverability from
+  backup posture.
 
 Provider APIs, SSH execution, nixcfg dispatch, alert delivery and target agents
 are external dependencies. Their availability and permissions affect the
@@ -1140,6 +1208,114 @@ is unavailable, and `/version` remains the machine interface.
 The release-history scheme label comes from the bundle's `schemes.json`
 (`INSPR-VER2` for `inspr-calendar-v2`). Unknown schemes fail the build; machine
 scheme identifiers remain unchanged.
+
+### Live UI harness
+
+`node scripts/live-ui.mjs inventory` and `node scripts/live-ui.mjs draft` are
+the only commands. Arguments are those two words. The runner opens one
+headless Chromium context against the personal Pharos UI and signs in through
+the normal OIDC Authorization Code + PKCE redirect at `GET /pharos/auth/login`.
+It does not add a login bypass. The signed-in account's server role stays
+Fleet manager. Blocking a request here is a runner restriction, not server
+RBAC.
+
+Approved application origins are `https://pharos.barta.cm` and
+`https://flow.inspr.at`, and only under `/pharos`. Paths for other
+applications on `https://flow.inspr.at` are denied. The only login-provider
+origin is `https://auth.inspr.at`. Every other origin is denied, including
+`https://pharos.agm.ng`. HTTP and IP hosts are denied. Origins and the base
+path are fixed; environment overrides are refused. Credentials are typed only
+on the login-provider origin.
+
+The primary-frame route denies the initial load of a popup or an iframe.
+Separately, the main page checks each redirect hop at request stage before
+that hop is sent, including a hop that keeps POST. A flat loopback debugger
+session closes every additional page, worker, and shared worker before that
+runtime executes. Pausing a runtime is not a network guard: an ordinary
+permitted worker-script GET can still reach the server. If the raw debugger
+or the main-page request guard is lost, the runner closes the contexts and
+the browser through a separate browser connection and keeps the guards and
+secrets until that browser has closed. An authentication challenge is
+cancelled and is not answered with a username or password.
+
+Application methods other than `GET` and `HEAD` are denied, including
+settings apply, host actions, restart, remove, provider purchase and cleanup,
+logout, and server-side drafts. `POST /agora/requests/host-preferences.json`
+persists a settings workflow, so it is not a client draft. The server
+mutation allowlist is empty. Machine routes such as `/report`, `/register`,
+`/agent`, and `/metrics` are denied. External map tiles stay unloaded.
+`draft` fills ordinary page fields and does not send an application mutation.
+
+On the login provider, `GET` and `HEAD` stay on the existing read prefixes
+and still deny console, management, admin, system, and debug paths. `POST`
+is allowed only for the exact paths `/ui/login/loginname` and
+`/ui/login/password`. Reset, init, revoke, token, enrollment, registration,
+recovery, and new-password posts are denied, including
+`/ui/login/password/reset`, `/ui/login/password/init`, `/oauth/v2/revoke`,
+`/oauth/v2/token`, `/ui/v2/login/password`, and `POST /v2/sessions`. A body
+field that asks for one of those actions is denied even on an exact login
+path. A visible reset, new-password, recovery, enrollment, or registration
+submit is not filled. A forgot-password link beside a current-password form
+is not that form. An optional passkey or security-key link is not
+`mfa-required`. A visible one-time-code field or a passwordless WebAuthn
+challenge stops as `mfa-required` and is not submitted.
+
+The issuer's MFA enrollment prompt is account setup, not a verification
+challenge. It is recognized from visible provider choices
+(`input[type=radio][name=provider]`) with a submit control, and only when
+the page has no password, one-time-code, or WebAuthn challenge field. A
+submit control named `skip` with value `true` marks that prompt optional;
+the class is the same when that control is absent. The runner does not
+choose a provider, click Skip, or submit the prompt. It returns before
+inventory with class `account-setup-required` (exit 5), types no credential
+into the prompt, and takes no screenshot. Finish that enrollment in a
+private browser session before this inspection. Copy that merely mentions
+multi-factor authentication, without those provider controls, stays
+`mfa-required`. The request allowlist is unchanged.
+
+After repeated safe percent-decoding, any substring of the username or
+password denies the request, including a short secret inside a larger path
+segment. Verdicts, navigation errors, and evidence use `path-category` or
+`[redacted]`. Evidence records method, path, and reason, and omits the raw
+URL, query, userinfo, fragment, and post body. Screenshots are taken only
+after classification `authenticated`, and never for a credential form, the
+login provider, or an `/auth/` path. Before the shot, the runner scans the
+full visible text, title, and input values for the whole password, including
+punctuation. A hidden input that contains the password refuses the shot. The
+label word Password does not. Username text is not treated as the password.
+
+The context is memory-only: headless Chromium, no persistent profile, no
+saved session, no trace, and no video. Username and password come from
+owner-only files outside this repository. Do not put those values in
+arguments, the environment, URLs, screenshots, traces, or stored sessions.
+
+| Name | Contract |
+| --- | --- |
+| `PHAROS_LIVE_UI_USERNAME_FILE` | Absolute path to one login name. Mode `0600`, parent directory mode `0700`, no symlink, outside this repository |
+| `PHAROS_LIVE_UI_PASSWORD_FILE` | Absolute path to one password, same ownership rules |
+| `PHAROS_LIVE_UI_OUTPUT_DIR` | Absolute directory, mode `0700`, outside this repository. Receives `evidence.json` (`inspr.pharos.live-ui-evidence.v1`) and authenticated screenshots |
+| `PHAROS_LIVE_UI_DRAFT_FILE` | Required for `draft`. Same ownership rules. JSON `{"path":"/pharos/...","fields":[{"selector":"...","value":"..."}]}` |
+
+`PHAROS_LIVE_UI_USERNAME`, `PHAROS_LIVE_UI_PASSWORD`, origin, issuer,
+base-path, and URL overrides, `DEBUG`, `PWDEBUG`, proxy variables, and
+`NODE_TLS_REJECT_UNAUTHORIZED=0` are refused. Classes are `authenticated`
+(exit 0), `broken-ui` or `refused` (exit 1), `auth-required` (exit 2),
+`mfa-required` (exit 3), `policy-denied` (exit 4), and
+`account-setup-required` (exit 5). Stdout also reports
+`server-role=unchanged`.
+
+`node --test tests/live-ui-guard.test.mjs` covers the guard. The CI check job
+runs it beside `tests/fleet-refresh.test.mjs`, on the same Node runtime and
+without Playwright. It is not part of `npm run test:browser`. The operator
+supplies the account and the files above when the session runs. This
+repository does not store them.
+
+Login v2 session posts, including `POST /ui/v2/login/password` and
+`POST /v2/sessions`, stay denied. A browser `POST /oauth/v2/token` stays
+denied; Pharos exchanges the authorization code on the server. If the live
+issuer needs one of those posts, the run fails closed. A password that is a
+substring of an ordinary path or of the username label fails closed. Hosts
+that the page does not name are not visited.
 
 ## Contributing
 
