@@ -270,7 +270,7 @@ function percentOdd(secret) {
     .join("");
 }
 
-test("pathname, encoding, fragment, and short secrets stay out of verdicts", () => {
+test("pathname, encoding, fragment, and short secrets stay out of verdicts", async () => {
   const secret = FIXTURE_PASSWORD;
   const short = "s3cr";
   const tiny = "ab1";
@@ -288,6 +288,8 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", () 
     `https://pharos.barta.cm/pharos/hosts/pres3crpost`,
     `https://pharos.barta.cm/pharos/hosts/pre-ab1-post`,
     `https://pharos.barta.cm/pharos/map?x=pre-a%62%31-post`,
+    `https://pharos.barta.cm/pharos/map?pre-a%62%31-post=1`,
+    `https://pharos.barta.cm/pharos/map?${secret}=1`,
     `https://pharos.barta.cm/pharos/hosts/pre-%2561%2562%2531-post`,
     `https://user:${short}@pharos.barta.cm/pharos/map`,
   ];
@@ -311,6 +313,35 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", () 
   );
   assert.equal(leaks(evidence, secrets), false);
   assert.equal(publicPath(`/pharos/${short}`, [short]), "path-category");
+  const punctuated = "Ab!cdEF12";
+  const key = request("GET", `https://pharos.barta.cm/pharos/map?${encodeURIComponent(punctuated)}=1`, [punctuated]);
+  assert.equal(key.allow, false);
+  assert.equal(key.reason, "secret-in-url");
+  assert.equal(leaks(key, [punctuated]), false);
+  const keyedFetch = fakeFetchSession();
+  assert.equal(
+    await settleFetchPause(
+      keyedFetch,
+      { requestId: "query-key", request: { method: "GET", url: "https://pharos.barta.cm/pharos/map?pre-a%62%31-post=1" } },
+      { secrets: ["ab1"] },
+    ),
+    "failed",
+  );
+  assert.equal(keyedFetch.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  const main = { id: "main" };
+  const routed = primaryFrameDecision(
+    {
+      url: () => "https://pharos.barta.cm/pharos/map?pre-a%62%31-post=1",
+      method: () => "GET",
+      resourceType: () => "document",
+      frame: () => main,
+    },
+    { mainFrame: () => main },
+    { secrets: ["ab1"] },
+  );
+  assert.equal(routed.allow, false);
+  assert.equal(routed.reason, "secret-in-url");
+  assert.equal(leaks(routed, ["ab1"]), false);
 });
 
 test("issuer reads are allowlisted and incidental channels fail closed", () => {
@@ -1007,16 +1038,24 @@ test("fetch guard enables request-stage pauses, cancels auth, and disposes after
   await enableFetchGuard(session, { secrets: [] }, () => {});
   assert.deepEqual(
     session.calls.map((call) => call.method === "on" ? `on:${call.event}` : call.method),
-    ["on:Fetch.requestPaused", "on:Fetch.authRequired", "Fetch.enable"],
+    ["on:close", "on:Fetch.requestPaused", "on:Fetch.authRequired", "Fetch.enable"],
   );
-  assert.deepEqual(session.calls[2].params.patterns, [{ urlPattern: "*", requestStage: "Request" }]);
-  assert.equal(session.calls[2].params.handleAuthRequests, true);
+  const enabled = session.calls.find((call) => call.method === "Fetch.enable");
+  assert.deepEqual(enabled.params.patterns, [{ urlPattern: "*", requestStage: "Request" }]);
+  assert.equal(enabled.params.handleAuthRequests, true);
   await session.listeners["Fetch.requestPaused"]({
     requestId: "direct-post",
     request: { method: "POST", url: "https://pharos.barta.cm/pharos/auth/logout" },
   });
   assert.equal(session.calls.some((call) => call.method === "Fetch.failRequest"), true);
   assert.equal(session.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  session.listeners.close();
+  await session.listeners["Fetch.requestPaused"]({
+    requestId: "after-close",
+    request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+  });
+  assert.equal(session.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  assert.equal(session.calls.filter((call) => call.method === "Fetch.failRequest").at(-1).params.requestId, "after-close");
 
   const auth = fakeFetchSession();
   assert.equal(await settleFetchAuth(auth, { requestId: "challenge" }), "cancelled");
@@ -1129,6 +1168,65 @@ test("flat attach resumes only the first page and closes every other target", as
   assert.equal(broken.sent.some((entry) => entry.method === "Target.closeTarget" && entry.params.targetId === "primary"), true);
   assert.equal(JSON.stringify(broken.sent).includes("secret-token"), false);
   assert.equal(JSON.stringify(broken.sent).includes("devtools"), false);
+});
+
+test("lost protocol state closes the primary target and stops later continuations", async () => {
+  const { connection, sent } = flatTransport();
+  const gate = createFlatTargetGuard(connection);
+  await gate.enable();
+  connection.receive(attachEvent("page", "primary", "page-session"));
+  await gate.settled();
+  assert.equal(gate.compromised(), "");
+  connection.receive(JSON.stringify({
+    method: "Target.detachedFromTarget",
+    params: { sessionId: "page-session", targetId: "primary" },
+  }));
+  await gate.settled();
+  assert.equal(gate.compromised(), "detached");
+  assert.equal(
+    sent.some((entry) => entry.method === "Target.closeTarget" && entry.params.targetId === "primary"),
+    true,
+  );
+
+  const lost = flatTransport();
+  const lostGate = createFlatTargetGuard(lost.connection);
+  await lostGate.enable();
+  lost.connection.receive(attachEvent("page", "primary", "page-session"));
+  await lostGate.settled();
+  lostGate.noteDisconnect();
+  await lostGate.settled();
+  assert.equal(lostGate.compromised(), "disconnected");
+  assert.equal(
+    lost.sent.some((entry) => entry.method === "Target.closeTarget" && entry.params.targetId === "primary"),
+    true,
+  );
+  const redirected = fakeFetchSession();
+  assert.equal(
+    await settleFetchPause(
+      redirected,
+      {
+        requestId: "redirected-login",
+        redirectedRequestId: "authorize",
+        request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+      },
+      { secrets: ["synthetic-only-secret"], gate: lostGate },
+    ),
+    "failed",
+  );
+  assert.equal(redirected.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  assert.equal(redirected.calls[0].method, "Fetch.failRequest");
+
+  const workerDetach = flatTransport();
+  const workerGate = createFlatTargetGuard(workerDetach.connection);
+  await workerGate.enable();
+  workerDetach.connection.receive(attachEvent("page", "primary", "page-session"));
+  await workerGate.settled();
+  workerDetach.connection.receive(JSON.stringify({
+    method: "Target.detachedFromTarget",
+    params: { sessionId: "shared-session", targetId: "shared-1" },
+  }));
+  await workerGate.settled();
+  assert.equal(workerGate.compromised(), "");
 });
 
 test("the debugger endpoint stays on the reserved loopback port", async () => {

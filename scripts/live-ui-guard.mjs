@@ -386,22 +386,32 @@ function rawPath(raw, url) {
   return clean.slice(start) || "/";
 }
 
+function rawQuery(raw) {
+  const clean = String(raw).split("#")[0];
+  const cut = clean.indexOf("?");
+  if (cut < 0) return "";
+  return clean.slice(cut + 1);
+}
+
 function pathLeaks(url, raw, secrets) {
   return pieceMatchesSecret(url.pathname || "/", secrets) || pieceMatchesSecret(rawPath(raw, url), secrets);
 }
 
 function secretInUrl(raw, url, secrets) {
   if (url.username || url.password) return true;
-  for (const key of url.searchParams.keys()) {
-    if (SECRET_QUERY_KEYS.has(String(key).toLowerCase())) return true;
-  }
   const pieces = [
     url.username,
     url.password,
     url.hash.startsWith("#") ? url.hash.slice(1) : url.hash,
     url.pathname,
-    ...url.searchParams.values(),
+    rawQuery(raw),
+    url.search.startsWith("?") ? url.search.slice(1) : url.search,
   ];
+  for (const key of url.searchParams.keys()) {
+    pieces.push(key);
+    if (SECRET_QUERY_KEYS.has(String(key).toLowerCase())) return true;
+  }
+  for (const value of url.searchParams.values()) pieces.push(value);
   if (pieces.some((piece) => pieceMatchesSecret(piece, secrets))) return true;
   return pathLeaks(url, raw, secrets);
 }
@@ -1114,7 +1124,19 @@ function headerUpgrade(headers) {
   return String(headers.upgrade || headers.Upgrade || "");
 }
 
+function protocolLost(policy) {
+  if (policy?.protocolLost === true) return true;
+  const gate = policy?.gate;
+  return typeof gate?.compromised === "function" && Boolean(gate.compromised());
+}
+
 export function decideFetchPause(event, policy = {}) {
+  if (protocolLost(policy)) {
+    return {
+      action: "fail",
+      verdict: decision(false, "network-guard", "?", "/", listedSecrets(policy.secrets)),
+    };
+  }
   if (event?.responseStatusCode || event?.responseErrorReason) {
     return {
       action: "fail",
@@ -1187,7 +1209,23 @@ export async function enableFetchGuard(session, policy, rememberFn) {
   if (!session || typeof session.on !== "function" || typeof session.send !== "function") {
     throw new LiveUiError("network-guard");
   }
-  session.on("Fetch.requestPaused", (paused) => settleFetchPause(session, paused, policy, rememberFn).catch(() => {}));
+  let lost = false;
+  const lose = () => {
+    lost = true;
+    const gate = policy?.gate;
+    if (typeof gate?.noteDisconnect === "function") {
+      try {
+        gate.noteDisconnect();
+      } catch {
+        // The local flag still stops every later continuation.
+      }
+    }
+  };
+  session.on("close", lose);
+  session.on("Fetch.requestPaused", (paused) => {
+    const active = lost ? { ...policy, protocolLost: true } : policy;
+    settleFetchPause(session, paused, active, rememberFn).catch(() => {});
+  });
   session.on("Fetch.authRequired", (challenge) => settleFetchAuth(session, challenge).catch(() => {}));
   await session.send("Fetch.enable", {
     patterns: fetchPausePatterns(),
@@ -1289,6 +1327,7 @@ export function createFlatTargetGuard(connection) {
     throw new LiveUiError("network-guard");
   }
   let primaryId = "";
+  let primarySessionId = "";
   let failure = "";
   let intentionalClose = false;
   let settled = Promise.resolve();
@@ -1323,6 +1362,7 @@ export function createFlatTargetGuard(connection) {
         return;
       }
       primaryId = info.targetId;
+      primarySessionId = sessionId;
       try {
         await connection.send("Target.setAutoAttach", FLAT_ATTACH, sessionId);
         await connection.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
@@ -1334,15 +1374,30 @@ export function createFlatTargetGuard(connection) {
     }
     await closeTarget(info.targetId);
   };
+  const onDetached = async (event) => {
+    const sessionId = String(event?.sessionId || "");
+    const targetId = String(event?.targetId || "");
+    const primary = (!sessionId && !targetId) || sessionId === primarySessionId || targetId === primaryId;
+    if (!primary || !primaryId) return;
+    fail("detached");
+    if (!intentionalClose) await closeTarget(primaryId);
+  };
   connection.onEvent((method, params) => {
-    if (method !== "Target.attachedToTarget") return;
-    settled = settled.then(() => onAttached(params)).catch(() => fail("attach"));
+    if (method === "Target.attachedToTarget") {
+      settled = settled.then(() => onAttached(params)).catch(() => fail("attach"));
+      return;
+    }
+    if (method === "Target.detachedFromTarget") {
+      settled = settled.then(() => onDetached(params)).catch(() => fail("detach"));
+    }
   });
   return {
     compromised: () => failure,
     attachedPrimary: () => primaryId,
     noteDisconnect() {
-      if (!intentionalClose) fail("disconnected");
+      if (intentionalClose) return;
+      fail("disconnected");
+      if (primaryId) closeTarget(primaryId).catch(() => {});
     },
     settled: () => settled,
     async enable() {
