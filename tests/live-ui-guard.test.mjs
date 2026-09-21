@@ -17,7 +17,7 @@ import {
   browserContextOptions,
   browserLaunchOptions,
   classifyObservation,
-  bindTargetCloser,
+  createTargetGate,
   classifyProbeSurface,
   collectProbeSurface,
   continuationAllowed,
@@ -28,7 +28,6 @@ import {
   decideRequest,
   disposeFetchGuard,
   enableFetchGuard,
-  foreignTargetAction,
   hostNamesFromPayload,
   ISSUER_LOGIN_POST_PATHS,
   loadPasswordFile,
@@ -40,8 +39,10 @@ import {
   repoRootFromScripts,
   sanitizeNavigationError,
   screenshotName,
+  pausedTargetPlan,
   screenshotPermitted,
   settleFetchAuth,
+  shutdownLiveSession,
   settleFetchPause,
   submitLabelRejected,
   takeAuthenticatedShot,
@@ -843,16 +844,24 @@ test("the browser session is headless, memory-only, and guarded before login", (
   assert.equal(runner.includes("context.on(\"response\""), false);
   assert.equal(runner.includes("split(/[^A-Za-z0-9"), false);
   assert.ok(runner.includes("enableFetchGuard"));
-  assert.ok(runner.includes("bindTargetCloser"));
+  assert.ok(runner.includes("createTargetGate"));
+  assert.ok(runner.includes("shutdownLiveSession"));
   assert.ok(runner.includes("newBrowserCDPSession"));
   assert.ok(runner.includes("takeAuthenticatedShot"));
   assert.ok(runner.includes("credentialFillPermitted"));
   assert.ok(guard.includes("Fetch.failRequest"));
   assert.ok(guard.includes('requestStage: "Request"'));
   assert.equal(guard.includes("ProvideCredentials"), false);
-  assert.ok(guard.includes("Target.setDiscoverTargets"));
+  assert.ok(guard.includes("waitForDebuggerOnStart: true"));
+  assert.ok(guard.includes("flatten: false"));
+  assert.ok(guard.includes("Target.sendMessageToTarget"));
+  assert.equal(guard.includes("Target.setDiscoverTargets"), false);
   assert.ok(guard.includes("Target.closeTarget"));
-  const discoverAt = runner.indexOf("closer.enable()", runAt);
+  const discoverAt = runner.indexOf("await gate.enable()", runAt);
+  const finallyAt = runner.lastIndexOf("finally");
+  assert.ok(runner.indexOf("shutdownLiveSession", finallyAt) > finallyAt);
+  assert.equal(runner.indexOf("secrets.fill", finallyAt), -1);
+  assert.equal(runner.indexOf("disposeFetchGuard", finallyAt), -1);
   const armAt = runner.indexOf("await guard.armPage", runAt);
   const shotAt = runner.indexOf("takeAuthenticatedShot", runner.indexOf("async function shoot"));
   assert.ok(discoverAt > runAt);
@@ -1002,27 +1011,211 @@ test("fetch guard enables request-stage pauses, cancels auth, and disposes after
   assert.deepEqual(disposeFailed.calls.map((call) => call.method), ["Fetch.disable", "detach"]);
 });
 
-test("new pages and service workers are closed and the first page is kept", async () => {
-  assert.equal(foreignTargetAction({ type: "page", targetId: "primary" }, false), "primary");
-  assert.equal(foreignTargetAction({ type: "page", targetId: "popup" }, true), "close");
-  assert.equal(foreignTargetAction({ type: "service_worker", targetId: "worker" }, true), "close");
-  assert.equal(foreignTargetAction({ type: "iframe", targetId: "frame" }, true), "ignore");
-  const session = fakeFetchSession();
+function protocolSession(options = {}) {
+  const calls = [];
+  const listeners = {};
+  return {
+    calls,
+    listeners,
+    on(event, handler) {
+      calls.push({ method: "on", event });
+      listeners[event] = handler;
+    },
+    async send(method, params) {
+      calls.push({ method, params });
+      if (method !== "Target.sendMessageToTarget") return;
+      const command = JSON.parse(params.message);
+      const body = options.failMethod === command.method
+        ? { id: command.id, error: { message: "failed" } }
+        : { id: command.id, result: {} };
+      queueMicrotask(() => {
+        listeners["Target.receivedMessageFromTarget"]({
+          sessionId: params.sessionId,
+          message: JSON.stringify(body),
+        });
+      });
+    },
+  };
+}
+
+function childMethods(session) {
+  return session.calls
+    .filter((call) => call.method === "Target.sendMessageToTarget")
+    .map((call) => JSON.parse(call.params.message).method);
+}
+
+test("paused targets install Fetch before resume and refused targets never resume", async () => {
+  assert.equal(pausedTargetPlan({ type: "page", targetId: "primary" }, ""), "guard");
+  assert.equal(pausedTargetPlan({ type: "page", targetId: "popup" }, "primary"), "refuse");
+  assert.equal(pausedTargetPlan({ type: "iframe", targetId: "frame" }, "primary"), "guard");
+  assert.equal(pausedTargetPlan({ type: "service_worker", targetId: "worker" }, "primary"), "refuse");
+  const session = protocolSession();
   const notes = [];
-  const closer = bindTargetCloser(session, (verdict) => {
+  const gate = createTargetGate(session, { secrets: ["synthetic-only-secret"] }, (verdict) => {
+    notes.push(verdict);
     if (verdict.reason === "serviceworker") throw new Error("evidence");
-    notes.push(verdict.reason);
   });
-  await closer.enable();
-  closer.onCreated({ targetInfo: { type: "page", targetId: "primary", url: "https://user:secret@pharos.barta.cm/pharos/" } });
-  closer.onCreated({ targetInfo: { type: "page", targetId: "primary", url: "https://pharos.barta.cm/pharos/" } });
-  closer.onCreated({ targetInfo: { type: "page", targetId: "popup" } });
-  closer.onCreated({ targetInfo: { type: "service_worker", targetId: "worker" } });
-  closer.onCreated({ targetInfo: { type: "iframe", targetId: "frame" } });
+  await gate.enable();
+  assert.equal(session.calls[0].method, "on");
+  assert.equal(session.calls[1].method, "on");
+  assert.equal(session.calls[2].method, "Target.setAutoAttach");
+  assert.deepEqual(session.calls[2].params, {
+    autoAttach: true,
+    waitForDebuggerOnStart: true,
+    flatten: false,
+  });
+  await gate.onAttached({
+    sessionId: "page-session",
+    waitingForDebugger: true,
+    targetInfo: { type: "page", targetId: "primary", url: "https://user:secret@pharos.barta.cm/pharos/" },
+  });
+  assert.deepEqual(childMethods(session), [
+    "Fetch.enable",
+    "Target.setAutoAttach",
+    "Runtime.runIfWaitingForDebugger",
+  ]);
+  const enable = session.calls.find((call) => call.method === "Target.sendMessageToTarget");
+  assert.deepEqual(JSON.parse(enable.params.message).params.patterns, [{ urlPattern: "*", requestStage: "Request" }]);
+  assert.equal(JSON.stringify(session.calls).includes("secret"), false);
+  assert.equal(gate.compromised(), "");
+
+  await gate.onAttached({
+    sessionId: "popup-session",
+    waitingForDebugger: true,
+    targetInfo: { type: "page", targetId: "popup" },
+  });
+  await gate.onAttached({
+    sessionId: "worker-session",
+    waitingForDebugger: true,
+    targetInfo: { type: "service_worker", targetId: "worker" },
+  });
   const closed = session.calls.filter((call) => call.method === "Target.closeTarget").map((call) => call.params.targetId);
   assert.deepEqual(closed, ["popup", "worker"]);
-  assert.equal(JSON.stringify(session.calls).includes("secret"), false);
-  assert.deepEqual(notes, ["popup"]);
+  assert.equal(notes.some((item) => item.reason === "popup"), true);
+  assert.equal(childMethods(session).filter((method) => method === "Runtime.runIfWaitingForDebugger").length, 1);
+
+  const beforeFrame = childMethods(session).length;
+  await gate.onMessage({
+    sessionId: "page-session",
+    message: JSON.stringify({
+      method: "Target.attachedToTarget",
+      params: {
+        sessionId: "frame-session",
+        waitingForDebugger: true,
+        targetInfo: { type: "iframe", targetId: "frame-1" },
+      },
+    }),
+  });
+  assert.deepEqual(childMethods(session).slice(beforeFrame, beforeFrame + 3), [
+    "Fetch.enable",
+    "Target.setAutoAttach",
+    "Runtime.runIfWaitingForDebugger",
+  ]);
+  const frameCommands = session.calls.filter((call) => {
+    if (call.method !== "Target.sendMessageToTarget") return false;
+    return call.params.sessionId === "frame-session";
+  });
+  assert.equal(frameCommands[0].params.sessionId, "frame-session");
+  assert.ok(frameCommands.findIndex((call) => JSON.parse(call.params.message).method === "Fetch.enable")
+    < frameCommands.findIndex((call) => JSON.parse(call.params.message).method === "Runtime.runIfWaitingForDebugger"));
+
+  await gate.onMessage({
+    sessionId: "frame-session",
+    message: JSON.stringify({
+      method: "Fetch.requestPaused",
+      params: {
+        requestId: "iframe-post",
+        request: { method: "POST", url: "https://pharos.agm.ng/pharos/receive" },
+      },
+    }),
+  });
+  const frameTraffic = session.calls.filter((call) => call.method === "Target.sendMessageToTarget" && call.params.sessionId === "frame-session");
+  const frameMethods = frameTraffic.map((call) => JSON.parse(call.params.message).method);
+  assert.equal(frameMethods.includes("Fetch.failRequest"), true);
+  assert.equal(frameMethods.includes("Fetch.continueRequest"), false);
+  assert.equal(JSON.stringify(frameTraffic).includes("pharos.agm.ng"), false);
+
+  const unpaused = protocolSession();
+  const unpausedGate = createTargetGate(unpaused, {}, () => {});
+  await unpausedGate.enable();
+  await unpausedGate.onAttached({
+    sessionId: "late",
+    waitingForDebugger: false,
+    targetInfo: { type: "iframe", targetId: "already-running" },
+  });
+  assert.equal(unpausedGate.compromised(), "iframe");
+  assert.equal(childMethods(unpaused).includes("Runtime.runIfWaitingForDebugger"), false);
+  assert.equal(unpaused.calls.some((call) => call.method === "Target.closeTarget"), true);
+
+  const broken = protocolSession({ failMethod: "Fetch.enable" });
+  const brokenGate = createTargetGate(broken, {}, () => {});
+  await brokenGate.enable();
+  await brokenGate.onAttached({
+    sessionId: "page-session",
+    waitingForDebugger: true,
+    targetInfo: { type: "page", targetId: "primary" },
+  });
+  assert.equal(brokenGate.compromised(), "page");
+  assert.equal(childMethods(broken).includes("Runtime.runIfWaitingForDebugger"), false);
+  assert.equal(broken.calls.some((call) => call.method === "Target.closeTarget" && call.params.targetId === "primary"), true);
+});
+
+test("cleanup closes the browser before disabling Fetch or erasing secrets", async () => {
+  const secrets = ["person@example.test", "synthetic-only-secret"];
+  const drafts = [{ value: "local-draft" }];
+  const failed = [];
+  const held = await shutdownLiveSession({
+    close: async () => {
+      failed.push(["close", secrets[1], drafts[0].value]);
+      throw new Error("close-failed");
+    },
+    sessions: [{
+      async send(method) {
+        failed.push(["disable", method, secrets[1]]);
+      },
+      async detach() {
+        failed.push("detach");
+      },
+    }],
+    detach: async () => {
+      failed.push("browser-detach");
+    },
+    secrets,
+    drafts,
+  });
+  assert.deepEqual(held, { released: false });
+  assert.deepEqual(failed, [["close", "synthetic-only-secret", "local-draft"]]);
+  assert.equal(secrets[1], "synthetic-only-secret");
+  assert.equal(drafts[0].value, "local-draft");
+
+  const order = [];
+  const released = await shutdownLiveSession({
+    close: async () => {
+      order.push(["close", secrets[1]]);
+    },
+    sessions: [{
+      async send(method) {
+        order.push(["session", method, secrets[1]]);
+      },
+      async detach() {
+        order.push(["session-detach", secrets[1]]);
+      },
+    }],
+    detach: async () => {
+      order.push(["browser-detach", secrets[1]]);
+    },
+    secrets,
+    drafts,
+  });
+  assert.deepEqual(released, { released: true });
+  assert.deepEqual(order, [
+    ["close", "synthetic-only-secret"],
+    ["session", "Fetch.disable", "synthetic-only-secret"],
+    ["session-detach", "synthetic-only-secret"],
+    ["browser-detach", "synthetic-only-secret"],
+  ]);
+  assert.equal(secrets[1], "");
+  assert.equal(drafts[0].value, "");
 });
 
 test("visible password text blocks the screenshot and username text does not", async () => {

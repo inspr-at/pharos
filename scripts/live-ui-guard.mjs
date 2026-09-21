@@ -1155,45 +1155,155 @@ export async function disposeFetchGuard(session) {
   }
 }
 
-export function foreignTargetAction(info, primaryClaimed) {
+const PAUSED_ATTACH = Object.freeze({
+  autoAttach: true,
+  waitForDebuggerOnStart: true,
+  flatten: false,
+});
+
+export function pausedTargetPlan(info, primaryId) {
   const type = String(info?.type || "");
-  if (type === "page" && !primaryClaimed) return "primary";
-  if (type === "page" || type === "service_worker" || type === "background_page") return "close";
-  return "ignore";
+  if (type === "browser" || type === "tab") return "ignore";
+  if (type === "page" && !primaryId) return "guard";
+  if (type === "iframe" || type === "worker") return "guard";
+  return "refuse";
 }
 
-export function bindTargetCloser(session, rememberFn) {
+export function createTargetGate(session, policy = {}, rememberFn) {
   if (!session || typeof session.on !== "function" || typeof session.send !== "function") {
     throw new LiveUiError("network-guard");
   }
-  const seen = new Set();
-  let primaryClaimed = false;
-  const onCreated = (event) => {
+  let nextId = 1;
+  const pending = new Map();
+  let primaryId = "";
+  let failure = "";
+  const fail = (reason) => {
+    if (!failure) failure = reason || "target";
+  };
+  const sendChild = async (sessionId, method, params) => {
+    const id = nextId;
+    nextId += 1;
+    const message = JSON.stringify({ id, method, params: params ?? {} });
+    let resolveResult;
+    let rejectResult;
+    const result = new Promise((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+    pending.set(id, { resolve: resolveResult, reject: rejectResult });
+    await session.send("Target.sendMessageToTarget", { sessionId, message });
+    return result;
+  };
+  const childApi = (sessionId) => ({
+    async send(method, params) {
+      await sendChild(sessionId, method, params);
+    },
+  });
+  const onAttached = async (event) => {
     const info = event?.targetInfo || {};
-    const action = foreignTargetAction(info, primaryClaimed);
-    if (action === "primary") {
-      primaryClaimed = true;
-      if (info.targetId) seen.add(info.targetId);
+    const sessionId = event?.sessionId || "";
+    if (!event?.waitingForDebugger) {
+      fail(info.type || "unpaused");
+      if (info.targetId) await session.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
       return;
     }
-    if (action !== "close" || !info.targetId || seen.has(info.targetId)) return;
-    seen.add(info.targetId);
-    if (typeof rememberFn === "function") {
-      try {
-        rememberFn(decideIncidental(info.type === "service_worker" ? "serviceworker" : "popup"));
-      } catch {
-        // Closing the target does not wait on evidence.
+    const plan = pausedTargetPlan(info, primaryId);
+    if (plan === "ignore") return;
+    if (plan === "guard" && info.type === "page" && !primaryId) primaryId = info.targetId || "page";
+    if (plan === "refuse") {
+      if (typeof rememberFn === "function") {
+        try {
+          rememberFn(decideIncidental(info.type === "service_worker" ? "serviceworker" : "popup"));
+        } catch {
+          // The target stays paused whether or not evidence was recorded.
+        }
       }
+      if (info.targetId) await session.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
+      return;
     }
-    session.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
+    if (!sessionId) {
+      fail("session");
+      if (info.targetId) await session.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
+      return;
+    }
+    try {
+      await sendChild(sessionId, "Fetch.enable", {
+        patterns: fetchPausePatterns(),
+        handleAuthRequests: true,
+      });
+      await sendChild(sessionId, "Target.setAutoAttach", PAUSED_ATTACH);
+      await sendChild(sessionId, "Runtime.runIfWaitingForDebugger", {});
+    } catch {
+      fail(info.type || "guard");
+      if (info.targetId) await session.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
+    }
   };
-  session.on("Target.targetCreated", onCreated);
+  const onMessage = async (event) => {
+    let parsed;
+    try {
+      parsed = JSON.parse(String(event?.message || ""));
+    } catch {
+      fail("protocol");
+      return;
+    }
+    if (parsed.id && pending.has(parsed.id)) {
+      const waiter = pending.get(parsed.id);
+      pending.delete(parsed.id);
+      if (parsed.error) waiter.reject(new Error("child-command"));
+      else waiter.resolve(parsed.result ?? {});
+      return;
+    }
+    if (parsed.method === "Target.attachedToTarget") {
+      await onAttached(parsed.params || {});
+      return;
+    }
+    if (parsed.method === "Fetch.requestPaused") {
+      await settleFetchPause(childApi(event?.sessionId), parsed.params, policy, rememberFn);
+      return;
+    }
+    if (parsed.method === "Fetch.authRequired") {
+      await settleFetchAuth(childApi(event?.sessionId), parsed.params);
+    }
+  };
   return {
-    onCreated,
+    onAttached,
+    onMessage,
+    compromised: () => failure,
     async enable() {
-      await session.send("Target.setDiscoverTargets", { discover: true });
+      session.on("Target.attachedToTarget", (event) => {
+        onAttached(event).catch(() => fail("attach"));
+      });
+      session.on("Target.receivedMessageFromTarget", (event) => {
+        onMessage(event).catch(() => fail("message"));
+      });
+      await session.send("Target.setAutoAttach", PAUSED_ATTACH);
     },
   };
+}
+
+export async function shutdownLiveSession({ close, sessions = [], detach, secrets, drafts } = {}) {
+  try {
+    if (typeof close === "function") await close();
+  } catch {
+    return { released: false };
+  }
+  for (const session of sessions) {
+    await disposeFetchGuard(session);
+  }
+  if (typeof detach === "function") {
+    try {
+      await detach();
+    } catch {
+      // The browser has already closed.
+    }
+  }
+  if (Array.isArray(secrets)) secrets.fill("");
+  if (Array.isArray(drafts)) {
+    for (const field of drafts) {
+      if (field && typeof field === "object") field.value = "";
+    }
+  }
+  return { released: true };
 }
 
 export function screenshotName(routePath, hostIndex = 1) {

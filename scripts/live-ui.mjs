@@ -17,7 +17,7 @@ import {
   assertSessionPrefix,
   browserContextOptions,
   browserLaunchOptions,
-  bindTargetCloser,
+  createTargetGate,
   classifyObservation,
   classifyProbeSurface,
   collectProbeSurface,
@@ -39,6 +39,7 @@ import {
   repoRootFromScripts,
   screenshotName,
   screenshotPermitted,
+  shutdownLiveSession,
   submitLabelRejected,
   takeAuthenticatedShot,
   LiveUiError,
@@ -111,6 +112,7 @@ async function installGuard(context, policy, blocked) {
 }
 
 async function openDocument(page, href, policy) {
+  if (policy?.gate?.compromised?.()) throw new LiveUiError("network-guard");
   const decision = decideRequest({ method: "GET", url: href }, policy);
   if (!decision.allow) throw new LiveUiError("navigation-denied");
   try {
@@ -432,7 +434,7 @@ async function run(command) {
       ? loadDraftFile(process.env.PHAROS_LIVE_UI_DRAFT_FILE, repoRoot)
       : null;
   const secrets = [username, password];
-  const policy = { secrets };
+  const policy = { secrets, gate: null };
   const blocked = [];
   const routes = [];
   let browser;
@@ -450,8 +452,9 @@ async function run(command) {
     if (browser.browserType().name() !== "chromium") throw new LiveUiError("browser-launch");
     if (typeof browser.newBrowserCDPSession !== "function") throw new LiveUiError("network-guard");
     browserSession = await browser.newBrowserCDPSession();
-    const closer = bindTargetCloser(browserSession, (verdict) => remember(blocked, verdict, secrets));
-    await closer.enable();
+    const gate = createTargetGate(browserSession, policy, (verdict) => remember(blocked, verdict, secrets));
+    policy.gate = gate;
+    await gate.enable();
     const options = browserContextOptions();
     if (["storageState", "recordVideo", "recordHar", "userDataDir"].some((key) => key in options)) {
       throw new LiveUiError("browser-context");
@@ -462,6 +465,7 @@ async function run(command) {
     const guard = await installGuard(context, policy, blocked);
     fetchSessions = guard.sessions;
     const page = await context.newPage();
+    if (gate.compromised()) throw new LiveUiError("network-guard");
     await guard.armPage(page);
     const watchSurface = (target) => {
       target.on("download", (download) => {
@@ -588,22 +592,23 @@ async function run(command) {
     report(overall, routes, blocked, secrets);
     return EXIT_CODES[overall] ?? 1;
   } finally {
-    secrets.fill("");
-    if (draft) {
-      for (const field of draft.fields) field.value = "";
-    }
-    for (const session of fetchSessions) {
-      await disposeFetchGuard(session);
-    }
-    if (browserSession && typeof browserSession.detach === "function") {
-      await browserSession.detach().catch(() => {});
-    }
-    if (browser) {
-      for (const context of browser.contexts()) {
-        await context.close().catch(() => {});
-      }
-      await browser.close().catch(() => {});
-    }
+    await shutdownLiveSession({
+      close: async () => {
+        if (!browser) return;
+        for (const context of browser.contexts()) {
+          await context.close();
+        }
+        await browser.close();
+      },
+      sessions: fetchSessions,
+      detach: async () => {
+        if (browserSession && typeof browserSession.detach === "function") {
+          await browserSession.detach();
+        }
+      },
+      secrets,
+      drafts: draft ? draft.fields : [],
+    });
   }
 }
 
