@@ -1141,6 +1141,64 @@ The release-history scheme label comes from the bundle's `schemes.json`
 (`INSPR-VER2` for `inspr-calendar-v2`). Unknown schemes fail the build; machine
 scheme identifiers remain unchanged.
 
+### Live UI harness
+
+`node scripts/live-ui.mjs inventory` and `node scripts/live-ui.mjs draft` open
+one headless Chromium context against the personal Pharos UI. The runner signs
+in through the normal OIDC Authorization Code + PKCE redirect at
+`GET /pharos/auth/login`. It does not add a login bypass, change server
+authentication, or change the Fleet manager role of the account that signs in.
+Blocking a request in this process does not remove that server authority.
+
+Approved application origins are `https://pharos.barta.cm` and
+`https://flow.inspr.at`, and only under `/pharos`. `https://flow.inspr.at`
+is the personal deployment's public prefix; paths for other applications on
+that host are denied. The only login-provider origin is `https://auth.inspr.at`.
+Every other origin is denied, including other Pharos deployments. Origins and
+the base path are fixed; environment overrides are refused. Credentials are
+entered only on the login-provider origin.
+
+The request guard is installed before any navigation. Application traffic may
+use `GET` and `HEAD` under `/pharos`. `POST`, `PUT`, `PATCH`, `DELETE`, and
+every other method are denied, including settings apply, host actions,
+restarts, removals, provider purchase and cleanup, logout, and server-side
+settings drafts. `POST /agora/requests/host-preferences.json` persists a
+settings workflow through `begin_settings_change`, so it is not treated as a
+safe draft. No application mutation is whitelisted. Machine routes such as
+`/report`, `/register`, `/agent`, and `/metrics` are denied at the origin root
+and under `/pharos`. External map tiles stay unloaded. Client-side drafts write
+into ordinary page fields and do not dispatch a request.
+
+On the login provider, `GET` and `HEAD` are allowed except console, management,
+admin, system, and debug paths. `POST` is allowed only under `/oauth`,
+`/oidc`, `/ui/login`, and `/ui/v2/login`. A second factor, passkey, or
+verification step stops the run with class `mfa-required` and is not submitted.
+
+The context is memory-only: headless Chromium, no persistent profile, no saved
+session, no trace, and no video. Screenshots are taken only after
+classification `authenticated`, and never for a credential form, the login
+provider, or an `/auth/` path. Navigation failures omit userinfo, query, and
+fragment. The report contains route, status, and class.
+
+Set these names to absolute paths outside this repository. Do not put the
+values in arguments, the environment, or URLs.
+
+| Name | Contract |
+| --- | --- |
+| `PHAROS_LIVE_UI_USERNAME_FILE` | One login name, mode `0600`, parent directory mode `0700`, no symlink |
+| `PHAROS_LIVE_UI_PASSWORD_FILE` | One password, same ownership rules |
+| `PHAROS_LIVE_UI_OUTPUT_DIR` | Directory mode `0700` for `evidence.json` and screenshots |
+| `PHAROS_LIVE_UI_DRAFT_FILE` | Optional for `draft`: `{"path":"/pharos/...","fields":[{"selector":"...","value":"..."}]}` |
+
+`DEBUG`, `PWDEBUG`, proxy variables, and `NODE_TLS_REJECT_UNAUTHORIZED=0` are
+refused. Classes are `authenticated`, `auth-required`, `mfa-required`,
+`policy-denied`, and `broken-ui`. Exit codes are 0, 2, 3, 4, and 1.
+
+Request-guard behavior is covered by `node --test tests/live-ui-guard.test.mjs`.
+That file is not part of `npm run test:browser`. The account and the files
+above are supplied by the operator when the session runs. This repository does
+not store them.
+
 ## Contributing
 
 ### Developer Certificate of Origin
