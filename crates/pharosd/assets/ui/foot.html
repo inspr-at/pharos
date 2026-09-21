@@ -19,7 +19,7 @@ const CLOCK_SKEW_SECS=2;
 const SELECTIVE_RESTORE_OVERDUE_SECS=30*24*60*60;
 const DAILY_SUCCESS_STALE_SECS=129600;
 const HISTORY_LEVEL_RANK={down:0,stale:1,late:2,unknown:3,first:4,ok:5};
-const DAILY_POSTURE_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
+const DAILY_FACT_RANK={failed:0,missing:1,stale:2,warning:3,disabled:3,unknown:4,'not-configured':5,ok:6,'not-required':7};
 function wholeGrace(grace){
   const extra=Number(grace);
   if(!Number.isInteger(extra)||extra<0||extra>3600)return null;
@@ -237,59 +237,95 @@ function agoNote(at,now,prefix){
   if(!Number.isFinite(stamp)||stamp<=0)return prefix+' not recorded';
   return prefix+' '+backupAgeText(stamp,now);
 }
-function projectDailyBackup(observations,now){
-  const jobs=(Array.isArray(observations)?observations:[]).filter(job=>job&&typeof job==='object');
-  if(!jobs.length)return {tone:'neutral',state:'unknown',label:'Not observed',detail:'No backup signal yet',at:null};
-  const primary=jobs.slice().sort((a,b)=>(DAILY_POSTURE_RANK[backupLevelKey(a.state)]??4)-(DAILY_POSTURE_RANK[backupLevelKey(b.state)]??4))[0];
-  let state=backupLevelKey(primary.state);
-  const at=Number(primary.last_success_at);
+function eligibleRestoreAt(at,now){
+  if(typeof at==='boolean'||at==null||at==='')return null;
+  const stamp=Number(at);
+  if(!Number.isSafeInteger(stamp)||stamp<=0||stamp>=253402300800)return null;
+  const current=Number(now);
+  if(!Number.isFinite(current)||stamp>current+CLOCK_SKEW_SECS)return null;
+  return stamp;
+}
+function projectDailyJob(job,now){
+  let state=backupLevelKey(job.state);
+  const at=Number(job.last_success_at);
   const hasSuccess=Number.isFinite(at)&&at>0;
   const current=Number(now);
   if((state==='healthy'||state==='warning')&&hasSuccess&&(at>current+CLOCK_SKEW_SECS||current-at>DAILY_SUCCESS_STALE_SECS))state='stale';
-  if(backupLevelKey(primary.configured)==='disabled'&&state!=='failed'&&state!=='missing'&&state!=='stale'&&state!=='warning'){
+  if(backupLevelKey(job.configured)==='disabled'&&state!=='failed'&&state!=='missing'&&state!=='stale'&&state!=='warning'){
     return {tone:'amber',state:'disabled',label:'Disabled',detail:'Backup is disabled and is not an exemption from backup policy',at:hasSuccess?at:null};
   }
   if(state==='healthy'&&!hasSuccess)return {tone:'neutral',state:'unknown',label:'Success time unknown',detail:'No successful-run time was recorded',at:null};
   if(state==='healthy'){
-    const schedule=String(primary.schedule||'').trim()||'schedule not declared';
-    return {tone:'good',state:'ok',label:dailyLabel(primary.schedule),detail:'last success '+backupAgeText(at,current)+' · '+schedule,at};
+    const schedule=String(job.schedule||'').trim()||'schedule not declared';
+    return {tone:'good',state:'ok',label:dailyLabel(job.schedule),detail:'last success '+backupAgeText(at,current)+' · '+schedule,at};
   }
   if(state==='failed')return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
   if(state==='missing')return {tone:'bad',state:'missing',label:'Missing',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
   if(state==='stale')return {tone:'amber',state:'stale',label:'Stale',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
   if(state==='warning')return {tone:'amber',state:'warning',label:'Review',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
   if(state==='not-configured')return {tone:'neutral',state:'not-configured',label:'Not configured',detail:'No backup is configured',at:hasSuccess?at:null};
-  if(state==='not-required')return {tone:'neutral',state:'not-required',label:'Not required',detail:String(primary.summary||'No backup is required'),at:hasSuccess?at:null};
-  return {tone:'neutral',state:state||'unknown',label:state==='unknown'?'Unknown':'Not observed',detail:state==='unknown'?'Backup evidence is unknown':String(primary.summary||'No backup evidence'),at:hasSuccess?at:null};
+  if(state==='not-required')return {tone:'neutral',state:'not-required',label:'Not required',detail:String(job.summary||'No backup is required'),at:hasSuccess?at:null};
+  return {tone:'neutral',state:state||'unknown',label:state==='unknown'?'Unknown':'Not observed',detail:state==='unknown'?'Backup evidence is unknown':String(job.summary||'No backup evidence'),at:hasSuccess?at:null};
+}
+function dailyProjectedRank(fact){
+  const rank=DAILY_FACT_RANK[fact?.state];
+  return Number.isInteger(rank)?rank:4;
+}
+function projectDailyBackup(observations,now){
+  const jobs=(Array.isArray(observations)?observations:[]).filter(job=>job&&typeof job==='object');
+  if(!jobs.length)return {tone:'neutral',state:'unknown',label:'Not observed',detail:'No backup signal yet',at:null};
+  let worst=null;
+  let worstRank=DAILY_FACT_RANK['not-required']+1;
+  for(const job of jobs){
+    const fact=projectDailyJob(job,now);
+    const rank=dailyProjectedRank(fact);
+    if(!worst||rank<worstRank){
+      worst=fact;
+      worstRank=rank;
+    }
+  }
+  return worst;
 }
 function projectRestoreStatus(observations,now){
   const jobs=(Array.isArray(observations)?observations:[]).filter(job=>job&&typeof job==='object');
   if(projectDailyBackup(jobs,now).state==='not-required')return {tone:'neutral',state:'not-required',label:'Not required',detail:'No selective restore is required',at:null,overdue:false,producer:''};
+  const current=Number(now);
   let passed=null;
-  let failed=null;
+  let latestAt=null;
+  let latestFailed=false;
+  let latestAdverse=false;
+  let sawRestore=false;
   for(const job of jobs){
     const restore=job?.restore_validation;
     if(backupLevelKey(restore?.level)!=='restore-sample')continue;
-    const at=Number(restore.checked_at);
-    if(!Number.isFinite(at)||at<=0||at>Number(now)+CLOCK_SKEW_SECS)continue;
+    sawRestore=true;
+    const at=eligibleRestoreAt(restore.checked_at,current);
+    if(at==null)continue;
     const state=backupLevelKey(restore.state);
-    if(state==='passed'){
-      const qualified=qualifyingSelectiveRestore(restore);
-      if(qualified&&(!passed||qualified.at>passed.at))passed=qualified;
+    const failed=state==='failed';
+    const adverse=state!=='passed';
+    if(latestAt==null||at>latestAt){
+      latestAt=at;
+      latestFailed=failed;
+      latestAdverse=adverse;
+    }else if(at===latestAt){
+      if(failed)latestFailed=true;
+      if(adverse)latestAdverse=true;
     }
-    if(state==='failed'&&(!failed||at>failed.at))failed={at};
+    if(state!=='passed')continue;
+    const qualified=qualifyingSelectiveRestore(restore);
+    if(qualified&&qualified.at===at&&(!passed||at>passed.at))passed={at,files:qualified.files};
   }
-  const current=Number(now);
-  if(failed&&(!passed||failed.at>passed.at)){
+  if(latestFailed&&(!passed||latestAt>passed.at)){
     return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(passed?passed.at:null,current,'last successful selective restore'),at:passed?passed.at:null,overdue:false,producer:'failed'};
   }
   if(!passed){
-    const sawRestore=jobs.some(job=>backupLevelKey(job?.restore_validation?.level)==='restore-sample');
     return {tone:'neutral',state:'unknown',label:'Not observed',detail:sawRestore?'No successful selective restore is recorded':'No selective restore evidence from the backup source',at:null,overdue:false,producer:''};
   }
   const age=Math.max(0,current-passed.at);
   if(age>SELECTIVE_RESTORE_OVERDUE_SECS)return {tone:'amber',state:'overdue',label:'Overdue',detail:agoNote(passed.at,current,'last successful selective restore'),at:passed.at,overdue:true,producer:'passed'};
-  return {tone:'good',state:'passed',label:'Passed',detail:agoNote(passed.at,current,'selective restore'),at:passed.at,overdue:false,producer:'passed'};
+  if(latestAt===passed.at&&!latestAdverse)return {tone:'good',state:'passed',label:'Passed',detail:agoNote(passed.at,current,'selective restore'),at:passed.at,overdue:false,producer:'passed'};
+  return {tone:'neutral',state:'unknown',label:'Unknown',detail:agoNote(passed.at,current,'last successful selective restore'),at:passed.at,overdue:false,producer:''};
 }
 function projectBackupCheck(observations,now){
   const jobs=Array.isArray(observations)?observations:[];
@@ -2363,7 +2399,36 @@ function releaseHistoryMark(mark){
   if(activeHistoryMark===mark)dismissHistoryHint();
   else if(focused&&typeof mark.blur==='function')mark.blur();
 }
+function historyBounds(container){
+  const start=Number(container?.dataset?.historyStart);
+  const end=Number(container?.dataset?.historyEnd);
+  if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start)return null;
+  return {start,end};
+}
+function historyStampInBounds(mark,bounds){
+  if(!bounds)return false;
+  const stamp=Number(mark?.dataset?.historyStamp);
+  return Number.isFinite(stamp)&&stamp>=bounds.start&&stamp<=bounds.end+CLOCK_SKEW_SECS;
+}
+function historyMarkEngaged(mark){
+  if(!mark)return false;
+  if(typeof document!=='undefined'&&document.activeElement===mark)return true;
+  return activeHistoryMark===mark;
+}
+function historyMarkStamp(mark){
+  const stamp=Number(mark?.dataset?.historyStamp);
+  return Number.isFinite(stamp)?stamp:0;
+}
+function paintRetainedHistoryGeometry(mark,bounds){
+  const stamp=Number(mark?.dataset?.historyStamp);
+  if(!bounds||!Number.isFinite(stamp))return;
+  const span=bounds.end-bounds.start;
+  if(!(span>0))return;
+  const x=Math.max(0,Math.min(100,((stamp-bounds.start)/span)*100));
+  mark.style.setProperty('--mark-x',x.toFixed(1)+'%');
+}
 function reconcileHistoryMarks(container,specs){
+  const bounds=historyBounds(container);
   const existing=new Map();
   Array.from(container.querySelectorAll('.beat-mark')).forEach(mark=>{
     const key=mark.dataset.historyKey;
@@ -2383,17 +2448,38 @@ function reconcileHistoryMarks(container,specs){
     paintHistoryMark(mark,spec);
     desired.push(mark);
   });
+  const retained=[];
   existing.forEach((mark,key)=>{
     if(seen.has(key))return;
+    if(historyMarkEngaged(mark)&&historyStampInBounds(mark,bounds)){
+      paintRetainedHistoryGeometry(mark,bounds);
+      retained.push(mark);
+      return;
+    }
     releaseHistoryMark(mark);
     mark.remove();
+  });
+  retained.forEach(mark=>{
+    const stamp=historyMarkStamp(mark);
+    let index=desired.findIndex(node=>historyMarkStamp(node)>stamp);
+    if(index<0)index=desired.length;
+    desired.splice(index,0,mark);
   });
   let previous=null;
   desired.forEach(mark=>{
     const next=previous?previous.nextSibling:container.firstChild;
-    if(next!==mark)container.insertBefore(mark,next);
+    placeHistoryMark(container,mark,next);
     previous=mark;
   });
+}
+function placeHistoryMark(container,mark,next){
+  if(!container||!mark||next===mark)return;
+  const focused=typeof document!=='undefined'&&document.activeElement===mark;
+  const pin=historyPin;
+  container.insertBefore(mark,next);
+  if(!focused||typeof document==='undefined'||document.activeElement===mark||typeof mark.focus!=='function')return;
+  try{mark.focus({preventScroll:true})}catch(_){try{mark.focus()}catch(__){}}
+  historyPin=pin;
 }
 function updateHistoryEvents(surface,marks){
   const list=surface?.querySelector('[data-history-events]');
@@ -2491,7 +2577,11 @@ function setBeatHistory(beat,beats,interval,now,grace){
   const stage=beat.querySelector('.beat-stage');
   if(stage)stage.setAttribute('aria-label',signalWindow.label+' heartbeat history by time');
   const marks=beat.querySelector('.beat-marks');
-  if(marks)reconcileHistoryMarks(marks,view.marks);
+  if(marks){
+    marks.dataset.historyStart=String(view.start);
+    marks.dataset.historyEnd=String(view.end);
+    reconcileHistoryMarks(marks,view.marks);
+  }
   const readout=beat.querySelector('[data-history-readout]');
   if(readout){readout.textContent='';readout.hidden=true;readout.removeAttribute('title')}
   if(activeHistoryMark&&beat.contains(activeHistoryMark))showHistoryHint(activeHistoryMark,historyPin?'full':'line');
