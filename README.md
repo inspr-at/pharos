@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-260920201529.0.0-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-260921083754.0.0-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -51,7 +51,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v260920201529.0.0
+## What ships in v260921083754.0.0
 
 | Area                    | Current capability                                                                                                                                                                                                       |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -999,7 +999,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v260920201529.0.0**. It is already used as a real
+Pharos is an active early release at **v260921083754.0.0**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 
@@ -1065,6 +1065,13 @@ stable-channel sequence, the two-step migration anchor (legacy â†’ calendar v1 â
 calendar v2), the exact legacy rollback authority and the Cargo SemVer mapping,
 which is the identity for v2 coordinates. The
 consistency gate keeps Cargo, Nix, the changelog and release workflow aligned.
+The release-history dialog omits the changelog's Unreleased section, including
+any pending notes. Release rows show a muted relative age, calculated from the
+recorded UTC release date, with the exact date available on hover. This also
+applies to legacy versions; historical changelog dates remain unchanged. The
+aligned metadata row includes a release-details download with a hint describing
+the JSON artifact versions and checksums.
+
 Development commits may descend from the current annotated release tag while
 preserving its release metadata. Publication still requires that exact tag at
 HEAD; changing a published coordinate requires a new release reservation.
@@ -1080,11 +1087,14 @@ source-lock digest hashes, in order, the exact bytes of `Cargo.lock`,
 The sidebar and release history render calendar v2 coordinates through the
 build-time-only INSPR Calendar display bundle in
 `crates/pharosd/assets/vendor/calendar-version-display`. The bundle is pinned
-to source `83d26aa605b21493d22805ba477e6ac279b6409d`; its manifest, configuration,
-renderer, interaction helper, AutoAnimate library and license are verified
+to source `317f872bc061576fc0b45d274d3a22f69bcd4c8a`; its manifest, configuration,
+scheme labels, renderer, interaction helper, AutoAnimate library and license are verified
 offline by `scripts/check-calendar-version-display.sh` and again by the Rust
 build. The server-rendered canonical coordinate remains visible if JavaScript
 is unavailable, and `/version` remains the machine interface.
+The release-history scheme label comes from the bundle's `schemes.json`
+(`INSPR-VER2` for `inspr-calendar-v2`). Unknown schemes fail the build; machine
+scheme identifiers remain unchanged.
 
 ## Contributing
 

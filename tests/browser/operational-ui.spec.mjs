@@ -64,11 +64,9 @@ test("release history exposes the complete immutable release identity", async ({
   const dialog = page.locator("[data-release-modal]");
   await expect(dialog).toHaveCount(1);
   const identity = dialog.locator("[data-release-identity]");
-  const schemeLabel = {
-    "inspr-calendar-v2": "Calendar v2",
-    "inspr-calendar-v1": "Calendar v1",
-    legacy: "Legacy",
-  }[releaseCoordinate.version_scheme];
+  const schemeLabel = JSON.parse(fs.readFileSync(new URL(
+    "../../crates/pharosd/assets/vendor/calendar-version-display/schemes.json", import.meta.url,
+  ), "utf8")).labels[releaseCoordinate.version_scheme];
   expect(schemeLabel).toBeDefined();
   await expect(identity).toContainText(schemeLabel);
   await expect(identity).toContainText(releaseCoordinate.release_channel);
@@ -76,6 +74,9 @@ test("release history exposes the complete immutable release identity", async ({
   await expect(dialog.locator("[data-release-set]")).toHaveAttribute(
     "href",
     `https://github.com/inspr-at/pharos/releases/download/v${releaseCoordinate.version}/release-set.json`,
+  );
+  await expect(dialog.getByRole("link", { name: "Download release details (JSON)", includeHidden: true })).toHaveAttribute(
+    "title", "Download release details (JSON): exact artifact versions and checksums.",
   );
 
   const pill = page.locator(".side-version");
@@ -117,6 +118,120 @@ test("release history exposes the complete immutable release identity", async ({
   } else {
     await expect(pillVersion).toHaveText(`v${releaseCoordinate.version}`);
   }
+});
+
+test("release history shows relative ages with exact-date hover and narrow layout", async ({
+  page,
+}, testInfo) => {
+  await page.clock.setFixedTime(new Date("2026-09-21T00:30:00Z"));
+  await page.goto("/");
+  const originalViewport = page.viewportSize();
+  const open = page.locator("[data-release-open]");
+  const dialog = page.locator("[data-release-modal]");
+  const heading = dialog.locator(".release-entry-heading").filter({
+    has: page.locator(".release-entry-version", { hasText: /^260920201529\.0\.0$/ }),
+  });
+  const age = heading.locator("time");
+  async function showHistory() {
+    // The existing sidebar is desktop-only. Open it there, then resize the
+    // actual dialog to exercise the history rows at the narrow viewport.
+    if (!(await open.isVisible())) {
+      await page.setViewportSize({ width: 1000, height: 900 });
+    }
+    await open.click();
+    await page.setViewportSize(originalViewport);
+    await expect(dialog).toBeVisible();
+  }
+
+  await showHistory();
+  await expect(age).toHaveText("1 day ago");
+  await expect(age).toHaveAttribute("datetime", "2026-09-20");
+  await expect(heading).toHaveAttribute("title", "2026-09-20");
+  await age.hover();
+  await expect(age).toHaveAttribute("title", "2026-09-20");
+  await expect(age).toHaveAttribute("aria-label", "1 day ago; released 2026-09-20");
+  await expect(heading).not.toContainText(" - ");
+  await expect(heading).not.toContainText("2026-09-20");
+
+  const changelog = fs.readFileSync(new URL("../../docs/CHANGELOG.md", import.meta.url), "utf8");
+  await expect(dialog.getByRole("heading", { name: "Unreleased", exact: true })).toHaveCount(0);
+  const unreleased = changelog.split(/^## Unreleased\s*$/m)[1]?.split(/^## /m)[0] ?? "";
+  for (const [, note] of unreleased.matchAll(/^- (.+)$/gm)) {
+    await expect(dialog.locator("li").filter({ hasText: note })).toHaveCount(0);
+  }
+  const [, legacyVersion, legacyDate] = changelog.match(/^## (0\.\d+\.\d+) - (\d{4}-\d{2}-\d{2})$/m);
+  const legacy = dialog.locator(".release-entry-heading").filter({
+    has: page.getByText(legacyVersion, { exact: true }),
+  });
+  await expect(legacy).toHaveAttribute("title", legacyDate);
+  await expect(legacy.locator("time")).toHaveAttribute("title", legacyDate);
+  await expect(legacy.locator("time")).not.toHaveText(legacyDate);
+
+  for (const [date, label, monthEndLabel] of [
+    ["2026-09-20", "today"],
+    ["2026-09-27", "1 week ago"],
+    ["2026-09-30", "1 week ago", "1 month ago"],
+    ["2026-10-04", "2 weeks ago"],
+    ["2026-10-20", "1 month ago"],
+    ["2027-02-28", "5 months ago", "1/2 year ago"],
+    ["2027-03-20", "1/2 year ago"],
+    ["2027-04-20", "7 months ago"],
+    ["2027-09-20", "1 year ago"],
+    ["2028-02-29", "1 year ago", "1 1/2 years ago"],
+    ["2028-03-20", "1 1/2 years ago"],
+    ["2026-09-19", "upcoming"],
+    ["2026-09-21", "1 day ago"],
+  ]) {
+    await dialog.locator(".release-close").click();
+    await page.clock.setFixedTime(new Date(`${date}T00:30:00Z`));
+    await showHistory();
+    await expect(age).toHaveText(label);
+    if (monthEndLabel) {
+      await expect(dialog.locator('time[datetime="2026-08-31"]').first()).toHaveText(monthEndLabel);
+    }
+  }
+
+  await page.setViewportSize({ width: 1000, height: 900 });
+  const metadata = await dialog.locator(".release-meta").evaluate((element) => {
+    const box = (selector) => element.querySelector(selector).getBoundingClientRect();
+    const identity = box("dl");
+    const download = box("a");
+    const label = box("dt");
+    const value = box("dd");
+    const center = (rect) => rect.top + rect.height / 2;
+    return {
+      centers: Math.abs(center(identity) - center(download)),
+      textCenters: Math.abs(center(label) - center(value)),
+      rightGap: element.getBoundingClientRect().right - download.right,
+      sameSize: getComputedStyle(element.querySelector("dt")).fontSize === getComputedStyle(element.querySelector("dd")).fontSize,
+    };
+  });
+  expect(metadata.centers).toBeLessThan(1);
+  expect(metadata.textCenters).toBeLessThan(1);
+  expect(metadata.rightGap).toBe(0);
+  expect(metadata.sameSize).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("release-history-header.png") });
+
+  await page.setViewportSize({ width: 320, height: 800 });
+  const headerOverflow = await dialog.locator(".release-head").evaluate(element => element.scrollWidth > element.clientWidth);
+  expect(headerOverflow).toBe(false);
+  await heading.scrollIntoViewIfNeeded();
+  const layout = await heading.evaluate((element) => {
+    const version = element.querySelector(".release-entry-version");
+    const time = element.querySelector("time");
+    const row = element.getBoundingClientRect();
+    const versionBox = version.getBoundingClientRect();
+    const timeBox = time.getBoundingClientRect();
+    return {
+      rightGap: row.right - timeBox.right,
+      overlap: versionBox.right > timeBox.left,
+      overflow: element.scrollWidth > element.clientWidth,
+      muted: getComputedStyle(time).color !== getComputedStyle(version).color,
+      aligned: getComputedStyle(time).textAlign,
+    };
+  });
+  expect(layout).toEqual({ rightGap: 0, overlap: false, overflow: false, muted: true, aligned: "right" });
+  await page.screenshot({ path: testInfo.outputPath("release-history-320.png") });
 });
 
 test("sign-in recovery is accessible, no-store, and restarts with one safe action", async ({

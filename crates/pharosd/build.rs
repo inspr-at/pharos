@@ -1,11 +1,13 @@
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, env, fs, path::Path, path::PathBuf, process::Command};
 
-const DISPLAY_SOURCE: &str = "83d26aa605b21493d22805ba477e6ac279b6409d";
+mod build_support;
+
+const DISPLAY_SOURCE: &str = "317f872bc061576fc0b45d274d3a22f69bcd4c8a";
 const DISPLAY_CONFIG_SHA256: &str =
     "7843f3515ce329277d2d576000bd60ac410d725b241d502a9a3fecb2533d956d";
 const DISPLAY_MANIFEST_SHA256: &str =
-    "e7052c82af0d0cdfe4a466bf3129c1de56014253247106f2670788419f118812";
+    "b1125b92bf8c0bb0a9e14968924230f04503d226b63d0a0aee544efbdaf00af2";
 
 fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -15,6 +17,7 @@ fn verify_calendar_bundle(manifest_dir: &Path) {
     let bundle = manifest_dir.join("assets/vendor/calendar-version-display");
     let expected: BTreeSet<&str> = [
         "display.json",
+        "schemes.json",
         "version.js",
         "presentation.js",
         "version-interaction.js",
@@ -68,7 +71,7 @@ fn verify_calendar_bundle(manifest_dir: &Path) {
         .expect("calendar display manifest files are an array");
     assert_eq!(
         entries.len(),
-        7,
+        8,
         "calendar display manifest entry count drifted"
     );
     for entry in entries {
@@ -126,6 +129,13 @@ fn main() {
         );
     }
     println!("cargo:rustc-env=PHAROS_APP_VERSION={version}");
+    let schemes: serde_json::Value = serde_json::from_slice(
+        &fs::read(manifest_dir.join("assets/vendor/calendar-version-display/schemes.json"))
+            .expect("verified doctrine scheme labels are readable"),
+    )
+    .expect("verified doctrine scheme labels are valid JSON");
+    let scheme_label = build_support::scheme_label(&schemes, string("version_scheme"));
+    println!("cargo:rustc-env=PHAROS_VERSION_SCHEME_LABEL={scheme_label}");
     println!(
         "cargo:rustc-env=PHAROS_VERSION_SCHEME={}",
         string("version_scheme")
