@@ -1381,6 +1381,433 @@ mod module_tests {
         assert_ne!(health.summary, "No action needed");
     }
 
+    fn daily_job(
+        id: &str,
+        state: BackupPostureState,
+        last_success_at: Option<i64>,
+        validation: Option<pharos_core::BackupValidationObservation>,
+    ) -> BackupObservation {
+        let mut observation = backup_observation(state, Some("daily"), last_success_at, validation);
+        observation.id = id.to_string();
+        observation
+    }
+
+    fn assert_run_both_orders(
+        left: &BackupObservation,
+        right: &BackupObservation,
+        now: i64,
+        state: &str,
+        tone: &str,
+        at: Option<i64>,
+        case: &str,
+    ) {
+        for (order, jobs) in [
+            ("forward", [left.clone(), right.clone()]),
+            ("reverse", [right.clone(), left.clone()]),
+        ] {
+            let view = fleet_protection_view(&jobs, now);
+            assert_eq!(view.run.state, state, "{case} {order}");
+            assert_eq!(view.run.tone, tone, "{case} {order}");
+            assert_eq!(view.run.at, at, "{case} {order}");
+            assert_ne!(view.run.tone, "good", "{case} {order}");
+            assert!(!view.daily_ok, "{case} {order}");
+        }
+    }
+
+    #[test]
+    fn protection_review_daily_projects_before_rank() {
+        let now = 1_700_000_000;
+        let fresh_at = now - 60;
+        let stale_at = now - BACKUP_RUN_STALE_AFTER_SECS - 1;
+        let fresh = daily_job("fresh", BackupPostureState::Healthy, Some(fresh_at), None);
+        let stale = daily_job("stale", BackupPostureState::Healthy, Some(stale_at), None);
+        assert_run_both_orders(
+            &fresh,
+            &stale,
+            now,
+            "stale",
+            "amber",
+            Some(stale_at),
+            "fresh+stale",
+        );
+        let forward = fleet_protection_view(&[fresh.clone(), stale.clone()], now);
+        assert_eq!(forward.run.label, "Stale");
+        assert_ne!(forward.run.label, "Daily OK");
+
+        let missing_time = daily_job("missing-time", BackupPostureState::Healthy, None, None);
+        assert_run_both_orders(
+            &fresh,
+            &missing_time,
+            now,
+            "unknown",
+            "neutral",
+            None,
+            "healthy+missing-time",
+        );
+        assert_eq!(
+            fleet_protection_view(&[missing_time.clone(), fresh.clone()], now)
+                .run
+                .label,
+            "Success time unknown"
+        );
+
+        let mut disabled = daily_job(
+            "disabled",
+            BackupPostureState::Healthy,
+            Some(fresh_at),
+            None,
+        );
+        disabled.configured = pharos_core::BackupConfiguredState::Disabled;
+        assert_run_both_orders(
+            &fresh,
+            &disabled,
+            now,
+            "disabled",
+            "amber",
+            Some(fresh_at),
+            "healthy+disabled",
+        );
+        assert_eq!(
+            fleet_protection_view(&[disabled.clone(), fresh.clone()], now)
+                .run
+                .label,
+            "Disabled"
+        );
+
+        let future = daily_job(
+            "future",
+            BackupPostureState::Healthy,
+            Some(now + 86_400),
+            None,
+        );
+        assert_run_both_orders(
+            &fresh,
+            &future,
+            now,
+            "stale",
+            "amber",
+            Some(now + 86_400),
+            "future-success",
+        );
+
+        let failed = daily_job("failed", BackupPostureState::Failed, Some(now - 400), None);
+        let missing = daily_job("missing", BackupPostureState::Missing, Some(now - 50), None);
+        assert_run_both_orders(
+            &failed,
+            &missing,
+            now,
+            "failed",
+            "bad",
+            Some(now - 400),
+            "failed+missing",
+        );
+        let warning = daily_job("warning", BackupPostureState::Warning, Some(fresh_at), None);
+        assert_run_both_orders(
+            &missing,
+            &stale,
+            now,
+            "missing",
+            "bad",
+            Some(now - 50),
+            "missing+stale",
+        );
+        assert_run_both_orders(
+            &stale,
+            &warning,
+            now,
+            "stale",
+            "amber",
+            Some(stale_at),
+            "stale+warning",
+        );
+        let unknown = daily_job("unknown", BackupPostureState::Unknown, None, None);
+        assert_run_both_orders(
+            &warning,
+            &unknown,
+            now,
+            "warning",
+            "amber",
+            Some(fresh_at),
+            "warning+unknown",
+        );
+        assert_run_both_orders(
+            &disabled,
+            &unknown,
+            now,
+            "disabled",
+            "amber",
+            Some(fresh_at),
+            "disabled+unknown",
+        );
+        let not_configured = daily_job(
+            "not-configured",
+            BackupPostureState::NotConfigured,
+            None,
+            None,
+        );
+        assert_run_both_orders(
+            &unknown,
+            &not_configured,
+            now,
+            "unknown",
+            "neutral",
+            None,
+            "unknown+not-configured",
+        );
+        assert_run_both_orders(
+            &not_configured,
+            &fresh,
+            now,
+            "not-configured",
+            "neutral",
+            None,
+            "not-configured+ok",
+        );
+
+        let exactly = fleet_protection_view(
+            std::slice::from_ref(&daily_job(
+                "boundary",
+                BackupPostureState::Healthy,
+                Some(now - BACKUP_RUN_STALE_AFTER_SECS),
+                None,
+            )),
+            now,
+        );
+        assert_eq!(exactly.run.state, "ok");
+        assert_eq!(exactly.run.tone, "good");
+        assert_eq!(exactly.run.label, "Daily OK");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_restore_both_orders(
+        left: &BackupObservation,
+        right: &BackupObservation,
+        now: i64,
+        state: &str,
+        tone: &str,
+        label: &str,
+        at: Option<i64>,
+        case: &str,
+    ) {
+        for (order, jobs) in [
+            ("forward", [left.clone(), right.clone()]),
+            ("reverse", [right.clone(), left.clone()]),
+        ] {
+            let view = fleet_protection_view(&jobs, now);
+            assert_eq!(view.restore.state, state, "{case} {order}");
+            assert_eq!(view.restore.tone, tone, "{case} {order}");
+            assert_eq!(view.restore.label, label, "{case} {order}");
+            assert_eq!(view.restore.at, at, "{case} {order}");
+        }
+    }
+
+    #[test]
+    fn protection_review_restore_uses_eligible_latest_evidence() {
+        let now = 1_700_000_000;
+        let fresh_at = now - 60;
+        let passed = |id: &str, at: Option<i64>| {
+            daily_job(
+                id,
+                BackupPostureState::Healthy,
+                Some(fresh_at),
+                Some(restore_sample(
+                    pharos_core::BackupValidationState::Passed,
+                    at,
+                )),
+            )
+        };
+        let sample = |id: &str, state: pharos_core::BackupValidationState, at: Option<i64>| {
+            daily_job(
+                id,
+                BackupPostureState::Healthy,
+                Some(fresh_at),
+                Some(restore_sample(state, at)),
+            )
+        };
+
+        for (case, at) in [
+            ("future-day", Some(now + 86_400)),
+            ("beyond-skew", Some(now + BACKUP_CLOCK_SKEW_SECS + 1)),
+            ("zero", Some(0)),
+            ("missing", None),
+            ("negative", Some(-1)),
+            ("out-of-range", Some(i64::MAX)),
+        ] {
+            let view = fleet_protection_view(std::slice::from_ref(&passed(case, at)), now);
+            assert_eq!(view.restore.state, "unknown", "{case}");
+            assert_eq!(view.restore.tone, "neutral", "{case}");
+            assert_eq!(view.restore.label, "Not observed", "{case}");
+            assert_eq!(view.restore.at, None, "{case}");
+            assert_ne!(view.restore.state, "passed", "{case}");
+        }
+
+        let skew_at = now + BACKUP_CLOCK_SKEW_SECS;
+        let within_skew =
+            fleet_protection_view(std::slice::from_ref(&passed("skew", Some(skew_at))), now);
+        assert_eq!(within_skew.restore.state, "passed");
+        assert_eq!(within_skew.restore.tone, "good");
+        assert_eq!(within_skew.restore.at, Some(skew_at));
+
+        let valid_at = now - 10;
+        let valid = passed("valid", Some(valid_at));
+        let future = passed("future", Some(now + 86_400));
+        assert_restore_both_orders(
+            &valid,
+            &future,
+            now,
+            "passed",
+            "good",
+            "Passed",
+            Some(valid_at),
+            "valid+future-passed",
+        );
+        let future_failed = sample(
+            "future-failed",
+            pharos_core::BackupValidationState::Failed,
+            Some(now + 86_400),
+        );
+        assert_restore_both_orders(
+            &valid,
+            &future_failed,
+            now,
+            "passed",
+            "good",
+            "Passed",
+            Some(valid_at),
+            "valid+future-failed",
+        );
+        let zero = passed("zero-pass", Some(0));
+        assert_restore_both_orders(
+            &valid,
+            &zero,
+            now,
+            "passed",
+            "good",
+            "Passed",
+            Some(valid_at),
+            "valid+zero",
+        );
+
+        let success_at = now - 1_000;
+        let newer_at = now - 100;
+        let success = passed("success", Some(success_at));
+        for (case, state) in [
+            ("newer-stale", pharos_core::BackupValidationState::Stale),
+            ("newer-unknown", pharos_core::BackupValidationState::Unknown),
+        ] {
+            let newer = sample(case, state, Some(newer_at));
+            assert_restore_both_orders(
+                &success,
+                &newer,
+                now,
+                "unknown",
+                "neutral",
+                "Unknown",
+                Some(success_at),
+                case,
+            );
+            let view = fleet_protection_view(&[success.clone(), newer], now);
+            assert!(!view.restore_overdue, "{case}");
+            assert_ne!(view.restore.state, "passed", "{case}");
+        }
+
+        let failed = sample(
+            "failed",
+            pharos_core::BackupValidationState::Failed,
+            Some(newer_at),
+        );
+        assert_restore_both_orders(
+            &success,
+            &failed,
+            now,
+            "failed",
+            "bad",
+            "Failed",
+            Some(success_at),
+            "newer-failed",
+        );
+
+        let tied_at = now - 100;
+        let tied_pass = passed("tied-pass", Some(tied_at));
+        for (case, state) in [
+            ("tied-failed", pharos_core::BackupValidationState::Failed),
+            ("tied-stale", pharos_core::BackupValidationState::Stale),
+            ("tied-unknown", pharos_core::BackupValidationState::Unknown),
+        ] {
+            let adverse = sample(case, state, Some(tied_at));
+            assert_restore_both_orders(
+                &tied_pass,
+                &adverse,
+                now,
+                "unknown",
+                "neutral",
+                "Unknown",
+                Some(tied_at),
+                case,
+            );
+        }
+
+        let exact_at = now - SELECTIVE_RESTORE_OVERDUE_AFTER_SECS;
+        let exact = fleet_protection_view(
+            std::slice::from_ref(&passed("exact-30", Some(exact_at))),
+            now,
+        );
+        assert_eq!(exact.restore.state, "passed");
+        assert_eq!(exact.restore.tone, "good");
+        assert_eq!(exact.restore.at, Some(exact_at));
+        assert!(!exact.restore_overdue);
+
+        let late_at = exact_at - 1;
+        let late =
+            fleet_protection_view(std::slice::from_ref(&passed("late-30", Some(late_at))), now);
+        assert_eq!(late.restore.state, "overdue");
+        assert_eq!(late.restore.tone, "amber");
+        assert_eq!(late.restore.label, "Overdue");
+        assert_eq!(late.restore.at, Some(late_at));
+        assert!(late.restore_overdue);
+        let newer_than_overdue = sample(
+            "newer-than-overdue",
+            pharos_core::BackupValidationState::Stale,
+            Some(now - 100),
+        );
+        assert_restore_both_orders(
+            &passed("old", Some(late_at)),
+            &newer_than_overdue,
+            now,
+            "overdue",
+            "amber",
+            "Overdue",
+            Some(late_at),
+            "overdue+newer-stale",
+        );
+
+        let repo_at = now - 5;
+        let repo = daily_job(
+            "repo",
+            BackupPostureState::Healthy,
+            Some(fresh_at),
+            Some(pharos_core::BackupValidationObservation {
+                level: pharos_core::BackupValidationLevel::RepositoryCheck,
+                state: pharos_core::BackupValidationState::Passed,
+                checked_at: Some(repo_at),
+                evidence_label: Some("repo check".to_string()),
+                summary: None,
+            }),
+        );
+        let repo_view = fleet_protection_view(&[repo.clone(), valid.clone()], now);
+        assert_eq!(repo_view.restore.state, "passed");
+        assert_eq!(repo_view.restore.tone, "good");
+        assert_eq!(repo_view.restore.at, Some(valid_at));
+        assert_eq!(
+            repo_view.check.as_ref().and_then(|fact| fact.at),
+            Some(repo_at)
+        );
+        let repo_only = fleet_protection_view(std::slice::from_ref(&repo), now);
+        assert_eq!(repo_only.restore.state, "unknown");
+        assert_eq!(repo_only.restore.label, "Not observed");
+        assert_ne!(repo_only.restore.tone, "good");
+    }
+
     #[test]
     fn suppress_down_does_not_paint_a_down_server_healthy() {
         let now = 2_000_000_000;
@@ -3126,6 +3553,27 @@ fn positive_instant(at: Option<i64>) -> Option<i64> {
     at.filter(|stamp| *stamp > 0)
 }
 
+/// Recorded positive seconds at or before now plus the shared 2s clock skew.
+/// Missing, zero, negative, and future times are not eligible restore evidence.
+fn eligible_restore_instant(at: Option<i64>, now: i64) -> Option<i64> {
+    let at = positive_instant(at)?;
+    if at > now.saturating_add(BACKUP_CLOCK_SKEW_SECS) {
+        return None;
+    }
+    Some(at)
+}
+
+/// Higher is more adverse. Equal timestamps use this so input order cannot
+/// prefer a pass over a tied failure, stale, or unknown record.
+fn restore_state_adversity(state: pharos_core::BackupValidationState) -> u8 {
+    match state {
+        pharos_core::BackupValidationState::Failed => 3,
+        pharos_core::BackupValidationState::Stale => 2,
+        pharos_core::BackupValidationState::Unknown => 1,
+        pharos_core::BackupValidationState::Passed => 0,
+    }
+}
+
 fn run_fact(observation: &BackupObservation, now: i64) -> ProtectionFact {
     let success_at = positive_instant(observation.last_success_at);
     let mut state = observation.state;
@@ -3327,17 +3775,22 @@ fn restore_fact(
         .copied()
         .filter(|validation| {
             validation.state == pharos_core::BackupValidationState::Passed
-                && validation.checked_at.is_some()
+                && eligible_restore_instant(validation.checked_at, now).is_some()
         })
         .max_by_key(|validation| validation.checked_at.unwrap_or(i64::MIN));
     let latest = validations
         .iter()
         .copied()
-        .max_by_key(|validation| validation.checked_at.unwrap_or(i64::MIN));
+        .filter(|validation| eligible_restore_instant(validation.checked_at, now).is_some())
+        .max_by(|left, right| {
+            left.checked_at.cmp(&right.checked_at).then_with(|| {
+                restore_state_adversity(left.state).cmp(&restore_state_adversity(right.state))
+            })
+        });
     let newer_failed = match (latest, last_success) {
         (Some(latest), Some(success)) => {
             latest.state == pharos_core::BackupValidationState::Failed
-                && latest.checked_at.unwrap_or(i64::MIN) > success.checked_at.unwrap_or(i64::MIN)
+                && latest.checked_at > success.checked_at
         }
         (Some(latest), None) => latest.state == pharos_core::BackupValidationState::Failed,
         _ => false,
@@ -3414,14 +3867,31 @@ fn restore_fact(
     )
 }
 
+/// Lower is worse. `not-required` ranks after every real job so it cannot hide one.
+fn projected_run_rank(fact: &ProtectionFact) -> usize {
+    match fact.state {
+        "failed" => 0,
+        "missing" => 1,
+        "stale" => 2,
+        "warning" | "disabled" => 3,
+        "unknown" => 4,
+        "not-configured" => 5,
+        "ok" => 6,
+        "not-required" => 7,
+        _ => 4,
+    }
+}
+
 pub(super) fn fleet_protection_view(
     observations: &[BackupObservation],
     now: i64,
 ) -> FleetProtectionView {
+    // Project freshness and configuration before ranking. Producer posture alone
+    // would keep a fresh healthy job ahead of another healthy job that is stale.
     let run = observations
         .iter()
-        .min_by_key(|observation| backup_posture_rank(observation.state))
         .map(|observation| run_fact(observation, now))
+        .min_by_key(projected_run_rank)
         .unwrap_or(ProtectionFact {
             state: "unknown",
             tone: "neutral",
