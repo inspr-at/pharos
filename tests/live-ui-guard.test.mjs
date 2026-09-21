@@ -17,13 +17,22 @@ import {
   browserContextOptions,
   browserLaunchOptions,
   classifyObservation,
+  classifyProbeSurface,
+  collectProbeSurface,
   continuationAllowed,
+  decideIncidental,
+  decideRedirect,
   decideRequest,
+  hostNamesFromPayload,
   loadPasswordFile,
   loadUsernameFile,
   parseClientDraft,
+  planInventory,
+  publicPath,
+  redactEvidence,
   repoRootFromScripts,
   sanitizeNavigationError,
+  screenshotName,
   screenshotPermitted,
   LiveUiError,
 } from "../scripts/live-ui-guard.mjs";
@@ -188,6 +197,208 @@ test("credential material in a URL is denied and stripped from navigation errors
   assert.equal(sanitized.includes("https://auth.inspr.at/oauth/v2/authorize"), true);
 });
 
+function leaks(value, parts) {
+  const blob = typeof value === "string" ? value : JSON.stringify(value);
+  return parts.some((part) => part && blob.includes(part));
+}
+
+function percentOdd(secret) {
+  return [...secret]
+    .map((char, index) => (index % 2 === 0 ? `%${char.charCodeAt(0).toString(16).padStart(2, "0")}` : char))
+    .join("");
+}
+
+test("pathname, encoding, fragment, and short secrets stay out of verdicts", () => {
+  const secret = FIXTURE_PASSWORD;
+  const short = "s3cr";
+  const tiny = "ab1";
+  const mixed = percentOdd(secret);
+  const encodedUser = encodeURIComponent(FIXTURE_USER);
+  const cases = [
+    `https://pharos.barta.cm/pharos/${secret}`,
+    `https://pharos.barta.cm/pharos/${mixed}`,
+    `https://pharos.barta.cm/pharos/${encodedUser}`,
+    `https://pharos.barta.cm/pharos/map#${secret}`,
+    `https://pharos.barta.cm/pharos/map#${short}`,
+    `https://pharos.barta.cm/pharos/${short}`,
+    `https://pharos.barta.cm/pharos/${tiny}`,
+    `https://pharos.barta.cm/pharos/pre-${short}-post`,
+    `https://user:${short}@pharos.barta.cm/pharos/map`,
+  ];
+  const secrets = [secret, FIXTURE_USER, short, tiny];
+  for (const url of cases) {
+    const result = request("GET", url, secrets);
+    assert.equal(result.allow, false);
+    assert.equal(result.reason, "secret-in-url");
+    assert.equal(leaks(result, [secret, FIXTURE_USER, encodedUser, mixed, short, tiny]), false);
+    const sanitized = sanitizeNavigationError(new Error(`navigation failed ${url}`), secrets);
+    assert.equal(leaks(sanitized, [secret, FIXTURE_USER, encodedUser, mixed, short, tiny]), false);
+    assert.equal(sanitized.includes("?"), false);
+  }
+  const evidence = redactEvidence(
+    { blocked: [{ method: "GET", path: `/pharos/${secret}`, reason: "secret-in-url" }] },
+    secrets,
+  );
+  assert.equal(leaks(evidence, secrets), false);
+  assert.equal(publicPath(`/pharos/${short}`, [short]), "path-category");
+});
+
+test("issuer reads are allowlisted and incidental channels fail closed", () => {
+  assert.equal(request("GET", "https://auth.inspr.at/ui/v2/assets/app.js").allow, true);
+  assert.equal(request("GET", "https://auth.inspr.at/.well-known/openid-configuration").allow, true);
+  assert.equal(request("GET", "https://auth.inspr.at/v2/sessions").reason, "issuer-read");
+  assert.equal(request("GET", "https://auth.inspr.at/robots.txt").allow, false);
+  assert.equal(request("POST", "https://auth.inspr.at/v2/sessions").allow, false);
+  const socket = decideRequest(
+    { method: "GET", url: "https://pharos.barta.cm/pharos/", resourceType: "websocket" },
+    {},
+  );
+  assert.equal(socket.allow, false);
+  assert.equal(socket.reason, "websocket");
+  assert.equal(continuationAllowed(socket), false);
+  const worker = decideRequest(
+    { method: "GET", url: "https://pharos.barta.cm/pharos/assets/app.js", resourceType: "serviceworker" },
+    {},
+  );
+  assert.equal(worker.reason, "serviceworker");
+  const redirected = decideRedirect({
+    method: "POST",
+    url: "https://pharos.barta.cm/pharos/agora/requests/host-preferences.json",
+  });
+  assert.equal(redirected.allow, false);
+  assert.equal(redirected.reason, "app-mutation");
+  assert.equal(decideRedirect({ method: "GET", url: "https://pharos.agm.ng/pharos/" }).allow, false);
+  assert.equal(decideIncidental("download").allow, false);
+  assert.equal(decideIncidental("popup").reason, "popup");
+  assert.equal(request("GET", "wss://pharos.barta.cm/pharos/socket").allow, false);
+});
+
+function matchesSelector(element, selector) {
+  return selector.split(",").some((part) => matchesOne(element, part.trim()));
+}
+
+function matchesOne(element, selector) {
+  const match = selector.match(/^([a-zA-Z]+|\*)?(?:\.([A-Za-z0-9_-]+))?(\[[^\]]+\])?$/);
+  if (!match) return false;
+  const [, tag, className, attrRaw] = match;
+  if (tag && tag !== "*" && element.tagName !== tag.toUpperCase()) return false;
+  if (className && !(element.attrs.class || "").split(/\s+/).includes(className)) return false;
+  if (!attrRaw) return Boolean(tag || className);
+  const attr = attrRaw.match(/^\[([A-Za-z0-9_-]+)(?:='([^']*)')?\]$/);
+  if (!attr) return false;
+  const [, name, value] = attr;
+  if (!Object.prototype.hasOwnProperty.call(element.attrs, name)) return false;
+  if (value !== undefined && String(element.attrs[name]) !== value) return false;
+  return true;
+}
+
+function domNode(tag, attrs = {}, children = [], text = "") {
+  const element = {
+    tagName: tag.toUpperCase(),
+    attrs,
+    children,
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(attrs, name) ? String(attrs[name]) : null;
+    },
+    hasAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(attrs, name);
+    },
+    getClientRects() {
+      return Object.prototype.hasOwnProperty.call(attrs, "hidden") ? [] : [1];
+    },
+    get innerText() {
+      return `${text} ${children.map((child) => child.innerText || "").join(" ")}`.trim();
+    },
+    get textContent() {
+      return this.innerText;
+    },
+    matches(selector) {
+      return matchesSelector(this, selector);
+    },
+    querySelector(selector) {
+      return this.querySelectorAll(selector)[0] || null;
+    },
+    querySelectorAll(selector) {
+      const found = [];
+      const walk = (items) => {
+        for (const child of items) {
+          if (child.matches(selector)) found.push(child);
+          walk(child.children || []);
+        }
+      };
+      walk(children);
+      return found;
+    },
+  };
+  return element;
+}
+
+function fakeDocument(children, text = "", title = "") {
+  const body = domNode("body", {}, children, text);
+  return {
+    title,
+    body,
+    querySelector(selector) {
+      return this.querySelectorAll(selector)[0] || null;
+    },
+    querySelectorAll(selector) {
+      return body.querySelectorAll(selector);
+    },
+  };
+}
+
+test("optional passkey login is not MFA and a real challenge is", () => {
+  const passwordLogin = fakeDocument([
+    domNode("form", {}, [
+      domNode("input", { type: "email", name: "loginName" }),
+      domNode("input", { type: "password", name: "password" }),
+      domNode("a", { href: "/passkey" }, [], "Sign in with a passkey"),
+      domNode("button", { type: "submit" }, [], "Next"),
+    ]),
+  ], "Email Password Sign in with a passkey Next");
+  const passwordProbe = classifyProbeSurface(collectProbeSurface(passwordLogin));
+  assert.equal(passwordProbe.passkeyAlternative, true);
+  assert.equal(passwordProbe.mfa, false);
+  assert.equal(passwordProbe.loginForm, true);
+  assert.equal(passwordProbe.authUiVisible, true);
+
+  const usernameStep = fakeDocument([
+    domNode("form", {}, [
+      domNode("input", { name: "loginName", autocomplete: "username" }),
+      domNode("a", { href: "/passkey" }, [], "Use a security key"),
+      domNode("button", { type: "submit" }, [], "Next"),
+    ]),
+  ]);
+  assert.equal(classifyProbeSurface(collectProbeSurface(usernameStep)).mfa, false);
+
+  const otp = fakeDocument([
+    domNode("form", {}, [
+      domNode("input", { name: "code", autocomplete: "one-time-code" }),
+      domNode("button", { type: "submit" }, [], "Verify"),
+    ], "Enter the verification code"),
+  ]);
+  const otpProbe = classifyProbeSurface(collectProbeSurface(otp));
+  assert.equal(otpProbe.mfa, true);
+  assert.equal(otpProbe.passkeyAlternative, false);
+
+  const webauthn = fakeDocument([
+    domNode("form", {}, [
+      domNode("button", { type: "submit" }, [], "Continue"),
+    ], "Use your security key"),
+  ]);
+  assert.equal(classifyProbeSurface(collectProbeSurface(webauthn)).mfa, true);
+  assert.equal(
+    classifyProbeSurface({
+      passwordCount: 1,
+      passkeyAlternative: true,
+      otpField: false,
+      webauthnChallenge: false,
+      text: "passkey security key webauthn",
+    }).mfa,
+    false,
+  );
+});
+
 test("classification separates auth, MFA, policy denial, and broken UI", () => {
   const app = { origin: "https://pharos.barta.cm", pathname: "/pharos/" };
   const issuer = { origin: PERSONAL_ISSUER_ORIGIN, pathname: "/ui/v2/login/otp" };
@@ -265,6 +476,33 @@ test("classification separates auth, MFA, policy denial, and broken UI", () => {
     }),
     "broken-ui",
   );
+  assert.equal(
+    classifyObservation({
+      location: app,
+      status: 200,
+      probe: { viewerOnly: true, managerShell: false, appShell: true },
+      managerConfirmed: true,
+    }),
+    "policy-denied",
+  );
+  assert.equal(
+    classifyObservation({
+      location: app,
+      status: 200,
+      probe: { accessRequest: true, appShell: true, managerShell: false },
+      managerConfirmed: true,
+    }),
+    "policy-denied",
+  );
+  assert.equal(
+    classifyObservation({
+      location: app,
+      status: 200,
+      probe: { authUiVisible: true, managerShell: true, appShell: true },
+      managerConfirmed: true,
+    }),
+    "auth-required",
+  );
 });
 
 test("screenshots require an authenticated application page without a credential form", () => {
@@ -306,6 +544,52 @@ test("screenshots require an authenticated application page without a credential
     }),
     false,
   );
+  assert.equal(
+    screenshotPermitted({
+      classification: "authenticated",
+      location: app,
+      probe: { ...ready, authUiVisible: true },
+    }),
+    false,
+  );
+});
+
+test("inventory includes nav, unlinked hosts, and host settings", () => {
+  const names = hostNamesFromPayload(
+    JSON.stringify({
+      hosts: [{ name: "legacy-host" }],
+      declared_hosts: [{ name: "declared-only" }],
+    }),
+  );
+  const planned = planInventory({
+    hostNames: names,
+    hrefs: [
+      "https://pharos.agm.ng/pharos/hosts/company",
+      "/pharos/settings/providers/hetzner-cloud",
+      "https://pharos.barta.cm/pharos/services/legacy-host/backup",
+      "https://tiles.openfreemap.org/styles/positron",
+    ],
+  });
+  for (const route of [
+    "/pharos/",
+    "/pharos/map",
+    "/pharos/alerts",
+    "/pharos/backups",
+    "/pharos/services",
+    "/pharos/activity",
+    "/pharos/settings/providers",
+  ]) {
+    assert.equal(planned.includes(route), true);
+  }
+  assert.equal(planned.includes("/pharos/hosts/legacy-host"), true);
+  assert.equal(planned.includes("/pharos/hosts/legacy-host?section=settings"), true);
+  assert.equal(planned.includes("/pharos/hosts/declared-only?section=settings"), true);
+  assert.equal(planned.includes("/pharos/hosts/company"), false);
+  assert.equal(planned.includes("/pharos/settings/providers/hetzner-cloud"), true);
+  assert.equal(planned.includes("/pharos/services/legacy-host/backup"), true);
+  assert.equal(screenshotName("/pharos/hosts/legacy-host", 3), "host-03.png");
+  assert.equal(screenshotName("/pharos/hosts/legacy-host?section=settings", 3), "host-03-settings.png");
+  assert.equal(screenshotName("/pharos/hosts/legacy-host", 3).includes("legacy-host"), false);
 });
 
 test("credentials are typed only at the personal issuer", () => {
@@ -456,4 +740,14 @@ test("the browser session is headless, memory-only, and guarded before login", (
   const loginAt = runner.indexOf("await signIn", runAt);
   assert.ok(guardAt > runAt);
   assert.ok(loginAt > guardAt);
+  assert.equal(runner.includes("mfaCopy"), false);
+  assert.ok(runner.includes("collectProbeSurface"));
+  assert.ok(runner.includes("classifyProbeSurface"));
+  assert.ok(runner.includes("routeWebSocket"));
+  assert.ok(runner.includes("decideIncidental(\"download\")"));
+  assert.equal(runner.includes("tracing.start"), false);
+  assert.equal(runner.includes("screencast"), false);
+  assert.equal(runner.includes(".storageState("), false);
+  assert.equal(guard.includes("acceptDownloads: false"), true);
+  assert.equal(guard.includes('serviceWorkers: "block"'), true);
 });
