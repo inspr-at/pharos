@@ -1227,11 +1227,16 @@ origin is `https://auth.inspr.at`. Every other origin is denied, including
 path are fixed; environment overrides are refused. Credentials are typed only
 on the login-provider origin.
 
-Each request is decided at request stage before that hop is sent, including a
-redirect that keeps POST. Recording a response is not the guard. A new page
-or worker stays paused until the same guard covers it, or it is closed. An
-authentication challenge is cancelled and is not answered with a username or
-password.
+The primary-frame route denies the initial load of a popup or an iframe.
+Separately, the main page checks each redirect hop at request stage before
+that hop is sent, including a hop that keeps POST. A flat loopback debugger
+session closes every additional page, worker, and shared worker before that
+runtime executes. Pausing a runtime is not a network guard: an ordinary
+permitted worker-script GET can still reach the server. If the raw debugger
+or the main-page request guard is lost, the runner closes the contexts and
+the browser through a separate browser connection and keeps the guards and
+secrets until that browser has closed. An authentication challenge is
+cancelled and is not answered with a username or password.
 
 Application methods other than `GET` and `HEAD` are denied, including
 settings apply, host actions, restart, remove, provider purchase and cleanup,
