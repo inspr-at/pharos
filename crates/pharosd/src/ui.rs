@@ -1249,9 +1249,7 @@ mod module_tests {
         );
         assert!(dated.contains("2023-11-14 22:13:20 UTC"));
         assert_eq!(dated.matches("data-daily-backup-date").count(), 1);
-        assert!(dated.contains(
-            r#"data-protection-evidence><summary>Exact times</summary>"#
-        ));
+        assert!(dated.contains(r#"data-protection-evidence><summary>Exact times</summary>"#));
         assert!(dated.contains("Daily OK"));
         assert!(dated.contains("Passed"));
         assert!(!dated.contains("1970"));
