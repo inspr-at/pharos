@@ -16,44 +16,49 @@ import {
   assertRuntimeEnvironment,
   assertSessionPrefix,
   browserContextOptions,
-  browserLaunchOptions,
   classifyObservation,
-  continuationAllowed,
+  classifyProbeSurface,
+  collectProbeSurface,
+  credentialFillPermitted,
+  decideIncidental,
   decideRequest,
+  disposeFetchGuard,
+  enableFetchGuard,
+  hostNamesFromPayload,
+  installPrimaryFrameRoute,
+  openGuardedBrowser,
   isHostPath,
   isUnderBasePath,
   loadDraftFile,
   loadPasswordFile,
   loadUsernameFile,
+  planInventory,
   publicLocation,
+  publicPath,
+  redactEvidence,
   repoRootFromScripts,
+  screenshotName,
   screenshotPermitted,
+  shutdownLiveSession,
+  submitLabelRejected,
+  takeAuthenticatedShot,
   LiveUiError,
 } from "./live-ui-guard.mjs";
-
-const SHOTS = new Map([
-  ["/pharos/", "01-home.png"],
-  ["/pharos/map", "02-map.png"],
-  ["/pharos/alerts", "03-alerts.png"],
-  ["/pharos/backups", "04-backups.png"],
-  ["/pharos/activity", "05-activity.png"],
-  ["/pharos/services", "06-services.png"],
-  ["/pharos/settings/providers", "07-providers.png"],
-  ["/pharos/agora", "08-agora.png"],
-  ["/pharos/version", "09-version.png"],
-]);
 
 const EMPTY_PROBE = Object.freeze({
   passwordCount: 0,
   mfa: false,
+  passkeyAlternative: false,
   noAccess: false,
   accessDenied: false,
+  accessRequest: false,
   managerShell: false,
   viewerOnly: false,
   appShell: false,
   authRecovery: false,
   rateLimited: false,
   loginForm: false,
+  authUiVisible: false,
 });
 
 function isDirectRun() {
@@ -62,9 +67,9 @@ function isDirectRun() {
   return pathToFileURL(path.resolve(entry)).href === import.meta.url;
 }
 
-function remember(blocked, result) {
+function remember(blocked, result, secrets) {
   if (blocked.length >= 80) return;
-  const pathName = result.path || "/";
+  const pathName = publicPath(result.path || "/", secrets);
   const method = result.method || "?";
   const reason = result.reason || "denied";
   if (blocked.some((item) => item.method === method && item.path === pathName && item.reason === reason)) {
@@ -73,27 +78,48 @@ function remember(blocked, result) {
   blocked.push({ method, path: pathName, reason });
 }
 
-async function installGuard(context, policy, blocked) {
-  await context.route("**/*", async (route) => {
-    let result;
-    try {
-      result = decideRequest(
-        { url: route.request().url(), method: route.request().method() },
-        policy,
-      );
-    } catch {
-      result = { allow: false, reason: "guard-error", method: "?", path: "/" };
-    }
-    if (!continuationAllowed(result)) {
-      remember(blocked, result.allow ? { ...result, reason: "guard-bypass" } : result);
-      await route.abort("blockedbyclient").catch(() => {});
-      return;
-    }
-    await route.continue();
+async function installGuard(context, policy, blocked, pageRef) {
+  const secrets = Array.isArray(policy.secrets) ? policy.secrets : [];
+  const sessions = [];
+  if (typeof context.routeWebSocket !== "function") throw new LiveUiError("browser-context");
+  await context.routeWebSocket(
+    () => true,
+    (socket) => {
+      socket.close({ code: 1008, reason: "policy" }).catch(() => {});
+    },
+  );
+  await installPrimaryFrameRoute(
+    context,
+    pageRef,
+    policy,
+    (verdict) => remember(blocked, verdict, secrets),
+    policy.gate,
+  );
+  await context.addInitScript(() => {
+    window.open = () => null;
   });
+  context.on("serviceworker", () => {
+    remember(blocked, decideIncidental("serviceworker"), secrets);
+  });
+  async function armPage(page) {
+    if (!page || typeof page.context !== "function" || typeof page.context().newCDPSession !== "function") {
+      throw new LiveUiError("network-guard");
+    }
+    const session = await page.context().newCDPSession(page);
+    sessions.push(session);
+    try {
+      await enableFetchGuard(session, policy, (verdict) => remember(blocked, verdict, secrets));
+    } catch {
+      await disposeFetchGuard(session);
+      throw new LiveUiError("network-guard");
+    }
+    return session;
+  }
+  return { sessions, armPage };
 }
 
 async function openDocument(page, href, policy) {
+  if (policy?.gate?.compromised?.()) throw new LiveUiError("network-guard");
   const decision = decideRequest({ method: "GET", url: href }, policy);
   if (!decision.allow) throw new LiveUiError("navigation-denied");
   try {
@@ -105,47 +131,17 @@ async function openDocument(page, href, policy) {
 
 async function readProbe(page) {
   try {
-    return await page.evaluate(() => {
-      const text = (document.body && document.body.innerText ? document.body.innerText : "").slice(0, 4000);
-      const passwordCount = Math.min(2, document.querySelectorAll("input[type='password']").length);
-      const otp = document.querySelector(
-        "input[autocomplete='one-time-code'], input[name='otp' i], input[name='totp' i]",
-      );
-      const mfaCopy =
-        /\b(passkey|security key|webauthn|authenticator|verification code|two-factor|multi-factor|second factor)\b/i.test(
-          text,
-        );
-      const managerShell = Boolean(document.querySelector("[data-can-manage='true']"));
-      return {
-        passwordCount,
-        mfa: Boolean(otp) || mfaCopy,
-        noAccess:
-          text.includes("No access yet") ||
-          text.includes("has not been granted any hosts or settings yet"),
-        accessDenied:
-          document.title === "Access denied · Pharos" ||
-          text.includes("has not granted you operator access"),
-        managerShell,
-        viewerOnly: Boolean(document.querySelector("[data-can-manage='false']")) && !managerShell,
-        appShell: Boolean(document.querySelector("main")),
-        authRecovery: Boolean(document.querySelector("[data-auth-recovery]")),
-        rateLimited: text.includes("authentication rate limit exceeded"),
-        loginForm: Boolean(
-          document.querySelector(
-            "input[name='loginName'], input[name='username'], input[autocomplete='username'], input[type='email']",
-          ),
-        ),
-      };
-    });
+    const surface = await page.evaluate(collectProbeSurface);
+    return classifyProbeSurface(surface);
   } catch {
     return { ...EMPTY_PROBE };
   }
 }
 
-function observe(pageUrl, status, probe, managerConfirmed) {
+function observe(pageUrl, status, probe, managerConfirmed, secrets) {
   let location = { origin: "", pathname: "/" };
   try {
-    location = publicLocation(pageUrl);
+    location = publicLocation(pageUrl, secrets);
   } catch {
     location = { origin: "", pathname: "/" };
   }
@@ -157,9 +153,21 @@ function observe(pageUrl, status, probe, managerConfirmed) {
 
 async function submitControl(page) {
   const submit = page.locator("button[type='submit'], input[type='submit']");
-  if ((await submit.count()) < 1) return false;
-  await submit.first().click();
-  return true;
+  const count = await submit.count();
+  for (let index = 0; index < count; index += 1) {
+    const control = submit.nth(index);
+    const label = await control
+      .evaluate((element) => {
+        const aria = element.getAttribute("aria-label") || "";
+        const text = element.innerText || element.value || "";
+        return `${aria} ${text}`.slice(0, 180);
+      })
+      .catch(() => "");
+    if (submitLabelRejected(label)) continue;
+    await control.click();
+    return true;
+  }
+  return false;
 }
 
 async function fillIssuerCredentials(page, username, password) {
@@ -176,11 +184,12 @@ async function fillIssuerCredentialsOnce(page, username, password) {
   assertCredentialEntryOrigin(origin);
   const before = await readProbe(page);
   if (before.mfa) return "mfa-required";
+  if (!credentialFillPermitted(before)) return "auth-required";
   const passwords = page.locator("input[type='password']");
   const users = page.locator(
     "input[name='loginName'], input[name='username'], input[autocomplete='username'], input[type='email']",
   );
-  if ((await passwords.count()) > 1) return "mfa-required";
+  if ((await passwords.count()) > 1) return "auth-required";
   if ((await passwords.count()) === 0) {
     if ((await users.count()) !== 1) return "auth-required";
     const userOrigin = await users.first().evaluate((element) => element.ownerDocument.location.origin);
@@ -196,11 +205,18 @@ async function fillIssuerCredentialsOnce(page, username, password) {
     }
   }
   const again = await readProbe(page);
-  if (again.mfa || (await passwords.count()) !== 1) {
-    return again.mfa ? "mfa-required" : "auth-required";
-  }
-  const fieldOrigin = await passwords.first().evaluate((element) => element.ownerDocument.location.origin);
-  assertCredentialEntryOrigin(fieldOrigin);
+  if (again.mfa) return "mfa-required";
+  if (!credentialFillPermitted(again) || (await passwords.count()) !== 1) return "auth-required";
+  const fieldOrigin = await passwords.first().evaluate((element) => {
+    const autocomplete = (element.getAttribute("autocomplete") || "").toLowerCase();
+    const name = (element.getAttribute("name") || "").toLowerCase();
+    return {
+      origin: element.ownerDocument.location.origin,
+      mutation: autocomplete === "new-password" || name.includes("reset") || name.includes("new"),
+    };
+  });
+  assertCredentialEntryOrigin(fieldOrigin.origin);
+  if (fieldOrigin.mutation) return "auth-required";
   await passwords.first().fill(password);
   if (!(await submitControl(page))) return "auth-required";
   return "submitted";
@@ -229,47 +245,62 @@ async function waitForReturnedApp(page) {
 async function signIn(page, username, password, policy) {
   const response = await openDocument(page, ENTRY_URL, policy);
   let probe = await readProbe(page);
-  let viewed = observe(page.url(), response ? response.status() : 0, probe, false);
+  let viewed = observe(page.url(), response ? response.status() : 0, probe, false, policy.secrets);
   if (viewed.location.origin === PERSONAL_ISSUER_ORIGIN) {
     const filled = await fillIssuerCredentials(page, username, password);
     if (filled !== "submitted") {
       probe = await readProbe(page);
-      viewed = observe(page.url(), 0, probe, false);
+      viewed = observe(page.url(), 0, probe, false, policy.secrets);
       viewed.classification = filled === "mfa-required" || probe.mfa ? "mfa-required" : "auth-required";
       return viewed;
     }
     await waitForReturnedApp(page);
     probe = await readProbe(page);
-    viewed = observe(page.url(), 0, probe, false);
+    viewed = observe(page.url(), 0, probe, false, policy.secrets);
   }
   if (probe.mfa) viewed.classification = "mfa-required";
   return viewed;
 }
 
-async function collectHostPaths(page, origin) {
+async function discoverInventory(page, origin, secrets, includeJson) {
   let hrefs = [];
+  let hostNames = [];
+  let payloads = [];
   try {
-    hrefs = await page.$$eval("a[href]", (nodes) =>
-      nodes.map((node) => (node.getAttribute("href") || "").slice(0, 200)),
-    );
+    const found = await page.evaluate(async (withJson) => {
+      const foundHrefs = [];
+      for (const node of document.querySelectorAll("a[href], [data-drawer-workspace-href]")) {
+        const href = node.getAttribute("href") || node.getAttribute("data-drawer-workspace-href") || "";
+        if (href) foundHrefs.push(href.slice(0, 200));
+      }
+      const foundNames = [];
+      for (const node of document.querySelectorAll("[data-host]")) {
+        const name = node.getAttribute("data-host") || "";
+        if (name) foundNames.push(name.slice(0, 63));
+      }
+      const foundPayloads = [];
+      if (withJson) {
+        for (const path of ["/pharos/hosts.json", "/pharos/declared-hosts.json"]) {
+          try {
+            const response = await fetch(path, { method: "GET", credentials: "same-origin", cache: "no-store" });
+            if (response.ok) foundPayloads.push((await response.text()).slice(0, 250000));
+          } catch {
+            // A missing inventory source stays empty.
+          }
+        }
+      }
+      return { hrefs: foundHrefs.slice(0, 300), hostNames: foundNames, payloads: foundPayloads };
+    }, includeJson);
+    hrefs = found.hrefs || [];
+    hostNames = found.hostNames || [];
+    payloads = found.payloads || [];
   } catch {
-    return [];
+    hrefs = [];
+    hostNames = [];
+    payloads = [];
   }
-  const found = [];
-  for (const href of hrefs) {
-    if (found.length >= 8) break;
-    let parsed;
-    try {
-      parsed = new URL(href, origin);
-    } catch {
-      continue;
-    }
-    if (!isHostPath(parsed.pathname)) continue;
-    const decision = decideRequest({ method: "GET", url: parsed.href }, {});
-    if (!decision.allow || decision.path !== parsed.pathname) continue;
-    if (!found.includes(parsed.pathname)) found.push(parsed.pathname);
-  }
-  return found;
+  for (const payload of payloads) hostNames.push(...hostNamesFromPayload(payload));
+  return planInventory({ hrefs, hostNames, origin, secrets });
 }
 
 async function visitRoute(page, origin, routePath, policy, managerConfirmed) {
@@ -277,7 +308,7 @@ async function visitRoute(page, origin, routePath, policy, managerConfirmed) {
   const response = await openDocument(page, href, policy);
   const status = response ? response.status() : 0;
   const probe = await readProbe(page);
-  const viewed = observe(page.url(), status, probe, managerConfirmed);
+  const viewed = observe(page.url(), status, probe, managerConfirmed, policy.secrets);
   return {
     path: routePath,
     status,
@@ -287,25 +318,54 @@ async function visitRoute(page, origin, routePath, policy, managerConfirmed) {
   };
 }
 
-async function shoot(page, outputDir, route) {
-  if (!screenshotPermitted(route)) return "";
-  const name = SHOTS.get(route.path) || "";
-  if (!name && !isHostPath(route.path)) return "";
-  const fileName = name || `host-${String(route.hostIndex).padStart(2, "0")}.png`;
-  const file = path.join(outputDir, fileName);
+async function waitForAuthUiHidden(page) {
   try {
-    await page.screenshot({
-      path: file,
-      type: "png",
-      fullPage: false,
-      animations: "disabled",
-      caret: "hide",
-    });
-    fs.chmodSync(file, 0o600);
+    await page.waitForFunction(
+      () => {
+        const nodes = document.querySelectorAll(
+          "input[type='password'], input[autocomplete='one-time-code'], input[autocomplete='webauthn'], input[name='otp'], input[name='totp']",
+        );
+        return [...nodes].every((node) => node.getClientRects().length === 0);
+      },
+      undefined,
+      { timeout: 2000 },
+    );
+  } catch {
+    // The following probe decides whether a shot is allowed.
+  }
+}
+
+async function shoot(page, outputDir, route, secrets) {
+  await waitForAuthUiHidden(page);
+  const probe = await readProbe(page);
+  const password = Array.isArray(secrets) ? secrets[secrets.length - 1] : "";
+  let location = route.location;
+  try {
+    location = publicLocation(page.url(), Array.isArray(secrets) ? secrets : []);
   } catch {
     return "";
   }
-  return fileName;
+  const fileName = screenshotName(route.path, route.hostIndex);
+  if (!fileName) return "";
+  const file = path.join(outputDir, fileName);
+  let written = false;
+  try {
+    written = await takeAuthenticatedShot(page, {
+      permitted: screenshotPermitted({ classification: route.classification, location, probe }),
+      password,
+      options: {
+        path: file,
+        type: "png",
+        fullPage: false,
+        animations: "disabled",
+        caret: "hide",
+      },
+    });
+    if (written) fs.chmodSync(file, 0o600);
+  } catch {
+    return "";
+  }
+  return written ? fileName : "";
 }
 
 async function applyClientDraft(page, draft) {
@@ -333,28 +393,32 @@ async function applyClientDraft(page, draft) {
   return { applied, result: "dom-only" };
 }
 
-function writeEvidence(dir, body) {
+function writeEvidence(dir, body, secrets) {
   const file = path.join(dir, "evidence.json");
-  const safe = {
-    schema: "inspr.pharos.live-ui-evidence.v1",
-    instance: "personal",
-    basePath: "/pharos",
-    serverRole: "unchanged",
-    serverMutationAllowlist: SERVER_MUTATION_ALLOWLIST,
-    clientDraft: body.clientDraft,
-    class: body.class,
-    appOrigin: body.appOrigin,
-    routes: body.routes,
-    blocked: body.blocked,
-  };
+  const safe = redactEvidence(
+    {
+      schema: "inspr.pharos.live-ui-evidence.v1",
+      instance: "personal",
+      basePath: "/pharos",
+      serverRole: "unchanged",
+      serverMutationAllowlist: SERVER_MUTATION_ALLOWLIST,
+      clientDraft: body.clientDraft,
+      class: body.class,
+      appOrigin: body.appOrigin,
+      routes: body.routes,
+      blocked: body.blocked,
+    },
+    secrets,
+  );
   fs.writeFileSync(file, `${JSON.stringify(safe, null, 2)}\n`, { mode: 0o600 });
   fs.chmodSync(file, 0o600);
 }
 
-function report(overall, routes, blocked) {
+function report(overall, routes, blocked, secrets) {
   process.stdout.write(`class=${overall}\n`);
   for (const route of routes) {
-    process.stdout.write(`route=${route.path} status=${route.status} class=${route.class}\n`);
+    const routePath = publicPath(route.path, secrets);
+    process.stdout.write(`route=${routePath} status=${route.status} class=${route.class}\n`);
     if (route.screenshot) process.stdout.write(`screenshot=${route.screenshot}\n`);
   }
   process.stdout.write(`blocked=${blocked.length}\n`);
@@ -377,19 +441,20 @@ async function run(command) {
       ? loadDraftFile(process.env.PHAROS_LIVE_UI_DRAFT_FILE, repoRoot)
       : null;
   const secrets = [username, password];
-  const policy = { secrets };
+  const policy = { secrets, gate: null };
   const blocked = [];
   const routes = [];
   let browser;
+  let gate;
+  let fetchSessions = [];
   let overall = "broken-ui";
   let appOrigin = "";
   let clientDraft = draft ? "dom-only" : "none";
   try {
-    const launch = browserLaunchOptions();
-    if (launch.headless !== true || Object.keys(launch).length !== 1) {
-      throw new LiveUiError("browser-launch");
-    }
-    browser = await chromium.launch(launch);
+    const opened = await openGuardedBrowser((options) => chromium.launch(options));
+    browser = opened.browser;
+    gate = opened.gate;
+    policy.gate = gate;
     if (browser.browserType().name() !== "chromium") throw new LiveUiError("browser-launch");
     const options = browserContextOptions();
     if (["storageState", "recordVideo", "recordHar", "userDataDir"].some((key) => key in options)) {
@@ -398,10 +463,29 @@ async function run(command) {
     const context = await browser.newContext(options);
     if (browser.contexts().length !== 1) throw new LiveUiError("browser-context");
     mark("install-request-guard");
-    await installGuard(context, policy, blocked);
+    const pageRef = { page: null };
+    const guard = await installGuard(context, policy, blocked, pageRef);
+    fetchSessions = guard.sessions;
     const page = await context.newPage();
+    pageRef.page = page;
+    if (gate.compromised() || !gate.attachedPrimary()) throw new LiveUiError("network-guard");
+    await guard.armPage(page);
+    const watchSurface = (target) => {
+      target.on("download", (download) => {
+        download.cancel().catch(() => {});
+        remember(blocked, decideIncidental("download"), secrets);
+      });
+      target.on("popup", (popup) => {
+        remember(blocked, decideIncidental("popup"), secrets);
+        popup.close().catch(() => {});
+      });
+    };
+    watchSurface(page);
     context.on("page", (popup) => {
-      if (popup !== page) popup.close().catch(() => {});
+      if (popup === page) return;
+      watchSurface(popup);
+      remember(blocked, decideIncidental("popup"), secrets);
+      popup.close().catch(() => {});
     });
     mark("open-login");
     const signedIn = await signIn(page, secrets[0], secrets[1], policy);
@@ -416,25 +500,50 @@ async function run(command) {
         clientDraft,
         routes,
         blocked,
-      });
-      report(overall, routes, blocked);
+      }, secrets);
+      report(overall, routes, blocked, secrets);
       return EXIT_CODES[overall] ?? 1;
     }
     appOrigin = signedIn.location.origin;
-    const hosts = await collectHostPaths(page, appOrigin);
     mark("read-only-navigation");
+    const seen = new Set();
+    const pending = await discoverInventory(page, appOrigin, secrets, true);
+    if (pending.length === 0) pending.push(...INVENTORY_ROUTES);
     const visited = [];
-    for (const routePath of [...new Set([...INVENTORY_ROUTES, ...hosts])]) {
+    let jsonFetched = true;
+    while (pending.length > 0 && seen.size < 48) {
+      const routePath = pending.shift();
+      if (!routePath || seen.has(routePath)) continue;
+      seen.add(routePath);
       const viewed = await visitRoute(page, appOrigin, routePath, policy, true);
       visited.push(viewed);
       if (viewed.class === "mfa-required" || viewed.class === "auth-required") {
         overall = viewed.class;
         break;
       }
-      if (viewed.class !== "authenticated") overall = viewed.class;
+      if (viewed.class !== "authenticated") {
+        overall = viewed.class;
+        continue;
+      }
+      const more = await discoverInventory(page, appOrigin, secrets, !jsonFetched);
+      jsonFetched = true;
+      for (const extra of more) {
+        if (!seen.has(extra)) pending.push(extra);
+      }
     }
     mark("screenshot-authenticated-only");
-    let hostIndex = 1;
+    const hostIndexByName = new Map();
+    let nextHostIndex = 1;
+    const hostIndexFor = (routePath) => {
+      const bare = String(routePath).split("?")[0];
+      if (!isHostPath(bare)) return 1;
+      const name = bare.slice("/pharos/hosts/".length);
+      if (!hostIndexByName.has(name)) {
+        hostIndexByName.set(name, nextHostIndex);
+        nextHostIndex += 1;
+      }
+      return hostIndexByName.get(name);
+    };
     for (const viewed of visited) {
       let current = viewed;
       let screenshot = "";
@@ -446,13 +555,12 @@ async function run(command) {
             classification: current.class,
             location: current.location,
             probe: current.probe,
-            hostIndex,
-          });
+            hostIndex: hostIndexFor(current.path),
+          }, secrets);
         }
       }
-      if (isHostPath(viewed.path)) hostIndex += 1;
       const record = {
-        path: viewed.path,
+        path: publicPath(viewed.path, secrets),
         status: current.status,
         class: current.class,
       };
@@ -469,8 +577,8 @@ async function run(command) {
           classification: "authenticated",
           location: drafted.location,
           probe: drafted.probe,
-          hostIndex,
-        });
+          hostIndex: hostIndexFor(draft.path),
+        }, secrets);
         const existing = routes.find((route) => route.path === draft.path);
         if (existing && shot) existing.screenshot = shot;
       }
@@ -482,20 +590,25 @@ async function run(command) {
     else if (routes.length === 0 || routes.some((route) => route.class !== "authenticated")) {
       overall = "broken-ui";
     } else overall = "authenticated";
-    writeEvidence(outputDir, { class: overall, appOrigin, clientDraft, routes, blocked });
-    report(overall, routes, blocked);
+    writeEvidence(outputDir, { class: overall, appOrigin, clientDraft, routes, blocked }, secrets);
+    report(overall, routes, blocked, secrets);
     return EXIT_CODES[overall] ?? 1;
   } finally {
-    secrets.fill("");
-    if (draft) {
-      for (const field of draft.fields) field.value = "";
-    }
-    if (browser) {
-      for (const context of browser.contexts()) {
-        await context.close().catch(() => {});
-      }
-      await browser.close().catch(() => {});
-    }
+    await shutdownLiveSession({
+      close: async () => {
+        if (!browser) return;
+        for (const context of browser.contexts()) {
+          await context.close();
+        }
+        await browser.close();
+      },
+      sessions: fetchSessions,
+      detach: async () => {
+        if (gate && typeof gate.close === "function") gate.close();
+      },
+      secrets,
+      drafts: draft ? draft.fields : [],
+    });
   }
 }
 
