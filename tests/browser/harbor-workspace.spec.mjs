@@ -152,12 +152,69 @@ test("host workspace uses fleet protection, real grace, and private fleet return
     const viewer = await newAuthedContext(browser, "read");
     try {
       const viewerPage = await viewer.newPage();
+      const postedSettings = [];
+      viewerPage.on("request", (request) => {
+        if (request.method() === "POST" && request.url().includes("/agora/requests/host-preferences.json")) {
+          postedSettings.push(request.url());
+        }
+      });
       await viewerPage.goto(`/hosts/${host}?section=settings`);
+      await viewerPage.waitForFunction(() => {
+        const root = document.querySelector("[data-color-root]");
+        const main = document.querySelector(".settings-main");
+        return root?.dataset.hostReported === "true" && main?.dataset.canManageFleet === "false";
+      });
+      await viewerPage.locator("details.settings-disclosure").first().locator("summary").click();
+      await viewerPage.locator("[data-advanced] summary").click();
+      await viewerPage.evaluate(() => {
+        const fire = (selector, type) => {
+          document.querySelector(selector)?.dispatchEvent(new Event(type, { bubbles: true }));
+        };
+        const down = document.querySelector("[data-alert-down]");
+        if (down) down.checked = !down.checked;
+        fire("[data-host-kind]", "change");
+        fire("[data-grace-source]", "change");
+        fire("[data-color]", "input");
+        fire("[data-alert-down]", "change");
+        fire("[data-alert-backup]", "change");
+        fire("[data-alert-nix]", "change");
+        fire("[data-nixpkgs-warn-after-days]", "input");
+        fire("[data-preset]", "click");
+      });
+      await expect(viewerPage.locator("[data-color]")).toBeDisabled();
+      await expect(viewerPage.locator("[data-preset]").first()).toBeDisabled();
+      await expect(viewerPage.locator("[data-host-kind]")).toBeDisabled();
+      await expect(viewerPage.locator("[data-alert-down]")).toBeDisabled();
+      await expect(viewerPage.locator("[data-alert-backup]")).toBeDisabled();
+      await expect(viewerPage.locator("[data-alert-nix]")).toBeDisabled();
+      await expect(viewerPage.locator("[data-nixpkgs-warn-after-days]")).toBeDisabled();
       await expect(viewerPage.locator("select[data-grace-source]")).toBeDisabled();
       await expect(viewerPage.locator("[data-grace-seconds]")).toBeDisabled();
+      await expect(viewerPage.locator("[data-grace-reset]")).toBeDisabled();
+      const review = viewerPage.locator("[data-review-settings]");
+      await expect(review).toBeDisabled();
+      await expect(viewerPage.locator("[data-discard-settings]")).toBeDisabled();
+      await review.click({ force: true });
+      await expect(viewerPage.locator("[data-settings-draft-review]")).toHaveCount(0);
+      expect(postedSettings).toEqual([]);
       await expect(viewerPage.locator("[data-host-workspace]")).toContainText(
         "Viewer access: settings and receipts stay visible, while guarded actions remain with a fleet manager.",
       );
+      expect((await viewerPage.request.post("/agora/requests/host-preferences.json", {
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        data: {
+          host,
+          preferences: { accent: "#112233", kind: "server", alerts: { suppress_down: true } },
+        },
+      })).status()).toBe(403);
+      expect((await viewerPage.request.post(`/host-actions/${host}/remove`, {
+        headers: { "x-pharos-action": "1" },
+        data: { confirmation: host, disposition: "unmanaged", successor: null },
+      })).status()).toBe(403);
+      expect((await viewerPage.request.post("/settings/fleet.json", {
+        headers: { "x-pharos-action": "1" },
+        data: { nixpkgs_warn_after_days: 7, heartbeat_grace_secs: 45 },
+      })).status()).toBe(403);
     } finally {
       await viewer.close();
     }
