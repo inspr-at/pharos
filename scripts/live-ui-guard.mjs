@@ -305,40 +305,118 @@ function listedSecrets(secrets) {
   return (Array.isArray(secrets) ? secrets : []).filter((secret) => typeof secret === "string" && secret.length > 0);
 }
 
-function decodeOnceSafe(value) {
-  const text = String(value ?? "");
-  if (!text.includes("%")) return text;
+function latin1Bytes(bytes) {
   let out = "";
-  for (let index = 0; index < text.length; index += 1) {
-    if (text[index] === "%" && /^[0-9A-Fa-f]{2}$/.test(text.slice(index + 1, index + 3))) {
-      out += String.fromCharCode(Number.parseInt(text.slice(index + 1, index + 3), 16));
-      index += 2;
+  for (const byte of bytes) out += String.fromCharCode(byte);
+  return out;
+}
+
+function structuralUtf8Length(bytes, index) {
+  const lead = bytes[index];
+  let need = 0;
+  if (lead <= 0x7F) need = 1;
+  else if ((lead & 0xE0) === 0xC0) need = 2;
+  else if ((lead & 0xF0) === 0xE0) need = 3;
+  else if ((lead & 0xF8) === 0xF0 && lead <= 0xF7) need = 4;
+  if (need === 0 || index + need > bytes.length) return 0;
+  for (let cursor = 1; cursor < need; cursor += 1) {
+    if ((bytes[index + cursor] & 0xC0) !== 0x80) return 0;
+  }
+  return need;
+}
+
+function codePointFromUtf8(bytes, index, length) {
+  if (length === 1) return bytes[index];
+  if (length === 2) return ((bytes[index] & 0x1F) << 6) | (bytes[index + 1] & 0x3F);
+  if (length === 3) {
+    return ((bytes[index] & 0x0F) << 12) | ((bytes[index + 1] & 0x3F) << 6) | (bytes[index + 2] & 0x3F);
+  }
+  return (
+    ((bytes[index] & 0x07) << 18) |
+    ((bytes[index + 1] & 0x3F) << 12) |
+    ((bytes[index + 2] & 0x3F) << 6) |
+    (bytes[index + 3] & 0x3F)
+  );
+}
+
+function utf8Bytes(bytes) {
+  const points = [];
+  for (let index = 0; index < bytes.length; ) {
+    const length = structuralUtf8Length(bytes, index);
+    const point = length === 0 ? null : codePointFromUtf8(bytes, index, length);
+    if (point === null || point > 0x10FFFF) {
+      points.push(bytes[index]);
+      index += 1;
+      continue;
+    }
+    points.push(point);
+    index += length;
+  }
+  let out = "";
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const next = points[index + 1];
+    if (point >= 0xD800 && point <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) {
+      out += String.fromCodePoint(0x10000 + ((point - 0xD800) << 10) + (next - 0xDC00));
+      index += 1;
     } else {
-      out += text[index];
+      out += String.fromCodePoint(point);
     }
   }
   return out;
 }
 
-function decodeRepeated(value) {
-  let current = String(value ?? "");
-  const forms = [current];
-  for (let index = 0; index < 8; index += 1) {
-    const next = decodeOnceSafe(current);
-    if (next === current) break;
-    forms.push(next);
-    current = next;
+function decodeOnceSafe(value, mode) {
+  const text = String(value ?? "");
+  if (!text.includes("%")) return text;
+  let out = "";
+  const bytes = [];
+  const flush = () => {
+    if (bytes.length === 0) return;
+    out += mode === "latin1" ? latin1Bytes(bytes) : utf8Bytes(bytes);
+    bytes.length = 0;
+  };
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "%" && /^[0-9A-Fa-f]{2}$/.test(text.slice(index + 1, index + 3))) {
+      bytes.push(Number.parseInt(text.slice(index + 1, index + 3), 16));
+      index += 2;
+    } else {
+      flush();
+      out += text[index];
+    }
   }
-  return forms;
+  flush();
+  return out;
+}
+
+function decodeRepeated(value) {
+  const forms = new Set([String(value ?? "")]);
+  let frontier = [...forms];
+  for (let round = 0; round < 8; round += 1) {
+    const grown = [];
+    for (const current of frontier) {
+      if (!current.includes("%")) continue;
+      for (const mode of ["utf8", "latin1"]) {
+        const next = decodeOnceSafe(current, mode);
+        if (!forms.has(next)) {
+          forms.add(next);
+          grown.push(next);
+        }
+      }
+    }
+    if (grown.length === 0) break;
+    frontier = grown;
+  }
+  return [...forms];
 }
 
 function percentEncode(secret, alphabet) {
-  return [...secret]
-    .map((char) => {
-      const hex = char.charCodeAt(0).toString(16).padStart(2, "0");
-      return `%${alphabet === "upper" ? hex.toUpperCase() : hex}`;
-    })
-    .join("");
+  let out = "";
+  for (const byte of new TextEncoder().encode(String(secret))) {
+    const hex = byte.toString(16).padStart(2, "0");
+    out += `%${alphabet === "upper" ? hex.toUpperCase() : hex}`;
+  }
+  return out;
 }
 
 function secretVariants(secret) {
@@ -348,17 +426,12 @@ function secretVariants(secret) {
   };
   add(percentEncode(secret, "lower"));
   add(percentEncode(secret, "upper"));
-  add(
-    [...secret]
-      .map((char, index) =>
-        index % 2 === 0 ? `%${char.charCodeAt(0).toString(16).padStart(2, "0")}` : char,
-      )
-      .join(""),
-  );
+  const chars = [...String(secret)];
+  add(chars.map((char, index) => (index % 2 === 0 ? percentEncode(char, "lower") : char)).join(""));
   add(secret.replace(/[@/?#&+=\s]/g, (char) => encodeURIComponent(char)));
-  const mid = Math.ceil(secret.length / 2);
-  add(`${percentEncode(secret.slice(0, mid), "lower")}${secret.slice(mid)}`);
-  add(`${secret.slice(0, mid)}${percentEncode(secret.slice(mid), "upper")}`);
+  const mid = Math.ceil(chars.length / 2);
+  add(`${percentEncode(chars.slice(0, mid).join(""), "lower")}${chars.slice(mid).join("")}`);
+  add(`${chars.slice(0, mid).join("")}${percentEncode(chars.slice(mid).join(""), "upper")}`);
   add(percentEncode(percentEncode(secret, "lower"), "lower"));
   return [...variants];
 }

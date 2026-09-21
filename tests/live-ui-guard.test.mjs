@@ -345,6 +345,77 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", asy
   assert.equal(leaks(routed, ["ab1"]), false);
 });
 
+test("unicode secrets match through percent-decoded paths, keys, and values", async () => {
+  const secret = "é!";
+  const face = "\u{1F600}";
+  const reviewer = "https://pharos.barta.cm/pharos/map?pre-%25C3%25A9!-post=1";
+  const hidden = [
+    reviewer,
+    `https://pharos.barta.cm/pharos/map?${encodeURIComponent(secret)}=1`,
+    `https://pharos.barta.cm/pharos/map?note=${encodeURIComponent(secret)}`,
+    `https://pharos.barta.cm/pharos/map?note=${encodeURIComponent(encodeURIComponent(secret))}`,
+    `https://pharos.barta.cm/pharos/map?pre-${encodeURIComponent(encodeURIComponent(secret))}-post=1`,
+    `https://pharos.barta.cm/pharos/${encodeURIComponent(secret)}`,
+    `https://pharos.barta.cm/pharos/%25C3%25A9!`,
+    `https://pharos.barta.cm/pharos/map#${encodeURIComponent(secret)}`,
+    `https://pharos.barta.cm/pharos/map#${encodeURIComponent(encodeURIComponent(secret))}`,
+    `https://pharos.barta.cm/pharos/map?${encodeURIComponent(face)}=1`,
+    `https://pharos.barta.cm/pharos/map?note=${encodeURIComponent(face)}`,
+    `https://pharos.barta.cm/pharos/map?pre-${encodeURIComponent(encodeURIComponent(face))}-post=1`,
+    `https://pharos.barta.cm/pharos/${encodeURIComponent(face)}`,
+    "https://pharos.barta.cm/pharos/map?x=%ED%A0%BD%ED%B8%80",
+    "https://pharos.barta.cm/pharos/map?x=%E0%83%A9!",
+  ];
+  for (const url of hidden) {
+    const result = request("GET", url, [secret, face]);
+    assert.equal(result.allow, false, url);
+    assert.equal(result.reason, "secret-in-url");
+    assert.equal(leaks(result, [secret, face, "%C3%A9", "%25C3%25A9"]), false);
+    const sanitized = sanitizeNavigationError(new Error(`navigation failed ${url}`), [secret, face]);
+    assert.equal(leaks(sanitized, [secret, face]), false);
+  }
+  const keyedFetch = fakeFetchSession();
+  assert.equal(
+    await settleFetchPause(
+      keyedFetch,
+      { requestId: "unicode-key", request: { method: "GET", url: reviewer } },
+      { secrets: [secret] },
+    ),
+    "failed",
+  );
+  assert.equal(keyedFetch.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  assert.equal(keyedFetch.calls[0].method, "Fetch.failRequest");
+  const main = { id: "main" };
+  const routed = primaryFrameDecision(
+    {
+      url: () => reviewer,
+      method: () => "GET",
+      resourceType: () => "document",
+      frame: () => main,
+    },
+    { mainFrame: () => main },
+    { secrets: [secret] },
+  );
+  assert.equal(routed.allow, false);
+  assert.equal(routed.reason, "secret-in-url");
+  assert.equal(leaks(routed, [secret]), false);
+  for (const url of [
+    "https://pharos.barta.cm/pharos/map?section=settings",
+    "https://pharos.barta.cm/pharos/map?q=%",
+    "https://pharos.barta.cm/pharos/map?q=%2",
+    "https://pharos.barta.cm/pharos/map?q=%ZZ",
+    "https://pharos.barta.cm/pharos/map?q=%C3%",
+    "https://pharos.barta.cm/pharos/map?q=%ED%A0%80",
+    "https://pharos.barta.cm/pharos/map",
+  ]) {
+    assert.equal(request("GET", url, [secret, face]).allow, true, url);
+  }
+  assert.equal(
+    request("GET", "https://pharos.barta.cm/pharos/map?q=%ZZ&pre-%25C3%25A9!-post=1", [secret]).allow,
+    false,
+  );
+});
+
 test("issuer reads are allowlisted and incidental channels fail closed", () => {
   assert.equal(request("GET", "https://auth.inspr.at/ui/v2/assets/app.js").allow, true);
   assert.equal(request("GET", "https://auth.inspr.at/.well-known/openid-configuration").allow, true);
