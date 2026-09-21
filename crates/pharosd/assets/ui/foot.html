@@ -4720,6 +4720,11 @@ function markFleetEntry(){
   const prior=existing&&typeof existing==='object'?existing:(typeof history==='undefined'?null:history.state);
   return applyFleetMarker(withFleetMarker(prior));
 }
+function fleetSearchText(){
+  const state=readNavigationState()??(typeof history==='undefined'?null:history.state);
+  if(!state||typeof state!=='object'||Array.isArray(state)||typeof state.pharosSearch!=='string')return null;
+  return state.pharosSearch;
+}
 function replaceDocumentUrl(url){
   const prior=readNavigationState()??(typeof history==='undefined'?null:history.state);
   const state=withFleetMarker(prior);
@@ -4734,10 +4739,22 @@ function updateUrlState(){
   params.set('sort',sort);
   params.set('filter',activeLiveFilter);
   params.set('signal',signalWindow.key);
-  const search=document.querySelector('[data-search]')?.value||'';
-  if(search)params.set('q',search);
+  const search=document.querySelector('input[data-search]')?.value||'';
+  if(fleetDocumentPath())params.delete('q');
+  else if(search)params.set('q',search);
   else params.delete('q');
-  replaceDocumentUrl(location.pathname+'?'+params.toString());
+  const query=params.toString();
+  const url=location.pathname+(query?'?'+query:'');
+  const prior=readNavigationState()??(typeof history==='undefined'?null:history.state);
+  const state=withFleetMarker(prior);
+  if(!state){
+    replaceDocumentUrl(url);
+    return;
+  }
+  if(search)state.pharosSearch=search;
+  else delete state.pharosSearch;
+  history.replaceState(state,'',url);
+  applyFleetMarker(state);
 }
 /* FLEET_MARKER_END */
 function initControls(){
@@ -4745,7 +4762,9 @@ function initControls(){
   const params=new URLSearchParams(location.search);
   const view=params.get('view')||'grid';
   const sort=params.get('sort')||'attention';
-  const search=params.get('q')||'';
+  const onFleet=Boolean(fleetDocumentPath());
+  const remembered=onFleet?fleetSearchText():null;
+  const search=onFleet?(remembered??''):(params.get('q')||'');
   const liveFilter=params.get('filter')||'all';
   const selectedSignalWindow=params.get('signal')||SIGNAL_WINDOWS[0].key;
   applyView(view,false);
@@ -4753,6 +4772,11 @@ function initControls(){
   applyFilter(search,false);
   applyLiveFilter(liveFilter,false);
   applySignalWindow(selectedSignalWindow,false);
+  if(onFleet&&params.has('q')){
+    params.delete('q');
+    const query=params.toString();
+    replaceDocumentUrl(location.pathname+(query?'?'+query:''));
+  }
   document.querySelectorAll('[data-view-button]').forEach(btn=>btn.addEventListener('click',()=>{applyView(btn.dataset.viewButton);updateUrlState()}));
   document.querySelector('[data-sort]')?.addEventListener('change',e=>{applySort(e.target.value);updateUrlState()});
   document.querySelector('[data-search]')?.addEventListener('input',e=>{applyFilter(e.target.value);updateUrlState()});
@@ -5203,6 +5227,10 @@ window.addEventListener('focus',onFleetFocus);
 window.addEventListener('pageshow',event=>{
   if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
   armFleetWatchdog();
+  if(fleetDocumentPath()){
+    const remembered=fleetSearchText();
+    if(remembered!=null)applyFilter(remembered,false);
+  }
   if(event.persisted||!fleetSnapshotFresh()||beatClockTimer==null||refreshTimer==null)recoverFleet('pageshow');
 });
 window.addEventListener('pagehide',()=>{

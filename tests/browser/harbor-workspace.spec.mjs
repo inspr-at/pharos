@@ -209,17 +209,27 @@ test("fleet breadcrumb returns to the real fleet entry", async ({ page }, testIn
     await page.locator('[data-view-button="list"]').click();
     await page.locator("[data-sort]").selectOption("name");
     await page.locator("input[data-search]").fill(host);
+    await expect(page.locator("input[data-search]")).toHaveValue(host);
     await expect.poll(() => {
       const url = new URL(page.url());
       return url.searchParams.get("view") === "list"
         && url.searchParams.get("sort") === "name"
-        && url.searchParams.get("q") === host;
+        && !url.searchParams.has("q")
+        && !url.search.includes(host);
     }).toBe(true);
-    await expect.poll(() => page.evaluate(() => {
+    await expect.poll(() => page.evaluate((expected) => {
       const state = window.navigation?.currentEntry?.getState?.() || null;
-      const path = state && state.pharosFleet && state.pharosFleet.path;
-      return typeof path === "string" && path === location.pathname;
-    })).toBe(true);
+      const marker = state && state.pharosFleet;
+      const hrefs = [...document.querySelectorAll("a[href]")].map((node) => node.getAttribute("href") || "");
+      const stored = Object.values(localStorage).some((value) => String(value).includes(expected));
+      return Boolean(marker)
+        && marker.path === location.pathname
+        && Object.keys(marker).length === 1
+        && state.pharosSearch === expected
+        && !hrefs.some((href) => href.includes("q=") || href.includes("return_q") || (href.includes("return_to") && href.includes(expected)))
+        && sessionStorage.length === 0
+        && !stored;
+    }, host)).toBe(true);
     const navigationApi = await page.evaluate(() => {
       const nav = window.navigation;
       if (!nav || typeof nav.entries !== "function" || typeof nav.traverseTo !== "function") return false;
@@ -258,13 +268,18 @@ test("fleet breadcrumb returns to the real fleet entry", async ({ page }, testIn
     await expect.poll(() => {
       const url = new URL(page.url());
       return url.pathname === "/"
-        && url.searchParams.get("q") === host
+        && !url.searchParams.has("q")
+        && !url.search.includes(host)
         && url.searchParams.get("view") === "list"
         && url.searchParams.get("sort") === "name";
     }).toBe(true);
+    await expect(page.locator("input[data-search]")).toHaveValue(host);
+    await expect(page.locator(`a.host-name[href="/hosts/${host}"]`).first()).toBeVisible();
     await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
     expect(await page.evaluate(() => sessionStorage.length)).toBe(0);
+    expect(await page.evaluate((expected) => Object.values(localStorage).some((value) => String(value).includes(expected)), host)).toBe(false);
     expect(await page.evaluate(() => window.name)).not.toContain("q=");
+    expect(await page.evaluate((expected) => window.name.includes(expected), host)).toBe(false);
 
     const fromAlerts = await page.context().newPage();
     try {
@@ -288,6 +303,8 @@ test("fleet breadcrumb returns to the real fleet entry", async ({ page }, testIn
       await expect.poll(() => new URL(direct.url()).pathname).toBe("/");
       expect(direct.url()).not.toContain("section=");
       expect(direct.url()).not.toContain("/hosts/");
+      expect(new URL(direct.url()).searchParams.has("q")).toBe(false);
+      await expect(direct.locator("input[data-search]")).toHaveValue("");
     } finally {
       await direct.close();
     }

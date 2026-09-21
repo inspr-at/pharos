@@ -1142,7 +1142,7 @@ test("fleet return marker stores only the fleet pathname", () => {
   assert.match(fleetRuntimeSource, /initControls\(\);\s*markFleetEntry\(\);/);
   assert.match(fleetRuntimeSource, /function writeAssistantUrl[\s\S]*?replaceDocumentUrl\(/);
 
-  function loadMarker({ fleet, pathname, search, prior }) {
+  function loadMarker({ fleet, pathname, search, prior, input = "qa-return-diagnostic" }) {
     const updates = [];
     const history = {
       state: prior,
@@ -1164,12 +1164,13 @@ test("fleet return marker stores only the fleet pathname", () => {
       },
     };
     const main = fleet ? { dataset: { view: "list", fleetSyncState: "current" } } : null;
+    const searchInput = { value: input };
     const document = {
       querySelector(selector) {
         if (selector === "main[data-fleet-sync-state]") return main;
         if (selector === "main") return main;
         if (selector === "[data-sort]") return { value: "name" };
-        if (selector === "[data-search]") return { value: "qa-return-diagnostic" };
+        if (selector === "input[data-search]") return searchInput;
         return null;
       },
     };
@@ -1186,7 +1187,7 @@ test("fleet return marker stores only the fleet pathname", () => {
 let activeLiveFilter='all';
 let signalWindow={key:'10m'};
 ${fleetRuntimeSource.slice(start, end)}
-globalThis.__marker = { updateUrlState, markFleetEntry, withFleetMarker, replaceDocumentUrl };
+globalThis.__marker = { updateUrlState, markFleetEntry, withFleetMarker, replaceDocumentUrl, fleetSearchText };
 `, context);
     return { context, history, updates };
   }
@@ -1202,15 +1203,38 @@ globalThis.__marker = { updateUrlState, markFleetEntry, withFleetMarker, replace
   assert.equal(fleet.updates.at(-1).state.pharosFleet.path, "/");
   assert.deepEqual(vmPlain(Object.keys(fleet.updates.at(-1).state.pharosFleet)), ["path"]);
 
+  assert.equal(fleet.context.__marker.fleetSearchText(), null);
   fleet.context.__marker.updateUrlState();
   assert.equal(fleet.history.state.pharosFleet.path, "/");
   assert.deepEqual(Object.keys(fleet.history.state.pharosFleet), ["path"]);
+  assert.equal(fleet.history.state.pharosSearch, "qa-return-diagnostic");
+  assert.equal(fleet.context.__marker.fleetSearchText(), "qa-return-diagnostic");
   assert.equal(fleet.history.state.scroll, 1);
   assert.match(fleet.history.url, /view=list/);
-  assert.match(fleet.history.url, /q=qa-return-diagnostic/);
   assert.match(fleet.history.url, /sort=name/);
-  assert.equal(JSON.stringify(fleet.history.state).includes("qa-return-diagnostic"), false);
+  assert.doesNotMatch(fleet.history.url, /(?:^|[?&])q=/);
+  assert.equal(JSON.stringify(fleet.history.state.pharosFleet).includes("qa-return-diagnostic"), false);
   assert.equal(JSON.stringify(fleet.history.state).includes("view"), false);
+  assert.equal(fleet.context.__marker.markFleetEntry(), true);
+  assert.equal(fleet.history.state.pharosSearch, "qa-return-diagnostic");
+  fleet.context.__marker.replaceDocumentUrl("/?view=list&sort=name&filter=all&signal=10m");
+  assert.equal(fleet.history.state.pharosSearch, "qa-return-diagnostic");
+  assert.equal(fleet.history.state.pharosFleet.path, "/");
+  assert.doesNotMatch(fleet.history.url, /(?:^|[?&])q=/);
+
+  const cleared = loadMarker({
+    fleet: true,
+    pathname: "/",
+    search: "?view=list&q=secret-host&sort=name",
+    prior: { scroll: 1, pharosSearch: "secret-host", pharosFleet: { path: "/" } },
+    input: "",
+  });
+  cleared.context.__marker.updateUrlState();
+  assert.equal(cleared.history.state.pharosSearch, undefined);
+  assert.equal(cleared.context.__marker.fleetSearchText(), null);
+  assert.doesNotMatch(cleared.history.url, /(?:^|[?&])q=/);
+  assert.equal(cleared.history.state.scroll, 1);
+  assert.equal(JSON.stringify(cleared.history.state).includes("secret-host"), false);
 
   const elsewhere = loadMarker({
     fleet: false,
