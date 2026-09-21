@@ -134,6 +134,12 @@ impl NixcfgDispatch {
                     .alerts
                     .nixpkgs_warn_after_days
                     .map(|days| days.to_string()),
+                // Omitted when the host inherits. "0" is a real override.
+                // An upgraded nixcfg workflow treats omission as clearing it.
+                heartbeat_grace_secs: preferences
+                    .alerts
+                    .heartbeat_grace_secs
+                    .map(|secs| secs.to_string()),
                 request_id,
             },
         };
@@ -387,6 +393,8 @@ struct WorkflowDispatchInputs<'a> {
     // override. Omission preserves compatibility for legacy settings requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     nixpkgs_warn_after_days: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_grace_secs: Option<String>,
     request_id: &'a str,
 }
 
@@ -658,6 +666,7 @@ mod tests {
                 suppress_backup: false,
                 suppress_nix_freshness: true,
                 nixpkgs_warn_after_days: None,
+                heartbeat_grace_secs: None,
             },
         }
     }
@@ -742,6 +751,7 @@ mod tests {
         assert_eq!(payload["inputs"]["suppress_backup"], false);
         assert_eq!(payload["inputs"]["suppress_nix_freshness"], true);
         assert!(payload["inputs"].get("nixpkgs_warn_after_days").is_none());
+        assert!(payload["inputs"].get("heartbeat_grace_secs").is_none());
         assert_eq!(payload["inputs"]["request_id"], request_id);
 
         let _ = std::fs::remove_file(token_path);
@@ -759,6 +769,23 @@ mod tests {
         let (_, body) = raw.split_once("\r\n\r\n").unwrap();
         let payload: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(payload["inputs"]["nixpkgs_warn_after_days"], "7");
+        assert!(payload["inputs"].get("heartbeat_grace_secs").is_none());
+        std::fs::remove_file(token_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn settings_dispatch_carries_zero_grace_and_omits_inheritance() {
+        let token_path = token_file();
+        let (base, request) = mock_github(204);
+        let client = NixcfgDispatch::for_test(Some(token_path.clone()), base);
+        let mut prefs = preferences();
+        prefs.alerts.heartbeat_grace_secs = Some(0);
+        client.dispatch("gpc0", &prefs).await.unwrap();
+        let raw = request.recv().unwrap();
+        let (_, body) = raw.split_once("\r\n\r\n").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["inputs"]["heartbeat_grace_secs"], "0");
+        assert!(payload["inputs"].get("nixpkgs_warn_after_days").is_none());
         std::fs::remove_file(token_path).unwrap();
     }
 
