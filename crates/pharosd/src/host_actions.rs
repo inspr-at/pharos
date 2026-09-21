@@ -4328,12 +4328,12 @@ pub(crate) fn host_lifecycle_with_apply(
         schema: HOST_LIFECYCLE_SCHEMA,
         version: HOST_LIFECYCLE_VERSION,
         slot: HostLifecycleSlot::Quiet,
-        label: "Up to date".to_string(),
+        label: "No pending changes".to_string(),
         level: "clear",
         invoke: HostLifecycleInvoke::HostSettings,
         run_id: None,
         update_restart_intent: None,
-        detail: "No host lifecycle work is waiting.".to_string(),
+        detail: "No pending work is waiting.".to_string(),
         blocked_by: Vec::new(),
         primary_action: None,
     }
@@ -9633,6 +9633,8 @@ mod tests {
         let applied_state = host_preferences_state(&observed, Some(&observed), None);
         let quiet = host_lifecycle(&[], "hsb8", applied_state, false);
         assert_eq!(quiet.slot, HostLifecycleSlot::Quiet);
+        assert_eq!(quiet.label, "No pending changes");
+        assert_eq!(quiet.detail, "No pending work is waiting.");
         assert_ne!(quiet.label, "Ready to apply");
 
         for kind in [
