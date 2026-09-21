@@ -1365,9 +1365,39 @@ fn render_page_with_access(
     format!(
         r##"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}{access_path}{host_table}{content}</main>{action_dialog}<script>
 function appUrl(path){{return (typeof window.pharosPublicPath==='function')?window.pharosPublicPath(path):path}}
+function fleetReturnPath(value){{
+  try{{
+    const url=new URL(value,location.origin);
+    const path=url.pathname.replace(/\/+$/,'')||'/';
+    return url.origin+' '+path;
+  }}catch(_error){{return ''}}
+}}
 document.querySelector('[data-fleet-return]')?.addEventListener('click',event=>{{
   if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;
-  if(history.length>1){{event.preventDefault();history.back();}}
+  const link=event.currentTarget;
+  const fleetHref=link.getAttribute('href')||'/';
+  const nav=window.navigation;
+  if(!nav||typeof nav.entries!=='function'||typeof nav.traverseTo!=='function')return;
+  let entries=[];
+  try{{entries=nav.entries()||[]}}catch(_error){{return}}
+  if(!Array.isArray(entries)||!entries.length)return;
+  const current=nav.currentEntry;
+  let currentIndex=entries.length-1;
+  if(current&&Number.isInteger(current.index)&&current.index>=0&&current.index<entries.length)currentIndex=current.index;
+  else if(current&&current.key){{
+    const found=entries.findIndex(entry=>entry&&entry.key===current.key);
+    if(found>=0)currentIndex=found;
+  }}
+  const fleetKey=fleetReturnPath(fleetHref);
+  if(!fleetKey)return;
+  for(let index=currentIndex-1;index>=0;index-=1){{
+    const entry=entries[index];
+    if(!entry||!entry.url||!entry.key)continue;
+    if(fleetReturnPath(entry.url)!==fleetKey)continue;
+    event.preventDefault();
+    Promise.resolve(nav.traverseTo(entry.key)).catch(()=>{{location.assign(fleetHref)}});
+    return;
+  }}
 }});
 document.querySelector('[data-host-workspace-primary]')?.addEventListener('click',event=>{{
   const href=event.currentTarget.getAttribute('href')||'';
@@ -3113,8 +3143,11 @@ mod tests {
         assert!(!html.contains("Access</button>"));
         assert!(!html.contains("stored-token-hash"));
         assert!(html.contains("[data-fleet-return]"));
-        assert!(html.contains("history.length>1"));
-        assert!(html.contains("history.back()"));
+        assert!(html.contains("window.navigation"));
+        assert!(html.contains("nav.entries()"));
+        assert!(html.contains("nav.traverseTo"));
+        assert!(!html.contains("history.back()"));
+        assert!(!html.contains("history.length"));
         assert!(!html.contains("document.referrer"));
         assert!(html.contains("section.dataset.hostSection!=='settings'"));
         assert!(html.contains("pharos.sidebar.still.v1"));

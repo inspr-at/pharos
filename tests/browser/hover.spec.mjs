@@ -169,3 +169,112 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
   expect(identity.count).toBe(1);
   expect(identity.key).toBe(`sample:${stamp}`);
 });
+
+test("history refresh keeps focus, the full hint, and geometry", async ({ page }) => {
+  await page.goto("/");
+  const stamp = await page.evaluate(() => {
+    const now = Date.now() / 1000;
+    const stamp = Math.floor(now - 20);
+    const previous = stamp - 90;
+    const holder = document.createElement("section");
+    holder.className = "grid";
+    holder.dataset.hoverRefresh = "true";
+    holder.innerHTML = `
+      <article class="card" data-host="focus-host" style="width:280px">
+        <div class="beat" data-interval="60" data-grace="15" style="width:240px">
+          <div class="beat-stage">
+            <span class="beat-marks">
+              <span class="beat-mark" role="img" tabindex="0" data-identity-probe="focus" data-history-key="sample:${stamp}" data-history-level="late" data-history-label="late heartbeat" data-history-detail="90s after previous" aria-label="late heartbeat · 90s after previous" style="--mark-x:50%"></span>
+            </span>
+          </div>
+        </div>
+      </article>`;
+    document.body.append(holder);
+    const beat = holder.querySelector(".beat");
+    window.setBeatHistory(beat, [previous, stamp], 60, now, 15);
+    window.__focusHistory = { stamp, previous, now };
+    return stamp;
+  });
+
+  const mark = page.locator('[data-identity-probe="focus"]');
+  const hint = page.locator("#history-hint");
+  await mark.focus();
+  await expect(hint).toBeVisible();
+  await expect(hint).toHaveAttribute("data-history-hint-mode", "full");
+  const before = await page.evaluate(() => {
+    const pack = (node) => {
+      const box = node.getBoundingClientRect();
+      return { x: box.x, y: box.y, width: box.width, height: box.height };
+    };
+    const mark = document.querySelector('[data-identity-probe="focus"]');
+    const card = document.querySelector('[data-host="focus-host"]');
+    const beat = card.querySelector(".beat");
+    return {
+      active: document.activeElement === mark,
+      hint: document.getElementById("history-hint").textContent,
+      label: mark.getAttribute("aria-label"),
+      described: mark.getAttribute("aria-describedby"),
+      mark: pack(mark),
+      card: pack(card),
+      beat: pack(beat),
+    };
+  });
+  expect(before.active).toBe(true);
+  expect(before.described).toBe("history-hint");
+  expect(before.hint).toBe(before.label);
+  expect(before.hint).toMatch(/after previous/);
+
+  const refreshed = await page.evaluate(() => {
+    const { stamp, previous, now } = window.__focusHistory;
+    const beat = document.querySelector('[data-host="focus-host"] .beat');
+    const mark = document.querySelector('[data-identity-probe="focus"]');
+    window.setBeatHistory(beat, [previous, stamp], 60, now, 15);
+    const pack = (node) => {
+      const box = node.getBoundingClientRect();
+      return { x: box.x, y: box.y, width: box.width, height: box.height };
+    };
+    const card = document.querySelector('[data-host="focus-host"]');
+    const hint = document.getElementById("history-hint");
+    return {
+      same: document.activeElement === mark,
+      connected: mark.isConnected,
+      hintHidden: hint.hidden,
+      hint: hint.textContent,
+      mode: hint.dataset.historyHintMode,
+      label: mark.getAttribute("aria-label"),
+      described: mark.getAttribute("aria-describedby"),
+      mark: pack(mark),
+      card: pack(card),
+      beat: pack(document.querySelector('[data-host="focus-host"] .beat')),
+    };
+  });
+  expect(refreshed.same).toBe(true);
+  expect(refreshed.connected).toBe(true);
+  expect(refreshed.hintHidden).toBe(false);
+  expect(refreshed.mode).toBe("full");
+  expect(refreshed.hint).toBe(refreshed.label);
+  expect(refreshed.hint).toBe(before.hint);
+  expect(refreshed.described).toBe("history-hint");
+  expect(refreshed.mark).toEqual(before.mark);
+  expect(refreshed.card).toEqual(before.card);
+  expect(refreshed.beat).toEqual(before.beat);
+  await expect(mark).toBeFocused();
+
+  const expired = await page.evaluate((sample) => {
+    const beat = document.querySelector('[data-host="focus-host"] .beat');
+    const old = document.querySelector('[data-identity-probe="focus"]');
+    const later = sample + 5000;
+    window.setBeatHistory(beat, [later - 40, later], 60, later + 5, 15);
+    const hint = document.getElementById("history-hint");
+    return {
+      connected: old.isConnected,
+      activeIsOld: document.activeElement === old,
+      hintHidden: hint.hidden,
+      described: old.getAttribute("aria-describedby") || "",
+    };
+  }, stamp);
+  expect(expired.connected).toBe(false);
+  expect(expired.activeIsOld).toBe(false);
+  expect(expired.hintHidden).toBe(true);
+  expect(expired.described).toBe("");
+});

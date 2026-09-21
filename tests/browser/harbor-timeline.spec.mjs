@@ -120,11 +120,16 @@ test("history refresh keeps the same mark and arrival uses the grace scale", asy
     const stamp = Math.floor(now - 20);
     const mark = beat.querySelector(".beat-mark");
     mark.dataset.historyKey = `sample:${stamp}`;
-    window.setBeatHistory(beat, [stamp], 60, now, 15);
+    window.setBeatHistory(beat, [stamp - 90, stamp], 60, now, 15);
     window.__timelineProbe = {
       stamp,
       kept: document.querySelector('[data-identity-probe="kept"]')?.dataset.historyKey || "",
+      firstObservationMarks: 0,
     };
+    window.setBeatHistory(beat, [stamp], 60, now, 15);
+    window.__timelineProbe.firstObservationMarks = beat.querySelectorAll(".beat-mark").length;
+    window.__timelineProbe.firstObservationKept = Boolean(document.querySelector('[data-identity-probe="kept"]')?.isConnected);
+    window.setBeatHistory(beat, [stamp - 90, stamp], 60, now, 15);
     beat.dataset.last = String(now - 30);
     beat.dataset.interval = "60";
     beat.dataset.grace = "15";
@@ -140,6 +145,8 @@ test("history refresh keeps the same mark and arrival uses the grace scale", asy
 
   const probe = await page.evaluate(() => window.__timelineProbe);
   expect(probe.kept).toBe(`sample:${probe.stamp}`);
+  expect(probe.firstObservationMarks).toBe(0);
+  expect(probe.firstObservationKept).toBe(false);
   const arrival = await page.evaluate(() => window.__timelineArrival);
   expect(arrival.state).toBe("on-time");
   expect(arrival.beat).toBe("tracking");

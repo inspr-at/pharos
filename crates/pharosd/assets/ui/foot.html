@@ -108,12 +108,24 @@ function gapInfo(gap,interval,grace){
   if(timing==='stale')return {level:'stale',label:'stale gap recovered',detail};
   return {level:'down',label:'offline gap recovered',detail};
 }
+function historyEventRank(level){
+  const rank=HISTORY_LEVEL_RANK[level];
+  return Number.isInteger(rank)?rank:5;
+}
+function preferHistoryEvent(candidate,current){
+  if(candidate.rank!==current.rank)return candidate.rank<current.rank;
+  if(candidate.gap!==current.gap)return candidate.gap>current.gap;
+  if(candidate.stamp!==current.stamp)return candidate.stamp<current.stamp;
+  return candidate.index<current.index;
+}
 function aggregateHistory(samples,windowDef,now,interval,grace){
   const kept=dedupeHeartbeats(samples);
   const end=Number(now);
   const windowSecs=Math.max(1,Number(windowDef?.secs)||1);
   const start=end-windowSecs;
-  if(!Number.isFinite(end)||kept.length<2)return {marks:[],partial:false,retainedStart:kept[0]??null,start,end,empty:'unobserved'};
+  const axisNowX=100;
+  const axisStartX=100;
+  if(!Number.isFinite(end)||kept.length<2)return {marks:[],partial:false,retainedStart:kept[0]??null,start,end,empty:'unobserved',axisNowX,axisStartX};
   const limit=end+CLOCK_SKEW_SECS;
   const candidates=[];
   for(let index=1;index<kept.length;index++){
@@ -124,10 +136,17 @@ function aggregateHistory(samples,windowDef,now,interval,grace){
   if(candidates.length>HISTORY_DOTS){
     const buckets=Array.from({length:HISTORY_DOTS},()=>null);
     candidates.forEach(index=>{
-      const raw=Math.floor(((Math.max(0,kept[index]-start))/windowSecs)*HISTORY_DOTS);
-      buckets[Math.min(HISTORY_DOTS-1,Math.max(0,raw))]=index;
+      const stamp=kept[index];
+      const previous=Number(kept[index-1]);
+      const gap=Number.isFinite(previous)?Math.max(0,stamp-previous):0;
+      const info=historyInfo(kept,index,interval,grace,end);
+      const raw=Math.floor((Math.max(0,stamp-start)/windowSecs)*HISTORY_DOTS);
+      const bucket=Math.min(HISTORY_DOTS-1,Math.max(0,raw));
+      const choice={index,rank:historyEventRank(info.level),gap,stamp};
+      const current=buckets[bucket];
+      if(!current||preferHistoryEvent(choice,current))buckets[bucket]=choice;
     });
-    indexes=buckets.filter(index=>index!=null);
+    indexes=buckets.filter(choice=>choice).map(choice=>choice.index);
   }
   const marks=indexes.map(index=>{
     const stamp=kept[index];
@@ -135,7 +154,7 @@ function aggregateHistory(samples,windowDef,now,interval,grace){
     const x=Math.max(0,Math.min(100,((stamp-start)/windowSecs)*100));
     return {key:'sample:'+stamp,x,stamp,level:info.level,label:info.label,detail:info.detail,kind:'sample'};
   });
-  return {marks,partial:kept[0]>start+1,retainedStart:kept[0],start,end,empty:marks.length?'observed':'quiet'};
+  return {marks,partial:kept[0]>start+1,retainedStart:kept[0],start,end,empty:marks.length?'observed':'quiet',axisNowX,axisStartX};
 }
 function signalInfo(beats,last,interval,now,windowDef=signalWindow,grace){
   const bounds=cadenceBounds(interval,grace);
@@ -242,23 +261,12 @@ function projectDailyBackup(observations,now){
   if(state==='not-required')return {tone:'neutral',state:'not-required',label:'Not required',detail:String(primary.summary||'No backup is required'),at:hasSuccess?at:null};
   return {tone:'neutral',state:state||'unknown',label:state==='unknown'?'Unknown':'Not observed',detail:state==='unknown'?'Backup evidence is unknown':String(primary.summary||'No backup evidence'),at:hasSuccess?at:null};
 }
-function primaryRepositoryId(jobs){
-  const objects=jobs.filter(job=>job&&typeof job==='object');
-  if(!objects.length)return '';
-  const primary=objects.slice().sort((a,b)=>(DAILY_POSTURE_RANK[backupLevelKey(a.state)]??4)-(DAILY_POSTURE_RANK[backupLevelKey(b.state)]??4))[0];
-  return String(primary.repository_id||'');
-}
 function projectRestoreStatus(observations,now){
   const jobs=(Array.isArray(observations)?observations:[]).filter(job=>job&&typeof job==='object');
   if(projectDailyBackup(jobs,now).state==='not-required')return {tone:'neutral',state:'not-required',label:'Not required',detail:'No selective restore is required',at:null,overdue:false,producer:''};
-  const repo=primaryRepositoryId(jobs);
-  const scoped=repo?jobs.filter(job=>{
-    const other=String(job.repository_id||'');
-    return !other||other===repo;
-  }):jobs;
   let passed=null;
   let failed=null;
-  for(const job of scoped){
+  for(const job of jobs){
     const restore=job?.restore_validation;
     if(backupLevelKey(restore?.level)!=='restore-sample')continue;
     const at=Number(restore.checked_at);
@@ -275,7 +283,7 @@ function projectRestoreStatus(observations,now){
     return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(passed?passed.at:null,current,'last successful selective restore'),at:passed?passed.at:null,overdue:false,producer:'failed'};
   }
   if(!passed){
-    const sawRestore=scoped.some(job=>backupLevelKey(job?.restore_validation?.level)==='restore-sample');
+    const sawRestore=jobs.some(job=>backupLevelKey(job?.restore_validation?.level)==='restore-sample');
     return {tone:'neutral',state:'unknown',label:'Not observed',detail:sawRestore?'No successful selective restore is recorded':'No selective restore evidence from the backup source',at:null,overdue:false,producer:''};
   }
   const age=Math.max(0,current-passed.at);
@@ -2252,25 +2260,42 @@ function paintHistoryMark(mark,spec){
   mark.setAttribute('aria-label',title);
   mark.style.setProperty('--mark-x',Math.max(0,Math.min(100,Number(spec.x)||0)).toFixed(1)+'%');
 }
+function releaseHistoryMark(mark){
+  if(!mark)return;
+  const focused=typeof document!=='undefined'&&document.activeElement===mark;
+  if(activeHistoryMark===mark)dismissHistoryHint();
+  else if(focused&&typeof mark.blur==='function')mark.blur();
+}
 function reconcileHistoryMarks(container,specs){
   const existing=new Map();
-  container.querySelectorAll('.beat-mark').forEach(mark=>{
+  Array.from(container.querySelectorAll('.beat-mark')).forEach(mark=>{
     const key=mark.dataset.historyKey;
-    if(!key||existing.has(key)){mark.remove();return}
+    if(!key||existing.has(key)){
+      releaseHistoryMark(mark);
+      mark.remove();
+      return;
+    }
     existing.set(key,mark);
   });
   const seen=new Set();
+  const desired=[];
   specs.forEach(spec=>{
     seen.add(spec.key);
     let mark=existing.get(spec.key);
-    if(!mark){mark=document.createElement('span');container.appendChild(mark)}
+    if(!mark)mark=document.createElement('span');
     paintHistoryMark(mark,spec);
-    container.appendChild(mark);
+    desired.push(mark);
   });
   existing.forEach((mark,key)=>{
     if(seen.has(key))return;
-    if(activeHistoryMark===mark)dismissHistoryHint();
+    releaseHistoryMark(mark);
     mark.remove();
+  });
+  let previous=null;
+  desired.forEach(mark=>{
+    const next=previous?previous.nextSibling:container.firstChild;
+    if(next!==mark)container.insertBefore(mark,next);
+    previous=mark;
   });
 }
 function updateHistoryEvents(surface,marks){
