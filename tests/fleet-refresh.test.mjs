@@ -255,3 +255,371 @@ test("suspension cancels polling instead of trusting background timers", async (
   assert.equal(page.activeTimers.size, 0);
   assert.equal(page.events.at(-1), "stop");
 });
+
+const pureStart = fleetRuntimeSource.indexOf("const HISTORY_DOTS=12;");
+const pureEnd = fleetRuntimeSource.indexOf("/* TIMELINE_PURE_END */");
+const clockStart = fleetRuntimeSource.indexOf("let beatClockTimer=null;");
+const clockEnd = fleetRuntimeSource.indexOf("/* TIMELINE_CLOCK_END */");
+const listenerEnd = fleetRuntimeSource.indexOf("/* FLEET_LISTENERS_END */");
+
+assert.notEqual(pureStart, -1, "timeline pure block must exist");
+assert.notEqual(pureEnd, -1, "timeline pure block must end");
+assert.notEqual(clockStart, -1, "beat clock block must exist");
+assert.notEqual(clockEnd, -1, "beat clock block must end");
+assert.notEqual(listenerEnd, -1, "fleet listener block must end");
+
+function legacyHeartbeatX(age, interval) {
+  if (age <= interval) return (age / interval) * 64;
+  if (age <= interval * 2) return 64 + ((age - interval) / interval) * (82 - 64);
+  if (age <= interval * 5) return 82 + ((age - interval * 2) / (interval * 3)) * (100 - 82);
+  return 100;
+}
+
+function loadPure() {
+  const source = `${fleetRuntimeSource.slice(pureStart, pureEnd)}
+globalThis.__pure = {
+  heartbeatTiming,
+  heartbeatTimelineX,
+  resolveHeartbeatGrace,
+  projectDailyBackup,
+  projectRestoreStatus,
+  projectHealth,
+  dedupeHeartbeats,
+  aggregateHistory,
+  historyInfo,
+};
+`;
+  const context = vm.createContext({ console });
+  vm.runInContext(source, context);
+  return context.__pure;
+}
+
+test("grace, restore, and history projections follow the shared contracts", () => {
+  const api = loadPure();
+  const now = 2_000_000_000;
+  const windowDef = { key: "10m", label: "10m", secs: 600 };
+
+  assert.equal(api.heartbeatTiming(75, 60, 15), "on-time");
+  assert.equal(api.heartbeatTiming(76, 60, 15), "late");
+  assert.equal(api.heartbeatTiming(20, 10, 15), "on-time");
+  assert.equal(api.heartbeatTiming(21, 10, 15), "stale");
+  assert.equal(api.heartbeatTiming(51, 10, 15), "down");
+  for (const age of [0, 30, 60, 61, 90, 120, 121, 200, 300, 301]) {
+    assert.equal(api.heartbeatTimelineX(age, 60, 0), legacyHeartbeatX(age, 60));
+  }
+
+  assert.deepEqual(api.resolveHeartbeatGrace({}, undefined), { secs: 15, source: "default", lateAfter: null });
+  const hostGrace = api.resolveHeartbeatGrace({
+    heartbeat_grace: { effective_secs: 0, source: "host", late_after_secs: 60 },
+  }, 15);
+  assert.equal(hostGrace.secs, 0);
+  assert.equal(hostGrace.source, "host");
+  assert.equal(api.resolveHeartbeatGrace({}, 40).source, "fleet");
+  assert.equal(api.resolveHeartbeatGrace({ preferences: { alerts: { heartbeat_grace_secs: 0 } } }, 40).secs, 0);
+
+  const current = api.projectRestoreStatus([{
+    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 2_592_000 },
+  }], now);
+  assert.equal(current.state, "current");
+  assert.equal(current.tone, "good");
+  assert.equal(current.overdue, false);
+
+  const overdue = api.projectRestoreStatus([{
+    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 2_592_001 },
+  }], now);
+  assert.equal(overdue.state, "overdue");
+  assert.equal(overdue.tone, "amber");
+  assert.equal(overdue.overdue, true);
+
+  const checkOnly = api.projectRestoreStatus([{
+    restore_validation: { level: "repository-check", state: "passed", checked_at: now - 10 },
+  }], now);
+  assert.equal(checkOnly.state, "unknown");
+  assert.notEqual(checkOnly.tone, "good");
+
+  const countedOut = api.projectRestoreStatus([{
+    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, files_restored: 0 },
+  }], now);
+  assert.equal(countedOut.state, "unknown");
+  assert.notEqual(countedOut.tone, "good");
+
+  const failed = api.projectRestoreStatus([
+    { restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 100 } },
+    { restore_validation: { level: "restore-sample", state: "failed", checked_at: now - 10 } },
+  ], now);
+  assert.equal(failed.state, "failed");
+  assert.equal(failed.tone, "bad");
+  assert.match(failed.detail, /Last successful selective restore/);
+
+  const daily = api.projectDailyBackup([{
+    state: "healthy", schedule: "daily", last_success_at: now - 50,
+  }], now);
+  assert.equal(daily.label, "Daily OK");
+  assert.equal(daily.tone, "good");
+  const hourly = api.projectDailyBackup([{
+    state: "healthy", schedule: "hourly", last_success_at: now - 50,
+  }], now);
+  assert.equal(hourly.label, "Successful");
+  assert.equal(hourly.tone, "good");
+  assert.equal(api.projectDailyBackup([{ configured: "disabled", state: "unknown" }], now).state, "not-required");
+  assert.equal(api.projectDailyBackup([{ state: "healthy", schedule: "daily" }], now).label, "Success time unknown");
+
+  const health = api.projectHealth({
+    liveness: "live",
+    backup: daily,
+    restore: overdue,
+    check: null,
+    services: [],
+    kernelRestart: false,
+    freshness: null,
+  });
+  assert.equal(health.tone, "amber");
+  assert.ok(health.reasons.some((reason) => reason.tone === "good" && reason.label === "Daily OK"));
+  assert.ok(health.reasons.some((reason) => reason.label === "Selective restore overdue"));
+
+  assert.deepEqual(api.dedupeHeartbeats([5, 5.4, 5.9, 6.5]), [5, 6.5]);
+  const start = now - 600;
+  const gapped = api.aggregateHistory([start + 10, start + 400], windowDef, now, 60, 15);
+  assert.equal(gapped.marks.some((mark) => mark.level === "ok"), false);
+  assert.equal(gapped.marks.some((mark) => mark.level === "down"), true);
+  assert.equal(api.historyInfo([now + 30], 0, 60, 15, now).level, "unknown");
+  assert.equal(api.aggregateHistory([now + 30], windowDef, now, 60, 15).marks.some((mark) => mark.level === "ok"), false);
+  assert.deepEqual(api.aggregateHistory([], windowDef, now, 60, 15).marks, []);
+});
+
+function controllableClock() {
+  let now = 0;
+  let seq = 0;
+  const timers = new Map();
+  function setTimeout(fn, ms) {
+    const id = ++seq;
+    timers.set(id, { fn, at: now + Number(ms || 0) });
+    return id;
+  }
+  function clearTimeout(id) {
+    timers.delete(id);
+  }
+  function advance(ms) {
+    const end = now + ms;
+    while (true) {
+      let nextAt = null;
+      let nextId = null;
+      for (const [id, timer] of timers) {
+        if (timer.at <= end && (nextAt == null || timer.at < nextAt || (timer.at === nextAt && id < nextId))) {
+          nextAt = timer.at;
+          nextId = id;
+        }
+      }
+      if (nextId == null) {
+        now = end;
+        return;
+      }
+      now = nextAt;
+      const timer = timers.get(nextId);
+      timers.delete(nextId);
+      timer.fn();
+    }
+  }
+  return { setTimeout, clearTimeout, advance, timers };
+}
+
+function elementMatches(node, selector) {
+  if (!node?.dataset) return false;
+  if (selector === "[data-fleet-recovery]") return Object.hasOwn(node.dataset, "fleetRecovery");
+  if (selector === "[data-fleet-retry]") return Object.hasOwn(node.dataset, "fleetRetry");
+  if (selector === "[data-fleet-sign-in]") return Object.hasOwn(node.dataset, "fleetSignIn");
+  return false;
+}
+
+function findElement(node, selector) {
+  if (!node) return null;
+  if (elementMatches(node, selector)) return node;
+  for (const child of node.childNodes || []) {
+    const found = findElement(child, selector);
+    if (found) return found;
+  }
+  return null;
+}
+
+function createTimelineElement(tag) {
+  return {
+    tag,
+    hidden: false,
+    textContent: "",
+    className: "",
+    type: "",
+    href: "",
+    dataset: {},
+    style: {},
+    childNodes: [],
+    setAttribute(name, value) {
+      if (name === "href") this.href = value;
+    },
+    append(...kids) {
+      this.childNodes.push(...kids);
+    },
+    addEventListener() {},
+    querySelector(selector) {
+      return findElement(this, selector);
+    },
+  };
+}
+
+function eventTarget() {
+  const map = new Map();
+  return {
+    addEventListener(type, fn) {
+      const list = map.get(type) || [];
+      list.push(fn);
+      map.set(type, list);
+    },
+    removeEventListener() {},
+    dispatch(type, event = {}) {
+      for (const fn of map.get(type) || []) fn(event);
+    },
+  };
+}
+
+function timelineHarness(fetch) {
+  const clock = controllableClock();
+  const created = [];
+  const asOf = {
+    dataset: { snapshotLabel: "as of 12:00:00" },
+    textContent: "as of 12:00:00",
+    insertAdjacentElement() {},
+  };
+  const main = {
+    dataset: { fleetSyncState: "current" },
+    querySelector: (selector) => (selector === "[data-as-of]" ? asOf : null),
+  };
+  const documentEvents = eventTarget();
+  const windowEvents = eventTarget();
+  const document = {
+    ...documentEvents,
+    hidden: false,
+    visibilityState: "visible",
+    hasFocus: () => false,
+    body: { dataset: {}, appendChild() {} },
+    documentElement: { dataset: {} },
+    createElement(tag) {
+      const node = createTimelineElement(tag);
+      created.push(node);
+      return node;
+    },
+    querySelector(selector) {
+      if (selector === "main[data-fleet-sync-state]") return main;
+      if (selector === "[data-fleet-recovery]") {
+        return created.find((node) => elementMatches(node, selector)) || null;
+      }
+      return null;
+    },
+  };
+  const window = {
+    ...windowEvents,
+    location: { pathname: "/fleet", search: "?view=cards", reload() {} },
+  };
+  const source = `${appUrlSource}
+${fleetRuntimeSource.slice(pureStart, pureEnd)}
+function updateBeatClock(){}
+${fleetRuntimeSource.slice(clockStart, clockEnd)}
+${fleetRuntimeSource.slice(lifecycleStart, listenerEnd)}
+globalThis.__timeline = {
+  resumeBeatClock,
+  scheduleRefresh,
+  suspendFleet,
+  recoverFleet,
+  armFleetWatchdog,
+  pageFrozen,
+  fleetRecoveryModel,
+  replaceApply(fn) { applyFleetSnapshot = fn; },
+  timers() { return { beat: beatClockTimer, refresh: refreshTimer }; },
+};
+`;
+  const context = vm.createContext({
+    AbortController,
+    console,
+    document,
+    fetch,
+    navigator: { onLine: true },
+    window,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+  });
+  vm.runInContext(source, context);
+  return { api: context.__timeline, asOf, clock, document, main, window };
+}
+
+test("a visible unfocused page keeps one clock and one poll", () => {
+  const queue = deferredFetchQueue();
+  const page = timelineHarness(queue.fetch);
+  page.api.resumeBeatClock();
+  page.api.scheduleRefresh(10_000);
+  const armed = page.api.timers();
+  assert.ok(armed.beat != null);
+  assert.ok(armed.refresh != null);
+
+  page.window.dispatch("blur");
+  assert.equal(page.api.timers().beat, armed.beat);
+  assert.equal(page.api.timers().refresh, armed.refresh);
+
+  page.document.hidden = true;
+  page.document.visibilityState = "hidden";
+  page.document.dispatch("visibilitychange");
+  assert.equal(page.api.timers().beat, null);
+  assert.equal(page.api.timers().refresh, null);
+  assert.equal(queue.pending.length, 0);
+});
+
+test("returning from hidden performs one recovery and focus does not fetch again", async () => {
+  const queue = deferredFetchQueue();
+  const page = timelineHarness(queue.fetch);
+  page.api.replaceApply(() => true);
+  page.document.hidden = true;
+  page.document.visibilityState = "hidden";
+  page.document.dispatch("visibilitychange");
+  page.document.hidden = false;
+  page.document.visibilityState = "visible";
+  page.document.dispatch("visibilitychange");
+  assert.equal(queue.pending.length, 1);
+  const recovery = page.api.recoverFleet("visible");
+  queue.pending[0].resolve(jsonResponse(snapshot(88)));
+  assert.equal(await recovery, true);
+  assert.ok(page.api.timers().beat != null);
+  assert.ok(page.api.timers().refresh != null);
+  page.window.dispatch("focus");
+  assert.equal(queue.pending.length, 1);
+});
+
+test("auth HTML stops the clock and offers sign-in", async () => {
+  const queue = deferredFetchQueue();
+  const page = timelineHarness(queue.fetch);
+  const recovery = page.api.recoverFleet("visible");
+  queue.pending[0].resolve(jsonResponse({}, {
+    redirected: true,
+    status: 200,
+    headers: { get: () => "text/html" },
+  }));
+  assert.equal(await recovery, false);
+  assert.equal(page.main.dataset.fleetSyncState, "stale");
+  assert.match(page.asOf.textContent, /^Data out of date/);
+  assert.equal(page.api.timers().beat, null);
+  assert.equal(page.api.fleetRecoveryModel("auth").action, "sign-in");
+  const box = page.document.querySelector("[data-fleet-recovery]");
+  const signIn = box.querySelector("[data-fleet-sign-in]");
+  const retry = box.querySelector("[data-fleet-retry]");
+  assert.equal(box.hidden, false);
+  assert.equal(signIn.hidden, false);
+  assert.equal(retry.hidden, true);
+  assert.match(signIn.href, /\/auth\/login\?return_to=/);
+});
+
+test("the visible-page watchdog restarts a stranded page without waiting for focus", () => {
+  const queue = deferredFetchQueue();
+  const page = timelineHarness(queue.fetch);
+  page.api.replaceApply(() => true);
+  page.api.armFleetWatchdog();
+  page.clock.advance(5000);
+  assert.equal(queue.pending.length, 1);
+  page.clock.advance(5000);
+  assert.equal(queue.pending.length, 1);
+});

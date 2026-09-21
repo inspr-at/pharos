@@ -13,6 +13,322 @@ function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);r
 function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 const ESC={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
 function esc(v){return String(v ?? '').replace(/[&<>"']/g,ch=>ESC[ch])}
+/* TIMELINE_PURE_START */
+const DEFAULT_HEARTBEAT_GRACE_SECS=15;
+const CLOCK_SKEW_SECS=2;
+const SELECTIVE_RESTORE_OVERDUE_SECS=30*24*60*60;
+const HISTORY_LEVEL_RANK={down:0,stale:1,late:2,unknown:3,first:4,ok:5};
+const DAILY_POSTURE_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
+function wholeGrace(grace){
+  const extra=Number(grace);
+  if(!Number.isInteger(extra)||extra<0||extra>3600)return null;
+  return extra;
+}
+function cadenceBounds(interval,grace){
+  const raw=Number(interval);
+  const cadence=Math.max(1,Number.isFinite(raw)&&raw>0?raw:60);
+  const parsed=wholeGrace(grace);
+  const graceSecs=parsed==null?DEFAULT_HEARTBEAT_GRACE_SECS:parsed;
+  const lateAfter=cadence+graceSecs;
+  const staleAfter=cadence*2;
+  const downAfter=cadence*5;
+  return {cadence,grace:graceSecs,lateAfter,onTimeThrough:Math.min(lateAfter,staleAfter),staleAfter,downAfter};
+}
+function heartbeatTiming(gap,interval,grace){
+  const bounds=cadenceBounds(interval,grace);
+  if(gap>bounds.downAfter)return 'down';
+  if(gap>bounds.staleAfter)return 'stale';
+  if(gap>bounds.lateAfter)return 'late';
+  return 'on-time';
+}
+function heartbeatTimelineX(age,interval,grace){
+  const bounds=cadenceBounds(interval,grace);
+  const span=Math.max(0,Number(age)||0);
+  if(span<=bounds.onTimeThrough)return bounds.onTimeThrough<=0?0:(span/bounds.onTimeThrough)*EXPECT_X;
+  if(span<=bounds.staleAfter){
+    const lateSpan=bounds.staleAfter-bounds.onTimeThrough;
+    if(lateSpan<=0)return STALE_X;
+    return EXPECT_X+((span-bounds.onTimeThrough)/lateSpan)*(STALE_X-EXPECT_X);
+  }
+  if(span<=bounds.downAfter)return STALE_X+((span-bounds.staleAfter)/(bounds.downAfter-bounds.staleAfter))*(100-STALE_X);
+  return 100;
+}
+function resolveHeartbeatGrace(host,fleetGrace){
+  const policy=host?.heartbeat_grace;
+  const policySecs=Number(policy?.effective_secs);
+  if(policy&&Number.isInteger(policySecs)&&policySecs>=0&&policySecs<=3600){
+    const lateAfter=Number(policy.late_after_secs);
+    return {secs:policySecs,source:policy.source==='host'?'host':'fleet',lateAfter:Number.isInteger(lateAfter)?lateAfter:null};
+  }
+  const override=host?.preferences?.alerts?.heartbeat_grace_secs;
+  const overrideSecs=Number(override);
+  if(override!=null&&override!==''&&Number.isInteger(overrideSecs)&&overrideSecs>=0&&overrideSecs<=3600)return {secs:overrideSecs,source:'host',lateAfter:null};
+  const fleetSecs=Number(fleetGrace);
+  if(fleetGrace!=null&&fleetGrace!==''&&Number.isInteger(fleetSecs)&&fleetSecs>=0&&fleetSecs<=3600)return {secs:fleetSecs,source:'fleet',lateAfter:null};
+  return {secs:DEFAULT_HEARTBEAT_GRACE_SECS,source:'default',lateAfter:null};
+}
+function evidenceAge(seconds){
+  const span=Math.max(0,Math.floor(Number(seconds)||0));
+  const days=Math.floor(span/86400);
+  if(days<=0)return dur(span);
+  const rest=span-days*86400;
+  return days+'d'+(rest?' '+dur(rest):'');
+}
+function dedupeHeartbeats(values){
+  const sorted=Array.from(new Set((Array.isArray(values)?values:[]).map(Number).filter(stamp=>Number.isFinite(stamp)&&stamp>0))).sort((a,b)=>a-b);
+  const kept=[];
+  for(const stamp of sorted){
+    const previous=kept[kept.length-1];
+    if(previous!=null&&stamp-previous<1)continue;
+    kept.push(stamp);
+  }
+  return kept;
+}
+function historyInfo(beats,index,interval,grace,now){
+  const stamp=Number(beats[index]);
+  if(!Number.isFinite(stamp)||stamp<=0)return {level:'unknown',label:'unknown sample',detail:'timestamp missing'};
+  if(Number.isFinite(Number(now))&&stamp>Number(now)+CLOCK_SKEW_SECS)return {level:'unknown',label:'clock skew',detail:'reported '+dur(stamp-Number(now))+' ahead of Pharos · '+clock(stamp)};
+  const previous=index>0?Number(beats[index-1]):null;
+  if(previous==null||!Number.isFinite(previous))return {level:'first',label:'first heartbeat',detail:'at '+clock(stamp)};
+  const gap=stamp-previous;
+  if(gap<0)return {level:'unknown',label:'clock skew',detail:'sample is earlier than the previous report · '+clock(stamp)};
+  const timing=heartbeatTiming(gap,interval,grace);
+  const detail=dur(gap)+' after previous · '+clock(stamp);
+  if(timing==='on-time')return {level:'ok',label:'on cadence',detail};
+  if(timing==='late')return {level:'late',label:'late heartbeat',detail};
+  if(timing==='stale')return {level:'stale',label:'stale gap recovered',detail};
+  return {level:'down',label:'offline gap recovered',detail};
+}
+function gapInfo(gap,interval,grace){
+  const timing=heartbeatTiming(gap,interval,grace);
+  if(timing==='on-time')return null;
+  const detail=dur(gap)+' between reports';
+  if(timing==='late')return {level:'late',label:'late heartbeat',detail};
+  if(timing==='stale')return {level:'stale',label:'stale gap recovered',detail};
+  return {level:'down',label:'offline gap recovered',detail};
+}
+function aggregateHistory(samples,windowDef,now,interval,grace){
+  const kept=dedupeHeartbeats(samples);
+  const end=Number(now);
+  const windowSecs=Math.max(1,Number(windowDef?.secs)||1);
+  const start=end-windowSecs;
+  const span=windowSecs;
+  if(!Number.isFinite(end)||!kept.length)return {marks:[],partial:false,retainedStart:kept[0]??null,start,end,empty:'unobserved'};
+  const partial=kept[0]>start+1;
+  const buckets=Array.from({length:HISTORY_DOTS},(_,index)=>({index,events:[]}));
+  const bucketIndex=stamp=>Math.min(HISTORY_DOTS-1,Math.max(0,Math.floor(((stamp-start)/span)*HISTORY_DOTS)));
+  kept.filter(stamp=>stamp>=start&&stamp<=end+CLOCK_SKEW_SECS).forEach(stamp=>{
+    const info=historyInfo(kept,kept.indexOf(stamp),interval,grace,end);
+    buckets[bucketIndex(Math.min(Math.max(stamp,start),end))].events.push({stamp,info,kind:'sample'});
+  });
+  const paintGap=(from,to)=>{
+    const info=gapInfo(to-from,interval,grace);
+    if(!info)return;
+    const left=Math.max(from,start);
+    const right=Math.min(to,end);
+    if(!(right>left))return;
+    const first=bucketIndex(left);
+    const last=bucketIndex(Math.max(left,right-0.001));
+    for(let index=first;index<=last;index++)buckets[index].events.push({stamp:start+(span*index)/HISTORY_DOTS,info,kind:'gap'});
+  };
+  for(let index=1;index<kept.length;index++){
+    if(kept[index]<=start||kept[index-1]>=end)continue;
+    paintGap(kept[index-1],kept[index]);
+  }
+  if(partial){
+    const limit=bucketIndex(Math.min(kept[0],end));
+    for(let index=0;index<limit;index++){
+      buckets[index].events.push({stamp:start+(span*index)/HISTORY_DOTS,info:{level:'unknown',label:'not retained',detail:'no stored heartbeat in this slice'},kind:'unobserved'});
+    }
+  }
+  const marks=[];
+  buckets.forEach(bucket=>{
+    if(!bucket.events.length)return;
+    bucket.events.sort((a,b)=>(HISTORY_LEVEL_RANK[a.info.level]??9)-(HISTORY_LEVEL_RANK[b.info.level]??9)||a.stamp-b.stamp);
+    const worst=bucket.events[0];
+    const stamp=Math.min(Math.max(worst.stamp,start),end);
+    const key=worst.kind==='sample'?'sample:'+worst.stamp:worst.kind+':'+bucket.index;
+    marks.push({key,x:((stamp-start)/span)*100,stamp:worst.kind==='sample'?worst.stamp:null,level:worst.info.level,label:worst.info.label,detail:worst.info.detail,kind:worst.kind});
+  });
+  return {marks,partial,retainedStart:kept[0],start,end,empty:marks.length?'observed':'quiet'};
+}
+function signalInfo(beats,last,interval,now,windowDef=signalWindow,grace){
+  const bounds=cadenceBounds(interval,grace);
+  const windowLabel=windowDef?.label||'window';
+  const windowSecs=Math.max(bounds.cadence,Number(windowDef?.secs)||bounds.cadence);
+  const samples=dedupeHeartbeats([].concat(beats||[],Number.isFinite(Number(last))&&Number(last)>0?[Number(last)]:[]));
+  const base='Heartbeat delivery over '+windowLabel+': ';
+  const uptime=' Not measured host or service uptime.';
+  if(!samples.length)return {text:'—',level:'wait',window:windowLabel,kind:'delivery',title:base+'no reports yet.'+uptime};
+  const requestedStart=Number(now)-windowSecs;
+  const future=samples.filter(stamp=>stamp>Number(now)+CLOCK_SKEW_SECS);
+  const usable=samples.filter(stamp=>stamp<=Number(now)+CLOCK_SKEW_SECS);
+  if(!usable.length)return {text:'—',level:'wait',window:windowLabel,kind:'delivery',title:base+'reports are ahead of Pharos and were not counted.'+uptime};
+  const retainedStart=Math.max(requestedStart,usable[0]);
+  const span=Math.max(bounds.cadence,Math.min(windowSecs,Number(now)-retainedStart));
+  const expected=Math.max(1,Math.ceil(span/bounds.cadence));
+  const received=usable.filter(stamp=>stamp>=retainedStart&&stamp<=Number(now)).length;
+  let longest=0;
+  let previous=retainedStart;
+  for(const stamp of usable){
+    if(stamp<retainedStart||stamp>Number(now))continue;
+    longest=Math.max(longest,stamp-previous);
+    previous=stamp;
+  }
+  longest=Math.max(longest,Number(now)-previous);
+  const percent=Math.max(0,Math.min(100,Math.round((received/expected)*100)));
+  const level=percent>=95?'good':percent>=75?'warn':'down';
+  const partial=usable[0]>requestedStart+1?' Partial retention from '+clock(usable[0])+'.':'';
+  const skew=future.length?' '+future.length+' clock-skewed report'+(future.length===1?'':'s')+' ignored.':'';
+  return {text:percent+'%',level,window:windowLabel,kind:'delivery',title:base+received+' of '+expected+' expected reports after duplicate collapse.'+partial+skew+' Longest gap '+dur(longest)+'.'+uptime};
+}
+function arrivalPresentation(last,interval,grace,now){
+  const bounds=cadenceBounds(interval,grace);
+  const at=Number(last);
+  const current=Number(now);
+  if(!Number.isFinite(at)||at<=0)return {state:'waiting',label:'No heartbeat yet',detail:'Awaiting first report. Late after '+bounds.lateAfter+'s.',x:0};
+  if(!Number.isFinite(current)||at>current+CLOCK_SKEW_SECS)return {state:'unknown',label:'Clock skew',detail:'Last report is ahead of Pharos',x:0};
+  const age=Math.max(0,current-at);
+  const x=heartbeatTimelineX(age,interval,grace);
+  const scale='Arrival scale: 0–'+EXPECT_X+'% on time through '+bounds.onTimeThrough+'s, '+STALE_X+'% at '+bounds.staleAfter+'s, 100% at '+bounds.downAfter+'s. History uses a separate time axis.';
+  const timing=heartbeatTiming(age,interval,grace);
+  if(timing==='on-time')return {state:'on-time',label:'On time',detail:'Late after '+dur(bounds.lateAfter-age)+'. '+scale,x,age};
+  if(timing==='late')return {state:'late',label:'Late',detail:dur(age-bounds.lateAfter)+' past grace. '+scale,x,age};
+  if(timing==='stale')return {state:'stale',label:'Stale',detail:dur(age)+' since last report. '+scale,x,age};
+  return {state:'down',label:'Down',detail:dur(age)+' since last report. '+scale,x,age};
+}
+function backupLevelKey(value){return String(value||'').trim().toLowerCase().replace(/_/g,'-')}
+function selectiveRestoreFileCount(restore){
+  const raw=restore?.restored_files??restore?.restored_file_count??restore?.files_restored;
+  if(raw==null||raw==='')return null;
+  const count=Number(raw);
+  return Number.isFinite(count)?count:null;
+}
+function qualifyingSelectiveRestore(restore){
+  if(!restore||backupLevelKey(restore.state)!=='passed'||backupLevelKey(restore.level)!=='restore-sample')return null;
+  const files=selectiveRestoreFileCount(restore);
+  if(files!=null&&files<1)return null;
+  const at=Number(restore.checked_at);
+  if(!Number.isFinite(at)||at<=0)return null;
+  return {at,files};
+}
+function dailyLabel(schedule){
+  const text=String(schedule||'').trim();
+  if(/^(daily|day|nightly)$/i.test(text)||/24h|every day/i.test(text))return 'Daily OK';
+  return 'Successful';
+}
+function projectDailyBackup(observations,now){
+  const jobs=(Array.isArray(observations)?observations:[]).filter(job=>job&&typeof job==='object');
+  if(!jobs.length)return {tone:'neutral',state:'unknown',label:'Not observed',detail:'No backup evidence',at:null};
+  if(jobs.every(job=>backupLevelKey(job.configured)==='disabled'))return {tone:'neutral',state:'not-required',label:'Not required',detail:'Backup is not configured',at:null};
+  const active=jobs.filter(job=>backupLevelKey(job.configured)!=='disabled');
+  const primary=active.slice().sort((a,b)=>(DAILY_POSTURE_RANK[backupLevelKey(a.state)]??4)-(DAILY_POSTURE_RANK[backupLevelKey(b.state)]??4))[0];
+  const state=backupLevelKey(primary.state);
+  const at=Number(primary.last_success_at);
+  const hasSuccess=Number.isFinite(at)&&at>0;
+  if(state==='healthy'&&hasSuccess){
+    const label=dailyLabel(primary.schedule);
+    const prefix=label==='Daily OK'?'Last success ':(String(primary.schedule||'').trim()?String(primary.schedule).trim()+' · ':'Last success ');
+    return {tone:'good',state:'healthy',label,detail:prefix+dur(Math.max(0,Number(now)-at))+' ago',at};
+  }
+  if(state==='healthy')return {tone:'neutral',state:'unknown',label:'Success time unknown',detail:'No success time was reported',at:null};
+  if(state==='failed'||state==='missing')return {tone:'bad',state,label:state==='failed'?'Backup failed':'Backup missing',detail:String(primary.summary||'Backup needs attention'),at:hasSuccess?at:null};
+  if(state==='stale'||state==='warning')return {tone:'amber',state,label:state==='stale'?'Backup stale':'Review backup',detail:String(primary.summary||'Backup needs attention'),at:hasSuccess?at:null};
+  if(state==='not-configured')return {tone:'neutral',state:'not-configured',label:'Not configured',detail:String(primary.summary||'No backup configured'),at:null};
+  return {tone:'neutral',state:state||'unknown',label:'Not observed',detail:String(primary.summary||'No backup evidence'),at:null};
+}
+function projectRestoreStatus(observations,now){
+  const jobs=Array.isArray(observations)?observations:[];
+  if(jobs.length&&jobs.every(job=>backupLevelKey(job?.configured)==='disabled'))return {tone:'neutral',state:'not-required',label:'Not required',detail:'Restore is not configured',at:null,overdue:false,producer:''};
+  let passed=null;
+  let failed=null;
+  for(const job of jobs){
+    const restore=job?.restore_validation;
+    if(backupLevelKey(restore?.level)!=='restore-sample')continue;
+    const at=Number(restore.checked_at);
+    if(!Number.isFinite(at)||at<=0||at>Number(now)+CLOCK_SKEW_SECS)continue;
+    const state=backupLevelKey(restore.state);
+    if(state==='passed'){
+      const qualified=qualifyingSelectiveRestore(restore);
+      if(qualified&&(!passed||qualified.at>passed.at))passed=qualified;
+    }
+    if(state==='failed'&&(!failed||at>failed.at))failed={at};
+  }
+  const passedAge=passed?Math.max(0,Number(now)-passed.at):null;
+  const files=passed&&passed.files!=null?' · '+passed.files+' file'+(passed.files===1?'':'s'):'';
+  if(failed&&(!passed||failed.at>passed.at)){
+    return {tone:'bad',state:'failed',label:'Failed',detail:'Selective restore did not succeed.'+(passed?' Last successful selective restore '+dur(passedAge)+' ago'+files+'.':''),at:failed.at,overdue:false,producer:'failed'};
+  }
+  if(!passed)return {tone:'neutral',state:'unknown',label:'Not observed',detail:'No successful selective restore',at:null,overdue:false,producer:''};
+  if(passedAge>SELECTIVE_RESTORE_OVERDUE_SECS)return {tone:'amber',state:'overdue',label:'Overdue',detail:'Last successful selective restore '+dur(passedAge)+' ago'+files,at:passed.at,overdue:true,producer:'passed'};
+  return {tone:'good',state:'current',label:'Passed',detail:'Last successful selective restore '+dur(passedAge)+' ago'+files,at:passed.at,overdue:false,producer:'passed'};
+}
+function projectBackupCheck(observations,now){
+  const jobs=Array.isArray(observations)?observations:[];
+  let best=null;
+  const consider=(state,at,summary)=>{
+    const stamp=Number(at);
+    const when=Number.isFinite(stamp)&&stamp>0?stamp:null;
+    if(!best||(when!=null&&(best.at==null||when>best.at)))best={state:backupLevelKey(state)||'unknown',at:when,summary:String(summary||'')};
+  };
+  jobs.forEach(job=>{
+    const restore=job?.restore_validation;
+    const level=backupLevelKey(restore?.level);
+    if(restore&&level&&level!=='restore-sample')consider(restore.state,restore.checked_at,restore.summary||restore.evidence_label||'');
+  });
+  if(!best)jobs.forEach(job=>{if(job?.last_check_state)consider(job.last_check_state,job.last_check_at,'');});
+  if(!best)return null;
+  const tone=best.state==='passed'?'good':best.state==='failed'?'bad':best.state==='stale'?'amber':'neutral';
+  const label=best.state==='passed'?'Check passed':best.state==='failed'?'Check failed':best.state==='stale'?'Check stale':'Check unknown';
+  const age=best.at==null?'time unknown':dur(Math.max(0,Number(now)-best.at))+' ago';
+  return {tone,state:best.state,label,detail:(best.summary?best.summary+' · ':'')+age,at:best.at};
+}
+function projectHealth(facts){
+  const reasons=[];
+  const add=(tone,label,at)=>reasons.push({tone,label,at:at==null?'':at});
+  const backup=facts?.backup;
+  const restore=facts?.restore;
+  const check=facts?.check;
+  if(facts?.liveness==='down'&&facts?.expectedOffline)add('good','Offline as expected',facts.lastSeen);
+  else if(facts?.liveness==='down')add('bad','Not reporting',facts.lastSeen);
+  if(backup?.tone==='bad')add('bad',backup.label,backup.at);
+  if(restore?.state==='failed')add('bad','Selective restore failed',restore.at);
+  if(check?.state==='failed')add('bad','Repository check failed',check.at);
+  if(facts?.liveness==='stale')add('amber','Heartbeat stale',facts.lastSeen);
+  if(backup?.tone==='amber')add('amber',backup.label,backup.at);
+  if(restore?.overdue)add('amber','Selective restore overdue',restore.at);
+  if(check?.state==='stale')add('amber','Repository check stale',check.at);
+  (Array.isArray(facts?.services)?facts.services:[]).forEach(service=>{
+    const id=String(service?.id||'');
+    if(id==='nix-freshness'||id==='appliance-convergence')return;
+    const state=backupLevelKey(service?.state);
+    const name=String(service?.label||'Service');
+    if(state==='warning'||state==='stale')add('amber',name+' '+state,'');
+    if(state==='unknown')add('neutral',name+' unknown','');
+  });
+  if(facts?.kernelRestart)add('amber','Kernel restart required','');
+  if(facts?.freshness?.level==='warn')add('amber',facts.freshness.label,'');
+  if(facts?.liveness==='awaiting_first_heartbeat')add('neutral','Awaiting first heartbeat','');
+  if(!backup||(backup.tone==='neutral'&&backup.state!=='not-required'))add('neutral',backup?.label||'Backup not observed',backup?.at);
+  if(!restore||(restore.tone==='neutral'&&restore.state!=='not-required'))add('neutral',restore?.label||'Restore not observed',restore?.at);
+  if(facts?.freshness?.level==='wait')add('neutral',facts.freshness.label,'');
+  if(backup?.tone==='good')add('good',backup.label,backup.at);
+  if(restore?.tone==='good')add('good',restore.label,restore.at);
+  const rank={bad:0,amber:1,neutral:2,good:3};
+  let tone='good';
+  reasons.forEach(reason=>{if((rank[reason.tone]??2)<rank[tone])tone=reason.tone});
+  const labels={good:'Healthy',amber:'Needs attention',bad:'Not healthy',neutral:'Unknown'};
+  return {tone,count:reasons.length,label:labels[tone]||'Unknown',reasons};
+}
+function projectProtection(observations,now){
+  return {daily:projectDailyBackup(observations,now),restore:projectRestoreStatus(observations,now),check:projectBackupCheck(observations,now)};
+}
+function fleetRecoveryModel(kind){
+  if(kind==='auth')return {kind:'auth',action:'sign-in',label:'Sign in'};
+  if(kind==='offline'||kind==='abort'||kind==='unavailable'||kind==='invalid'||kind==='stale')return {kind,action:'retry',label:'Retry'};
+  return null;
+}
+/* TIMELINE_PURE_END */
 const LEGACY_UI_COOKIES=['pharos_sort','pharos_view','pharos_search','pharos_live_filter','pharos_signal_window'];
 const UI_PREFERENCE_TTL_MS=180*24*60*60*1000;
 function clearLegacyUiCookies(){
@@ -98,7 +414,7 @@ function updateHostDrawerDraftState(){
   if(discard)discard.disabled=!canManage||!dirty;
   if(review)review.disabled=!canManage||!dirty;
 }
-function updateOpenHostDrawer(host){
+function updateOpenHostDrawer(host,now){
   if(!host||host.name!==hostDrawerContext.host)return;
   const lifecycle=host.lifecycle||{};
   setHostDrawerText('[data-host-drawer-state]',String(host.liveness||'unknown').replaceAll('_',' '));
@@ -109,6 +425,17 @@ function updateOpenHostDrawer(host){
   setHostDrawerText('[data-host-drawer-owner]',hostDrawerOwner(lifecycle,''));
   setHostDrawerText('[data-host-drawer-next]',hostDrawerNext(lifecycle,''));
   setHostDrawerText('[data-host-drawer-settings-state]',String(host.preferences_state||'applied').replaceAll('_',' '));
+  const assurance=projectHostAssurance(host,Number.isFinite(Number(now))?Number(now):Date.now()/1000);
+  updateDrawerAssurance(assurance.protection,assurance.health);
+}
+function updateDrawerAssurance(protection,health){
+  setHostDrawerText('[data-host-drawer-health]',health?.label||'');
+  setHostDrawerText('[data-host-drawer-backup]',protection?.daily?(protection.daily.label+' · '+protection.daily.detail):'');
+  setHostDrawerText('[data-host-drawer-restore]',protection?.restore?(protection.restore.label+' · '+protection.restore.detail):'');
+  const full=hostDrawerField('[data-host-drawer-full-page]');
+  const workspace=hostDrawerField('[data-host-drawer-workspace]');
+  const href=workspace?.getAttribute?.('href')||workspace?.href||'';
+  if(full&&href)full.setAttribute('href',href);
 }
 function populateHostDrawer(surface){
   const host=surface.dataset.host||'';
@@ -133,6 +460,13 @@ function populateHostDrawer(surface){
   setHostDrawerText('[data-host-drawer-settings-state]',String(surface.dataset.drawerSettingsState||'applied').replaceAll('_',' '));
   const workspace=hostDrawerField('[data-host-drawer-workspace]');
   if(workspace)workspace.href=surface.dataset.drawerWorkspaceHref||appUrl('/hosts/'+encodeURIComponent(host));
+  const fullPage=hostDrawerField('[data-host-drawer-full-page]');
+  if(fullPage&&workspace)fullPage.setAttribute('href',workspace.getAttribute('href')||workspace.href||'');
+  const openHost=fleetHostsByName.get(host);
+  if(openHost){
+    const assurance=projectHostAssurance(openHost,Date.now()/1000);
+    updateDrawerAssurance(assurance.protection,assurance.health);
+  }
   applyHostDrawerDraft(hostDrawerContext.base);
   updateHostDrawerDraftState();
 }
@@ -995,34 +1329,6 @@ function openRequestedWorkflow(){
 }
 function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
 function signalWindowByKey(key){return SIGNAL_WINDOWS.find(w=>w.key===key)||SIGNAL_WINDOWS[0]}
-function historyWindowMeta(samples,windowDef){
-  if(samples.length<2)return {start:0,latest:0,span:1,candidates:[]};
-  const latest=samples[samples.length-1];
-  const start=Math.max(latest-windowDef.secs,samples[0]);
-  const span=Math.max(1,latest-start);
-  const candidates=samples.map((stamp,index)=>({stamp,index})).filter(item=>item.index>0&&item.stamp>=start&&item.stamp<=latest);
-  return {start,latest,span,candidates};
-}
-function visibleHistory(samples,windowDef){
-  const meta=historyWindowMeta(samples,windowDef);
-  if(meta.candidates.length<=HISTORY_DOTS)return {...meta,visible:meta.candidates};
-  const buckets=Array(HISTORY_DOTS).fill(null);
-  for(const item of meta.candidates){
-    const bucket=Math.min(HISTORY_DOTS-1,Math.max(0,Math.floor(((item.stamp-meta.start)/meta.span)*HISTORY_DOTS)));
-    buckets[bucket]=item;
-  }
-  return {...meta,visible:buckets.filter(Boolean)};
-}
-function historyInfo(beats,index,interval){
-  const stamp=beats[index];
-  const previous=index>0?beats[index-1]:null;
-  if(previous==null)return {level:'first',label:'first heartbeat',detail:'at '+clock(stamp)};
-  const gap=Math.max(0,stamp-previous);
-  if(gap<=interval)return {level:'ok',label:'on cadence',detail:dur(gap)+' after previous · '+clock(stamp)};
-  if(gap<=interval*2)return {level:'late',label:'late heartbeat',detail:dur(gap)+' after previous · '+clock(stamp)};
-  if(gap<=interval*5)return {level:'stale',label:'stale gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
-  return {level:'down',label:'offline gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
-}
 function setFreshRow(surface,kind,state){
   const row=surface.querySelector('[data-fresh-kind="'+kind+'"]');
   if(!row)return;
@@ -1094,6 +1400,7 @@ function updateFreshness(surface,f,now,threshold=30){
       label:'nixcfg',
       visible:Boolean(evidence&&nixcfg?.relation!=='current')
     });
+    updateConfigEvidence(surface,f);
     return;
   }
   if(!f||f.applicable===false){
@@ -1101,6 +1408,7 @@ function updateFreshness(surface,f,now,threshold=30){
     setFreshRow(surface,'commits-behind',{value:'n/a',klass:'na'});
     setFreshRow(surface,'deployment-evidence',{value:'n/a',klass:'na',label:'Active generation'});
     setFreshRow(surface,'secondary-nixpkgs',{value:'n/a',klass:'na',label:'Other root nixpkgs'});
+    updateConfigEvidence(surface,f);
     return;
   }
   const evidence=f.deployment_evidence;
@@ -1156,6 +1464,33 @@ function updateFreshness(surface,f,now,threshold=30){
   }else{
     setFreshRow(surface,'secondary-nixpkgs',{value:'not reported',klass:'na',label:'Other root nixpkgs'});
   }
+  updateConfigEvidence(surface,f);
+}
+function shortRevision(value){
+  const text=String(value??'').trim();
+  if(!text||text==='null'||text==='undefined')return '';
+  return text.length>12?text.slice(0,12):text;
+}
+function updateConfigEvidence(surface,freshness){
+  if(!surface)return;
+  const applicable=Boolean(freshness&&freshness.applicable!==false);
+  const evidence=applicable?freshness.deployment_evidence:null;
+  const nixcfg=applicable?freshness.nixcfg_comparison:null;
+  const nixpkgs=applicable?freshness.nixpkgs_comparison:null;
+  const write=(selector,value)=>{
+    const node=surface.querySelector(selector);
+    if(!node)return;
+    node.textContent=value||'Not observed';
+  };
+  write('[data-deployed-sha]',evidence?shortRevision(evidence.source_revision):'');
+  write('[data-nixcfg-sha]',nixcfg?shortRevision(nixcfg.upstream_revision):'');
+  write('[data-nixpkgs-sha]',evidence?shortRevision(evidence.nixpkgs_revision):'');
+  const summary=surface.querySelector('[data-config-summary]');
+  if(!summary)return;
+  if(!evidence&&!nixcfg)summary.textContent='Not observed';
+  else if(nixcfg?.relation==='current')summary.textContent=nixpkgs?.relation==='different'?'nixcfg current · nixpkgs differs':'Exact match';
+  else if(nixcfg?.relation)summary.textContent='nixcfg '+nixcfg.relation;
+  else summary.textContent='Not observed';
 }
 function kernelNeedsRestart(kernel){
   return kernel?.state==='reboot_required'&&typeof kernel.running_version==='string'&&typeof kernel.expected_version==='string';
@@ -1183,6 +1518,27 @@ function freshnessAttention(f,now,threshold=30){
 function downAlertsSuppressed(preferences){
   return preferences?.kind==='workstation'||Boolean(preferences?.alerts?.suppress_down);
 }
+function expectedOfflineHost(host){
+  if(downAlertsSuppressed(host?.preferences))return true;
+  const services=Array.isArray(host?.service_observations)?host.service_observations:[];
+  return services.some(service=>service?.id==='appliance-convergence'&&service.summary==='powered off as expected');
+}
+function projectHostAssurance(host,now){
+  const observations=Array.isArray(host?.backup_observations)?host.backup_observations:[];
+  const protection=projectProtection(observations,now);
+  const health=projectHealth({
+    liveness:host?.liveness,
+    expectedOffline:host?.liveness==='down'&&expectedOfflineHost(host),
+    lastSeen:host?.last_seen,
+    backup:protection.daily,
+    restore:protection.restore,
+    check:protection.check,
+    services:host?.service_observations,
+    kernelRestart:kernelNeedsRestart(host?.kernel),
+    freshness:freshnessAttention(host?.freshness,now,host?.nixpkgs_warn_after_days)
+  });
+  return {protection,health};
+}
 function attentionFor(live,f,preferences,now,threshold=30){
   if(live==='down'&&!downAlertsSuppressed(preferences))return {label:'silent heartbeat',level:'down',rank:0};
   if(live==='stale')return {label:'stale heartbeat',level:'warn',rank:1};
@@ -1206,7 +1562,8 @@ function backupDetail(obs,now){
 }
 function backupInfo(host,now){
   const observations=Array.isArray(host.backup_observations)?host.backup_observations:[];
-  if(!observations.length)return {state:'unknown',level:'watch',label:'Not observed',detail:'No backup signal yet',search:'',total:0};
+  const protection=projectProtection(observations,now);
+  if(!observations.length)return {state:'unknown',level:'watch',label:'Not observed',detail:'No backup signal yet',search:'',total:0,protection};
   const primary=[...observations].sort((a,b)=>(BACKUP_RANK[a.state]??4)-(BACKUP_RANK[b.state]??4))[0];
   const state=primary.state||'unknown';
   const label=BACKUP_LABEL[state]||'Backup pending';
@@ -1214,7 +1571,79 @@ function backupInfo(host,now){
   const last=Number.isFinite(Number(primary.last_success_at))?dur(now-Number(primary.last_success_at))+' ago':'not yet';
   const schedule=String(primary.schedule||'not declared');
   const target=String(primary.target_label||'not declared');
-  return {state,level:BACKUP_LEVEL[state]||'watch',label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' ')};
+  return {state,level:BACKUP_LEVEL[state]||'watch',label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' '),protection};
+}
+function setFactText(root,selector,value){
+  const node=root?.querySelector(selector);
+  if(node)node.textContent=value==null?'':String(value);
+}
+function updateBackupStatus(surface,protection){
+  if(!surface||!protection)return;
+  const daily=protection.daily;
+  const restore=protection.restore;
+  const check=protection.check;
+  const protectionNode=surface.querySelector('[data-protection]');
+  if(protectionNode){
+    protectionNode.hidden=false;
+    protectionNode.dataset.selectiveRestoreOverdueAfterSecs=String(SELECTIVE_RESTORE_OVERDUE_SECS);
+  }
+  const dailyNode=surface.querySelector('[data-daily-backup]');
+  if(dailyNode&&daily){
+    dailyNode.hidden=false;
+    dailyNode.dataset.dailyBackupState=daily.state;
+    dailyNode.dataset.dailyBackupTone=daily.tone;
+    if(daily.at!=null)dailyNode.dataset.dailyBackupAt=String(daily.at);
+    else delete dailyNode.dataset.dailyBackupAt;
+    const host=surface.dataset.host||'';
+    if(typeof dailyNode.setAttribute==='function')dailyNode.setAttribute('href',appUrl('/backups?host='+encodeURIComponent(host)));
+    setFactText(dailyNode,'[data-daily-backup-label]',daily.label);
+    setFactText(dailyNode,'[data-daily-backup-note]',daily.detail);
+  }
+  const checkNode=surface.querySelector('[data-backup-check]');
+  if(checkNode){
+    checkNode.hidden=!check;
+    if(check){
+      checkNode.dataset.backupCheckState=check.state;
+      checkNode.dataset.backupCheckTone=check.tone;
+      if(check.at!=null)checkNode.dataset.backupCheckAt=String(check.at);
+      else delete checkNode.dataset.backupCheckAt;
+      setFactText(checkNode,'[data-backup-check-label]',check.label);
+      setFactText(checkNode,'[data-backup-check-note]',check.detail);
+    }
+  }
+  const restoreNode=surface.querySelector('[data-restore]');
+  if(restoreNode&&restore){
+    restoreNode.hidden=false;
+    restoreNode.dataset.restoreState=restore.state;
+    restoreNode.dataset.restoreTone=restore.tone;
+    restoreNode.dataset.restoreOverdue=restore.overdue?'true':'false';
+    restoreNode.dataset.restoreProducer=restore.producer||'';
+    if(restore.at!=null)restoreNode.dataset.restoreAt=String(restore.at);
+    else delete restoreNode.dataset.restoreAt;
+    setFactText(restoreNode,'[data-restore-label]',restore.label);
+    setFactText(restoreNode,'[data-restore-note]',restore.detail);
+  }
+}
+function updateHealthProjection(surface,health){
+  if(!surface||!health)return;
+  surface.dataset.health=health.tone;
+  surface.dataset.healthCount=String(health.reasons.length);
+  const badge=surface.querySelector('[data-health-badge]');
+  if(badge)badge.dataset.healthTone=health.tone;
+  setFactText(surface,'[data-health-label]',health.label);
+  const summary=health.reasons.map(reason=>reason.label).filter(Boolean).join(' · ')||health.label;
+  setFactText(surface,'[data-health-summary]',summary);
+  const list=surface.querySelector('[data-health-reasons]');
+  if(!list||typeof document.createElement!=='function')return;
+  list.replaceChildren();
+  health.reasons.forEach(reason=>{
+    const item=document.createElement('li');
+    item.dataset.healthReason='true';
+    item.dataset.healthTone=reason.tone;
+    if(reason.at!==''&&reason.at!=null)item.dataset.healthAt=String(reason.at);
+    item.textContent=reason.label;
+    list.appendChild(item);
+  });
 }
 function updateBackup(surface,info){
   const el=surface.querySelector('.backup-chip[data-backup-state]');
@@ -1240,6 +1669,7 @@ function updateBackup(surface,info){
     visible:info.state!=='healthy'
   });
   syncFreshnessRail(surface);
+  updateBackupStatus(surface,info.protection);
 }
 function setReason(surface,reason){
   const el=surface.querySelector('[data-reason]');
@@ -1546,188 +1976,393 @@ function updatePreferenceState(surface,host){
   if(validColor(pendingColor))surface.style.setProperty('--pending-color',pendingColor);
   else surface.style.removeProperty('--pending-color');
 }
-function markHtml(beats,interval,windowDef=signalWindow){
-  const kept=Array.from(new Set(beats)).sort((a,b)=>a-b);
-  if(kept.length<2)return '';
-  const cadence=Math.max(1,Number(interval)||60);
-  const newestX=EXPECT_X-HISTORY_STEP;
-  const view=visibleHistory(kept,windowDef);
-  return view.visible.map(item=>{
-    const x=((item.stamp-view.start)/view.span)*newestX;
-    const info=historyInfo(kept,item.index,cadence);
-    const title=info.label+' · '+info.detail;
-    return '<span class="beat-mark" role="img" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
-  }).join('');
-}
 function syncHistoryStart(beat){
-  const first=beat.querySelector('.beat-mark');
-  const start=first?.style.getPropertyValue('--mark-x').trim()||'0%';
-  beat.style.setProperty('--history-start-x',start);
-}
-function signalInfo(beats,last,interval,now,windowDef=signalWindow){
-  const cadence=Math.max(1,Number(interval)||60);
-  const samples=Array.from(new Set(beats.concat(Number.isFinite(last)&&last>0?[last]:[]))).filter(Number.isFinite).filter(n=>n>0).sort((a,b)=>a-b);
-  if(!samples.length)return {text:'new',level:'wait',window:windowDef.label,title:'Signal over '+windowDef.label+': waiting for first heartbeat'};
-  const requestedStart=now-windowDef.secs;
-  const retainedStart=Math.max(requestedStart,samples[0]);
-  const span=Math.max(cadence,Math.min(windowDef.secs,now-retainedStart));
-  const expected=Math.max(1,Math.ceil(span/cadence));
-  const received=samples.filter(stamp=>stamp>=retainedStart&&stamp<=now).length;
-  let longestGap=Math.max(0,Math.min(now-samples[samples.length-1],span));
-  let previous=retainedStart;
-  for(const stamp of samples){
-    if(stamp<retainedStart||stamp>now)continue;
-    longestGap=Math.max(longestGap,stamp-previous);
-    previous=stamp;
-  }
-  longestGap=Math.max(longestGap,now-previous);
-  const percent=Math.max(0,Math.min(100,Math.round((received/expected)*100)));
-  const level=percent>=95?'good':percent>=75?'warn':'down';
-  const coverage=retainedStart>requestedStart?' · retained '+dur(span):'';
-  return {text:percent+'%',level,window:windowDef.label,title:'Signal over '+windowDef.label+': '+received+' of '+expected+' expected heartbeats received · longest gap '+dur(longestGap)+coverage};
+  beat.style.setProperty('--history-start-x','100%');
+  beat.style.setProperty('--now-x','100%');
 }
 function updateSignal(surface,info){
   const signal=surface?.querySelector('[data-signal]');
-  if(!signal)return;
+  if(!signal||!info)return;
   signal.dataset.signalLevel=info.level;
+  signal.dataset.signalKind=info.kind||'delivery';
   signal.dataset.signalWindowKey=info.window;
   signal.title=info.title;
   signal.setAttribute('aria-label',info.title);
   const text=signal.querySelector('[data-signal-percent]');
   if(text)text.textContent=info.text;
+  const kind=signal.querySelector('.signal-label');
+  if(kind)kind.textContent='delivery';
   const windowLabel=signal.querySelector('[data-signal-window]');
   if(windowLabel){
     const next=SIGNAL_WINDOWS[(SIGNAL_WINDOWS.findIndex(w=>w.label===info.window)+1)%SIGNAL_WINDOWS.length]||SIGNAL_WINDOWS[0];
     windowLabel.textContent=info.window;
-    windowLabel.title=info.title+'; click for '+next.label;
-    windowLabel.setAttribute('aria-label',info.title+'; click for '+next.label);
+    const tip='Heartbeat delivery window '+info.window+'; click for '+next.label+'. Not measured uptime.';
+    windowLabel.title=tip;
+    windowLabel.setAttribute('aria-label',tip);
   }
 }
-function setHistoryHint(mark,show){
-  const surface=mark.closest('[data-host]');
-  if(!surface)return;
-  const seen=surface.querySelector('[data-seen]');
-  const asof=surface.querySelector('[data-card-asof]');
-  if(!seen)return;
-  if(show){
-    surface.dataset.historyHint='true';
-    seen.textContent=mark.dataset.historyLabel||'historic heartbeat';
-    if(asof)asof.textContent=mark.dataset.historyDetail||'';
-  }else{
-    delete surface.dataset.historyHint;
-    seen.textContent=seen.dataset.defaultText||seen.textContent;
-    if(asof)asof.textContent=asof.dataset.defaultText||asof.textContent;
-  }
+let activeHistoryMark=null;
+let historyPin=null;
+function historyHintText(mark){
+  const label=mark?.dataset?.historyLabel||'Heartbeat';
+  const detail=mark?.dataset?.historyDetail||'';
+  return detail?label+' · '+detail:label;
 }
-function bindHistoryHints(root=document){
-  root.querySelectorAll('.beat-mark').forEach(mark=>{
-    if(mark.dataset.hintBound==='true')return;
-    mark.dataset.hintBound='true';
-    mark.addEventListener('mouseenter',()=>setHistoryHint(mark,true));
-    mark.addEventListener('mouseleave',()=>setHistoryHint(mark,false));
-    mark.addEventListener('focus',()=>setHistoryHint(mark,true));
-    mark.addEventListener('blur',()=>setHistoryHint(mark,false));
+function installHistoryChrome(){
+  if(document.getElementById('history-hint-chrome')||typeof document.createElement!=='function')return;
+  const style=document.createElement('style');
+  style.id='history-hint-chrome';
+  style.textContent='.beat[data-history-axis="time"] .beat-threshold,.beat[data-history-axis="time"] .beat-fill,.beat[data-history-axis="time"] .beat-current{display:none}.beat-stage{position:relative}.history-readout{position:absolute;left:0;right:0;top:0;height:14px;line-height:14px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;pointer-events:none;font-size:10px}.history-hint{position:fixed;z-index:80;max-width:min(320px,calc(100vw - 16px));pointer-events:none;padding:6px 8px;border-radius:6px;background:#17304a;color:#fff;font-size:11px;line-height:1.35}.history-hint[data-history-hint-mode="line"]{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.history-hint[data-history-hint-mode="full"]{white-space:normal}.arrival{display:flex;align-items:baseline;gap:8px;min-height:18px;min-width:0;overflow:hidden;font-size:11px}.arrival-track{position:relative;flex:0 0 72px;height:4px;border-radius:999px;background:rgba(137,151,163,.25)}.arrival [data-arrival-fill]{position:absolute;left:0;top:0;bottom:0;width:var(--arrival-x,0%);background:var(--fill-color,var(--sea))}';
+  (document.head||document.documentElement).appendChild(style);
+}
+function ensureHistoryOverlay(){
+  let overlay=document.getElementById('history-hint');
+  if(overlay)return overlay;
+  overlay=document.createElement('div');
+  overlay.id='history-hint';
+  overlay.className='history-hint';
+  overlay.dataset.historyHintOverlay='true';
+  overlay.setAttribute('role','tooltip');
+  overlay.hidden=true;
+  document.body.appendChild(overlay);
+  return overlay;
+}
+function ensureHistoryReadout(beat){
+  let readout=beat.querySelector('[data-history-readout]');
+  if(readout)return readout;
+  readout=document.createElement('div');
+  readout.className='history-readout';
+  readout.dataset.historyReadout='true';
+  (beat.querySelector('.beat-stage')||beat).appendChild(readout);
+  return readout;
+}
+function positionHistoryOverlay(mark,overlay){
+  const rect=mark.getBoundingClientRect();
+  const width=overlay.offsetWidth||180;
+  const height=overlay.offsetHeight||28;
+  const left=Math.max(8,Math.min(window.innerWidth-width-8,rect.left));
+  let top=rect.top-height-8;
+  if(top<8)top=Math.min(window.innerHeight-height-8,rect.bottom+8);
+  overlay.style.left=left+'px';
+  overlay.style.top=top+'px';
+}
+function showHistoryHint(mark,mode){
+  if(!mark)return;
+  activeHistoryMark=mark;
+  const full=mode==='full';
+  const text=historyHintText(mark);
+  const beat=mark.closest('.beat');
+  const readout=beat?ensureHistoryReadout(beat):null;
+  if(readout){
+    if(!readout.dataset.default)readout.dataset.default=readout.textContent||'';
+    readout.textContent=text;
+    readout.title=text;
+  }
+  const overlay=ensureHistoryOverlay();
+  overlay.hidden=false;
+  overlay.dataset.historyHintMode=full?'full':'line';
+  overlay.textContent=text;
+  overlay.title=text;
+  mark.setAttribute('aria-describedby','history-hint');
+  positionHistoryOverlay(mark,overlay);
+}
+function hideHistoryHint(force){
+  if(!force&&historyPin)return;
+  const mark=activeHistoryMark;
+  const readout=mark?.closest('.beat')?.querySelector('[data-history-readout]');
+  if(readout)readout.textContent=readout.dataset.default||'';
+  const overlay=document.getElementById('history-hint');
+  if(overlay)overlay.hidden=true;
+  if(mark)mark.removeAttribute('aria-describedby');
+  activeHistoryMark=null;
+  if(force)historyPin=null;
+}
+function setHistoryHint(mark,show,mode){
+  if(!mark)return;
+  if(show)showHistoryHint(mark,mode||(historyPin?'full':'line'));
+  else hideHistoryHint(false);
+}
+function dismissHistoryHint(){
+  const mark=activeHistoryMark;
+  historyPin=null;
+  hideHistoryHint(true);
+  if(mark&&document.activeElement===mark)mark.blur();
+}
+function bindHistoryHints(){
+  installHistoryChrome();
+  if(document.documentElement?.dataset?.historyHints==='true')return;
+  if(document.documentElement)document.documentElement.dataset.historyHints='true';
+  document.addEventListener('pointerover',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark||(event.pointerType&&event.pointerType!=='mouse'&&event.pointerType!=='pen'))return;
+    if(historyPin)return;
+    showHistoryHint(mark,'line');
+  });
+  document.addEventListener('pointerout',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark||mark!==activeHistoryMark||historyPin)return;
+    if(event.pointerType&&event.pointerType!=='mouse'&&event.pointerType!=='pen')return;
+    if(event.relatedTarget&&mark.contains(event.relatedTarget))return;
+    hideHistoryHint(false);
+  });
+  document.addEventListener('focusin',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark)return;
+    historyPin='keyboard';
+    showHistoryHint(mark,'full');
+  });
+  document.addEventListener('focusout',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark||historyPin!=='keyboard')return;
+    historyPin=null;
+    hideHistoryHint(true);
+  });
+  document.addEventListener('pointerup',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark||event.pointerType!=='touch')return;
+    if(historyPin==='touch'&&activeHistoryMark===mark){historyPin=null;hideHistoryHint(true);return}
+    historyPin='touch';
+    showHistoryHint(mark,'full');
+  });
+  document.addEventListener('click',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(!mark||event.pointerType==='touch')return;
+    historyPin='keyboard';
+    showHistoryHint(mark,'full');
+  });
+  document.addEventListener('keydown',event=>{
+    const mark=event.target?.closest?.('.beat-mark');
+    if(mark&&(event.key==='Enter'||event.key===' ')){event.preventDefault();historyPin='keyboard';showHistoryHint(mark,'full')}
+    if(event.key==='Escape'&&activeHistoryMark){event.preventDefault();dismissHistoryHint()}
   });
 }
-function setBeatHistory(beat,beats,interval){
-  const all=Array.from(new Set(beats)).sort((a,b)=>a-b);
-  const view=visibleHistory(all,signalWindow);
-  const kept=view.visible.map(item=>item.stamp);
-  const cadence=Math.max(1,Number(interval)||Number(beat.dataset.interval)||60);
-  beat.dataset.signalBeats=all.join(',');
-  beat.dataset.beats=kept.join(',');
-  beat.dataset.count=String(kept.length);
-  beat.dataset.historyWindow=signalWindow.label;
-  const windowLabel=beat.querySelector('[data-history-window-label]');
-  if(windowLabel)windowLabel.textContent=signalWindow.label;
-  const marks=beat.querySelector('.beat-marks');
-  if(marks){
-    marks.innerHTML=markHtml(all,cadence,signalWindow);
-    syncHistoryStart(beat);
-    bindHistoryHints(marks);
+function paintHistoryMark(mark,spec){
+  mark.className='beat-mark';
+  mark.setAttribute('role','img');
+  mark.tabIndex=0;
+  mark.dataset.historyKey=spec.key;
+  mark.dataset.historyLevel=spec.level;
+  mark.dataset.historyLabel=spec.label;
+  mark.dataset.historyDetail=spec.detail;
+  if(spec.stamp!=null)mark.dataset.historyStamp=String(spec.stamp);
+  else delete mark.dataset.historyStamp;
+  const title=spec.label+' · '+spec.detail;
+  mark.title=title;
+  mark.setAttribute('aria-label',title);
+  mark.style.setProperty('--mark-x',Math.max(0,Math.min(100,Number(spec.x)||0)).toFixed(1)+'%');
+}
+function reconcileHistoryMarks(container,specs){
+  const existing=new Map();
+  container.querySelectorAll('.beat-mark').forEach(mark=>{
+    const key=mark.dataset.historyKey;
+    if(!key||existing.has(key)){mark.remove();return}
+    existing.set(key,mark);
+  });
+  const seen=new Set();
+  specs.forEach(spec=>{
+    seen.add(spec.key);
+    let mark=existing.get(spec.key);
+    if(!mark){mark=document.createElement('span');container.appendChild(mark)}
+    paintHistoryMark(mark,spec);
+    container.appendChild(mark);
+  });
+  existing.forEach((mark,key)=>{
+    if(seen.has(key))return;
+    if(activeHistoryMark===mark)dismissHistoryHint();
+    mark.remove();
+  });
+}
+function updateHistoryEvents(surface,marks){
+  const list=surface?.querySelector('[data-history-events]');
+  if(!list)return;
+  const existing=new Map();
+  list.querySelectorAll('[data-history-key]').forEach(row=>existing.set(row.dataset.historyKey,row));
+  const seen=new Set();
+  marks.forEach(mark=>{
+    seen.add(mark.key);
+    let row=existing.get(mark.key);
+    if(!row){
+      row=document.createElement('div');
+      row.dataset.historyKey=mark.key;
+      const time=document.createElement('time');
+      const text=document.createElement('span');
+      row.append(time,text);
+      list.appendChild(row);
+    }
+    const time=row.querySelector('time');
+    const text=row.querySelector('span');
+    if(time)time.textContent=mark.label;
+    if(text)text.textContent=mark.detail;
+    row.dataset.historyLevel=mark.level;
+  });
+  existing.forEach((row,key)=>{if(!seen.has(key))row.remove()});
+}
+function beatGraceSecs(beat){
+  const raw=Number(beat?.dataset?.grace);
+  return Number.isInteger(raw)&&raw>=0&&raw<=3600?raw:DEFAULT_HEARTBEAT_GRACE_SECS;
+}
+function updateArrival(beat,last,interval,grace,now){
+  const presentation=arrivalPresentation(last,interval,grace,now);
+  let arrival=beat.querySelector('[data-arrival]');
+  if(!arrival){
+    arrival=document.createElement('div');
+    arrival.className='arrival';
+    arrival.dataset.arrival='true';
+    const label=document.createElement('span');
+    label.dataset.arrivalLabel='true';
+    const track=document.createElement('span');
+    track.className='arrival-track';
+    track.setAttribute('aria-hidden','true');
+    const fill=document.createElement('span');
+    fill.dataset.arrivalFill='true';
+    track.appendChild(fill);
+    const detail=document.createElement('span');
+    detail.dataset.arrivalDetail='true';
+    arrival.append(label,track,detail);
+    beat.appendChild(arrival);
   }
+  arrival.dataset.arrivalState=presentation.state;
+  const label=arrival.querySelector('[data-arrival-label]');
+  const detail=arrival.querySelector('[data-arrival-detail]');
+  const fill=arrival.querySelector('[data-arrival-fill]');
+  if(label)label.textContent=presentation.label;
+  if(detail){detail.textContent=presentation.detail;detail.title=presentation.detail}
+  if(fill)fill.style.setProperty('--arrival-x',presentation.x.toFixed(2)+'%');
+  return presentation;
+}
+function setBeatHistory(beat,beats,interval,now,grace){
+  if(!beat)return;
+  const cadence=Math.max(1,Number(interval)||Number(beat.dataset.interval)||60);
+  const graceSecs=grace==null?beatGraceSecs(beat):Number(grace);
+  const at=Number.isFinite(Number(now))?Number(now):Date.now()/1000;
+  const all=dedupeHeartbeats(beats);
+  const view=aggregateHistory(all,signalWindow,at,cadence,graceSecs);
+  beat.dataset.historyAxis='time';
+  beat.dataset.signalBeats=all.join(',');
+  beat.dataset.beats=view.marks.filter(mark=>mark.stamp!=null).map(mark=>mark.stamp).join(',');
+  beat.dataset.count=String(view.marks.length);
+  beat.dataset.historyWindow=signalWindow.label;
+  syncHistoryStart(beat);
+  const windowLabel=beat.querySelector('[data-history-window-label]');
+  if(windowLabel){
+    windowLabel.textContent=signalWindow.label;
+    if(windowLabel.matches('button')){
+      windowLabel.title='Change delivery window';
+      windowLabel.setAttribute('aria-label','Change delivery window; currently '+signalWindow.label);
+    }
+  }
+  const zones=beat.querySelector('.beat-zones');
+  if(zones)Array.from(zones.children).forEach(node=>{
+    if(node.hasAttribute('data-history-window-label')||node.hasAttribute('data-signal-window'))return;
+    const text=node.textContent.trim();
+    if(text==='expected'||text==='start')node.textContent='start';
+    if(text==='late'||text==='now')node.textContent='now';
+  });
+  beat.querySelectorAll('.beat-threshold,.beat-fill,.beat-current').forEach(node=>{node.hidden=true});
+  const stage=beat.querySelector('.beat-stage');
+  if(stage)stage.setAttribute('aria-label',signalWindow.label+' heartbeat history by time. Current lateness is separate. Empty is not healthy.');
+  const marks=beat.querySelector('.beat-marks');
+  if(marks)reconcileHistoryMarks(marks,view.marks);
+  const readout=ensureHistoryReadout(beat);
+  const legend=signalWindow.label+' time axis'+(view.partial&&view.retainedStart?' · retained from '+clock(view.retainedStart):'')+' · empty is not healthy';
+  readout.dataset.default=legend;
+  readout.title=legend;
+  if(activeHistoryMark&&beat.contains(activeHistoryMark))showHistoryHint(activeHistoryMark,historyPin?'full':'line');
+  else readout.textContent=legend;
+  updateHistoryEvents(beat.closest('[data-host]'),view.marks);
+  bindHistoryHints();
 }
 function flashBeat(beat){
+  if(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)return;
   beat.dataset.flash='true';
   window.setTimeout(()=>{delete beat.dataset.flash},950);
 }
-function heartbeatX(age,interval){
-  if(age<=interval)return (age/interval)*EXPECT_X;
-  if(age<=interval*2)return EXPECT_X+((age-interval)/interval)*(STALE_X-EXPECT_X);
-  if(age<=interval*5)return STALE_X+((age-interval*2)/(interval*3))*(100-STALE_X);
-  return 100;
+function heartbeatX(age,interval,grace){
+  return heartbeatTimelineX(age,interval,grace);
 }
 function updateBeatClock(beat,now){
   const last=Number(beat.dataset.last);
   const interval=Math.max(1,Number(beat.dataset.interval)||60);
+  const grace=beatGraceSecs(beat);
+  const bounds=cadenceBounds(interval,grace);
   const surface=beat.closest('[data-host]');
-  if(!Number.isFinite(last)||last<=0){
-    beat.style.setProperty('--expect-alpha','.22');
-    beat.style.setProperty('--now-x','0%');
+  const presentation=updateArrival(beat,last,interval,grace,now);
+  syncHistoryStart(beat);
+  const age=Number.isFinite(last)&&last>0?Math.max(0,now-last):0;
+  const onTime=bounds.onTimeThrough>0?Math.max(0,Math.min(1,age/bounds.onTimeThrough)):0;
+  beat.style.setProperty('--expect-fill',(onTime*360).toFixed(1)+'deg');
+  if(!Number.isFinite(last)||last<=0||presentation.state==='waiting'||presentation.state==='unknown'){
     beat.style.setProperty('--fill-color','var(--wait)');
-    beat.style.setProperty('--expect-fill','0deg');
-    beat.style.setProperty('--target-ring','3px');
-    beat.style.setProperty('--late-alpha','.3');
     beat.dataset.beat='waiting';
-    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats),last,interval,now));
-    return;
-  }
-  const age=Math.max(0,now-last);
-  const expect=Math.max(0,Math.min(1,age/interval));
-  const x=heartbeatX(age,interval);
-  beat.style.setProperty('--now-x',x.toFixed(2)+'%');
-  beat.style.setProperty('--expect-alpha',(.34+expect*.45).toFixed(3));
-  beat.style.setProperty('--expect-fill',(expect*360).toFixed(1)+'deg');
-  beat.style.setProperty('--target-ring',(3+expect*5).toFixed(1)+'px');
-  if(age<=interval){
+  }else if(presentation.state==='on-time'){
     beat.style.setProperty('--fill-color',beat.dataset.self==='true'?'var(--sun)':'var(--sea)');
     beat.dataset.beat=beat.dataset.self==='true'?'lit':'tracking';
-  }else if(age<=interval*2){
+  }else if(presentation.state==='late'){
     beat.style.setProperty('--fill-color','var(--sun)');
-    beat.style.setProperty('--expect-alpha','.79');
     beat.style.setProperty('--expect-fill','360deg');
-    beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='late';
-  }else if(age<=interval*5){
+  }else if(presentation.state==='stale'){
     beat.style.setProperty('--fill-color','var(--stale)');
-    beat.style.setProperty('--expect-alpha','.86');
     beat.style.setProperty('--expect-fill','360deg');
-    beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='stale';
   }else{
     beat.style.setProperty('--fill-color','var(--down)');
-    beat.style.setProperty('--expect-alpha','.86');
     beat.style.setProperty('--expect-fill','360deg');
-    beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='down';
   }
-  updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,now));
+  updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,now,signalWindow,grace));
 }
 let beatClockTimer=null;
+let fleetWatchdogTimer=null;
 function stopBeatClock(){
   if(beatClockTimer!=null)clearTimeout(beatClockTimer);
   beatClockTimer=null;
 }
 function frame(){
   stopBeatClock();
-  if(document.hidden||document.body.dataset.hostActionDialogOpen==='true')return;
-  if(!fleetSnapshotFresh()){
-    setFleetSyncState('stale');
-    if(typeof document.hasFocus!=='function'||document.hasFocus())recoverFleet('watchdog');
+  if(pageFrozen()||document.body.dataset.hostActionDialogOpen==='true')return;
+  if(fleetMain()?.dataset.fleetSyncState!=='current'||!fleetSnapshotFresh()){
+    if(!fleetSnapshotFresh())setFleetSyncState('stale');
+    if(recoveryPromise==null&&refreshPromise==null)recoverFleet('watchdog');
     return;
   }
   const now=Date.now()/1000;
-  document.querySelectorAll('.beat').forEach(beat=>{
-    updateBeatClock(beat,now);
-  });
+  document.querySelectorAll('.beat').forEach(beat=>updateBeatClock(beat,now));
   beatClockTimer=setTimeout(frame,1000);
 }
 function resumeBeatClock(){
   stopBeatClock();
   const main=fleetMain();
-  if(main?.dataset.fleetSyncState!=='current')return;
-  if(!document.hidden&&(typeof document.hasFocus!=='function'||document.hasFocus())&&document.body.dataset.hostActionDialogOpen!=='true')frame();
+  if(!main||main.dataset.fleetSyncState!=='current')return;
+  if(pageFrozen()||document.body.dataset.hostActionDialogOpen==='true')return;
+  frame();
 }
+function armFleetWatchdog(){
+  if(fleetWatchdogTimer!=null)return;
+  const tick=()=>{
+    fleetWatchdogTimer=setTimeout(tick,5000);
+    if(pageFrozen()||!fleetMain())return;
+    if(document.body.dataset.hostActionDialogOpen==='true'){
+      if(refreshTimer==null&&refreshPromise==null)scheduleRefresh();
+      return;
+    }
+    const main=fleetMain();
+    const stranded=beatClockTimer==null||(refreshTimer==null&&refreshPromise==null);
+    if(stranded||!fleetSnapshotFresh()||main.dataset.fleetSyncState!=='current'){
+      if(recoveryPromise==null&&refreshPromise==null)recoverFleet('watchdog');
+    }
+  };
+  fleetWatchdogTimer=setTimeout(tick,5000);
+}
+function onFleetFocus(){
+  if(document.documentElement)document.documentElement.dataset.fleetFocus='focused';
+  if(pageFrozen())return;
+  const main=fleetMain();
+  const stranded=beatClockTimer==null||(refreshTimer==null&&refreshPromise==null);
+  const unhealthy=!main||main.dataset.fleetSyncState!=='current'||!fleetSnapshotFresh();
+  if(stranded||unhealthy)recoverFleet('focus');
+}
+/* TIMELINE_CLOCK_END */
 function setSeen(card,last,now){
   const seen=card.querySelector('[data-seen]');
   if(!seen)return;
@@ -1927,8 +2562,10 @@ function applySignalWindow(key,write=true){
     const surface=beat.closest('[data-host]');
     const last=Number(beat.dataset.last);
     const interval=Math.max(1,Number(beat.dataset.interval)||60);
-    setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),interval);
-    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,Date.now()/1000,signalWindow));
+    const at=Date.now()/1000;
+    const grace=beatGraceSecs(beat);
+    setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),interval,at,grace);
+    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,at,signalWindow,grace));
   });
 }
 function cycleSignalWindow(){
@@ -3909,6 +4546,7 @@ let refreshPromise=null;
 let refreshAbort=null;
 let refreshGeneration=0;
 let recoveryPromise=null;
+let lastFleetFailureKind='';
 let lastSuccessfulRefreshAt=Date.now();
 function fleetMain(){return document.querySelector('main[data-fleet-sync-state]')}
 function fleetSnapshotFresh(at=Date.now()){
@@ -3918,17 +4556,64 @@ function fleetSnapshotLabel(asof){
   const label=asof?.dataset.snapshotLabel||asof?.textContent||'last update unavailable';
   return label.startsWith('as of ')?'last update '+label.slice(6):label;
 }
-function setFleetSyncState(state){
+function pageFrozen(){
+  if(document.body?.dataset?.fleetLifecycleFrozen==='true')return true;
+  if(document.hidden)return true;
+  const state=document.visibilityState;
+  if(state==null||state==='')return false;
+  return state==='hidden'||state==='prerender';
+}
+function ensureFleetRecovery(kind){
+  if(typeof document.createElement!=='function'||!document.body)return;
+  const model=fleetRecoveryModel(kind);
+  let box=document.querySelector('[data-fleet-recovery]');
+  if(!box){
+    box=document.createElement('div');
+    box.className='fleet-recovery';
+    box.dataset.fleetRecovery='true';
+    box.hidden=true;
+    const retry=document.createElement('button');
+    retry.type='button';
+    retry.dataset.fleetRetry='true';
+    retry.textContent='Retry';
+    retry.addEventListener('click',()=>{if(!pageFrozen())recoverFleet('retry')});
+    const signIn=document.createElement('a');
+    signIn.dataset.fleetSignIn='true';
+    signIn.textContent='Sign in';
+    box.append(retry,signIn);
+    const asof=fleetMain()?.querySelector('[data-as-of]');
+    if(asof&&typeof asof.insertAdjacentElement==='function')asof.insertAdjacentElement('afterend',box);
+    else document.body.appendChild(box);
+  }
+  const retry=box.querySelector('[data-fleet-retry]');
+  const signIn=box.querySelector('[data-fleet-sign-in]');
+  if(!model){box.hidden=true;return}
+  box.hidden=false;
+  if(retry)retry.hidden=model.action!=='retry';
+  if(signIn){
+    signIn.hidden=model.action!=='sign-in';
+    if(model.action==='sign-in'){
+      const path=(window.location?.pathname||'/')+(window.location?.search||'');
+      signIn.href=appUrl('/auth/login?return_to='+encodeURIComponent(path));
+    }
+  }
+}
+function setFleetSyncState(state,reason){
   const main=fleetMain();
   if(!main)return;
   main.dataset.fleetSyncState=state;
+  if(state==='current')lastFleetFailureKind='';
+  else if(reason)lastFleetFailureKind=reason;
   const asof=main.querySelector('[data-as-of]');
-  if(!asof)return;
-  if(!asof.dataset.snapshotLabel)asof.dataset.snapshotLabel=asof.textContent||'';
-  asof.dataset.refreshState=state;
-  if(state==='syncing')asof.textContent='Syncing\u2026 \u00b7 '+fleetSnapshotLabel(asof);
-  else if(state==='stale')asof.textContent='Data out of date \u00b7 '+fleetSnapshotLabel(asof);
-  else asof.textContent=asof.dataset.snapshotLabel;
+  if(asof){
+    if(!asof.dataset.snapshotLabel)asof.dataset.snapshotLabel=asof.textContent||'';
+    asof.dataset.refreshState=state;
+    if(state==='syncing')asof.textContent='Syncing\u2026 \u00b7 '+fleetSnapshotLabel(asof);
+    else if(state==='stale')asof.textContent='Data out of date \u00b7 '+fleetSnapshotLabel(asof);
+    else asof.textContent=asof.dataset.snapshotLabel;
+  }
+  if(state==='stale')ensureFleetRecovery(reason||lastFleetFailureKind||'unavailable');
+  else ensureFleetRecovery('');
 }
 function setFleetSnapshotLabel(now){
   const asof=fleetMain()?.querySelector('[data-as-of]');
@@ -3966,6 +4651,7 @@ function applyFleetSnapshot(data){
   const now=Number(data.as_of);
   for(const h of hosts){
     const surfaces=hostSurfaces(h.name);
+    const assurance=projectHostAssurance(h,now);
     for(const card of surfaces){
       const live=h.liveness;
       card.dataset.live=live;
@@ -3986,6 +4672,7 @@ function applyFleetSnapshot(data){
       updateKernelFault(card,h);
       updateFreshness(card,h.freshness,now,h.nixpkgs_warn_after_days);
       updateBackup(card,backup);
+      updateHealthProjection(card,assurance.health);
       setSeen(card,h.last_seen,now);
       setCardAsOf(card,now);
       const beat=card.querySelector('.beat');
@@ -3995,19 +4682,24 @@ function applyFleetSnapshot(data){
         const interval=h.heartbeat_interval_secs || 60;
         const incoming=Array.isArray(h.heartbeat_log)?h.heartbeat_log.map(Number).filter(Number.isFinite):[];
         const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
+        const grace=resolveHeartbeatGrace(h,data.fleet_heartbeat_grace_secs);
+        const bounds=cadenceBounds(interval,grace.secs);
         beat.dataset.interval=interval;
-        setBeatHistory(beat,beats,interval);
-        updateSignal(card,signalInfo(beats,last,interval,now));
+        beat.dataset.grace=String(grace.secs);
+        beat.dataset.graceSource=grace.source;
+        beat.dataset.lateAfter=String(grace.lateAfter==null?bounds.lateAfter:grace.lateAfter);
+        beat.dataset.last=Number.isFinite(last)?String(last):'';
+        beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
+        setBeatHistory(beat,beats,interval,now,grace.secs);
+        updateBeatClock(beat,now);
         if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous){
-          beat.style.setProperty('--hit-x',heartbeatX(Math.max(0,last-previous),Math.max(1,Number(interval)||60)).toFixed(2)+'%');
+          beat.style.setProperty('--hit-x','100%');
           flashBeat(beat);
         }
         beat.dataset.ready='true';
-        beat.dataset.last=Number.isFinite(last)?String(last):'';
-        beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
       }
     }
-    updateOpenHostDrawer(h);
+    updateOpenHostDrawer(h,now);
   }
   updateFleetSummary(hosts);
   applySort(document.querySelector('[data-sort]')?.value||'attention',false);
@@ -4026,8 +4718,15 @@ function nextRefreshDelay(){
 }
 function scheduleRefresh(delay=nextRefreshDelay()){
   clearRefreshTimer();
-  if(!fleetMain()||document.hidden||(typeof document.hasFocus==='function'&&!document.hasFocus()))return;
+  if(!fleetMain()||pageFrozen())return;
   refreshTimer=setTimeout(()=>refresh('timer'),delay);
+}
+function classifyFleetResponse(res){
+  const status=Number(res?.status);
+  const type=String(res?.headers?.get?.('content-type')||'').toLowerCase();
+  if(res?.redirected||status===401||status===403||type.includes('text/html'))return 'auth';
+  if(!res?.ok||!type.includes('application/json'))return 'unavailable';
+  return '';
 }
 function abandonRefresh(){
   clearRefreshTimer();
@@ -4048,18 +4747,31 @@ async function refresh(reason='manual',options={}){
   refreshPromise=(async()=>{
   try{
     const res=await fetch(appUrl('/hosts.json?refresh='+Date.now()),{headers:{Accept:'application/json'},cache:'no-store',credentials:'same-origin',signal:controller.signal});
-    const contentType=String(res.headers.get('content-type')||'').toLowerCase();
-    if(!res.ok||res.redirected||!contentType.includes('application/json'))throw new Error('fleet snapshot unavailable');
+    const failure=classifyFleetResponse(res);
+    if(failure){
+      const error=new Error('fleet snapshot unavailable');
+      error.fleetKind=failure;
+      throw error;
+    }
     const data=await res.json();
     if(generation!==refreshGeneration)return false;
-    if(!validFleetSnapshot(data))throw new Error('fleet snapshot invalid');
+    if(!validFleetSnapshot(data)){
+      const error=new Error('fleet snapshot invalid');
+      error.fleetKind='invalid';
+      throw error;
+    }
     if(!applyFleetSnapshot(data))return false;
     lastSuccessfulRefreshAt=Date.now();
     setFleetSyncState('current');
     resumeBeatClock();
     return true;
   }catch(error){
-    if(generation===refreshGeneration&&(options.recovery===true||!fleetSnapshotFresh()))setFleetSyncState('stale');
+    if(generation!==refreshGeneration)return false;
+    const kind=error?.name==='AbortError'?'abort':(error?.fleetKind||(typeof navigator!=='undefined'&&navigator.onLine===false?'offline':'unavailable'));
+    if(kind==='auth'||options.recovery===true||!fleetSnapshotFresh()){
+      if(kind==='auth'&&options.recovery!==true)stopBeatClock();
+      setFleetSyncState('stale',kind);
+    }
     return false;
   }
   finally{
@@ -4079,7 +4791,7 @@ function suspendFleet(){
   recoveryPromise=null;
 }
 function recoverFleet(reason='foreground'){
-  if(!fleetMain()||document.hidden)return Promise.resolve(false);
+  if(!fleetMain()||pageFrozen())return Promise.resolve(false);
   if(recoveryPromise)return recoveryPromise;
   stopBeatClock();
   setFleetSyncState('syncing');
@@ -4089,7 +4801,7 @@ function recoverFleet(reason='foreground'){
   return recoveryPromise;
 }
 function resumeRefresh(reason){
-  if(document.hidden){
+  if(pageFrozen()){
     suspendFleet();
     return Promise.resolve(false);
   }
@@ -4249,13 +4961,43 @@ function initFreshnessChipScroll(){
     if(event.key==='Escape'&&activeFreshPopover?.classList.contains('visible'))hideFreshPopover();
   });
 }
-document.addEventListener('visibilitychange',()=>{if(document.hidden)suspendFleet();else recoverFleet('visible')});
-window.addEventListener('blur',suspendFleet);
-window.addEventListener('focus',()=>recoverFleet('focus'));
-window.addEventListener('pageshow',event=>{if(event.persisted||!fleetSnapshotFresh())recoverFleet('pageshow')});
-window.addEventListener('online',()=>recoverFleet('online'));
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden)suspendFleet();
+  else{
+    if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+    recoverFleet('visible');
+  }
+});
+window.addEventListener('blur',()=>{
+  if(document.documentElement)document.documentElement.dataset.fleetFocus='unfocused';
+});
+window.addEventListener('focus',onFleetFocus);
+window.addEventListener('pageshow',event=>{
+  if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+  if(event.persisted||!fleetSnapshotFresh()||beatClockTimer==null||refreshTimer==null)recoverFleet('pageshow');
+});
+window.addEventListener('pagehide',()=>{
+  if(document.body)document.body.dataset.fleetLifecycleFrozen='true';
+  suspendFleet();
+});
+window.addEventListener('freeze',()=>{
+  if(document.body)document.body.dataset.fleetLifecycleFrozen='true';
+  suspendFleet();
+});
+window.addEventListener('resume',()=>{
+  if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+  recoverFleet('resume');
+});
+window.addEventListener('online',()=>{if(!pageFrozen())recoverFleet('online')});
+/* FLEET_LISTENERS_END */
 document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
-document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
+document.querySelectorAll('.beat').forEach(beat=>{
+  const grace=beatGraceSecs(beat);
+  setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60,Date.now()/1000,grace);
+  beat.dataset.ready='true';
+});
+bindHistoryHints();
+armFleetWatchdog();
 initFreshnessChipScroll();
 initHostDrawer();
 initControls();
