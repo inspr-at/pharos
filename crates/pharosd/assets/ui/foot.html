@@ -1165,6 +1165,17 @@ async function withdrawSettingsChange(actionItem,root){
     }
   }
 }
+function activeHostActionJobId(root){
+  if(document.body?.dataset.hostActionDialogOpen!=='true')return '';
+  if(!hostActionContext||hostActionContext.root!==root||!hostActionContext.jobId)return '';
+  return String(hostActionContext.jobId);
+}
+function hostActionReportIsChild(job,parentId){
+  if(!parentId||!job)return false;
+  const id=String(job.id||'');
+  if(!id||id===parentId)return false;
+  return [job.settings_change_id,job.workflow?.settings_change_id,job.workflow?.parent_run_id].some(value=>String(value||'')===parentId);
+}
 function updateHostActionState(surface,host,backup){
   const root=surface.querySelector('[data-host-actions]');
   if(!root)return;
@@ -1172,9 +1183,7 @@ function updateHostActionState(surface,host,backup){
   const kernel=host.kernel||{};
   const kernelState=String(kernel.state||'unknown');
   const nixcfgComparison=host.freshness?.nixcfg_comparison;
-  const nixpkgsComparison=host.freshness?.nixpkgs_comparison;
   const provenGitUpdate=nixcfgComparison?.relation==='behind'&&Number(nixcfgComparison.commits_behind)>0;
-  const provenNixpkgsUpdate=nixpkgsComparison?.relation==='different';
   const canManage=root.dataset.canManage==='true';
   const systemUpdateAvailable=root.dataset.systemUpdateAvailable==='true';
   const hostRemovalAvailable=root.dataset.hostRemovalAvailable==='true';
@@ -1193,8 +1202,18 @@ function updateHostActionState(surface,host,backup){
   root.dataset.retirementSuccessor=String(retirement?.successor||'');
   root.dataset.retirementDeclarationPending=retirement?.declaration_pending===true?'true':'false';
   root.dataset.retirementCredentialPending=retirement?.credential_retirement_pending===true?'true':'false';
-  if(job){root.dataset.actionJobId=String(job.id||'');root.dataset.actionKind=String(workflow?.kind||job.kind||'');root.dataset.actionState=String(job.state||'')}
-  else{delete root.dataset.actionJobId;delete root.dataset.actionKind;delete root.dataset.actionState}
+  const openParentId=activeHostActionJobId(root);
+  if(job&&!hostActionReportIsChild(job,openParentId)){
+    root.dataset.actionJobId=String(job.id||'');
+    root.dataset.actionKind=String(workflow?.kind||job.kind||'');
+    root.dataset.actionState=String(job.state||'');
+  }else if(openParentId){
+    root.dataset.actionJobId=openParentId;
+  }else{
+    delete root.dataset.actionJobId;
+    delete root.dataset.actionKind;
+    delete root.dataset.actionState;
+  }
   if(backup){root.dataset.backupState=String(backup.state||'unknown');root.dataset.backupLabel=String(backup.label||'Not observed')}
   const update=root.querySelector('[data-host-action="system-update"]');
   const restart=root.querySelector('[data-host-action="update-restart"]');
@@ -1203,7 +1222,7 @@ function updateHostActionState(surface,host,backup){
   const primarySeparator=root.querySelector('[data-primary-separator]');
   const removeSeparator=root.querySelector('[data-remove-separator]');
   const updateJobActive=host.update_restart_active===true;
-  const updatePending=kernelState==='reboot_required'||provenGitUpdate||provenNixpkgsUpdate;
+  const updatePending=kernelState==='reboot_required'||provenGitUpdate;
   const lifecycle=host.lifecycle||{};
   root.dataset.updatePending=updatePending?'true':'false';
   root.dataset.updateRestartActive=host.update_restart_active===true?'true':'false';
@@ -5214,5 +5233,5 @@ initProviderConnection();
 initProviderSetupGuide();
 setFleetSyncState('current');
 resumeBeatClock();
-scheduleRefresh(3000);
+scheduleRefresh(document.body?.dataset.hostActionDialogOpen==='true'?DIALOG_REFRESH_MS:3000);
 </script></body></html>
