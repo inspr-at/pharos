@@ -14,7 +14,7 @@ const test = base.extend({
 const tileOrigin = "https://tiles.openfreemap.org";
 const hosts = ["map-alpha", "map-bravo"].map((name, index) => ({
   name, lat: 47.1, lon: 15.4, live: "live", status: "Live",
-  search: name, settings_href: `/hosts/${name}/settings`,
+  search: name, settings_href: `/hosts/${name}`,
   site_id: "synthetic-site", site_label: "Synthetic site", region: "Europe",
   location_source: "declared", location_state: "observed", location_stale: false,
   inbound_label: "12 ms", inbound_title: "Synthetic inbound", inbound_level: "good",
@@ -187,7 +187,7 @@ test("key-free vector basemap preserves labels, navigation, filters and viewport
   await page.screenshot({ path: testInfo.outputPath("keyfree-map.png") });
   expect(evidence.pageErrors).toEqual([]);
   expect(await page.evaluate(() => window.__mapCspViolations)).toEqual([]);
-  await expect(page.locator('.map-node[data-host="map-alpha"]')).toHaveAttribute("href", "/hosts/map-alpha/settings");
+  await expect(page.locator('.map-node[data-host="map-alpha"]')).toHaveAttribute("href", "/hosts/map-alpha");
 });
 
 test("expired, corrupt or unavailable preference storage fails closed", async ({ page }) => {

@@ -2040,9 +2040,11 @@ test("legacy Agora links hand host context to the host workspace and never dead-
 
   const selected = await page.goto(`/agora?host=${encodeURIComponent(host)}`);
   expect(selected?.status()).toBe(200);
-  await expect(page).toHaveURL(new RegExp(`/hosts/${host}$`));
+  await expect(page).toHaveURL(new RegExp(`/hosts/${host}\\?section=settings$`));
   await expect(page.locator("[data-host-workspace]")).toHaveAttribute("data-host", host);
   await expect(page.locator("[data-color-root]")).toHaveAttribute("data-host", host);
+  await expect(page.locator("[data-host-section='settings']")).toBeVisible();
+  await expect(page.locator("[data-host-section='overview']")).toBeHidden();
 
   await page.goto("/agora");
   await expect(page).toHaveURL(/\/$/);
@@ -2668,7 +2670,7 @@ test("fleet refresh kernel chip follows server lifecycle transitions", async ({ 
     },
   });
   expect(await applyServerFleetSnapshot(page)).toBe(true);
-  await expect(card.locator("[data-host-lifecycle-chip-copy]")).toContainText("Up to date");
+  await expect(card.locator("[data-host-lifecycle-chip-copy]")).toContainText("No pending changes");
 
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },
@@ -2775,14 +2777,14 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await page.locator("[data-view-button='list']").click();
   await expect(page.locator("main")).toHaveAttribute("data-view", "list");
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await page.locator("[data-view-button='grid']").click();
 
@@ -2897,7 +2899,7 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
     "data-lifecycle-level",
@@ -2907,7 +2909,7 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await expect(row.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
     "data-lifecycle-level",

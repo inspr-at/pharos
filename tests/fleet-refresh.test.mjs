@@ -325,7 +325,7 @@ test("grace, restore, and history projections follow the shared contracts", () =
   const current = api.projectRestoreStatus([{
     restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 2_592_000 },
   }], now);
-  assert.equal(current.state, "current");
+  assert.equal(current.state, "passed");
   assert.equal(current.tone, "good");
   assert.equal(current.overdue, false);
 
@@ -354,31 +354,79 @@ test("grace, restore, and history projections follow the shared contracts", () =
   ], now);
   assert.equal(failed.state, "failed");
   assert.equal(failed.tone, "bad");
-  assert.match(failed.detail, /Last successful selective restore/);
+  assert.match(failed.detail, /last successful selective restore/);
 
   const daily = api.projectDailyBackup([{
     state: "healthy", schedule: "daily", last_success_at: now - 50,
   }], now);
   assert.equal(daily.label, "Daily OK");
   assert.equal(daily.tone, "good");
+  assert.equal(daily.state, "ok");
   const hourly = api.projectDailyBackup([{
     state: "healthy", schedule: "hourly", last_success_at: now - 50,
   }], now);
   assert.equal(hourly.label, "Successful");
   assert.equal(hourly.tone, "good");
-  assert.equal(api.projectDailyBackup([{ configured: "disabled", state: "unknown" }], now).state, "not-required");
+  const disabled = api.projectDailyBackup([{ configured: "disabled", state: "unknown" }], now);
+  assert.equal(disabled.state, "disabled");
+  assert.equal(disabled.tone, "amber");
+  assert.equal(disabled.label, "Disabled");
+  assert.match(disabled.detail, /not an exemption/);
+  assert.notEqual(api.projectRestoreStatus([{ configured: "disabled", state: "unknown" }], now).state, "not-required");
+  const disabledFailed = api.projectDailyBackup([{
+    configured: "disabled", state: "failed", last_success_at: now - 10,
+  }], now);
+  assert.equal(disabledFailed.state, "failed");
+  assert.equal(disabledFailed.label, "Failed");
+  assert.equal(disabledFailed.tone, "bad");
   assert.equal(api.projectDailyBackup([{ state: "healthy", schedule: "daily" }], now).label, "Success time unknown");
+  const exactFresh = api.projectDailyBackup([{
+    state: "healthy", schedule: "daily", last_success_at: now - 129600,
+  }], now);
+  assert.equal(exactFresh.label, "Daily OK");
+  assert.equal(exactFresh.tone, "good");
+  const justStale = api.projectDailyBackup([{
+    state: "healthy", schedule: "daily", last_success_at: now - 129601,
+  }], now);
+  assert.equal(justStale.state, "stale");
+  assert.equal(justStale.tone, "amber");
+  assert.equal(justStale.label, "Stale");
+  const future = api.projectDailyBackup([{
+    state: "healthy", schedule: "daily", last_success_at: now + 3,
+  }], now);
+  assert.notEqual(future.tone, "good");
+  assert.equal(future.state, "stale");
+  assert.equal(future.label, "Stale");
   const staleDaily = api.projectDailyBackup([{
     state: "healthy", schedule: "daily", last_success_at: now - 3 * 24 * 60 * 60,
   }], now);
   assert.equal(staleDaily.state, "stale");
   assert.equal(staleDaily.tone, "amber");
+  assert.equal(staleDaily.label, "Stale");
   assert.notEqual(staleDaily.label, "Daily OK");
   const recentRestore = api.projectRestoreStatus([{
     restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 * 24 * 60 * 60 },
   }], now);
   assert.equal(recentRestore.tone, "good");
+  assert.equal(recentRestore.state, "passed");
   assert.equal(recentRestore.overdue, false);
+  const borrowed = api.projectRestoreStatus([
+    { repository_id: "repo-a", state: "failed", schedule: "daily", last_success_at: now - 3 * 24 * 60 * 60 },
+    { repository_id: "repo-b", state: "healthy", schedule: "daily", last_success_at: now - 10, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 } },
+  ], now);
+  assert.notEqual(borrowed.tone, "good");
+  assert.equal(borrowed.state, "unknown");
+  const ownedRestore = api.projectRestoreStatus([
+    { repository_id: "repo-a", state: "healthy", schedule: "daily", last_success_at: now - 50, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 } },
+  ], now);
+  assert.equal(ownedRestore.tone, "good");
+  assert.equal(ownedRestore.state, "passed");
+  const borrowedDaily = api.projectDailyBackup([
+    { repository_id: "repo-a", state: "failed", schedule: "daily", last_success_at: now - 3 * 24 * 60 * 60 },
+    { repository_id: "repo-b", state: "healthy", schedule: "daily", last_success_at: now - 10, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 } },
+  ], now);
+  assert.equal(borrowedDaily.label, "Failed");
+  assert.equal(borrowedDaily.tone, "bad");
   const mixed = api.projectHealth({
     liveness: "live",
     backup: staleDaily,
@@ -389,12 +437,15 @@ test("grace, restore, and history projections follow the shared contracts", () =
     freshness: null,
   });
   assert.equal(mixed.tone, "amber");
-  assert.ok(mixed.reasons.some((reason) => reason.label === "Backup stale"));
-  assert.ok(mixed.reasons.some((reason) => reason.tone === "good" && reason.label === "Passed"));
+  assert.equal(mixed.summary, "Backup Stale");
+  assert.equal(mixed.count, 1);
+  assert.ok(mixed.reasons.every((reason) => reason.tone !== "good"));
+  assert.ok(mixed.reasons.some((reason) => reason.label === "Backup Stale"));
+  assert.equal(mixed.reasons.some((reason) => reason.label === "Passed"), false);
   const arrival = api.arrivalPresentation(now - 10, 60, 15, now);
   assert.equal(arrival.state, "on-time");
-  assert.doesNotMatch(`${arrival.label} ${arrival.detail}`, /%|Arrival scale|time axis/);
-  assert.match(arrival.detail, /Late after/);
+  assert.equal(arrival.label, "On time");
+  assert.doesNotMatch(`${arrival.label} ${arrival.detail}`, /%|Arrival scale|time axis|empty is not healthy/);
 
   const health = api.projectHealth({
     liveness: "live",
@@ -406,17 +457,157 @@ test("grace, restore, and history projections follow the shared contracts", () =
     freshness: null,
   });
   assert.equal(health.tone, "amber");
-  assert.ok(health.reasons.some((reason) => reason.tone === "good" && reason.label === "Daily OK"));
-  assert.ok(health.reasons.some((reason) => reason.label === "Selective restore overdue"));
+  assert.equal(health.summary, "Restore Overdue");
+  assert.equal(health.reasons.some((reason) => reason.tone === "good"), false);
+  assert.ok(health.reasons.some((reason) => reason.label === "Restore Overdue"));
+  const suppressed = api.projectHealth({
+    liveness: "down",
+    expectedOffline: false,
+    backup: daily,
+    restore: recentRestore,
+    check: null,
+    services: [],
+    kernelRestart: false,
+    freshness: null,
+  });
+  assert.equal(suppressed.tone, "bad");
+  assert.equal(suppressed.label, "Not reporting");
+  assert.equal(suppressed.summary, "Not reporting");
+  assert.equal(suppressed.reasons.some((reason) => reason.label === "Offline as expected"), false);
+  assert.equal(suppressed.reasons.some((reason) => reason.tone === "good"), false);
 
   assert.deepEqual(vmPlain(api.dedupeHeartbeats([5, 5.4, 5.9, 6.5])), [5, 6.5]);
   const start = now - 600;
   const gapped = api.aggregateHistory([start + 10, start + 400], windowDef, now, 60, 15);
   assert.equal(gapped.marks.some((mark) => mark.level === "ok"), false);
-  assert.equal(gapped.marks.some((mark) => mark.level === "down"), true);
+  assert.equal(gapped.marks.some((mark) => mark.level === "unknown"), false);
+  const downMark = gapped.marks.find((mark) => mark.level === "down");
+  assert.ok(downMark);
+  assert.ok(Math.abs(downMark.x - (400 / 600) * 100) < 0.2);
   assert.equal(api.historyInfo([now + 30], 0, 60, 15, now).level, "unknown");
-  assert.equal(api.aggregateHistory([now + 30], windowDef, now, 60, 15).marks.some((mark) => mark.level === "ok"), false);
+  assert.deepEqual(vmPlain(api.aggregateHistory([now - 10], windowDef, now, 60, 15).marks), []);
+  assert.deepEqual(vmPlain(api.aggregateHistory([now + 30], windowDef, now, 60, 15).marks), []);
   assert.deepEqual(vmPlain(api.aggregateHistory([], windowDef, now, 60, 15).marks), []);
+});
+
+test("down-alert suppression and exact times follow the scan contract", () => {
+  const attentionStart = fleetRuntimeSource.indexOf("function expectedOfflineHost");
+  const attentionEnd = fleetRuntimeSource.indexOf("const BACKUP_RANK=");
+  const attentionContext = vm.createContext({ console });
+  vm.runInContext(`
+function freshnessAttention(){return null}
+${fleetRuntimeSource.slice(attentionStart, attentionEnd)}
+globalThis.__attention = { expectedOfflineHost, attentionFor };
+`, attentionContext);
+  const attention = attentionContext.__attention;
+  const suppressed = { kind: "server", alerts: { suppress_down: true } };
+  assert.equal(attention.expectedOfflineHost({ preferences: suppressed, service_observations: [] }), false);
+  assert.equal(attention.attentionFor("down", null, suppressed, 1).label, "silent heartbeat");
+  assert.equal(attention.attentionFor("down", null, suppressed, 1).level, "down");
+  assert.equal(attention.expectedOfflineHost({ preferences: { kind: "workstation" }, service_observations: [] }), true);
+  assert.equal(attention.attentionFor("down", null, { kind: "workstation" }, 1).label, "offline as expected");
+  assert.equal(attention.expectedOfflineHost({
+    preferences: { kind: "server" },
+    service_observations: [{ id: "appliance-convergence", summary: "powered off as expected" }],
+  }), true);
+
+  const factStart = fleetRuntimeSource.indexOf("function setFactText");
+  const factEnd = fleetRuntimeSource.indexOf("function updateHealthProjection");
+  function factNode() {
+    return {
+      hidden: false,
+      dataset: {},
+      childNodes: [],
+      attributes: {},
+      className: "",
+      textContent: "",
+      parentElement: null,
+      setAttribute(name, value) { this.attributes[name] = String(value); },
+      appendChild(child) {
+        child.parentElement = this;
+        this.childNodes.push(child);
+        return child;
+      },
+      remove() {
+        if (!this.parentElement) return;
+        this.parentElement.childNodes = this.parentElement.childNodes.filter((child) => child !== this);
+        this.parentElement = null;
+      },
+      querySelector(selector) {
+        const wanted = selector.startsWith("[") ? selector.slice(1, -1) : "";
+        const visit = (node) => {
+          for (const child of node.childNodes) {
+            if (wanted && Object.prototype.hasOwnProperty.call(child.attributes, wanted)) return child;
+            const nested = visit(child);
+            if (nested) return nested;
+          }
+          return null;
+        };
+        return visit(this);
+      },
+      querySelectorAll(selector) {
+        const found = [];
+        const visit = (node) => {
+          for (const child of node.childNodes) {
+            if (selector === ".fact-exact" && String(child.className).split(/\s+/).includes("fact-exact")) found.push(child);
+            visit(child);
+          }
+        };
+        visit(this);
+        return found;
+      },
+    };
+  }
+  const created = [];
+  const document = {
+    createElement() {
+      const node = factNode();
+      created.push(node);
+      return node;
+    },
+  };
+  const factContext = vm.createContext({ console, document });
+  vm.runInContext(`
+function appUrl(path){return path}
+const SELECTIVE_RESTORE_OVERDUE_SECS=2592000;
+${fleetRuntimeSource.slice(factStart, factEnd)}
+globalThis.__facts = { updateBackupStatus };
+`, factContext);
+  const daily = factNode();
+  daily.dataset.host = "alpha";
+  const label = factNode();
+  label.attributes["data-daily-backup-label"] = "";
+  const note = factNode();
+  note.attributes["data-daily-backup-note"] = "";
+  const time = factNode();
+  time.attributes["data-daily-backup-date"] = "";
+  const duplicate = factNode();
+  duplicate.className = "fact-exact";
+  note.appendChild(duplicate);
+  daily.appendChild(label);
+  daily.appendChild(note);
+  daily.appendChild(time);
+  const surface = {
+    dataset: { host: "alpha" },
+    querySelector(selector) {
+      if (selector === "[data-daily-backup]") return daily;
+      return null;
+    },
+  };
+  const protection = {
+    daily: { state: "ok", tone: "good", label: "Daily OK", detail: "last success 50s ago", at: 1_700_000_000 },
+    restore: null,
+    check: null,
+  };
+  factContext.__facts.updateBackupStatus(surface, protection);
+  factContext.__facts.updateBackupStatus(surface, protection);
+  const times = daily.childNodes.filter((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-daily-backup-date"));
+  assert.equal(times.length, 1);
+  assert.equal(times[0], time);
+  assert.equal(times[0].attributes.datetime, "2023-11-14T22:13:20Z");
+  assert.equal(times[0].textContent, "2023-11-14 22:13:20 UTC");
+  assert.equal(note.childNodes.some((child) => String(child.className).includes("fact-exact")), false);
+  assert.equal(created.filter((node) => Object.prototype.hasOwnProperty.call(node.attributes, "data-daily-backup-date")).length, 0);
 });
 
 function controllableClock() {
