@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 260921161439.0.0 - 2026-09-21
+
+- Gate nixpkgs-difference attention on the age of the deployed revision using the server clock. The fleet default is 30 days, editable in Settings; a host may override it through its alert preferences. A revision must be strictly older than the effective threshold; equal or unknown ages stay quiet (PHAROS-289).
+- Persist fleet freshness settings atomically and keep server-rendered and refreshed cards consistent. Proven update and deployment proposal eligibility are unchanged (PHAROS-289).
+- Rollout: upgrade pharosd and every beacon that reads the shared host-preferences registry before publishing a per-host age override. The nixcfg host-settings workflow and contract must support the optional field before overrides are used (PHAROS-289).
+
 ## 260921083754.0.0 - 2026-09-21
 
 - Read the release-history scheme label from the verified INSPR presentation bundle, displaying `INSPR-VER2` while retaining the machine scheme id; reject unknown schemes during the build (PHAROS-284).
