@@ -69,7 +69,7 @@ const AGORA_CSS: &str = r#"<style data-pharos-page-style="agora">
 .empty-settings{width:min(840px,100%);margin:26px auto 0;box-shadow:none}
 @media (max-width:640px){.host-picker{grid-template-columns:1fr;gap:6px}.host-settings-surface{margin-top:18px}.host-settings-identity,.host-color-task,.settings-disclosure>summary,.settings-disclosure-body,.settings-draft-actions{padding-left:4px;padding-right:4px}.host-color-choice{gap:13px}.host-advanced-meta,.host-kind-row{grid-template-columns:1fr}.settings-draft-actions,.settings-draft-buttons{align-items:stretch;flex-direction:column}.settings-draft-buttons{width:100%}.settings-draft-buttons button{width:100%}}
 .host-breadcrumb{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 16px;color:var(--muted);font-size:13px}.host-breadcrumb a{display:inline-flex;align-items:center;gap:6px;color:#1e668f;font-weight:680;text-decoration:none}.host-breadcrumb a:focus-visible,.host-tabs a:focus-visible,.host-disclosure>summary:focus-visible,.host-color-well:focus-visible,.grace-select:focus-visible,.grace-input:focus-visible,.grace-reset:focus-visible,.host-issue a:focus-visible,.host-settings-surface input:focus-visible,.host-settings-surface select:focus-visible,.host-settings-surface button:focus-visible{outline:2px solid rgba(31,127,181,.55);outline-offset:3px}
-.host-profile{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin-bottom:8px}.os-badge,.os-health-badge{display:grid;place-items:center;width:48px;height:48px;flex:0 0 auto;border-radius:50%;background:#5c7384;color:#fff}.os-badge .ico,.os-badge-icon .ico,.os-health-badge .ico{width:24px;height:24px;color:#fff}.os-badge[data-health-tone="good"],.os-health-badge[data-health-tone="good"]{background:#1f8a4c}.os-badge[data-health-tone="amber"],.os-health-badge[data-health-tone="amber"]{background:#b26a00}.os-badge[data-health-tone="bad"],.os-health-badge[data-health-tone="bad"]{background:#c62828}.os-badge[data-health-tone="neutral"],.os-health-badge[data-health-tone="neutral"]{background:#5c7384}.harbor-health{margin-top:8px}.health-reasons{margin:8px 0 0;padding-left:18px}.fact-value.good{color:#1f8a4c}.fact-value.amber{color:#9a5b00}.fact-value.bad{color:#c62828}.fact-value.neutral{color:#526d82}.protection-pair{display:grid;gap:0;margin-top:8px}.protection-fact{display:block;padding:12px 0;border-top:1px solid rgba(214,226,234,.7);color:inherit;text-decoration:none}
+.host-profile{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin-bottom:8px}.os-badge,.os-health-badge{display:grid;place-items:center;width:48px;height:48px;flex:0 0 auto;border-radius:50%;background:#5c7384;color:#fff}.os-badge .ico,.os-badge-icon .ico,.os-health-badge .ico{width:24px;height:24px;color:#fff}.os-badge[data-health-tone="good"],.os-health-badge[data-health-tone="good"]{background:#1f8a4c}.os-badge[data-health-tone="amber"],.os-health-badge[data-health-tone="amber"]{background:#b26a00}.os-badge[data-health-tone="bad"],.os-health-badge[data-health-tone="bad"]{background:#c62828}.os-badge[data-health-tone="neutral"],.os-health-badge[data-health-tone="neutral"]{background:#5c7384}.harbor-health{margin-top:8px}.health-reasons{margin:8px 0 0;padding-left:18px}.fact-value.good{color:#1f8a4c}.fact-value.amber{color:#9a5b00}.fact-value.bad{color:#c62828}.fact-value.neutral{color:#526d82}.protection-pair{display:grid;gap:0;margin-top:8px}.protection-fact{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 8px;min-width:0;padding:12px 0;border-top:1px solid rgba(214,226,234,.7);color:inherit;line-height:1.45;text-decoration:none}.protection-fact .fact-label,.protection-fact .fact-value,.protection-fact .fact-note{min-width:0;overflow-wrap:anywhere}
 .host-profile-copy{min-width:0;flex:1 1 220px}.host-profile-copy strong,.host-profile-copy p{display:block;overflow-wrap:anywhere}.host-profile-copy strong{font-size:18px}.host-profile-copy p{margin:4px 0 0;color:var(--muted);font-size:13px;line-height:1.45}
 .host-accent-identity{display:inline-flex;align-items:center;gap:8px;margin-left:auto;color:var(--muted);font-size:12px}.host-accent-swatch{width:14px;height:14px;border:1px solid rgba(210,226,234,.92);border-radius:50%;background:var(--host-accent,#1f7fb5)}
 .host-tabs{display:flex;flex-wrap:wrap;gap:8px 22px;margin:8px 0 18px;border-bottom:1px solid rgba(210,226,234,.92)}.host-tabs a{padding:0 0 10px;border-bottom:2px solid transparent;color:var(--muted);font-size:14px;font-weight:650;text-decoration:none}.host-tabs a[aria-current="page"]{border-color:#1f7fb5;color:#176b98}
@@ -517,6 +517,11 @@ fn render_heartbeat_history(log: &[i64], now: i64, interval_secs: u64, grace_sec
     format!(r#"<ol class="host-history" data-heartbeat-history-list>{items}</ol>"#)
 }
 
+fn workspace_protection_facts(html: String) -> String {
+    html.replace("</span><strong", "</span> <strong")
+        .replace("</strong><span", "</strong> <span")
+}
+
 fn render_host_workspace(
     base: &pharos_core::PublicBasePath,
     host: &AgoraHostView,
@@ -566,7 +571,8 @@ fn render_host_workspace(
         crate::icons::SERVER
     };
     let badge = crate::os_badge_markup(icon, &health);
-    let protection_body = crate::protection_markup(&protection, &host.name, base);
+    let protection_body =
+        workspace_protection_facts(crate::protection_markup(&protection, &host.name, base));
     let daily_sentence = "";
     let service_items = services
         .iter()
@@ -748,14 +754,14 @@ fn render_host_workspace(
         workflow_handler = workflow_handler,
         manager_note = html_escape(manager_note),
         daily_overview = daily_sentence,
-        protection_overview = protection_body,
+        protection_overview = &protection_body,
         report_at_overview = html_escape(&report_at),
         report_overview = html_escape(&report),
         activity_overview = crate::app_href(base, &format!("/activity?host={host_path}")),
         activity_overview_label = "Open activity",
         backups_hidden = hidden_unless(extras.section, WorkspaceSection::Backups),
         daily_backups = daily_sentence,
-        protection_backups = crate::protection_markup(&protection, &host.name, base),
+        protection_backups = &protection_body,
         activity_hidden = hidden_unless(extras.section, WorkspaceSection::Activity),
         report_at_activity = html_escape(&report_at),
         report_activity = html_escape(&report),
@@ -3192,6 +3198,9 @@ mod tests {
         let head = &html[..head_end];
         assert!(head.contains(r#"data-pharos-page-style="agora""#));
         assert!(head.contains(".host-color-well"));
+        assert!(head.contains(
+            ".protection-fact{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 8px"
+        ));
     }
 
     #[test]
@@ -3239,6 +3248,10 @@ mod tests {
         assert!(html.contains("60s + 45s grace → late after 105s"));
         assert!(html.contains(r#"data-selective-restore-overdue-after-secs="2592000""#));
         assert!(html.contains(r#"data-restore-producer="missing""#));
+        assert!(html.contains(r#">Backup run</span> <strong"#));
+        assert!(html.contains(r#">Not observed</strong> <span"#));
+        assert!(html.contains(r#">Selective restore</span> <strong"#));
+        assert!(!html.contains(r#">Backup run</span><strong"#));
         assert!(html.contains(r#"data-health-tone="neutral""#));
         assert!(!html.contains("Daily OK"));
         assert!(!html.contains("heartbeat-grace.json"));
