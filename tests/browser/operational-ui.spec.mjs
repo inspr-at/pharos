@@ -64,11 +64,9 @@ test("release history exposes the complete immutable release identity", async ({
   const dialog = page.locator("[data-release-modal]");
   await expect(dialog).toHaveCount(1);
   const identity = dialog.locator("[data-release-identity]");
-  const schemeLabel = {
-    "inspr-calendar-v2": "Calendar v2",
-    "inspr-calendar-v1": "Calendar v1",
-    legacy: "Legacy",
-  }[releaseCoordinate.version_scheme];
+  const schemeLabel = JSON.parse(fs.readFileSync(new URL(
+    "../../crates/pharosd/assets/vendor/calendar-version-display/schemes.json", import.meta.url,
+  ), "utf8")).labels[releaseCoordinate.version_scheme];
   expect(schemeLabel).toBeDefined();
   await expect(identity).toContainText(schemeLabel);
   await expect(identity).toContainText(releaseCoordinate.release_channel);

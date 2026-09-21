@@ -129,12 +129,7 @@ pub(super) fn release_label() -> String {
 }
 
 pub(super) fn release_scheme_label() -> &'static str {
-    match VERSION_SCHEME {
-        "inspr-calendar-v2" => "Calendar v2",
-        "inspr-calendar-v1" => "Calendar v1",
-        "legacy" => "Legacy",
-        _ => "Unknown",
-    }
+    env!("PHAROS_VERSION_SCHEME_LABEL")
 }
 
 pub(super) fn release_set_url() -> String {
@@ -496,7 +491,7 @@ mod module_tests {
     #[test]
     fn release_dialog_exposes_discriminated_identity_and_exact_manifest_link() {
         let dialog = release_dialog();
-        assert!(dialog.contains(">Calendar v2<"));
+        assert!(dialog.contains(">INSPR-VER2<"));
         assert!(dialog.contains(">stable<"));
         assert!(dialog.contains(&format!(">#{RELEASE_SEQUENCE}<")));
         assert!(dialog.contains(&format!(

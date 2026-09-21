@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Read the release-history scheme label from the verified INSPR presentation bundle, displaying `INSPR-VER2` while retaining the machine scheme id; reject unknown schemes during the build (PHAROS-284).
+
 - Show release-history ages in muted, right-aligned text with readable day, week, month and half-year units; retain exact dates on hover for calendar and legacy versions, omit the Unreleased section, and align release metadata with a subtle release-details download button (PHAROS-283).
 
 ## 260920201529.0.0 - 2026-09-20

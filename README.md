@@ -1087,11 +1087,14 @@ source-lock digest hashes, in order, the exact bytes of `Cargo.lock`,
 The sidebar and release history render calendar v2 coordinates through the
 build-time-only INSPR Calendar display bundle in
 `crates/pharosd/assets/vendor/calendar-version-display`. The bundle is pinned
-to source `83d26aa605b21493d22805ba477e6ac279b6409d`; its manifest, configuration,
-renderer, interaction helper, AutoAnimate library and license are verified
+to source `317f872bc061576fc0b45d274d3a22f69bcd4c8a`; its manifest, configuration,
+scheme labels, renderer, interaction helper, AutoAnimate library and license are verified
 offline by `scripts/check-calendar-version-display.sh` and again by the Rust
 build. The server-rendered canonical coordinate remains visible if JavaScript
 is unavailable, and `/version` remains the machine interface.
+The release-history scheme label comes from the bundle's `schemes.json`
+(`INSPR-VER2` for `inspr-calendar-v2`). Unknown schemes fail the build; machine
+scheme identifiers remain unchanged.
 
 ## Contributing
 

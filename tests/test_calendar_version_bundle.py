@@ -22,7 +22,17 @@ class CalendarVersionBundleTest(unittest.TestCase):
     def test_exact_bundle_passes(self):
         result = self.run_check(ROOT)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("source=83d26aa605b21493d22805ba477e6ac279b6409d", result.stdout)
+        self.assertIn("source=317f872bc061576fc0b45d274d3a22f69bcd4c8a", result.stdout)
+
+    def test_scheme_label_drift_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.fixture(directory)
+            labels = json.loads(bundle.joinpath("schemes.json").read_text())
+            labels["labels"]["inspr-calendar-v2"] = "Invented label"
+            bundle.joinpath("schemes.json").write_text(json.dumps(labels))
+            result = self.run_check(directory)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("schemes.json bytes drifted", result.stderr)
 
     def test_renderer_or_manifest_drift_fails(self):
         with tempfile.TemporaryDirectory() as directory:

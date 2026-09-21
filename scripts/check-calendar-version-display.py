@@ -6,11 +6,12 @@ import stat
 import sys
 from pathlib import Path
 
-SOURCE = "83d26aa605b21493d22805ba477e6ac279b6409d"
+SOURCE = "317f872bc061576fc0b45d274d3a22f69bcd4c8a"
 CONFIG_SHA256 = "7843f3515ce329277d2d576000bd60ac410d725b241d502a9a3fecb2533d956d"
-MANIFEST_SHA256 = "e7052c82af0d0cdfe4a466bf3129c1de56014253247106f2670788419f118812"
+MANIFEST_SHA256 = "b1125b92bf8c0bb0a9e14968924230f04503d226b63d0a0aee544efbdaf00af2"
 FILES = {
     "display.json": (1656, CONFIG_SHA256),
+    "schemes.json": (169, "4c903f9f4dc63ae141f48131b6e5150d86e8381d50ecde89782cf77ad2f4a5b7"),
     "version.js": (4871, "9a09693e0cef3af586f617ba24cdae96165d95d12f5c447b1d2e67d35a70c9b8"),
     "presentation.js": (2769, "fd0354837edd05179aeeaa86c271bced25031a3f29e148c448b684116b7dd3ca"),
     "version-interaction.js": (7671, "cfe539ad84651666d18b192f37659dab7c36aa8e68c43c9bdd42b42e85de2ba1"),

@@ -13,6 +13,9 @@ mod alerting;
 mod alerts;
 mod appliance_probes;
 mod auth;
+#[cfg(test)]
+#[path = "../build_support.rs"]
+mod build_support;
 mod durable_file;
 mod flow_host;
 mod host_actions;
