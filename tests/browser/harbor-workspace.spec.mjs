@@ -128,7 +128,10 @@ test("host workspace uses fleet protection, real grace, and private fleet return
     await expect(page.locator("[data-settings-draft-review]")).toContainText(
       "Heartbeat grace: fleet default → 30 seconds",
     );
-    await page.getByRole("button", { name: "Discard draft", exact: true }).click();
+    await page
+      .getByRole("dialog", { name: `Confirm changes for ${host}` })
+      .getByRole("button", { name: "Discard draft", exact: true })
+      .click();
     await grace.getByRole("button", { name: "Use fleet default", exact: true }).click();
     await expect(review).toBeDisabled();
 
@@ -202,7 +205,21 @@ test("fleet breadcrumb returns to the real fleet entry", async ({ page }, testIn
   try {
     await reportHost(page, host, backup("restore-sample", serverNow - 60, serverNow - 60));
     await page.setViewportSize({ width: 1100, height: 280 });
-    await page.goto(`/?view=list&q=${encodeURIComponent(host)}&sort=name`);
+    await page.goto("/");
+    await page.locator('[data-view-button="list"]').click();
+    await page.locator("[data-sort]").selectOption("name");
+    await page.locator("[data-search]").fill(host);
+    await expect.poll(() => {
+      const url = new URL(page.url());
+      return url.searchParams.get("view") === "list"
+        && url.searchParams.get("sort") === "name"
+        && url.searchParams.get("q") === host;
+    }).toBe(true);
+    await expect.poll(() => page.evaluate(() => {
+      const state = window.navigation?.currentEntry?.getState?.() || null;
+      const path = state && state.pharosFleet && state.pharosFleet.path;
+      return typeof path === "string" && path === location.pathname;
+    })).toBe(true);
     const navigationApi = await page.evaluate(() => {
       const nav = window.navigation;
       if (!nav || typeof nav.entries !== "function" || typeof nav.traverseTo !== "function") return false;
@@ -240,7 +257,10 @@ test("fleet breadcrumb returns to the real fleet entry", async ({ page }, testIn
     await page.locator("[data-fleet-return]").click();
     await expect.poll(() => {
       const url = new URL(page.url());
-      return url.pathname === "/" && url.searchParams.get("q") === host && url.searchParams.get("view") === "list";
+      return url.pathname === "/"
+        && url.searchParams.get("q") === host
+        && url.searchParams.get("view") === "list"
+        && url.searchParams.get("sort") === "name";
     }).toBe(true);
     await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
     expect(await page.evaluate(() => sessionStorage.length)).toBe(0);

@@ -1365,12 +1365,41 @@ fn render_page_with_access(
     format!(
         r##"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}{access_path}{host_table}{content}</main>{action_dialog}<script>
 function appUrl(path){{return (typeof window.pharosPublicPath==='function')?window.pharosPublicPath(path):path}}
-function fleetReturnPath(value){{
+function fleetPathname(value){{
+  if(typeof value!=='string'||!value.startsWith('/'))return '';
   try{{
     const url=new URL(value,location.origin);
-    const path=url.pathname.replace(/\/+$/,'')||'/';
-    return url.origin+' '+path;
+    if(url.origin!==location.origin)return '';
+    return url.pathname.replace(/\/+$/,'')||'/';
   }}catch(_error){{return ''}}
+}}
+function fleetMarkerPath(entry){{
+  if(!entry||typeof entry.getState!=='function')return '';
+  let state=null;
+  try{{state=entry.getState()}}catch(_error){{return ''}}
+  const path=state&&state.pharosFleet&&state.pharosFleet.path;
+  return fleetPathname(path);
+}}
+function fleetEntryMatches(entry,fleetHref){{
+  if(!entry||!entry.key)return false;
+  const expected=fleetPathname(fleetHref);
+  if(!expected||fleetMarkerPath(entry)!==expected)return false;
+  if(typeof entry.url!=='string'||!entry.url)return true;
+  try{{
+    const url=new URL(entry.url,location.origin);
+    return url.origin===location.origin&&fleetPathname(url.pathname)===expected;
+  }}catch(_error){{return false}}
+}}
+function followFleetTraversal(result,fallback){{
+  const fail=()=>{{location.assign(fallback)}};
+  const committed=result&&result.committed;
+  const finished=result&&result.finished;
+  const watchFinished=()=>{{
+    if(finished&&typeof finished.then==='function')finished.catch(fail);
+    else if(!(committed&&typeof committed.then==='function'))fail();
+  }};
+  if(committed&&typeof committed.then==='function')committed.then(watchFinished,fail);
+  else watchFinished();
 }}
 document.querySelector('[data-fleet-return]')?.addEventListener('click',event=>{{
   if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;
@@ -1388,14 +1417,13 @@ document.querySelector('[data-fleet-return]')?.addEventListener('click',event=>{
     const found=entries.findIndex(entry=>entry&&entry.key===current.key);
     if(found>=0)currentIndex=found;
   }}
-  const fleetKey=fleetReturnPath(fleetHref);
-  if(!fleetKey)return;
   for(let index=currentIndex-1;index>=0;index-=1){{
     const entry=entries[index];
-    if(!entry||!entry.url||!entry.key)continue;
-    if(fleetReturnPath(entry.url)!==fleetKey)continue;
+    if(!fleetEntryMatches(entry,fleetHref))continue;
     event.preventDefault();
-    Promise.resolve(nav.traverseTo(entry.key)).catch(()=>{{location.assign(fleetHref)}});
+    let result=null;
+    try{{result=nav.traverseTo(entry.key)}}catch(_error){{location.assign(fleetHref);return}}
+    followFleetTraversal(result,fleetHref);
     return;
   }}
 }});
@@ -3146,6 +3174,10 @@ mod tests {
         assert!(html.contains("window.navigation"));
         assert!(html.contains("nav.entries()"));
         assert!(html.contains("nav.traverseTo"));
+        assert!(html.contains("pharosFleet"));
+        assert!(html.contains("result.committed"));
+        assert!(html.contains("result.finished"));
+        assert!(!html.contains("Promise.resolve(nav.traverseTo"));
         assert!(!html.contains("history.back()"));
         assert!(!html.contains("history.length"));
         assert!(!html.contains("document.referrer"));
