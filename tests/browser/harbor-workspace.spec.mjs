@@ -237,23 +237,45 @@ test("fleet breadcrumb returns to the real fleet entry", async ({ page }, testIn
       return Array.isArray(entries) && entries.length > 0 && entries.every((entry) => typeof entry.key === "string" && "url" in entry);
     });
     expect(navigationApi).toBe(true);
-    const name = page.locator(`a.host-name[href="/hosts/${host}"]`).first();
-    await expect(name).toHaveAttribute("href", `/hosts/${host}`);
+    const listRow = page.locator(`[data-list-body] tr[data-host="${host}"]`);
+    const listHost = listRow.locator(`a.host-name[href="/hosts/${host}"]`);
+    await expect(listRow).toBeVisible();
+    await expect(listHost).toBeVisible();
+    await expect(listHost).toHaveAttribute("href", `/hosts/${host}`);
+    await expect.poll(() => page.evaluate((expected) => {
+      const row = document.querySelector(`[data-list-body] tr[data-host="${expected}"]`);
+      const needle = expected.toLowerCase();
+      return Boolean(row)
+        && !row.hidden
+        && String(row.dataset.search || "").includes(needle)
+        && [...document.querySelectorAll("[data-list-body] tr[data-host]")].every((el) => el === row || el.hidden);
+    }, host)).toBe(true);
     const scrolled = await page.evaluate((href) => {
+      const link = document.querySelector(`[data-list-body] a.host-name[href="${href}"]`);
       const max = document.documentElement.scrollHeight - window.innerHeight;
       const target = Math.min(180, Math.max(0, max));
       window.scrollTo(0, target);
-      return { y: window.scrollY, max, href: document.querySelector(`a.host-name[href="${href}"]`)?.getAttribute("href") || "" };
+      const inView = (node) => {
+        if (!node) return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < window.innerHeight;
+      };
+      if (link && !inView(link)) {
+        const top = link.getBoundingClientRect().top + window.scrollY;
+        let next = Math.min(Math.max(0, max), Math.max(0, top - 40));
+        if (next === 0 && max > 0) next = Math.min(max, 1);
+        window.scrollTo(0, next);
+      }
+      return { y: window.scrollY, max, href: link?.getAttribute("href") || "", inView: inView(link) };
     }, `/hosts/${host}`);
     expect(scrolled.href).toBe(`/hosts/${host}`);
     expect(scrolled.href).not.toContain("from=");
     expect(scrolled.max).toBeGreaterThan(0);
     expect(scrolled.y).toBeGreaterThan(0);
+    expect(scrolled.inView).toBe(true);
     await Promise.all([
       page.waitForURL((url) => url.pathname === `/hosts/${host}`),
-      page.evaluate((href) => {
-        document.querySelector(`a.host-name[href="${href}"]`).click();
-      }, `/hosts/${host}`),
+      listHost.click(),
     ]);
     for (const section of ["backups", "activity", "settings"]) {
       await page.locator(`[data-host-tab][data-section="${section}"]`).click();
@@ -274,7 +296,16 @@ test("fleet breadcrumb returns to the real fleet entry", async ({ page }, testIn
         && url.searchParams.get("sort") === "name";
     }).toBe(true);
     await expect(page.locator("input[data-search]")).toHaveValue(host);
-    await expect(page.locator(`a.host-name[href="/hosts/${host}"]`).first()).toBeVisible();
+    await expect(listRow).toBeVisible();
+    await expect(listHost).toBeVisible();
+    await expect.poll(() => page.evaluate((expected) => {
+      const row = document.querySelector(`[data-list-body] tr[data-host="${expected}"]`);
+      const needle = expected.toLowerCase();
+      return Boolean(row)
+        && !row.hidden
+        && String(row.dataset.search || "").includes(needle)
+        && [...document.querySelectorAll("[data-list-body] tr[data-host]")].every((el) => el === row || el.hidden);
+    }, host)).toBe(true);
     await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
     expect(await page.evaluate(() => sessionStorage.length)).toBe(0);
     expect(await page.evaluate((expected) => Object.values(localStorage).some((value) => String(value).includes(expected)), host)).toBe(false);
