@@ -5528,7 +5528,8 @@ mod tests {
         assert!(html.contains(r#"data-scheme="inspr-calendar-v2""#));
         assert!(html.contains("Release history"));
         assert!(html.contains("Pharos Changelog"));
-        assert!(html.contains("0.1.0 - 2026-07-09"));
+        assert!(html.contains(r#"class="release-entry-version">0.1.0</span>"#));
+        assert!(html.contains(r#"datetime="2026-07-09" title="2026-07-09""#));
         assert!(html.contains("document.body.appendChild(modal)"));
         assert!(html.contains("modal.dataset.releasePortal='body'"));
         assert!(html.contains("event.key==='Escape'"));
@@ -5546,7 +5547,10 @@ mod tests {
     fn changelog_renderer_escapes_operator_text() {
         let html = changelog_html();
 
-        assert!(html.contains("<h3>0.1.0 - 2026-07-09</h3>"));
+        assert!(!html.contains("<h3>Unreleased</h3>"));
+        assert!(html.contains(r#"<h3 class="release-entry-heading" title="2026-07-09">"#));
+        assert!(html.contains(r#"class="release-entry-version">0.1.0</span>"#));
+        assert!(!html.contains("0.1.0 - 2026-07-09"));
         assert!(html.contains("<li>Added a visible dashboard version badge"));
         assert!(!html.contains("<script"));
     }

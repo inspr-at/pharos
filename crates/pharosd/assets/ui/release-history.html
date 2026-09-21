@@ -9,8 +9,37 @@
   modal.setAttribute('aria-hidden','true');
   let opener=null;
   const closeButton=modal.querySelector('.release-close');
+  function relativeAge(date,today){
+    const days=Math.round((today-date)/86400000);
+    if(days<0)return 'upcoming';
+    if(days===0)return 'today';
+    const count=(value,unit)=>`${value} ${unit}${value===1?'':'s'} ago`;
+    // Changelog dates have day precision in UTC. Calendar months also handle
+    // short months: January 31 to February 28 is one month, not four weeks.
+    let months=(today.getUTCFullYear()-date.getUTCFullYear())*12+today.getUTCMonth()-date.getUTCMonth();
+    const lastDay=new Date(Date.UTC(today.getUTCFullYear(),today.getUTCMonth()+1,0)).getUTCDate();
+    if(today.getUTCDate()<Math.min(date.getUTCDate(),lastDay))months--;
+    if(months===0)return days<7?count(days,'day'):count(Math.floor(days/7),'week');
+    if(months===6)return '1/2 year ago';
+    if(months<12)return count(months,'month');
+    const years=Math.floor(months/12);
+    return months%12>=6?`${years} 1/2 years ago`:count(years,'year');
+  }
+  function refreshAges(){
+    const now=new Date();
+    const today=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()));
+    modal.querySelectorAll('time.release-age[datetime]').forEach(element=>{
+      const iso=element.getAttribute('datetime');
+      const date=new Date(`${iso}T00:00:00Z`);
+      if(!Number.isFinite(date.getTime()))return;
+      const label=relativeAge(date,today);
+      element.textContent=label;
+      element.setAttribute('aria-label',`${label}; released ${iso}`);
+    });
+  }
   function show(){
     opener=document.activeElement;
+    refreshAges();
     modal.hidden=false;
     modal.removeAttribute('aria-hidden');
     document.body.dataset.releaseOpen='true';

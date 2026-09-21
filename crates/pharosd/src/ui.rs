@@ -147,6 +147,9 @@ pub(super) fn release_set_url() -> String {
 pub(super) fn changelog_html() -> String {
     let mut html = String::new();
     let mut in_list = false;
+    let mut in_unreleased = false;
+    let date_format = time::format_description::parse_borrowed::<2>("[year]-[month]-[day]")
+        .expect("release date format");
     for line in CHANGELOG_MD.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -161,7 +164,24 @@ pub(super) fn changelog_html() -> String {
                 html.push_str("</ul>");
                 in_list = false;
             }
-            html.push_str(&format!("<h3>{}</h3>", html_escape(text)));
+            in_unreleased = text.eq_ignore_ascii_case("Unreleased");
+            if in_unreleased {
+                continue;
+            }
+            if let Some((version, date)) = text
+                .rsplit_once(" - ")
+                .filter(|(_, date)| time::Date::parse(date, &date_format).is_ok())
+            {
+                html.push_str(&format!(
+                    r#"<h3 class="release-entry-heading" title="{date}"><span class="release-entry-version">{version}</span> <time class="release-age" datetime="{date}" title="{date}">{date}</time></h3>"#,
+                    version = html_escape(version),
+                    date = html_escape(date),
+                ));
+            } else {
+                html.push_str(&format!("<h3>{}</h3>", html_escape(text)));
+            }
+        } else if in_unreleased {
+            continue;
         } else if let Some(text) = trimmed.strip_prefix("# ") {
             if in_list {
                 html.push_str("</ul>");
@@ -190,7 +210,7 @@ pub(super) fn changelog_html() -> String {
 
 pub(super) fn release_dialog() -> String {
     format!(
-        r#"<section class="release-overlay" data-release-modal hidden aria-label="release history"><div class="release-backdrop" data-release-close></div><div class="release-sheet" role="dialog" aria-modal="true" aria-labelledby="release-history-title"><header class="release-head"><div><h2 id="release-history-title">Release history</h2><p>Running {version} · build {commit}</p><dl class="release-identity" data-release-identity><div><dt>Scheme</dt><dd>{scheme}</dd></div><div><dt>Channel</dt><dd>{channel}</dd></div><div><dt>Sequence</dt><dd>#{sequence}</dd></div></dl><a class="release-set-link" data-release-set href="{release_set}" target="_blank" rel="noopener noreferrer">Open exact release set</a></div><button class="release-close" type="button" data-release-close>Close</button></header><div class="release-body">{history}</div></div></section>"#,
+        r#"<section class="release-overlay" data-release-modal hidden aria-label="release history"><div class="release-backdrop" data-release-close></div><div class="release-sheet" role="dialog" aria-modal="true" aria-labelledby="release-history-title"><header class="release-head"><div class="release-title"><h2 id="release-history-title">Release history</h2><p>Running {version} · build {commit}</p></div><button class="release-close" type="button" data-release-close>Close</button><div class="release-meta"><dl class="release-identity" data-release-identity><div><dt>Scheme</dt><dd>{scheme}</dd></div><div><dt>Channel</dt><dd>{channel}</dd></div><div><dt>Sequence</dt><dd>#{sequence}</dd></div></dl><a class="release-set-link" data-release-set href="{release_set}" download="release-set.json" target="_blank" rel="noopener noreferrer" aria-label="Download release details (JSON)" title="Download release details (JSON): exact artifact versions and checksums."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 16v4h14v-4"/></svg><span>Release details</span></a></div></header><div class="release-body">{history}</div></div></section>"#,
         version = release_label_html(true),
         commit = html_escape(GIT_COMMIT),
         scheme = html_escape(release_scheme_label()),

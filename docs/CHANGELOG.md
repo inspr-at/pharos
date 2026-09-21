@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Show release-history ages in muted, right-aligned text with readable day, week, month and half-year units; retain exact dates on hover for calendar and legacy versions, omit the Unreleased section, and align release metadata with a subtle release-details download button (PHAROS-283).
+
 ## 260920201529.0.0 - 2026-09-20
 
 - Replace credential-requiring CARTO tiles with an optional key-free OpenFreeMap basemap. Load external map resources only after contextual permission while preserving fleet labels and controls when offline (PHAROS-280).

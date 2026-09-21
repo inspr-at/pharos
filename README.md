@@ -1065,6 +1065,13 @@ stable-channel sequence, the two-step migration anchor (legacy â†’ calendar v1 â
 calendar v2), the exact legacy rollback authority and the Cargo SemVer mapping,
 which is the identity for v2 coordinates. The
 consistency gate keeps Cargo, Nix, the changelog and release workflow aligned.
+The release-history dialog omits the changelog's Unreleased section, including
+any pending notes. Release rows show a muted relative age, calculated from the
+recorded UTC release date, with the exact date available on hover. This also
+applies to legacy versions; historical changelog dates remain unchanged. The
+aligned metadata row includes a release-details download with a hint describing
+the JSON artifact versions and checksums.
+
 Development commits may descend from the current annotated release tag while
 preserving its release metadata. Publication still requires that exact tag at
 HEAD; changing a published coordinate requires a new release reservation.
