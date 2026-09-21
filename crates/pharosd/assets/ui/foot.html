@@ -1057,7 +1057,14 @@ function nixChannelEndOfLife(channel,now){
   const month=date.getUTCMonth()+1;
   return year>releaseYear+1||(year===releaseYear+1&&month>=eolMonth);
 }
-function updateFreshness(surface,f,now){
+function nixpkgsAgeWarning(f,now,threshold=30){
+  if(!f?.applicable||!f.deployment_evidence||f.nixpkgs_comparison?.relation!=='different')return false;
+  const stamp=Number(f.deployment_evidence.nixpkgs_last_modified);
+  if(f.deployment_evidence.nixpkgs_last_modified==null||!Number.isFinite(stamp)||!Number.isFinite(Number(now)))return false;
+  const age=Math.floor(Math.max(0,Number(now)-stamp)/86400);
+  return age<=36500&&age>threshold;
+}
+function updateFreshness(surface,f,now,threshold=30){
   if(surface.classList.contains('card')){
     const applicable=Boolean(f&&f.applicable!==false);
     const evidence=applicable?f.deployment_evidence:null;
@@ -1072,7 +1079,7 @@ function updateFreshness(surface,f,now){
       value:nixpkgs?.relation==='different'?'nixpkgs differs from '+channel:'nixpkgs comparison unknown',
       klass:nixpkgs?.relation==='different'?'warn':'na',
       label:'nixpkgs',
-      visible:Boolean(evidence&&nixpkgs?.relation!=='current')
+      visible:Boolean(evidence&&(!nixpkgs||nixpkgsAgeWarning(f,now,threshold)))
     });
     const nixcfgValue=nixcfg?.relation==='behind'
       ? String(Number(nixcfg.commits_behind)||0)+' commits behind'
@@ -1105,7 +1112,7 @@ function updateFreshness(surface,f,now){
   const relation=nixpkgs?.relation;
   const suffix=relation==='current'?'exact':relation==='different'?'differs':'unknown';
   const age=evidence&&hasAge
-    ? {value:String(ageDays)+'d · '+suffix,klass:relation==='current'?'ok':relation==='different'?'warn':'na'}
+    ? {value:String(ageDays)+'d · '+suffix,klass:relation==='current'?'ok':nixpkgsAgeWarning(f,now,threshold)?'warn':'na'}
     : {value:'unverified',klass:'na'};
   if(evidence&&nixChannelEndOfLife(channel,now)){
     age.value=age.value+' · EOL';
@@ -1159,13 +1166,13 @@ function kernelSearch(kernel){
 function kernelLifecycleActive(lifecycle){
   return String(lifecycle?.slot||'')==='kernel_drift';
 }
-function freshnessAttention(f,now){
+function freshnessAttention(f,now,threshold=30){
   if(!f||f.applicable===false)return null;
   const evidence=f.deployment_evidence;
   if(!evidence)return {label:'freshness unverified',level:'wait',rank:1};
   if(nixChannelEndOfLife(evidence.nixpkgs_channel,now))return {label:String(evidence.nixpkgs_channel)+' end of life',level:'warn',rank:1};
   if(!f.nixpkgs_comparison)return {label:'nixpkgs comparison unknown',level:'wait',rank:2};
-  if(f.nixpkgs_comparison.relation==='different')return {label:'nixpkgs differs from '+String(evidence.nixpkgs_channel),level:'warn',rank:2};
+  if(nixpkgsAgeWarning(f,now,threshold))return {label:'nixpkgs differs from '+String(evidence.nixpkgs_channel),level:'warn',rank:2};
   const nixcfg=f.nixcfg_comparison;
   if(!nixcfg)return {label:'nixcfg comparison unknown',level:'wait',rank:3};
   if(nixcfg.relation==='behind')return {label:String(Number(nixcfg.commits_behind))+' commits behind',level:'warn',rank:3};
@@ -1176,11 +1183,11 @@ function freshnessAttention(f,now){
 function downAlertsSuppressed(preferences){
   return preferences?.kind==='workstation'||Boolean(preferences?.alerts?.suppress_down);
 }
-function attentionFor(live,f,preferences,now){
+function attentionFor(live,f,preferences,now,threshold=30){
   if(live==='down'&&!downAlertsSuppressed(preferences))return {label:'silent heartbeat',level:'down',rank:0};
   if(live==='stale')return {label:'stale heartbeat',level:'warn',rank:1};
   if(live==='awaiting_first_heartbeat')return {label:'awaiting first beat',level:'wait',rank:2};
-  const freshness=freshnessAttention(f,now);
+  const freshness=preferences?.alerts?.suppress_nix_freshness?null:freshnessAttention(f,now,threshold);
   if(freshness)return freshness;
   if(live==='down')return {label:preferences?.kind==='workstation'?'offline as expected':'down alerts muted',level:'ok',rank:4};
   return {label:'all clear',level:'ok',rank:4};
@@ -1241,7 +1248,7 @@ function setReason(surface,reason){
   const text=el.querySelector('span');
   if(text)text.textContent=reason.label;
 }
-function updateReasonVisibility(surface,reason,freshness,kernel,now,lifecycle){
+function updateReasonVisibility(surface,reason,freshness,kernel,now,lifecycle,threshold=30){
   const el=surface.querySelector('[data-reason]');
   if(!el)return;
   if(kernelLifecycleActive(lifecycle)){
@@ -1253,7 +1260,7 @@ function updateReasonVisibility(surface,reason,freshness,kernel,now,lifecycle){
     el.hidden=restart;
     return;
   }
-  const freshnessReason=freshnessAttention(freshness,now);
+  const freshnessReason=freshnessAttention(freshness,now,threshold);
   const duplicateFreshness=freshnessReason?.label===reason?.label;
   el.hidden=restart||duplicateFreshness||reason?.label==='all clear';
 }
@@ -1281,6 +1288,7 @@ function updateMuted(surface,info){
 function formatPreferencesSummary(prefs){
   if(!prefs||typeof prefs!=='object')return 'not reported';
   const parts=[];
+  if(prefs.alerts?.nixpkgs_warn_after_days!=null)parts.push('nixpkgs warning after '+prefs.alerts.nixpkgs_warn_after_days+'d');
   if(typeof prefs.accent==='string'&&prefs.accent)parts.push('accent '+prefs.accent);
   if(typeof prefs.kind==='string'&&prefs.kind&&prefs.kind!=='server')parts.push(String(prefs.kind));
   const alerts=prefs.alerts;
@@ -3810,6 +3818,25 @@ function initProviderSetupGuide(){
   }));
 }
 function initProviderConnection(){
+  document.querySelector('[data-fleet-settings]')?.addEventListener('submit',async event=>{
+    event.preventDefault();
+    const form=event.currentTarget;
+    if(!form.reportValidity())return;
+    const button=form.querySelector('button');
+    const status=form.querySelector('[data-fleet-settings-status]');
+    button.disabled=true;
+    status.textContent='Saving…';
+    try{
+      const response=await fetch(appUrl('/settings/fleet.json'),{
+        method:'POST',headers:{'Content-Type':'application/json','X-Pharos-Action':'1'},
+        body:JSON.stringify({nixpkgs_warn_after_days:Number(new FormData(form).get('nixpkgs_warn_after_days'))})
+      });
+      const body=await response.json();
+      if(!response.ok)throw new Error(body.error||'Settings could not be saved.');
+      status.textContent='Saved. Applies to the fleet immediately.';
+    }catch(error){status.textContent=error.message||'Settings could not be saved.'}
+    finally{button.disabled=false}
+  });
   const details=document.querySelector('[data-provider-details]');
   document.querySelectorAll('[data-provider-open-details]').forEach(button=>button.addEventListener('click',()=>{
     if(!details){
@@ -3942,7 +3969,7 @@ function applyFleetSnapshot(data){
     for(const card of surfaces){
       const live=h.liveness;
       card.dataset.live=live;
-      const attention=h.attention||attentionFor(h.liveness,h.freshness,h.preferences,now);
+      const attention=h.attention||attentionFor(h.liveness,h.freshness,h.preferences,now,h.nixpkgs_warn_after_days);
       const backup=backupInfo(h,now);
       const muted=mutedInfo(h.preferences);
       card.dataset.sev=String(attention.rank ?? sevFor(live));
@@ -3954,10 +3981,10 @@ function applyFleetSnapshot(data){
       updatePreferenceState(card,h);
       updateHostActionState(card,h,backup);
       updateHostLifecycle(card,h);
-      updateReasonVisibility(card,attention,h.freshness,h.kernel,now,h.lifecycle);
+      updateReasonVisibility(card,attention,h.freshness,h.kernel,now,h.lifecycle,h.nixpkgs_warn_after_days);
       updateMuted(card,muted);
       updateKernelFault(card,h);
-      updateFreshness(card,h.freshness,now);
+      updateFreshness(card,h.freshness,now,h.nixpkgs_warn_after_days);
       updateBackup(card,backup);
       setSeen(card,h.last_seen,now);
       setCardAsOf(card,now);

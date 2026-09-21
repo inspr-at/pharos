@@ -877,6 +877,7 @@ mod tests {
                 suppress_down: true,
                 suppress_backup: false,
                 suppress_nix_freshness: true,
+                nixpkgs_warn_after_days: None,
             },
             ..Default::default()
         };

@@ -92,6 +92,8 @@ export PHAROS_HOST_REMOVAL_DISPATCH_ENABLED=true
 export PHAROS_NIXCFG_DISPATCH_TOKEN_FILE="$PHAROS_BROWSER_RUN_DIR/dispatch-token"
 export PHAROS_NIXCFG_DISPATCH_API_BASE="http://127.0.0.1:${PHAROS_BROWSER_DISPATCH_PORT}"
 export PHAROS_ALLOW_OPEN=true
+# Exercise durable fleet settings in the harness-owned directory.
+export PHAROS_DB="$PHAROS_BROWSER_RUN_DIR/hosts.json"
 export RUST_LOG="${RUST_LOG:-warn}"
 
 node "$ROOT/tests/browser/validate-harness-env.mjs"

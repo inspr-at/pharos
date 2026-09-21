@@ -763,6 +763,51 @@ runs retain their receipt and expose no next action to poll.
 
 ### Declarative settings and fleet proposals
 
+Fleet Settings → **Fleet freshness** stores the default nixpkgs warning
+threshold in days (30 initially; whole numbers 1–3650). It is saved atomically
+beside `PHAROS_DB` as `<database filename>.fleet-settings.json`, survives
+restarts, and applies to the next page or fleet refresh without restarting
+pharosd. Ephemeral installations without `PHAROS_DB` cannot save this setting.
+
+In a host's **Alert preferences**, an optional **nixpkgs warning threshold**
+uses the existing guarded host-settings request and apply workflow. Empty
+means inherit the fleet default. The shared `inspr.pharos.host-preferences.v1`
+registry carries it as `hosts.<host>.alerts.nixpkgs_warn_after_days`; it is
+omitted when unset. The effective limit is the reported host override, then
+the saved fleet default, then 30 days. Requested or declared overrides become
+effective after the beacon reports them as applied.
+
+The `nixpkgs differs from <channel>` attention reason, amber card fault and
+sort weight require an exact `different` comparison **and** deployed nixpkgs
+age **greater than** the effective limit. Age is whole days computed from
+generation-owned `nixpkgs_last_modified` on the server clock; equality stays
+quiet. Missing generation evidence remains unverified; an unknown age cannot
+prove staleness. EOL channels, missing comparisons, nixcfg drift, and alert
+suppression retain their separate rules. Detail views can still report the
+revision difference neutrally below the limit. Map attention and the
+freshness entries in Alerts/Activity use the same threshold. Factual `tldr()`,
+`has_proven_deployable_update`, and guarded update/proposal eligibility remain
+independent of this attention policy. The beacon's coarse `nix-freshness`
+service observation remains factual and is excluded from service attention
+counts because the server's dedicated freshness policy owns that signal.
+
+Rollout: upgrade pharosd and **every beacon reading the registry before
+publishing any override**. Old binaries reject unknown preference fields,
+including fields belonging to another host in a shared registry. With the
+field omitted, old/new preferences and the existing report versions remain
+compatible; populating it before the readers upgrade is not safe. Before
+enabling overrides, nixcfg must extend the strict registry validator and
+writer in `scripts/update-pharos-host-settings.sh` and the T08 contract test,
+and its `pharos-host-settings.yml`
+workflow must accept the optional `nixpkgs_warn_after_days` input (string
+integer 1–3650; empty/omitted removes the override). Pharos omits that workflow
+input when inheriting. An older workflow can still accept ordinary settings
+requests; an override request requires the updated workflow. For rollback to
+old binaries, first remove overrides from declarations and reports, drain
+pending preference requests/workflows, and verify value-free persisted state
+contains no new preference field. The fleet settings sidecar itself is ignored
+by older pharosd versions.
+
 The nixcfg integration dispatches fixed GitHub Actions workflows. Pharos has no
 Git implementation and cannot merge or deploy a host. A dispatch acceptance
 means only that GitHub received the request.

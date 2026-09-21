@@ -130,6 +130,10 @@ impl NixcfgDispatch {
                 suppress_down: preferences.alerts.suppress_down,
                 suppress_backup: preferences.alerts.suppress_backup,
                 suppress_nix_freshness: preferences.alerts.suppress_nix_freshness,
+                nixpkgs_warn_after_days: preferences
+                    .alerts
+                    .nixpkgs_warn_after_days
+                    .map(|days| days.to_string()),
                 request_id,
             },
         };
@@ -379,6 +383,10 @@ struct WorkflowDispatchInputs<'a> {
     suppress_down: bool,
     suppress_backup: bool,
     suppress_nix_freshness: bool,
+    // The upgraded workflow treats an omitted/empty input as removing the
+    // override. Omission preserves compatibility for legacy settings requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nixpkgs_warn_after_days: Option<String>,
     request_id: &'a str,
 }
 
@@ -649,6 +657,7 @@ mod tests {
                 suppress_down: true,
                 suppress_backup: false,
                 suppress_nix_freshness: true,
+                nixpkgs_warn_after_days: None,
             },
         }
     }
@@ -732,9 +741,25 @@ mod tests {
         assert_eq!(payload["inputs"]["suppress_down"], true);
         assert_eq!(payload["inputs"]["suppress_backup"], false);
         assert_eq!(payload["inputs"]["suppress_nix_freshness"], true);
+        assert!(payload["inputs"].get("nixpkgs_warn_after_days").is_none());
         assert_eq!(payload["inputs"]["request_id"], request_id);
 
         let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn settings_dispatch_carries_the_optional_age_override_as_a_workflow_input() {
+        let token_path = token_file();
+        let (base, request) = mock_github(204);
+        let client = NixcfgDispatch::for_test(Some(token_path.clone()), base);
+        let mut prefs = preferences();
+        prefs.alerts.nixpkgs_warn_after_days = Some(7);
+        client.dispatch("gpc0", &prefs).await.unwrap();
+        let raw = request.recv().unwrap();
+        let (_, body) = raw.split_once("\r\n\r\n").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["inputs"]["nixpkgs_warn_after_days"], "7");
+        std::fs::remove_file(token_path).unwrap();
     }
 
     #[tokio::test]

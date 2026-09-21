@@ -1295,6 +1295,7 @@ if(root){{
   const down=root.querySelector('[data-alert-down]');
   const backup=root.querySelector('[data-alert-backup]');
   const nix=root.querySelector('[data-alert-nix]');
+  const nixAge=root.querySelector('[data-nixpkgs-warn-after-days]');
   const kind=root.querySelector('[data-host-kind]');
   const downCopy=root.querySelector('[data-alert-down-copy]');
   let manualDownSuppressed=root.dataset.manualDownSuppressed==='true';
@@ -1333,6 +1334,7 @@ if(root){{
         suppress_down:manualDownSuppressed,
         suppress_backup:!backup?.checked,
         suppress_nix_freshness:!nix?.checked,
+        ...(nixAge?.value!==''?{{nixpkgs_warn_after_days:Number(nixAge.value)}}:{{}}),
       }},
     }};
   }}
@@ -1344,6 +1346,7 @@ if(root){{
     Object.entries(alertLabels).forEach(([key,label])=>{{
       if(before.alerts[key]!==after.alerts[key])changes.push(label+': '+(after.alerts[key]?'off':'on'));
     }});
+    if((before.alerts.nixpkgs_warn_after_days??null)!==(after.alerts.nixpkgs_warn_after_days??null))changes.push('nixpkgs warning threshold: '+(before.alerts.nixpkgs_warn_after_days??'fleet default')+' → '+(after.alerts.nixpkgs_warn_after_days??'fleet default'));
     return changes;
   }}
   function updateDraftState(){{
@@ -1354,7 +1357,7 @@ if(root){{
     const review=root.querySelector('[data-review-settings]');
     const discard=root.querySelector('[data-discard-settings]');
     if(summary)summary.textContent=dirty?(changes.length+' unsent '+(changes.length===1?'change':'changes')):'Change a setting to prepare a review.';
-    if(review)review.disabled=!dirty||settingsWorkflow.confirming;
+    if(review)review.disabled=!dirty||settingsWorkflow.confirming||!nixAge?.checkValidity();
     if(discard)discard.disabled=!dirty||settingsWorkflow.confirming;
     if(dirty)setStatus('draft','Draft only — no request sent.');
     else setStatus(persistedStatusState,persistedStatusText);
@@ -1365,6 +1368,7 @@ if(root){{
     manualDownSuppressed=preferences.alerts?.suppress_down===true;
     if(backup)backup.checked=preferences.alerts?.suppress_backup!==true;
     if(nix)nix.checked=preferences.alerts?.suppress_nix_freshness!==true;
+    if(nixAge)nixAge.value=preferences.alerts?.nixpkgs_warn_after_days??'';
     syncDownAlertPolicy();
     updateAlertSummary();
   }}
@@ -1389,6 +1393,7 @@ if(root){{
     return section;
   }}
   function openDraftConfirmation(){{
+    if(!nixAge?.reportValidity())return;
     const changes=preferenceChanges(savedPreferences,draftPreferences());
     if(!changes.length)return;
     stopSettingsWorkflowPoll();
@@ -1498,6 +1503,7 @@ if(root){{
   root.querySelector('[data-review-settings]')?.addEventListener('click',openDraftConfirmation);
   root.querySelector('[data-discard-settings]')?.addEventListener('click',discardDraft);
   down?.addEventListener('change',()=>{{manualDownSuppressed=!down.checked;updateAlertSummary();updateDraftState()}});
+  nixAge?.addEventListener('input',updateDraftState);
   [backup,nix].forEach(input=>input?.addEventListener('change',()=>{{updateAlertSummary();updateDraftState()}}));
   kind?.addEventListener('change',()=>{{syncDownAlertPolicy();updateDraftState()}});
   document.querySelector('[data-host-action-overlay]')?.addEventListener('click',event=>{{
@@ -1519,6 +1525,7 @@ if(root){{
         accent:incomingAccent,
         kind:incomingKind,
         alerts:{{
+          ...savedPreferences.alerts,
           suppress_down:boolValue('draft_suppress_down'),
           suppress_backup:boolValue('draft_suppress_backup'),
           suppress_nix_freshness:boolValue('draft_suppress_nix'),
@@ -1747,7 +1754,7 @@ fn render_color_panel(host: &AgoraHostView, ready: bool, can_manage_fleet: bool)
         ""
     };
     format!(
-        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-is-nix="{is_nix}" data-kind="{kind}" data-manual-down-suppressed="{manual_down_suppressed}" data-target-path="{target_path}" data-target-attribute="{target_attribute}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section><section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span data-alert-down-copy>{down_copy}</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{down_disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-kind-row"><span class="host-kind-copy"><strong>Host type</strong><span>Controls whether continuous availability is expected.</span></span><select data-host-kind aria-label="Host type"{disabled}><option value="server"{server_selected}>Server</option><option value="workstation"{workstation_selected}>Workstation</option></select></div><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section><footer class="settings-draft-actions"><span class="settings-draft-copy"><strong>Draft changes</strong><span data-draft-summary>Change a setting to prepare a review.</span></span><span class="settings-draft-buttons"><button class="secondary-action" type="button" data-discard-settings disabled>Discard draft</button><button class="primary-action" type="button" data-review-settings disabled{disabled}>Review changes</button></span></footer></section>"##,
+        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-is-nix="{is_nix}" data-kind="{kind}" data-manual-down-suppressed="{manual_down_suppressed}" data-target-path="{target_path}" data-target-attribute="{target_attribute}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section><section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span data-alert-down-copy>{down_copy}</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{down_disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>nixpkgs warning threshold (days)</strong><span>Leave empty to use the fleet default.</span></span><input data-nixpkgs-warn-after-days aria-label="Host nixpkgs warning threshold (days)" type="number" min="1" max="3650" step="1" value="{nix_age}" placeholder="Fleet default"{disabled}></label></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-kind-row"><span class="host-kind-copy"><strong>Host type</strong><span>Controls whether continuous availability is expected.</span></span><select data-host-kind aria-label="Host type"{disabled}><option value="server"{server_selected}>Server</option><option value="workstation"{workstation_selected}>Workstation</option></select></div><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section><footer class="settings-draft-actions"><span class="settings-draft-copy"><strong>Draft changes</strong><span data-draft-summary>Change a setting to prepare a review.</span></span><span class="settings-draft-buttons"><button class="secondary-action" type="button" data-discard-settings disabled>Discard draft</button><button class="primary-action" type="button" data-review-settings disabled{disabled}>Review changes</button></span></footer></section>"##,
         host_name = html_escape(&host.name),
         ready = if ready { "true" } else { "false" },
         has_reported = if host.has_reported { "true" } else { "false" },
@@ -1785,6 +1792,11 @@ fn render_color_panel(host: &AgoraHostView, ready: bool, can_manage_fleet: bool)
         },
         backup_checked = checked(!shown_preferences.alerts.suppress_backup),
         nix_checked = checked(!shown_preferences.alerts.suppress_nix_freshness),
+        nix_age = shown_preferences
+            .alerts
+            .nixpkgs_warn_after_days
+            .map(|days| days.to_string())
+            .unwrap_or_default(),
         sliders = crate::icons::SLIDERS,
         server_selected = server_selected,
         workstation_selected = workstation_selected,

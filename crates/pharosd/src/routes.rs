@@ -17,6 +17,7 @@ fn human_routes() -> Router<AppState> {
             get(managed_service_ui::service_detail_page),
         )
         .route("/settings/providers", get(provider_settings_page))
+        .route("/settings/fleet.json", post(update_fleet_settings))
         .route("/settings/providers.json", get(provider_connections_json))
         .route(
             "/settings/providers/{provider}",

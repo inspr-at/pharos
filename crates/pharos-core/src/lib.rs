@@ -97,6 +97,17 @@ pub struct HostAlertPreferences {
     pub suppress_backup: bool,
     #[serde(default)]
     pub suppress_nix_freshness: bool,
+    /// Optional deployed-nixpkgs age limit. Omitted on the wire until configured,
+    /// so unchanged preferences remain readable by older beacons and servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nixpkgs_warn_after_days: Option<u32>,
+}
+
+pub const DEFAULT_NIXPKGS_WARN_AFTER_DAYS: u32 = 30;
+pub const MAX_NIXPKGS_WARN_AFTER_DAYS: u32 = 3650;
+
+pub fn valid_nixpkgs_warn_after_days(days: u32) -> bool {
+    (1..=MAX_NIXPKGS_WARN_AFTER_DAYS).contains(&days)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,11 +122,26 @@ pub struct HostPreferences {
 }
 
 impl HostPreferences {
+    pub fn nixpkgs_warn_after_days(&self, fleet_default: Option<u32>) -> u32 {
+        self.alerts
+            .nixpkgs_warn_after_days
+            .filter(|days| valid_nixpkgs_warn_after_days(*days))
+            .or(fleet_default.filter(|days| valid_nixpkgs_warn_after_days(*days)))
+            .unwrap_or(DEFAULT_NIXPKGS_WARN_AFTER_DAYS)
+    }
+
     pub fn suppresses_down_alerts(&self) -> bool {
         self.kind == HostKind::Workstation || self.alerts.suppress_down
     }
 
     pub fn validate_contract(&self) -> Result<(), String> {
+        if self
+            .alerts
+            .nixpkgs_warn_after_days
+            .is_some_and(|days| !valid_nixpkgs_warn_after_days(days))
+        {
+            return Err("nixpkgs warning threshold must be between 1 and 3650 days".to_string());
+        }
         if let Some(accent) = self.accent.as_deref() {
             let bytes = accent.as_bytes();
             if bytes.len() != 7
@@ -1429,6 +1455,21 @@ impl NixFreshness {
             .nixpkgs_comparison
             .as_ref()
             .is_some_and(|comparison| comparison.relation == NixpkgsRevisionRelation::Different)
+    }
+
+    /// Attention policy only: a revision difference needs age-based attention
+    /// once the deployed revision's server-clock age exceeds the configured limit.
+    /// Missing generation evidence or unknown age never proves staleness.
+    pub fn nixpkgs_age_warning_at(&self, now: UnixSeconds, threshold_days: u32) -> bool {
+        self.applicable
+            && self.deployment_evidence.is_some()
+            && self
+                .nixpkgs_comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.relation == NixpkgsRevisionRelation::Different)
+            && self
+                .nixpkgs_age_days_at(now)
+                .is_some_and(|days| days > threshold_days)
     }
 
     /// Server-clock age of the generation's exact locked nixpkgs revision.
@@ -4874,6 +4915,74 @@ mod tests {
     }
 
     #[test]
+    fn nixpkgs_threshold_resolution_and_wire_compatibility() {
+        let mut preferences: HostPreferences = serde_json::from_str(
+            r#"{"kind":"server","alerts":{"suppress_down":false,"suppress_backup":false,"suppress_nix_freshness":false}}"#,
+        ).unwrap();
+        assert_eq!(preferences.nixpkgs_warn_after_days(None), 30);
+        assert_eq!(preferences.nixpkgs_warn_after_days(Some(45)), 45);
+        assert!(!serde_json::to_string(&preferences)
+            .unwrap()
+            .contains("nixpkgs_warn_after_days"));
+        preferences.alerts.nixpkgs_warn_after_days = Some(7);
+        assert_eq!(preferences.nixpkgs_warn_after_days(Some(45)), 7);
+        assert_eq!(
+            serde_json::from_str::<HostPreferences>(&serde_json::to_string(&preferences).unwrap())
+                .unwrap(),
+            preferences
+        );
+        for days in [1, 30, 3650] {
+            preferences.alerts.nixpkgs_warn_after_days = Some(days);
+            assert!(preferences.validate_contract().is_ok());
+        }
+        for days in [0, 3651, u32::MAX] {
+            preferences.alerts.nixpkgs_warn_after_days = Some(days);
+            assert!(preferences.validate_contract().is_err());
+        }
+        for invalid in ["-1", "1.5", "\"30\""] {
+            let raw = format!(r#"{{"alerts":{{"nixpkgs_warn_after_days":{invalid}}}}}"#);
+            assert!(serde_json::from_str::<HostPreferences>(&raw).is_err());
+        }
+    }
+
+    #[test]
+    fn nixpkgs_age_warning_uses_strict_server_clock_boundary_and_requires_proof() {
+        let mut freshness = proven_current_freshness("nixos-unstable");
+        let modified = freshness
+            .deployment_evidence
+            .as_ref()
+            .unwrap()
+            .nixpkgs_last_modified;
+        freshness.nixpkgs_comparison = Some(NixpkgsGitComparison {
+            upstream_revision: "4".repeat(40),
+            relation: NixpkgsRevisionRelation::Different,
+        });
+        // A fresh host-clock mirror must not hide the actual deployed age.
+        freshness.nixpkgs_age_days = Some(0);
+        for age in [0, 29, 30] {
+            assert!(!freshness.nixpkgs_age_warning_at(modified + age * 86_400, 30));
+        }
+        assert!(!freshness.nixpkgs_age_warning_at(modified + 31 * 86_400 - 1, 30));
+        assert!(freshness.nixpkgs_age_warning_at(modified + 31 * 86_400, 30));
+        assert!(freshness.nixpkgs_age_warning_at(modified + 8 * 86_400, 7));
+        assert!(!freshness.nixpkgs_age_warning_at(modified - 1, 30));
+        assert!(!freshness.nixpkgs_age_warning_at(i64::MAX, 30));
+        // Policy does not change update/proposal evidence or factual TL;DR.
+        assert!(freshness.has_proven_deployable_update());
+        assert!(freshness.tldr().contains("nixpkgs differs"));
+        let now = modified + 31 * 86_400;
+        freshness.nixpkgs_comparison.as_mut().unwrap().relation = NixpkgsRevisionRelation::Current;
+        assert!(!freshness.nixpkgs_age_warning_at(now, 30));
+        freshness.nixpkgs_comparison = None;
+        assert!(!freshness.nixpkgs_age_warning_at(now, 30));
+        freshness.deployment_evidence = None;
+        freshness.nixpkgs_age_days = Some(100);
+        assert!(!freshness.nixpkgs_age_warning_at(now, 30));
+        freshness.nixpkgs_age_days = None;
+        assert!(!freshness.nixpkgs_age_warning_at(now, 30));
+    }
+
+    #[test]
     fn tldr_variants() {
         let na = NixFreshness {
             applicable: false,
@@ -5374,6 +5483,7 @@ mod tests {
                 suppress_down: false,
                 suppress_backup: true,
                 suppress_nix_freshness: false,
+                nixpkgs_warn_after_days: None,
             },
         };
         let response = HostReportResponse::pending("gpc0", preferences.clone())
