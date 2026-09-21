@@ -31,6 +31,7 @@ export const EXIT_CODES = Object.freeze({
   "auth-required": 2,
   "mfa-required": 3,
   "policy-denied": 4,
+  "account-setup-required": 5,
 });
 export const INVENTORY_ROUTES = Object.freeze([
   "/pharos/",
@@ -704,6 +705,7 @@ export function classifyObservation({ location, status, probe, managerConfirmed 
   const permissionDenied = Boolean(
     probe?.noAccess || probe?.accessDenied || probe?.accessRequest || probe?.viewerOnly,
   );
+  if (probe?.accountSetup) return "account-setup-required";
   if (probe?.mfa) return "mfa-required";
   if (probe?.rateLimited || probe?.authRecovery) return "auth-required";
   if (probe?.passwordCount > 0 || probe?.loginForm || probe?.authUiVisible || onIssuer || authPath) {
@@ -740,6 +742,7 @@ export function screenshotPermitted({ classification, location, probe }) {
     !probe ||
     probe.passwordCount > 0 ||
     probe.mfa ||
+    probe.accountSetup ||
     probe.loginForm ||
     probe.authUiVisible ||
     probe.noAccess ||
@@ -963,6 +966,8 @@ export function collectProbeSurface(root) {
     rateLimited: false,
     loginForm: false,
     accountMutation: false,
+    accountSetup: false,
+    enrollmentOptional: false,
   });
   const document = root && typeof root.querySelectorAll === "function" ? root : globalThis.document;
   if (!document || typeof document.querySelectorAll !== "function") return emptySurface();
@@ -984,6 +989,23 @@ export function collectProbeSurface(root) {
     return passwords.length === 0 && usernames.length === 0;
   });
   const webauthnInputs = visible("input[autocomplete='webauthn']");
+  const providerChoices = visible("input").filter((element) => {
+    const type = String(element.getAttribute("type") || "").toLowerCase();
+    const name = String(element.getAttribute("name") || "").toLowerCase();
+    return type === "radio" && name === "provider";
+  });
+  const skipEnrollment = visible("button, input[type='submit']").some((element) => {
+    const name = String(element.getAttribute("name") || "").toLowerCase();
+    const value = String(element.getAttribute("value") || "").toLowerCase();
+    const type = String(element.getAttribute("type") || "submit").toLowerCase();
+    return name === "skip" && value === "true" && type === "submit";
+  });
+  const enrollmentPrompt =
+    providerChoices.length > 0 &&
+    passwords.length === 0 &&
+    otp.length === 0 &&
+    webauthnInputs.length === 0 &&
+    visible("button, input[type='submit']").length > 0;
   const labelOf = (element) =>
     `${element.getAttribute("aria-label") || ""} ${element.getAttribute("value") || ""} ${element.innerText || element.textContent || ""}`.slice(0, 180);
   const passkeyControl = (element) => /\b(passkey|security key|webauthn)\b/i.test(labelOf(element));
@@ -1032,7 +1054,9 @@ export function collectProbeSurface(root) {
     passwordCount: Math.min(2, passwords.length),
     usernameField: usernames.length > 0,
     otpField: otp.length > 0,
-    webauthnChallenge: webauthnInputs.length > 0 || (!primaryLogin && challenge),
+    webauthnChallenge: !enrollmentPrompt && (webauthnInputs.length > 0 || (!primaryLogin && challenge)),
+    accountSetup: enrollmentPrompt,
+    enrollmentOptional: enrollmentPrompt && skipEnrollment,
     passkeyAlternative: primaryLogin && visible("a, button").some(passkeyControl),
     accountMutation: newPasswordField || visible("button, input[type='submit']").some(mutationControl),
     noAccess:
@@ -1051,11 +1075,14 @@ export function collectProbeSurface(root) {
 }
 
 export function classifyProbeSurface(surface = {}) {
-  const mfa = Boolean(surface.otpField || surface.webauthnChallenge);
+  const accountSetup = Boolean(surface.accountSetup);
+  const mfa = !accountSetup && Boolean(surface.otpField || surface.webauthnChallenge);
   return {
     passwordCount: Math.min(2, Number(surface.passwordCount) || 0),
     mfa,
-    passkeyAlternative: Boolean(surface.passkeyAlternative) && !mfa,
+    accountSetup,
+    enrollmentOptional: accountSetup && Boolean(surface.enrollmentOptional),
+    passkeyAlternative: Boolean(surface.passkeyAlternative) && !mfa && !accountSetup,
     noAccess: Boolean(surface.noAccess),
     accessDenied: Boolean(surface.accessDenied),
     accessRequest: Boolean(surface.accessRequest),
@@ -1071,6 +1098,7 @@ export function classifyProbeSurface(surface = {}) {
         surface.usernameField ||
         surface.otpField ||
         surface.webauthnChallenge ||
+        surface.accountSetup ||
         surface.loginForm,
     ),
   };
@@ -1141,12 +1169,12 @@ export function planInventory({
 }
 
 export function credentialFillPermitted(probe) {
-  if (!probe || probe.mfa || probe.authRecovery || probe.accountMutation) return false;
+  if (!probe || probe.mfa || probe.accountSetup || probe.authRecovery || probe.accountMutation) return false;
   return true;
 }
 
 export function submitLabelRejected(label) {
-  return /\b(passkey|security key|webauthn|reset password|new password|change password|sign up|sign-up|create account|enroll|enrol|register|recover|recovery)\b/i.test(
+  return /\b(passkey|security key|webauthn|reset password|new password|change password|sign up|sign-up|create account|enroll|enrol|register|recover|recovery|skip)\b/i.test(
     String(label || ""),
   );
 }

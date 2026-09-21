@@ -1171,8 +1171,21 @@ into ordinary page fields and do not dispatch a request.
 
 On the login provider, `GET` and `HEAD` are allowed except console, management,
 admin, system, and debug paths. `POST` is allowed only under `/oauth`,
-`/oidc`, `/ui/login`, and `/ui/v2/login`. A second factor, passkey, or
-verification step stops the run with class `mfa-required` and is not submitted.
+`/oidc`, `/ui/login`, and `/ui/v2/login`. A second factor or verification step
+stops the run with class `mfa-required` and is not submitted. An optional
+passkey or security-key link on the ordinary username or password form is not
+a second factor and is not clicked.
+
+The issuer's MFA enrollment prompt is account setup, not a verification
+challenge. It is recognized from visible provider choices
+(`input[type=radio][name=provider]`) with a submit control and without a
+password, one-time-code, or WebAuthn challenge field. When MFA is optional,
+that prompt also has a submit control named `skip` with value `true`. The
+runner does not choose a provider, skip enrollment, or continue. It stops
+with class `account-setup-required`. Finish that enrollment in a private
+browser session before this inspection. Copy that merely mentions
+multi-factor authentication, without those provider controls, is not this
+class.
 
 The context is memory-only: headless Chromium, no persistent profile, no saved
 session, no trace, and no video. Screenshots are taken only after
@@ -1192,7 +1205,8 @@ values in arguments, the environment, or URLs.
 
 `DEBUG`, `PWDEBUG`, proxy variables, and `NODE_TLS_REJECT_UNAUTHORIZED=0` are
 refused. Classes are `authenticated`, `auth-required`, `mfa-required`,
-`policy-denied`, and `broken-ui`. Exit codes are 0, 2, 3, 4, and 1.
+`policy-denied`, `account-setup-required`, and `broken-ui`. Exit codes are
+0, 2, 3, 4, 5, and 1. `account-setup-required` is exit 5.
 
 Request-guard behavior is covered by `node --test tests/live-ui-guard.test.mjs`.
 That file is not part of `npm run test:browser`. The account and the files
