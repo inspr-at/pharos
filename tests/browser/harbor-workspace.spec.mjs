@@ -103,7 +103,7 @@ test("host workspace uses fleet protection, real grace, and private fleet return
       "true",
     );
     await expect(page.locator("[data-health-badge]")).toHaveAttribute("data-health-tone", "amber");
-    await expect(page.locator("[data-backup-daily-ok]")).toContainText("Daily backup remains OK");
+    await expect(page.locator('[data-host-section="overview"] [data-backup-daily-ok]')).toContainText("Daily backup remains OK");
     await expect(page.locator("[data-host-service='sync']")).toContainText("File sync");
     await expect(page.locator("[data-host-service='sync']")).toContainText("running");
     await expect(page.getByText(/^\d+ service/)).toHaveCount(0);

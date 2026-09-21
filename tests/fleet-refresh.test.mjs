@@ -284,6 +284,7 @@ globalThis.__pure = {
   projectDailyBackup,
   projectRestoreStatus,
   projectHealth,
+  arrivalPresentation,
   dedupeHeartbeats,
   aggregateHistory,
   historyInfo,
@@ -292,6 +293,10 @@ globalThis.__pure = {
   const context = vm.createContext({ console });
   vm.runInContext(source, context);
   return context.__pure;
+}
+
+function vmPlain(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 test("grace, restore, and history projections follow the shared contracts", () => {
@@ -308,7 +313,7 @@ test("grace, restore, and history projections follow the shared contracts", () =
     assert.equal(api.heartbeatTimelineX(age, 60, 0), legacyHeartbeatX(age, 60));
   }
 
-  assert.deepEqual(api.resolveHeartbeatGrace({}, undefined), { secs: 15, source: "default", lateAfter: null });
+  assert.deepEqual(vmPlain(api.resolveHeartbeatGrace({}, undefined)), { secs: 15, source: "default", lateAfter: null });
   const hostGrace = api.resolveHeartbeatGrace({
     heartbeat_grace: { effective_secs: 0, source: "host", late_after_secs: 60 },
   }, 15);
@@ -363,6 +368,33 @@ test("grace, restore, and history projections follow the shared contracts", () =
   assert.equal(hourly.tone, "good");
   assert.equal(api.projectDailyBackup([{ configured: "disabled", state: "unknown" }], now).state, "not-required");
   assert.equal(api.projectDailyBackup([{ state: "healthy", schedule: "daily" }], now).label, "Success time unknown");
+  const staleDaily = api.projectDailyBackup([{
+    state: "healthy", schedule: "daily", last_success_at: now - 3 * 24 * 60 * 60,
+  }], now);
+  assert.equal(staleDaily.state, "stale");
+  assert.equal(staleDaily.tone, "amber");
+  assert.notEqual(staleDaily.label, "Daily OK");
+  const recentRestore = api.projectRestoreStatus([{
+    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 * 24 * 60 * 60 },
+  }], now);
+  assert.equal(recentRestore.tone, "good");
+  assert.equal(recentRestore.overdue, false);
+  const mixed = api.projectHealth({
+    liveness: "live",
+    backup: staleDaily,
+    restore: recentRestore,
+    check: null,
+    services: [],
+    kernelRestart: false,
+    freshness: null,
+  });
+  assert.equal(mixed.tone, "amber");
+  assert.ok(mixed.reasons.some((reason) => reason.label === "Backup stale"));
+  assert.ok(mixed.reasons.some((reason) => reason.tone === "good" && reason.label === "Passed"));
+  const arrival = api.arrivalPresentation(now - 10, 60, 15, now);
+  assert.equal(arrival.state, "on-time");
+  assert.doesNotMatch(`${arrival.label} ${arrival.detail}`, /%|Arrival scale|time axis/);
+  assert.match(arrival.detail, /Late after/);
 
   const health = api.projectHealth({
     liveness: "live",
@@ -377,14 +409,14 @@ test("grace, restore, and history projections follow the shared contracts", () =
   assert.ok(health.reasons.some((reason) => reason.tone === "good" && reason.label === "Daily OK"));
   assert.ok(health.reasons.some((reason) => reason.label === "Selective restore overdue"));
 
-  assert.deepEqual(api.dedupeHeartbeats([5, 5.4, 5.9, 6.5]), [5, 6.5]);
+  assert.deepEqual(vmPlain(api.dedupeHeartbeats([5, 5.4, 5.9, 6.5])), [5, 6.5]);
   const start = now - 600;
   const gapped = api.aggregateHistory([start + 10, start + 400], windowDef, now, 60, 15);
   assert.equal(gapped.marks.some((mark) => mark.level === "ok"), false);
   assert.equal(gapped.marks.some((mark) => mark.level === "down"), true);
   assert.equal(api.historyInfo([now + 30], 0, 60, 15, now).level, "unknown");
   assert.equal(api.aggregateHistory([now + 30], windowDef, now, 60, 15).marks.some((mark) => mark.level === "ok"), false);
-  assert.deepEqual(api.aggregateHistory([], windowDef, now, 60, 15).marks, []);
+  assert.deepEqual(vmPlain(api.aggregateHistory([], windowDef, now, 60, 15).marks), []);
 });
 
 function controllableClock() {
@@ -513,6 +545,18 @@ function timelineHarness(fetch) {
       }
       return null;
     },
+    querySelectorAll(selector) {
+      const matches = [];
+      const visit = (node) => {
+        if (!node) return;
+        const classes = String(node.className || "").split(/\s+/);
+        if (selector.startsWith(".") && classes.includes(selector.slice(1))) matches.push(node);
+        for (const child of node.childNodes || []) visit(child);
+      };
+      for (const node of created) visit(node);
+      visit(this.body);
+      return matches;
+    },
   };
   const window = {
     ...windowEvents,
@@ -557,10 +601,15 @@ test("a visible unfocused page keeps one clock and one poll", () => {
   const armed = page.api.timers();
   assert.ok(armed.beat != null);
   assert.ok(armed.refresh != null);
+  page.clock.advance(1000);
+  assert.notEqual(page.api.timers().beat, armed.beat);
+  assert.equal(page.api.timers().refresh, armed.refresh);
+  assert.equal(queue.pending.length, 0);
 
   page.window.dispatch("blur");
-  assert.equal(page.api.timers().beat, armed.beat);
+  assert.notEqual(page.api.timers().beat, null);
   assert.equal(page.api.timers().refresh, armed.refresh);
+  assert.equal(queue.pending.length, 0);
 
   page.document.hidden = true;
   page.document.visibilityState = "hidden";
@@ -622,4 +671,19 @@ test("the visible-page watchdog restarts a stranded page without waiting for foc
   assert.equal(queue.pending.length, 1);
   page.clock.advance(5000);
   assert.equal(queue.pending.length, 1);
+});
+
+test("a hidden page does not keep the watchdog looping", () => {
+  const queue = deferredFetchQueue();
+  const page = timelineHarness(queue.fetch);
+  page.api.armFleetWatchdog();
+  page.api.scheduleRefresh(10_000);
+  page.api.resumeBeatClock();
+  page.document.hidden = true;
+  page.document.visibilityState = "hidden";
+  page.document.dispatch("visibilitychange");
+  page.clock.advance(20_000);
+  assert.equal(queue.pending.length, 0);
+  assert.equal(page.api.timers().beat, null);
+  assert.equal(page.api.timers().refresh, null);
 });

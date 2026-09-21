@@ -17,6 +17,7 @@ function esc(v){return String(v ?? '').replace(/[&<>"']/g,ch=>ESC[ch])}
 const DEFAULT_HEARTBEAT_GRACE_SECS=15;
 const CLOCK_SKEW_SECS=2;
 const SELECTIVE_RESTORE_OVERDUE_SECS=30*24*60*60;
+const DAILY_SUCCESS_STALE_SECS=129600;
 const HISTORY_LEVEL_RANK={down:0,stale:1,late:2,unknown:3,first:4,ok:5};
 const DAILY_POSTURE_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
 function wholeGrace(grace){
@@ -190,12 +191,11 @@ function arrivalPresentation(last,interval,grace,now){
   if(!Number.isFinite(current)||at>current+CLOCK_SKEW_SECS)return {state:'unknown',label:'Clock skew',detail:'Last report is ahead of Pharos',x:0};
   const age=Math.max(0,current-at);
   const x=heartbeatTimelineX(age,interval,grace);
-  const scale='Arrival scale: 0–'+EXPECT_X+'% on time through '+bounds.onTimeThrough+'s, '+STALE_X+'% at '+bounds.staleAfter+'s, 100% at '+bounds.downAfter+'s. History uses a separate time axis.';
   const timing=heartbeatTiming(age,interval,grace);
-  if(timing==='on-time')return {state:'on-time',label:'On time',detail:'Late after '+dur(bounds.lateAfter-age)+'. '+scale,x,age};
-  if(timing==='late')return {state:'late',label:'Late',detail:dur(age-bounds.lateAfter)+' past grace. '+scale,x,age};
-  if(timing==='stale')return {state:'stale',label:'Stale',detail:dur(age)+' since last report. '+scale,x,age};
-  return {state:'down',label:'Down',detail:dur(age)+' since last report. '+scale,x,age};
+  if(timing==='on-time')return {state:'on-time',label:'On time',detail:'Late after '+dur(bounds.lateAfter-age)+'.',x,age};
+  if(timing==='late')return {state:'late',label:'Late',detail:dur(age-bounds.lateAfter)+' past grace.',x,age};
+  if(timing==='stale')return {state:'stale',label:'Stale',detail:dur(age)+' since last report.',x,age};
+  return {state:'down',label:'Down',detail:dur(age)+' since last report.',x,age};
 }
 function backupLevelKey(value){return String(value||'').trim().toLowerCase().replace(/_/g,'-')}
 function selectiveRestoreFileCount(restore){
@@ -227,9 +227,12 @@ function projectDailyBackup(observations,now){
   const at=Number(primary.last_success_at);
   const hasSuccess=Number.isFinite(at)&&at>0;
   if(state==='healthy'&&hasSuccess){
-    const label=dailyLabel(primary.schedule);
-    const prefix=label==='Daily OK'?'Last success ':(String(primary.schedule||'').trim()?String(primary.schedule).trim()+' · ':'Last success ');
-    return {tone:'good',state:'healthy',label,detail:prefix+dur(Math.max(0,Number(now)-at))+' ago',at};
+    const age=Math.max(0,Number(now)-at);
+    const freshLabel=dailyLabel(primary.schedule);
+    const prefix=freshLabel==='Daily OK'?'Last success ':(String(primary.schedule||'').trim()?String(primary.schedule).trim()+' · ':'Last success ');
+    const detail=prefix+dur(age)+' ago';
+    if(age>DAILY_SUCCESS_STALE_SECS)return {tone:'amber',state:'stale',label:'Backup stale',detail,at};
+    return {tone:'good',state:'healthy',label:freshLabel,detail,at};
   }
   if(state==='healthy')return {tone:'neutral',state:'unknown',label:'Success time unknown',detail:'No success time was reported',at:null};
   if(state==='failed'||state==='missing')return {tone:'bad',state,label:state==='failed'?'Backup failed':'Backup missing',detail:String(primary.summary||'Backup needs attention'),at:hasSuccess?at:null};
@@ -1577,6 +1580,56 @@ function setFactText(root,selector,value){
   const node=root?.querySelector(selector);
   if(node)node.textContent=value==null?'':String(value);
 }
+function appendExactTime(node,at){
+  const stamp=Number(at);
+  if(!node||!Number.isFinite(stamp)||stamp<=0||typeof document.createElement!=='function')return;
+  const exact=document.createElement('time');
+  exact.className='fact-exact';
+  exact.dateTime=new Date(stamp*1000).toISOString();
+  exact.textContent=exact.dateTime;
+  node.appendChild(exact);
+}
+function setTimedFact(root,selector,value,at){
+  setFactText(root,selector,value);
+  const node=root?.querySelector(selector);
+  if(!node)return;
+  if(value)node.title=String(value);
+  appendExactTime(node,at);
+}
+function visibleText(node){
+  const text=Array.from(node?.childNodes||[]).filter(child=>child.nodeType===3).map(child=>child.textContent||'').join('').trim();
+  return text||String(node?.textContent||'').trim();
+}
+function compactHealthScan(surface){
+  if(!surface||surface.dataset?.hostSurface!=='runtime')return;
+  const block=surface.querySelector('[data-health-block]');
+  if(!block)return;
+  const list=block.querySelector('[data-health-reasons]');
+  const summary=block.querySelector('[data-health-summary]');
+  if(!list||!summary)return;
+  const items=Array.from(list.querySelectorAll('[data-health-reason]'));
+  const problems=items.filter(item=>item.dataset.healthTone&&item.dataset.healthTone!=='good');
+  const shown=problems.length?problems:items;
+  if(shown.length){
+    const top=visibleText(shown[0]);
+    const extra=shown.length-1;
+    summary.textContent=extra>0?top+' · +'+extra+' more':top;
+    summary.title=items.map(visibleText).filter(Boolean).join(' · ');
+  }
+  let details=block.querySelector('details.health-more');
+  if(!details&&typeof document.createElement==='function'){
+    details=document.createElement('details');
+    details.className='health-more';
+    details.appendChild(document.createElement('summary'));
+    list.before(details);
+    details.appendChild(list);
+  }
+  const toggle=details?.querySelector('summary');
+  if(toggle)toggle.textContent=shown.length===1?'1 reason':shown.length+' reasons';
+  surface.querySelectorAll('.fact-note').forEach(note=>{
+    if(!note.title)note.title=visibleText(note);
+  });
+}
 function updateBackupStatus(surface,protection){
   if(!surface||!protection)return;
   const daily=protection.daily;
@@ -1597,7 +1650,7 @@ function updateBackupStatus(surface,protection){
     const host=surface.dataset.host||'';
     if(typeof dailyNode.setAttribute==='function')dailyNode.setAttribute('href',appUrl('/backups?host='+encodeURIComponent(host)));
     setFactText(dailyNode,'[data-daily-backup-label]',daily.label);
-    setFactText(dailyNode,'[data-daily-backup-note]',daily.detail);
+    setTimedFact(dailyNode,'[data-daily-backup-note]',daily.detail,daily.at);
   }
   const checkNode=surface.querySelector('[data-backup-check]');
   if(checkNode){
@@ -1608,7 +1661,7 @@ function updateBackupStatus(surface,protection){
       if(check.at!=null)checkNode.dataset.backupCheckAt=String(check.at);
       else delete checkNode.dataset.backupCheckAt;
       setFactText(checkNode,'[data-backup-check-label]',check.label);
-      setFactText(checkNode,'[data-backup-check-note]',check.detail);
+      setTimedFact(checkNode,'[data-backup-check-note]',check.detail,check.at);
     }
   }
   const restoreNode=surface.querySelector('[data-restore]');
@@ -1621,7 +1674,7 @@ function updateBackupStatus(surface,protection){
     if(restore.at!=null)restoreNode.dataset.restoreAt=String(restore.at);
     else delete restoreNode.dataset.restoreAt;
     setFactText(restoreNode,'[data-restore-label]',restore.label);
-    setFactText(restoreNode,'[data-restore-note]',restore.detail);
+    setTimedFact(restoreNode,'[data-restore-note]',restore.detail,restore.at);
   }
 }
 function updateHealthProjection(surface,health){
@@ -1642,8 +1695,10 @@ function updateHealthProjection(surface,health){
     item.dataset.healthTone=reason.tone;
     if(reason.at!==''&&reason.at!=null)item.dataset.healthAt=String(reason.at);
     item.textContent=reason.label;
+    if(reason.at!==''&&reason.at!=null)appendExactTime(item,reason.at);
     list.appendChild(item);
   });
+  compactHealthScan(surface);
 }
 function updateBackup(surface,info){
   const el=surface.querySelector('.backup-chip[data-backup-state]');
@@ -1874,7 +1929,7 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
       setHostActionFact('scope',resolver.title,true);
     }
   }else{
-    if(title)title.textContent=String(lifecycle.label||'Up to date');
+    if(title)title.textContent=String(lifecycle.label||'No pending work');
     if(copy)copy.textContent=String(lifecycle.detail||'No host lifecycle work is waiting.');
     if(infoTitle)infoTitle.textContent='No drift';
     if(infoCopy)infoCopy.textContent='Pharos has no saved workflow or drift waiting on this host.';
@@ -2008,13 +2063,7 @@ function historyHintText(mark){
   const detail=mark?.dataset?.historyDetail||'';
   return detail?label+' · '+detail:label;
 }
-function installHistoryChrome(){
-  if(document.getElementById('history-hint-chrome')||typeof document.createElement!=='function')return;
-  const style=document.createElement('style');
-  style.id='history-hint-chrome';
-  style.textContent='.beat[data-history-axis="time"] .beat-threshold,.beat[data-history-axis="time"] .beat-fill,.beat[data-history-axis="time"] .beat-current{display:none}.beat-stage{position:relative}.history-readout{position:absolute;left:0;right:0;top:0;height:14px;line-height:14px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;pointer-events:none;font-size:10px}.history-hint{position:fixed;z-index:80;max-width:min(320px,calc(100vw - 16px));pointer-events:none;padding:6px 8px;border-radius:6px;background:#17304a;color:#fff;font-size:11px;line-height:1.35}.history-hint[data-history-hint-mode="line"]{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.history-hint[data-history-hint-mode="full"]{white-space:normal}.arrival{display:flex;align-items:baseline;gap:8px;min-height:18px;min-width:0;overflow:hidden;font-size:11px}.arrival-track{position:relative;flex:0 0 72px;height:4px;border-radius:999px;background:rgba(137,151,163,.25)}.arrival [data-arrival-fill]{position:absolute;left:0;top:0;bottom:0;width:var(--arrival-x,0%);background:var(--fill-color,var(--sea))}';
-  (document.head||document.documentElement).appendChild(style);
-}
+function installHistoryChrome(){}
 function ensureHistoryOverlay(){
   let overlay=document.getElementById('history-hint');
   if(overlay)return overlay;
@@ -2264,11 +2313,12 @@ function setBeatHistory(beat,beats,interval,now,grace){
   const marks=beat.querySelector('.beat-marks');
   if(marks)reconcileHistoryMarks(marks,view.marks);
   const readout=ensureHistoryReadout(beat);
-  const legend=signalWindow.label+' time axis'+(view.partial&&view.retainedStart?' · retained from '+clock(view.retainedStart):'')+' · empty is not healthy';
-  readout.dataset.default=legend;
-  readout.title=legend;
+  readout.dataset.default='';
   if(activeHistoryMark&&beat.contains(activeHistoryMark))showHistoryHint(activeHistoryMark,historyPin?'full':'line');
-  else readout.textContent=legend;
+  else{
+    readout.textContent='';
+    readout.removeAttribute('title');
+  }
   updateHistoryEvents(beat.closest('[data-host]'),view.marks);
   bindHistoryHints();
 }
@@ -2338,10 +2388,11 @@ function resumeBeatClock(){
   frame();
 }
 function armFleetWatchdog(){
-  if(fleetWatchdogTimer!=null)return;
+  if(fleetWatchdogTimer!=null||pageFrozen())return;
   const tick=()=>{
-    fleetWatchdogTimer=setTimeout(tick,5000);
+    fleetWatchdogTimer=null;
     if(pageFrozen()||!fleetMain())return;
+    fleetWatchdogTimer=setTimeout(tick,5000);
     if(document.body.dataset.hostActionDialogOpen==='true'){
       if(refreshTimer==null&&refreshPromise==null)scheduleRefresh();
       return;
@@ -4511,6 +4562,9 @@ function updateUrlState(){
   params.set('sort',sort);
   params.set('filter',activeLiveFilter);
   params.set('signal',signalWindow.key);
+  const search=document.querySelector('[data-search]')?.value||'';
+  if(search)params.set('q',search);
+  else params.delete('q');
   const url=location.pathname+'?'+params.toString();
   history.replaceState(null,'',url);
 }
@@ -4519,7 +4573,7 @@ function initControls(){
   const params=new URLSearchParams(location.search);
   const view=params.get('view')||'grid';
   const sort=params.get('sort')||'attention';
-  const search='';
+  const search=params.get('q')||'';
   const liveFilter=params.get('filter')||'all';
   const selectedSignalWindow=params.get('signal')||SIGNAL_WINDOWS[0].key;
   applyView(view,false);
@@ -4529,7 +4583,7 @@ function initControls(){
   applySignalWindow(selectedSignalWindow,false);
   document.querySelectorAll('[data-view-button]').forEach(btn=>btn.addEventListener('click',()=>{applyView(btn.dataset.viewButton);updateUrlState()}));
   document.querySelector('[data-sort]')?.addEventListener('change',e=>{applySort(e.target.value);updateUrlState()});
-  document.querySelector('[data-search]')?.addEventListener('input',e=>applyFilter(e.target.value));
+  document.querySelector('[data-search]')?.addEventListener('input',e=>{applyFilter(e.target.value);updateUrlState()});
   document.querySelectorAll('[data-live-filter]').forEach(btn=>btn.addEventListener('click',()=>{applyLiveFilter(btn.dataset.liveFilter);updateUrlState()}));
   document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
   bindFreeformDrag();
@@ -4789,6 +4843,7 @@ function suspendFleet(){
   stopBeatClock();
   abandonRefresh();
   recoveryPromise=null;
+  if(typeof fleetWatchdogTimer!=='undefined'&&fleetWatchdogTimer!=null){clearTimeout(fleetWatchdogTimer);fleetWatchdogTimer=null}
 }
 function recoverFleet(reason='foreground'){
   if(!fleetMain()||pageFrozen())return Promise.resolve(false);
@@ -4965,6 +5020,7 @@ document.addEventListener('visibilitychange',()=>{
   if(document.hidden)suspendFleet();
   else{
     if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+    armFleetWatchdog();
     recoverFleet('visible');
   }
 });
@@ -4974,6 +5030,7 @@ window.addEventListener('blur',()=>{
 window.addEventListener('focus',onFleetFocus);
 window.addEventListener('pageshow',event=>{
   if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+  armFleetWatchdog();
   if(event.persisted||!fleetSnapshotFresh()||beatClockTimer==null||refreshTimer==null)recoverFleet('pageshow');
 });
 window.addEventListener('pagehide',()=>{
@@ -4986,10 +5043,12 @@ window.addEventListener('freeze',()=>{
 });
 window.addEventListener('resume',()=>{
   if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+  armFleetWatchdog();
   recoverFleet('resume');
 });
 window.addEventListener('online',()=>{if(!pageFrozen())recoverFleet('online')});
 /* FLEET_LISTENERS_END */
+document.querySelectorAll('[data-host-surface="runtime"]').forEach(compactHealthScan);
 document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
 document.querySelectorAll('.beat').forEach(beat=>{
   const grace=beatGraceSecs(beat);
