@@ -1330,19 +1330,33 @@ export function createFlatTargetGuard(connection) {
   let primarySessionId = "";
   let failure = "";
   let intentionalClose = false;
+  let emergencyStarted = false;
+  let emergencyClose = null;
   let settled = Promise.resolve();
   const fail = (code) => {
     if (!failure) failure = code || "target";
   };
+  const terminate = (reason) => {
+    if (intentionalClose) return;
+    fail(reason);
+    if (emergencyStarted || typeof emergencyClose !== "function") return;
+    emergencyStarted = true;
+    try {
+      const pending = emergencyClose();
+      if (pending && typeof pending.then === "function") pending.catch(() => {});
+    } catch {
+      // The compromised flag already denies later Fetch continuations.
+    }
+  };
   const closeTarget = async (targetId) => {
     if (!targetId) {
-      fail("close");
+      terminate("close");
       return;
     }
     try {
       await connection.send("Target.closeTarget", { targetId });
     } catch {
-      fail("close");
+      terminate("close");
     }
   };
   const onAttached = async (event) => {
@@ -1350,15 +1364,13 @@ export function createFlatTargetGuard(connection) {
     const type = String(info.type || "");
     if (type === "browser" || type === "tab") return;
     if (!event?.waitingForDebugger) {
-      fail("unpaused");
-      await closeTarget(info.targetId);
+      terminate("unpaused");
       return;
     }
     if (type === "page" && !primaryId) {
       const sessionId = String(event.sessionId || "");
       if (!sessionId || !info.targetId) {
-        fail("primary");
-        await closeTarget(info.targetId);
+        terminate("primary");
         return;
       }
       primaryId = info.targetId;
@@ -1367,8 +1379,7 @@ export function createFlatTargetGuard(connection) {
         await connection.send("Target.setAutoAttach", FLAT_ATTACH, sessionId);
         await connection.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
       } catch {
-        fail("primary");
-        await closeTarget(info.targetId);
+        terminate("primary");
       }
       return;
     }
@@ -1379,32 +1390,36 @@ export function createFlatTargetGuard(connection) {
     const targetId = String(event?.targetId || "");
     const primary = (!sessionId && !targetId) || sessionId === primarySessionId || targetId === primaryId;
     if (!primary || !primaryId) return;
-    fail("detached");
-    if (!intentionalClose) await closeTarget(primaryId);
+    terminate("detached");
   };
   connection.onEvent((method, params) => {
     if (method === "Target.attachedToTarget") {
-      settled = settled.then(() => onAttached(params)).catch(() => fail("attach"));
+      settled = settled.then(() => onAttached(params)).catch(() => terminate("attach"));
       return;
     }
     if (method === "Target.detachedFromTarget") {
-      settled = settled.then(() => onDetached(params)).catch(() => fail("detach"));
+      settled = settled.then(() => onDetached(params)).catch(() => terminate("detach"));
     }
   });
   return {
     compromised: () => failure,
     attachedPrimary: () => primaryId,
+    setEmergencyClose(close) {
+      emergencyClose = close;
+    },
+    beginShutdown() {
+      intentionalClose = true;
+    },
     noteDisconnect() {
       if (intentionalClose) return;
-      fail("disconnected");
-      if (primaryId) closeTarget(primaryId).catch(() => {});
+      terminate("disconnected");
     },
     settled: () => settled,
     async enable() {
       try {
         await connection.send("Target.setAutoAttach", FLAT_ATTACH);
       } catch {
-        fail("protocol");
+        terminate("protocol");
         throw new LiveUiError("network-guard");
       }
     },
@@ -1521,23 +1536,41 @@ export async function connectFlatDebugger(port, deps = {}) {
   return gate;
 }
 
+async function closeLiveBrowser(browser) {
+  if (!browser) return;
+  try {
+    const contexts = typeof browser.contexts === "function" ? browser.contexts() : [];
+    for (const context of contexts) {
+      if (typeof context?.close === "function") await context.close();
+    }
+  } catch {
+    // The browser close is the termination that does not depend on the raw socket.
+  }
+  if (typeof browser.close === "function") await browser.close();
+}
+
 export async function openGuardedBrowser(launchBrowser, deps) {
   if (typeof launchBrowser !== "function") throw new LiveUiError("browser-launch");
   const port = await reserveLoopbackDebuggerPort();
   const launch = browserLaunchOptions(port);
   let browser;
+  let gate;
   try {
     browser = await launchBrowser(launch);
-    const gate = await connectFlatDebugger(port, deps);
+    gate = await connectFlatDebugger(port, deps);
+    gate.setEmergencyClose(() => closeLiveBrowser(browser));
     try {
       await gate.enable();
     } catch (error) {
+      gate.beginShutdown();
       gate.close();
       throw error;
     }
     return { browser, gate };
   } catch (error) {
-    if (browser && typeof browser.close === "function") await browser.close().catch(() => {});
+    if (browser && typeof browser.close === "function" && !gate?.compromised()) {
+      await browser.close().catch(() => {});
+    }
     if (error instanceof LiveUiError) throw error;
     throw new LiveUiError("network-guard");
   }

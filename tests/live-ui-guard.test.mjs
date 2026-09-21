@@ -35,6 +35,7 @@ import {
   ISSUER_LOGIN_POST_PATHS,
   loadPasswordFile,
   loadUsernameFile,
+  openGuardedBrowser,
   installPrimaryFrameRoute,
   parseClientDraft,
   planInventory,
@@ -917,6 +918,11 @@ test("the browser session is headless, memory-only, and guarded before login", (
   assert.ok(loginAt > armAt);
   assert.ok(runner.indexOf("shutdownLiveSession", finallyAt) > finallyAt);
   assert.ok(runner.indexOf("gate.close()", finallyAt) > runner.indexOf("shutdownLiveSession", finallyAt));
+  const shutdownClose = runner.slice(runner.indexOf("close: async () => {"), runner.indexOf("sessions: fetchSessions"));
+  assert.ok(shutdownClose.indexOf("beginShutdown") >= 0);
+  assert.ok(shutdownClose.indexOf("beginShutdown") < shutdownClose.indexOf("browser.close()"));
+  const openedGuard = guard.slice(guard.indexOf("export async function openGuardedBrowser"));
+  assert.ok(openedGuard.indexOf("setEmergencyClose") < openedGuard.indexOf("await gate.enable"));
   assert.equal(runner.indexOf("secrets.fill", finallyAt), -1);
   assert.equal(runner.indexOf("disposeFetchGuard", finallyAt), -1);
   const shotAt = runner.indexOf("takeAuthenticatedShot", runner.indexOf("async function shoot"));
@@ -1109,8 +1115,12 @@ function attachEvent(type, targetId, sessionId, waitingForDebugger = true) {
 }
 
 test("flat attach resumes only the first page and closes every other target", async () => {
+  const expectedCloses = [];
   const { connection, sent } = flatTransport();
   const gate = createFlatTargetGuard(connection);
+  gate.setEmergencyClose(() => {
+    expectedCloses.push("browser");
+  });
   await gate.enable();
   assert.equal(sent[0].method, "Target.setAutoAttach");
   assert.equal(Object.hasOwn(sent[0], "sessionId"), false);
@@ -1146,33 +1156,48 @@ test("flat attach resumes only the first page and closes every other target", as
   await gate.settled();
   const closed = sent.filter((entry) => entry.method === "Target.closeTarget").map((entry) => entry.params.targetId);
   assert.deepEqual(closed, ["popup", "frame-1", "worker-1", "shared-1", "sw-1"]);
+  assert.deepEqual(expectedCloses, []);
+  assert.equal(gate.compromised(), "");
   assert.equal(sent.filter((entry) => entry.method === "Runtime.runIfWaitingForDebugger").length, 1);
   assert.equal(sent.filter((entry) => entry.method === "Target.closeTarget").every((entry) => !entry.sessionId), true);
   assert.equal(JSON.stringify(sent).includes("secret"), false);
 
+  const unpausedCloses = [];
   const unpaused = flatTransport();
   const unpausedGate = createFlatTargetGuard(unpaused.connection);
+  unpausedGate.setEmergencyClose(() => {
+    unpausedCloses.push("browser");
+  });
   await unpausedGate.enable();
   unpaused.connection.receive(attachEvent("iframe", "already-running", "late", false));
   await unpausedGate.settled();
   assert.equal(unpausedGate.compromised(), "unpaused");
   assert.equal(unpaused.sent.some((entry) => entry.method === "Runtime.runIfWaitingForDebugger"), false);
-  assert.equal(unpaused.sent.some((entry) => entry.method === "Target.closeTarget"), true);
+  assert.deepEqual(unpausedCloses, ["browser"]);
 
+  const brokenCloses = [];
   const broken = flatTransport({ failMethod: "Runtime.runIfWaitingForDebugger" });
   const brokenGate = createFlatTargetGuard(broken.connection);
+  brokenGate.setEmergencyClose(() => {
+    brokenCloses.push("browser");
+  });
   await brokenGate.enable();
   broken.connection.receive(attachEvent("page", "primary", "page-session"));
   await brokenGate.settled();
   assert.equal(brokenGate.compromised(), "primary");
-  assert.equal(broken.sent.some((entry) => entry.method === "Target.closeTarget" && entry.params.targetId === "primary"), true);
+  assert.deepEqual(brokenCloses, ["browser"]);
+  assert.equal(broken.sent.some((entry) => entry.method === "Target.closeTarget"), false);
   assert.equal(JSON.stringify(broken.sent).includes("secret-token"), false);
   assert.equal(JSON.stringify(broken.sent).includes("devtools"), false);
 });
 
 test("lost protocol state closes the primary target and stops later continuations", async () => {
+  const detachedCloses = [];
   const { connection, sent } = flatTransport();
   const gate = createFlatTargetGuard(connection);
+  gate.setEmergencyClose(() => {
+    detachedCloses.push("browser");
+  });
   await gate.enable();
   connection.receive(attachEvent("page", "primary", "page-session"));
   await gate.settled();
@@ -1183,23 +1208,25 @@ test("lost protocol state closes the primary target and stops later continuation
   }));
   await gate.settled();
   assert.equal(gate.compromised(), "detached");
-  assert.equal(
-    sent.some((entry) => entry.method === "Target.closeTarget" && entry.params.targetId === "primary"),
-    true,
-  );
+  assert.deepEqual(detachedCloses, ["browser"]);
+  assert.equal(sent.some((entry) => entry.method === "Target.closeTarget" && entry.params.targetId === "primary"), false);
 
+  const lostCloses = [];
   const lost = flatTransport();
   const lostGate = createFlatTargetGuard(lost.connection);
+  lostGate.setEmergencyClose(() => {
+    lostCloses.push("browser");
+  });
   await lostGate.enable();
   lost.connection.receive(attachEvent("page", "primary", "page-session"));
   await lostGate.settled();
+  lost.connection.failAll();
+  lostGate.noteDisconnect();
   lostGate.noteDisconnect();
   await lostGate.settled();
   assert.equal(lostGate.compromised(), "disconnected");
-  assert.equal(
-    lost.sent.some((entry) => entry.method === "Target.closeTarget" && entry.params.targetId === "primary"),
-    true,
-  );
+  assert.deepEqual(lostCloses, ["browser"]);
+  assert.equal(lost.sent.some((entry) => entry.method === "Target.closeTarget"), false);
   const redirected = fakeFetchSession();
   assert.equal(
     await settleFetchPause(
@@ -1227,6 +1254,183 @@ test("lost protocol state closes the primary target and stops later continuation
   }));
   await workerGate.settled();
   assert.equal(workerGate.compromised(), "");
+
+  const commandCloses = [];
+  const command = flatTransport({ failMethod: "Target.closeTarget" });
+  const commandGate = createFlatTargetGuard(command.connection);
+  commandGate.setEmergencyClose(() => {
+    commandCloses.push("browser");
+  });
+  await commandGate.enable();
+  command.connection.receive(attachEvent("page", "primary", "page-session"));
+  await commandGate.settled();
+  command.connection.receive(attachEvent("shared_worker", "shared-1", "shared-session"));
+  await commandGate.settled();
+  assert.equal(commandGate.compromised(), "close");
+  assert.deepEqual(commandCloses, ["browser"]);
+  assert.equal(JSON.stringify(command.sent).includes("devtools"), false);
+
+  const teardownCloses = [];
+  const teardown = flatTransport();
+  const teardownGate = createFlatTargetGuard(teardown.connection);
+  teardownGate.setEmergencyClose(() => {
+    teardownCloses.push("browser");
+  });
+  await teardownGate.enable();
+  teardown.connection.receive(attachEvent("page", "primary", "page-session"));
+  await teardownGate.settled();
+  teardownGate.beginShutdown();
+  teardownGate.noteDisconnect();
+  teardown.connection.receive(JSON.stringify({
+    method: "Target.detachedFromTarget",
+    params: { sessionId: "page-session", targetId: "primary" },
+  }));
+  await teardownGate.settled();
+  teardownGate.close();
+  assert.deepEqual(teardownCloses, []);
+  assert.equal(teardownGate.compromised(), "");
+
+  const fetchCloses = [];
+  const fetchLoss = flatTransport();
+  const fetchGate = createFlatTargetGuard(fetchLoss.connection);
+  fetchGate.setEmergencyClose(() => {
+    fetchCloses.push("browser");
+  });
+  await fetchGate.enable();
+  const session = fakeFetchSession();
+  await enableFetchGuard(session, { gate: fetchGate, secrets: ["synthetic-only-secret"] }, () => {});
+  session.listeners.close();
+  session.listeners.close();
+  assert.deepEqual(fetchCloses, ["browser"]);
+  assert.equal(fetchGate.compromised(), "disconnected");
+  assert.equal(
+    await settleFetchPause(
+      session,
+      {
+        requestId: "after-fetch-close",
+        redirectedRequestId: "authorize",
+        request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+      },
+      { secrets: ["synthetic-only-secret"], gate: fetchGate },
+    ),
+    "failed",
+  );
+});
+
+test("a closed raw debugger socket closes the Playwright browser once", async () => {
+  const browser = {
+    closes: 0,
+    contextsClosed: 0,
+    contexts() {
+      return [{
+        async close() {
+          browser.contextsClosed += 1;
+        },
+      }];
+    },
+    async close() {
+      browser.closes += 1;
+    },
+  };
+  let socket;
+  class Socket {
+    constructor(url) {
+      const parsed = new URL(url);
+      assert.equal(parsed.hostname, "127.0.0.1");
+      assert.equal(parsed.protocol, "ws:");
+      assert.equal(parsed.username, "");
+      assert.equal(parsed.search, "");
+      socket = this;
+      this.listeners = {};
+      this.sent = [];
+    }
+
+    addEventListener(type, fn) {
+      (this.listeners[type] ||= []).push(fn);
+      if (type === "open") fn();
+    }
+
+    send(text) {
+      const envelope = JSON.parse(text);
+      this.sent.push(envelope);
+      queueMicrotask(() => {
+        for (const fn of this.listeners.message || []) {
+          fn({ data: JSON.stringify({ id: envelope.id, result: {} }) });
+        }
+      });
+    }
+
+    close() {
+      for (const fn of this.listeners.close || []) fn();
+    }
+  }
+  const { gate } = await openGuardedBrowser((options) => {
+    assert.equal(options.headless, true);
+    assert.equal(options.args.length, 2);
+    return browser;
+  }, {
+    fetch: async (url) => {
+      const port = new URL(url).port;
+      return {
+        ok: true,
+        text: async () => JSON.stringify({
+          Browser: "Chrome/test",
+          webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/local-id`,
+        }),
+      };
+    },
+    WebSocket: Socket,
+  });
+  assert.equal(browser.closes, 0);
+  socket.close();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(gate.compromised(), "disconnected");
+  assert.equal(browser.contextsClosed, 1);
+  assert.equal(browser.closes, 1);
+  assert.equal(socket.sent.some((entry) => entry.method === "Target.closeTarget"), false);
+  socket.close();
+  for (const fn of socket.listeners.error || []) fn();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(browser.closes, 1);
+
+  const errorBrowser = {
+    closes: 0,
+    contexts() {
+      return [];
+    },
+    async close() {
+      errorBrowser.closes += 1;
+    },
+  };
+  let errorSocket;
+  class ErrorSocket extends Socket {
+    constructor(url) {
+      super(url);
+      errorSocket = this;
+    }
+  }
+  const opened = await openGuardedBrowser(() => errorBrowser, {
+    fetch: async (url) => {
+      const port = new URL(url).port;
+      return {
+        ok: true,
+        text: async () => JSON.stringify({
+          Browser: "Chrome/test",
+          webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/local-id`,
+        }),
+      };
+    },
+    WebSocket: ErrorSocket,
+  });
+  for (const fn of errorSocket.listeners.error || []) fn();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(opened.gate.compromised(), "disconnected");
+  assert.equal(errorBrowser.closes, 1);
+  opened.gate.beginShutdown();
+  opened.gate.close();
+  assert.equal(errorBrowser.closes, 1);
+  gate.beginShutdown();
+  gate.close();
 });
 
 test("the debugger endpoint stays on the reserved loopback port", async () => {
