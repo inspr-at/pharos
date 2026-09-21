@@ -847,15 +847,49 @@ globalThis.__facts = { updateBackupStatus, utcObservedStamp, recordedUnix };
   };
   protection.daily.at = 1_700_000_000;
   factContext.__facts.updateBackupStatus(evidenceSurface, protection);
-  const disclosed = evidence.childNodes.filter((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-daily-backup-date"));
+  const disclosed = evidence.childNodes.filter((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-daily-backup-instant"));
   assert.equal(disclosed.length, 1);
-  assert.equal(disclosed[0].textContent, "2023-11-14 22:13:20 UTC");
+  const disclosedTime = disclosed[0].querySelector("[data-daily-backup-date]");
+  const disclosedLabel = disclosed[0].querySelector("[data-daily-backup-instant-label]");
+  assert.equal(disclosedTime.attributes.datetime, "2023-11-14T22:13:20Z");
+  assert.equal(disclosedTime.textContent, "2023-11-14 22:13:20 UTC");
+  assert.equal(disclosedLabel.textContent, "Backup last success ");
+  assert.equal(`${disclosedLabel.textContent}${disclosedTime.textContent}`, "Backup last success 2023-11-14 22:13:20 UTC");
   assert.equal(evidence.hidden, false);
+  protection.restore = {
+    state: "passed",
+    tone: "good",
+    label: "Passed",
+    detail: "selective restore 1d ago",
+    at: 1_699_136_000,
+    overdue: false,
+    producer: "passed",
+  };
+  const restore = factNode();
+  evidenceSurface.querySelector = (selector) => {
+    if (selector === "[data-daily-backup]") return daily;
+    if (selector === "[data-restore]") return restore;
+    if (selector === "[data-protection-evidence]") return evidence;
+    return null;
+  };
+  factContext.__facts.updateBackupStatus(evidenceSurface, protection);
+  const restoreInstant = evidence.childNodes.find((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-restore-instant"));
+  assert.ok(restoreInstant);
+  assert.equal(restoreInstant.querySelector("[data-restore-instant-label]").textContent, "Selective restore last success ");
+  assert.equal(restoreInstant.querySelector("[data-restore-date]").attributes.datetime, "2023-11-04T22:13:20Z");
+  assert.equal(evidence.querySelector("[data-due-instant]"), null);
   protection.daily.at = null;
   factContext.__facts.updateBackupStatus(evidenceSurface, protection);
-  assert.equal(evidence.childNodes.some((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-daily-backup-date")), false);
+  assert.equal(evidence.childNodes.some((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-daily-backup-instant")), false);
+  assert.equal(evidence.querySelector("[data-daily-backup-instant-label]"), null);
+  assert.equal(evidence.hidden, false);
+  protection.restore.at = "9223372036854775807";
+  factContext.__facts.updateBackupStatus(evidenceSurface, protection);
+  assert.equal(evidence.childNodes.some((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-restore-instant")), false);
+  assert.equal(evidence.querySelector("[data-restore-instant-label]"), null);
   assert.equal(evidence.hidden, true);
   assert.equal(created.some((node) => String(node.textContent).includes("1970")), false);
+  assert.equal(created.some((node) => String(node.textContent).includes("Due")), false);
 });
 
 function controllableClock() {

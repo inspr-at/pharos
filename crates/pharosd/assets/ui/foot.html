@@ -1640,6 +1640,11 @@ function utcObservedStamp(at){
   if(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(iso))return null;
   return {iso,visible:iso.slice(0,10)+' '+iso.slice(11,19)+' UTC'};
 }
+function evidenceCaption(hook){
+  if(hook==='daily-backup')return 'Backup last success';
+  if(hook==='restore')return 'Selective restore last success';
+  return '';
+}
 function upsertObservedTime(parent,at,hook){
   if(!parent||typeof parent.querySelector!=='function'||typeof document.createElement!=='function')return;
   const selector='[data-'+hook+'-date]';
@@ -1653,6 +1658,43 @@ function upsertObservedTime(parent,at,hook){
     time=document.createElement('time');
     time.setAttribute('data-'+hook+'-date','');
     parent.appendChild(time);
+  }
+  time.setAttribute('datetime',stamp.iso);
+  if(time.textContent!==stamp.visible)time.textContent=stamp.visible;
+}
+function upsertEvidenceTime(parent,at,hook){
+  if(!parent||typeof parent.querySelector!=='function'||typeof document.createElement!=='function')return;
+  const caption=evidenceCaption(hook);
+  const instantName='data-'+hook+'-instant';
+  let instant=parent.querySelector('['+instantName+']');
+  const stamp=caption?utcObservedStamp(at):null;
+  if(!stamp){
+    if(instant&&typeof instant.remove==='function')instant.remove();
+    else{
+      const bare=parent.querySelector('[data-'+hook+'-date]');
+      if(bare&&typeof bare.remove==='function')bare.remove();
+    }
+    return;
+  }
+  if(!instant){
+    instant=document.createElement('span');
+    instant.className='protection-instant';
+    instant.setAttribute(instantName,'');
+    const label=document.createElement('span');
+    label.className='protection-instant-label';
+    label.setAttribute('data-'+hook+'-instant-label','');
+    label.textContent=caption+' ';
+    instant.appendChild(label);
+    parent.appendChild(instant);
+  }else{
+    const label=instant.querySelector('[data-'+hook+'-instant-label]');
+    if(label&&label.textContent!==caption+' ')label.textContent=caption+' ';
+  }
+  let time=instant.querySelector('[data-'+hook+'-date]');
+  if(!time){
+    time=document.createElement('time');
+    time.setAttribute('data-'+hook+'-date','');
+    instant.appendChild(time);
   }
   time.setAttribute('datetime',stamp.iso);
   if(time.textContent!==stamp.visible)time.textContent=stamp.visible;
@@ -1750,7 +1792,8 @@ function placeObservedTime(surface,node,at,hook){
       if(typeof time.remove==='function')time.remove();
     });
   }
-  upsertObservedTime(evidence||node,recorded,hook);
+  if(evidence)upsertEvidenceTime(evidence,recorded,hook);
+  else upsertObservedTime(node,recorded,hook);
   if(evidence)evidence.hidden=!(evidence.querySelector('[data-daily-backup-date]')||evidence.querySelector('[data-restore-date]'));
 }
 function updateBackupStatus(surface,protection){

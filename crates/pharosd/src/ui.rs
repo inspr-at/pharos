@@ -1250,6 +1250,17 @@ mod module_tests {
         assert!(dated.contains("2023-11-14 22:13:20 UTC"));
         assert_eq!(dated.matches("data-daily-backup-date").count(), 1);
         assert!(dated.contains(r#"data-protection-evidence><summary>Exact times</summary>"#));
+        assert!(dated.contains(
+            r#"data-daily-backup-instant><span class="protection-instant-label" data-daily-backup-instant-label>Backup last success</span> <time datetime="2023-11-14T22:13:20Z" data-daily-backup-date>2023-11-14 22:13:20 UTC</time>"#
+        ));
+        assert!(dated.contains(
+            r#"<span class="protection-instant-label" data-restore-instant-label>Selective restore last success</span> <time"#
+        ));
+        assert!(!dated.contains(r#"data-protection-evidence open"#));
+        assert!(!dated.contains("data-due-instant"));
+        assert!(!missing.contains("protection-instant"));
+        assert!(!missing.contains("Backup last success"));
+        assert!(!coerced.contains("protection-instant"));
         assert!(dated.contains("Daily OK"));
         assert!(dated.contains("Passed"));
         assert!(!dated.contains("1970"));
@@ -3652,6 +3663,30 @@ fn observed_time_markup(at: Option<i64>, kind: &str) -> String {
     )
 }
 
+fn evidence_caption(kind: &str) -> Option<&'static str> {
+    match kind {
+        "daily-backup" => Some("Backup last success"),
+        "restore" => Some("Selective restore last success"),
+        _ => None,
+    }
+}
+
+fn evidence_time_markup(at: Option<i64>, kind: &str) -> String {
+    let Some(caption) = evidence_caption(kind) else {
+        return String::new();
+    };
+    let Some((iso, visible)) = positive_instant(at).and_then(utc_stamp) else {
+        return String::new();
+    };
+    format!(
+        r#"<span class="protection-instant" data-{kind}-instant><span class="protection-instant-label" data-{kind}-instant-label>{caption}</span> <time datetime="{iso}" data-{kind}-date>{visible}</time></span>"#,
+        kind = kind,
+        caption = caption,
+        iso = html_escape(&iso),
+        visible = html_escape(&visible),
+    )
+}
+
 fn fact_instant_attr(at: Option<i64>) -> String {
     positive_instant(at)
         .map(|stamp| stamp.to_string())
@@ -3720,8 +3755,8 @@ pub(super) fn protection_markup(
         "present"
     };
     let restore_at = fact_instant_attr(view.restore.at);
-    let backup_time = observed_time_markup(view.run.at, "daily-backup");
-    let restore_time = observed_time_markup(view.restore.at, "restore");
+    let backup_time = evidence_time_markup(view.run.at, "daily-backup");
+    let restore_time = evidence_time_markup(view.restore.at, "restore");
     let evidence_hidden = if backup_time.is_empty() && restore_time.is_empty() {
         " hidden"
     } else {
