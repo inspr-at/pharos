@@ -1518,10 +1518,7 @@ impl NixFreshness {
         self.nixcfg_comparison.as_ref().is_some_and(|comparison| {
             comparison.relation == GitRevisionRelation::Behind
                 && comparison.commits_behind.is_some_and(|commits| commits > 0)
-        }) || self
-            .nixpkgs_comparison
-            .as_ref()
-            .is_some_and(|comparison| comparison.relation == NixpkgsRevisionRelation::Different)
+        })
     }
 
     /// Attention policy only: a revision difference needs age-based attention
@@ -5329,7 +5326,10 @@ mod tests {
             "60s + 15s grace → late after 75s"
         );
         assert!(heartbeat_late_rule_copy(10, 15).contains("Stale still begins after 20s"));
-        assert_eq!(heartbeat_grace_source_label(HeartbeatGraceSource::Host), "host override");
+        assert_eq!(
+            heartbeat_grace_source_label(HeartbeatGraceSource::Host),
+            "host override"
+        );
         assert_eq!(heartbeat_timing_label(HeartbeatTiming::OnTime), "on time");
 
         // Grace 0 keeps the previous expected/late/stale marker math.
@@ -5394,8 +5394,8 @@ mod tests {
         assert!(freshness.nixpkgs_age_warning_at(modified + 8 * 86_400, 7));
         assert!(!freshness.nixpkgs_age_warning_at(modified - 1, 30));
         assert!(!freshness.nixpkgs_age_warning_at(i64::MAX, 30));
-        // Policy does not change update/proposal evidence or factual TL;DR.
-        assert!(freshness.has_proven_deployable_update());
+        // A channel tip is an age-warning input, not a locked deployable update.
+        assert!(!freshness.has_proven_deployable_update());
         assert!(freshness.tldr().contains("nixpkgs differs"));
         let now = modified + 31 * 86_400;
         freshness.nixpkgs_comparison.as_mut().unwrap().relation = NixpkgsRevisionRelation::Current;
@@ -5407,6 +5407,34 @@ mod tests {
         assert!(!freshness.nixpkgs_age_warning_at(now, 30));
         freshness.nixpkgs_age_days = None;
         assert!(!freshness.nixpkgs_age_warning_at(now, 30));
+    }
+
+    #[test]
+    fn proven_deployable_update_requires_nixcfg_commits_not_a_channel_tip() {
+        let mut channel_only = proven_current_freshness("nixos-unstable");
+        channel_only.nixpkgs_comparison = Some(NixpkgsGitComparison {
+            upstream_revision: "4".repeat(40),
+            relation: NixpkgsRevisionRelation::Different,
+        });
+        assert!(!channel_only.has_proven_deployable_update());
+
+        let mut behind = proven_current_freshness("nixos-unstable");
+        behind.nixcfg_comparison = Some(NixcfgGitComparison {
+            upstream_revision: "5".repeat(40),
+            relation: GitRevisionRelation::Behind,
+            commits_behind: Some(3),
+        });
+        behind.nixpkgs_comparison = Some(NixpkgsGitComparison {
+            upstream_revision: "4".repeat(40),
+            relation: NixpkgsRevisionRelation::Different,
+        });
+        assert!(behind.has_proven_deployable_update());
+
+        behind.nixcfg_comparison.as_mut().unwrap().commits_behind = Some(0);
+        assert!(!behind.has_proven_deployable_update());
+        behind.nixcfg_comparison.as_mut().unwrap().commits_behind = None;
+        assert!(!behind.has_proven_deployable_update());
+        assert!(!NixFreshness::default().has_proven_deployable_update());
     }
 
     #[test]

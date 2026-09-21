@@ -414,6 +414,7 @@ struct WorkspaceExtras {
     fleet_nixpkgs_warn_days: u32,
     fleet_grace_seconds: u64,
     section: WorkspaceSection,
+    can_manage_fleet: bool,
 }
 
 fn workspace_tab_href(
@@ -498,10 +499,10 @@ fn render_host_workspace(
     runtime: Option<&Host>,
     lifecycle: &crate::HostLifecycle,
     settings_state: crate::HostPreferencesState,
-    can_manage_fleet: bool,
     settings_editor: &str,
     extras: WorkspaceExtras,
 ) -> String {
+    let can_manage_fleet = extras.can_manage_fleet;
     let now = extras.now;
     let observations = runtime
         .map(|host| host.backup_observations.as_slice())
@@ -520,16 +521,16 @@ fn render_host_workspace(
     let last_seen = runtime.and_then(|host| host.last_seen);
     let interval = runtime.and_then(|host| host.heartbeat_interval_secs);
     let live = pharos_core::liveness(last_seen, interval, now);
-    let health = crate::host_health_view(
+    let health = crate::host_health_view(crate::HostHealthQuery {
         live,
-        applied,
+        preferences: applied,
         freshness,
-        runtime.and_then(|host| host.kernel.as_ref()),
+        kernel: runtime.and_then(|host| host.kernel.as_ref()),
         services,
-        &protection,
+        protection: &protection,
         now,
-        extras.fleet_nixpkgs_warn_days,
-    );
+        nixpkgs_threshold: extras.fleet_nixpkgs_warn_days,
+    });
     let grace = applied.heartbeat_grace_policy(Some(extras.fleet_grace_seconds), interval);
     let host_path = crate::url_query_escape(&host.name);
     let accent = displayed_preferences(host)
@@ -542,11 +543,7 @@ fn render_host_workspace(
     };
     let badge = crate::os_badge_markup(icon, &health);
     let protection_body = crate::protection_markup(&protection, &host.name, base);
-    let daily_sentence = if protection.daily_ok && protection.restore_overdue {
-        r#"<p data-backup-daily-ok>Daily backup remains OK. The selective restore is overdue.</p>"#
-    } else {
-        ""
-    };
+    let daily_sentence = "";
     let service_items = services
         .iter()
         .filter(|observation| !crate::is_nix_freshness_observation(observation))
@@ -599,7 +596,7 @@ fn render_host_workspace(
         grace.interval_secs,
         grace.effective_secs,
     );
-    let quiet = lifecycle.run_id.is_none() && lifecycle.label == "Up to date";
+    let quiet = lifecycle.run_id.is_none() && lifecycle.slot == crate::HostLifecycleSlot::Quiet;
     let (primary_href, primary_label, workflow_handler) =
         if let Some(run_id) = lifecycle.run_id.as_deref() {
             let settings_workflow = lifecycle.slot == crate::HostLifecycleSlot::SettingsChange;
@@ -688,13 +685,14 @@ fn render_host_workspace(
     ]
     .concat();
     let fleet_home = crate::app_href(base, "/");
+    let open = format!(
+        r#"<div class="host-workspace" data-host-workspace data-host="{host_name}" data-can-manage-fleet="{can_manage}">"#,
+        host_name = html_escape(&host.name),
+        can_manage = can_manage_fleet,
+    );
     format!(
         r#"{open}<nav class="host-breadcrumb" aria-label="Breadcrumb"><a data-fleet-return href="{fleet_home}">Fleet</a><span aria-hidden="true">/</span><span>{crumb_host}</span></nav><header class="host-profile">{badge}<div class="host-profile-copy"><strong>{profile_host}</strong><p>{role}</p></div><span class="host-accent-identity"><span class="host-accent-swatch" style="--host-accent:{accent}"></span>Host color</span></header><nav class="host-tabs" aria-label="Host workspace sections">{tabs}</nav><section class="host-section" data-host-section="overview"{overview_hidden}><div class="host-columns"><div class="host-stack"><section class="host-panel" data-host-health><h2>Health</h2>{health}</section><section class="host-panel" data-host-heartbeat data-grace="{grace_secs}" data-grace-source="{grace_source}" data-late-after="{late_after}" data-interval="{interval_secs}"><h2>Heartbeat</h2><p data-heartbeat-reachability>Reachability is {reachability}. Grace does not move stale or down.</p><p data-heartbeat-timing>{timing}</p><p data-grace-rule>{rule}</p><p>Source: {grace_source_label}.</p></section><section class="host-panel" data-host-workspace-services><h2>Services</h2>{services_body}<a class="host-workspace-link" href="{services_href}">Open services</a></section><details class="host-disclosure" data-host-workspace-technical><summary>Technical context</summary><div class="host-meta"><div><span>Configuration target</span><strong>{target}</strong></div><div><span>Target path</span><strong>{target_path}</strong></div><div><span>Source revision</span><strong>{source_revision}</strong></div><div><span>nixpkgs revision</span><strong>{nixpkgs_revision}</strong></div></div></details></div><div class="host-stack"><section class="host-next-action" data-host-next-action data-manager="{can_manage}">{next_heading}{lifecycle_copy}<a class="primary-action" data-host-workspace-primary data-workflow-handler="{workflow_handler}" href="{primary_href}">{primary_label}</a><p class="task-note">{manager_note}</p><div class="host-receipt-slot" data-host-workspace-receipts><strong>Workflow receipts</strong><span class="host-receipt-empty" data-host-receipt-empty>Loading saved receipts…</span><ol class="host-receipt-list" data-host-receipt-list></ol></div></section><section class="host-panel" data-host-workspace-protection><h2>Protection</h2>{daily_overview}{protection_overview}</section><section class="host-panel" data-host-workspace-activity><h2>Activity</h2><p data-last-report data-last-seen="{report_at_overview}">Last report: {report_overview}</p><a class="host-workspace-link" href="{activity_overview}">{activity_overview_label}</a></section></div></div></section><section class="host-section" data-host-section="backups"{backups_hidden}><section class="host-panel"><h2>Backups</h2>{daily_backups}{protection_backups}</section></section><section class="host-section" data-host-section="activity"{activity_hidden}><section class="host-panel"><h2>Activity</h2><p data-last-report data-last-seen="{report_at_activity}">Last report: {report_activity}</p>{history}<a class="host-workspace-link" href="{activity_tab_href}">Open activity</a></section></section><section class="host-section host-workspace-settings" id="host-settings-editor" data-host-section="settings" data-host-workspace-settings{settings_hidden}><p data-host-settings-state>Settings state: {settings_state}</p>{settings_editor}</section></div>"#,
-        open = format!(
-            r#"<div class="host-workspace" data-host-workspace data-host="{host_name}" data-can-manage-fleet="{can_manage}">"#,
-            host_name = html_escape(&host.name),
-            can_manage = can_manage_fleet,
-        ),
+        open = open,
         fleet_home = fleet_home,
         crumb_host = html_escape(&host.name),
         profile_host = html_escape(&host.name),
@@ -1318,13 +1316,13 @@ fn render_page_with_access(
                 workspace.runtime,
                 workspace.lifecycle,
                 workspace.settings_state,
-                can_manage_fleet,
                 &editor,
                 WorkspaceExtras {
                     now: workspace.now,
                     fleet_nixpkgs_warn_days: workspace.fleet_nixpkgs_warn_days,
                     fleet_grace_seconds: workspace.fleet_grace_seconds,
                     section: workspace.section,
+                    can_manage_fleet,
                 },
             ),
         )
@@ -2892,6 +2890,7 @@ mod tests {
             fleet_nixpkgs_warn_days: 14,
             fleet_grace_seconds: 45,
             section: WorkspaceSection::Overview,
+            can_manage_fleet: true,
         }
     }
 
@@ -3089,8 +3088,11 @@ mod tests {
         assert!(!html.contains("Access</button>"));
         assert!(!html.contains("stored-token-hash"));
         assert!(html.contains("[data-fleet-return]"));
+        assert!(html.contains("pharos.sidebar.still.v1"));
+        assert!(html.contains(
+            "localStorage.setItem(storageKey,JSON.stringify({version:1,value:preferStill,expiresAt:Date.now()+storageTtlMs}))"
+        ));
         assert!(!html.contains("sessionStorage"));
-        assert!(!html.contains("localStorage"));
         assert_eq!(html.matches(r#"data-pharos-page-style="agora""#).count(), 1);
         let head_end = html.find("</head>").expect("document head");
         let head = &html[..head_end];
@@ -3114,7 +3116,6 @@ mod tests {
             Some(&runtime_hosts[0]),
             &lifecycle,
             settings_state,
-            true,
             &editor,
             shown_workspace_extras(),
         );
@@ -3132,8 +3133,8 @@ mod tests {
         assert!(!html.contains("sessionStorage"));
         assert!(!html.contains("localStorage"));
         assert!(!html.contains("return_q"));
-        assert!(!html.contains("Up to date"));
-        assert!(!html.contains("No host lifecycle work is waiting"));
+        assert!(!html.contains("No pending changes"));
+        assert!(!html.contains("No pending work is waiting"));
         assert!(html.contains(r#"data-fleet-return"#));
         assert!(html.contains(r#"data-host-tab"#));
         assert!(html.contains("?section=backups"));
@@ -3156,9 +3157,11 @@ mod tests {
             Some(&runtime_hosts[0]),
             &lifecycle,
             settings_state,
-            false,
             &viewer_editor,
-            shown_workspace_extras(),
+            WorkspaceExtras {
+                can_manage_fleet: false,
+                ..shown_workspace_extras()
+            },
         );
         assert!(viewer_html.contains(r#"data-manager="false""#));
         assert!(viewer_html.contains("Viewer access: settings and receipts stay visible"));
@@ -3205,7 +3208,6 @@ mod tests {
             Some(&runtime_hosts[0]),
             &settings,
             crate::HostPreferencesState::RequestPending,
-            true,
             &editor,
             shown_workspace_extras(),
         );
@@ -3228,7 +3230,6 @@ mod tests {
             Some(&runtime_hosts[0]),
             &update,
             crate::HostPreferencesState::Applied,
-            true,
             &editor,
             shown_workspace_extras(),
         );
@@ -3248,7 +3249,6 @@ mod tests {
             Some(&runtime_hosts[0]),
             &removal,
             crate::HostPreferencesState::Applied,
-            true,
             &editor,
             shown_workspace_extras(),
         );

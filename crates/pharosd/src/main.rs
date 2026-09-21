@@ -3610,16 +3610,16 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
         .map(|host| host.name.clone())
         .collect();
     let fleet_settings = state.fleet_settings.get();
-    let mut payload = hosts_payload_with_grace(
+    let mut payload = hosts_payload_with_grace(HostsPayloadQuery {
         runtime_hosts,
-        &manifests,
-        &declared_preferences,
-        &action_jobs,
-        Some(&janus_action_hosts),
+        manifests: &manifests,
+        declared_preferences: &declared_preferences,
+        action_jobs: &action_jobs,
+        janus_action_hosts: Some(&janus_action_hosts),
         now,
-        fleet_settings.nixpkgs_warn_after_days,
-        fleet_settings.heartbeat_grace_secs,
-    );
+        fleet_threshold: fleet_settings.nixpkgs_warn_after_days,
+        fleet_grace_secs: fleet_settings.heartbeat_grace_secs,
+    });
     if let Some(hosts) = payload
         .get_mut("hosts")
         .and_then(|hosts| hosts.as_array_mut())
@@ -3659,6 +3659,18 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
     no_store_json(payload)
 }
 
+struct HostsPayloadQuery<'a> {
+    runtime_hosts: Vec<Host>,
+    manifests: &'a [HostManifest],
+    declared_preferences: &'a BTreeMap<String, HostPreferences>,
+    action_jobs: &'a [HostActionJob],
+    janus_action_hosts: Option<&'a BTreeSet<String>>,
+    now: i64,
+    fleet_threshold: u32,
+    fleet_grace_secs: u64,
+}
+
+#[cfg(test)]
 fn hosts_payload(
     runtime_hosts: Vec<Host>,
     manifests: &[HostManifest],
@@ -3668,7 +3680,7 @@ fn hosts_payload(
     now: i64,
     fleet_threshold: u32,
 ) -> serde_json::Value {
-    hosts_payload_with_grace(
+    hosts_payload_with_grace(HostsPayloadQuery {
         runtime_hosts,
         manifests,
         declared_preferences,
@@ -3676,20 +3688,21 @@ fn hosts_payload(
         janus_action_hosts,
         now,
         fleet_threshold,
-        pharos_core::DEFAULT_HEARTBEAT_GRACE_SECS,
-    )
+        fleet_grace_secs: pharos_core::DEFAULT_HEARTBEAT_GRACE_SECS,
+    })
 }
 
-fn hosts_payload_with_grace(
-    runtime_hosts: Vec<Host>,
-    manifests: &[HostManifest],
-    declared_preferences: &BTreeMap<String, HostPreferences>,
-    action_jobs: &[HostActionJob],
-    janus_action_hosts: Option<&BTreeSet<String>>,
-    now: i64,
-    fleet_threshold: u32,
-    fleet_grace_secs: u64,
-) -> serde_json::Value {
+fn hosts_payload_with_grace(query: HostsPayloadQuery<'_>) -> serde_json::Value {
+    let HostsPayloadQuery {
+        runtime_hosts,
+        manifests,
+        declared_preferences,
+        action_jobs,
+        janus_action_hosts,
+        now,
+        fleet_threshold,
+        fleet_grace_secs,
+    } = query;
     let manifests = manifest_by_host(manifests);
     let hosts: Vec<_> = runtime_hosts
         .into_iter()
@@ -6369,9 +6382,11 @@ mod tests {
         );
         assert!(html.contains(r#"data-history-level="ok""#));
         assert!(html.contains(r#"data-history-label="on cadence""#));
-        assert!(html.contains(r#"--mark-x:29.3%""#));
-        assert!(html.contains(r#"--mark-x:58.7%""#));
+        assert!(html.contains(r#"data-history-axis="time""#));
+        assert!(html.contains(r#"--mark-x:85.0%""#));
+        assert!(html.contains(r#"--mark-x:95.0%""#));
         assert!(!html.contains(r#"--mark-x:64.0%""#));
+        assert!(!html.contains("0-64%"));
         assert!(html.contains("nixpkgs lock (nixos-unstable)"));
         assert!(html.contains(r#"data-fresh-kind="nixcfg-drift" tabindex="0""#));
         assert!(html.contains(r#"<strong class="warn" data-fresh-value>3 commits behind</strong>"#));
@@ -6383,7 +6398,8 @@ mod tests {
         assert!(html.contains("beat-fill"));
         assert!(html.contains("beat-now"));
         assert!(html.contains("beat-current"));
-        assert!(html.contains(r#"--history-start-x:29.3%"#));
+        assert!(html.contains(r#"--history-start-x:100.0%"#));
+        assert!(html.contains(r#"data-arrival-label"#));
         assert!(html.contains("beat-zones"));
         assert!(HEAD.contains("left:max(0px,calc(var(--pulse-left) - 4px))"));
         assert!(HEAD.contains("left:clamp(4px,var(--mark-x),calc(100% - 4px))"));
@@ -6421,11 +6437,19 @@ mod tests {
         assert!(html.contains("function updateFleetSummary(hosts)"));
         assert!(html.contains("updateFleetSummary(hosts);"));
         assert!(html.contains("Data out of date \\u00b7 "));
-        assert!(html.contains("res.redirected||!contentType.includes('application/json')"));
-        assert!(html.contains("window.addEventListener('blur',suspendFleet)"));
+        assert!(html.contains("function classifyFleetResponse(res)"));
         assert!(html.contains(
-            "if(!fleetMain()||document.hidden||(typeof document.hasFocus==='function'&&!document.hasFocus()))return;"
+            "if(res?.redirected||status===401||status===403||type.includes('text/html'))return 'auth'"
         ));
+        assert!(
+            html.contains("if(!res?.ok||!type.includes('application/json'))return 'unavailable'")
+        );
+        assert!(html.contains("function pageFrozen()"));
+        assert!(html.contains("if(document.hidden)return true"));
+        assert!(html.contains("window.addEventListener('pagehide'"));
+        assert!(html.contains("suspendFleet()"));
+        assert!(!html.contains("window.addEventListener('blur',suspendFleet)"));
+        assert!(html.contains("document.documentElement.dataset.fleetFocus='unfocused'"));
         assert!(html.contains("if(options.force===true&&refreshPromise)abandonRefresh();"));
         assert!(html.contains("if(generation!==refreshGeneration)return false;"));
         assert!(html.contains("if(!fleetMembershipMatches(hosts))"));
@@ -7538,7 +7562,7 @@ mod tests {
             shell("markus", true),
             true,
         );
-        assert!(current_html.contains(r#"data-host-lifecycle-chip-copy>Up to date</span>"#));
+        assert!(current_html.contains(r#"data-host-lifecycle-chip-copy>No pending changes</span>"#));
         assert!(!current_html.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
     }
 
@@ -9208,20 +9232,23 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
-    fn heartbeat_history_uses_outcome_slots_before_expected_marker() {
+    fn heartbeat_history_is_a_time_axis_ending_at_now() {
         let (marks, history_start_x) =
             heartbeat_marks(&[100, 160, 220, 340], 60, SIGNAL_DEFAULT_WINDOW_SECS);
 
-        assert!((history_start_x - 14.7).abs() < 0.1);
+        assert!((history_start_x - 100.0).abs() < 0.1);
         assert!(!marks.contains(r#"data-history-level="first""#));
         assert!(marks.contains(r#"data-history-level="ok""#));
         assert!(marks.contains(r#"data-history-level="late""#));
-        assert!(marks.contains(r#"--mark-x:14.7%""#));
-        assert!(marks.contains(r#"--mark-x:29.3%""#));
-        assert!(marks.contains(r#"--mark-x:58.7%""#));
+        assert!(marks.contains(r#"--mark-x:70.0%""#));
+        assert!(marks.contains(r#"--mark-x:80.0%""#));
+        assert!(marks.contains(r#"--mark-x:100.0%""#));
         assert!(!marks.contains(r#"--mark-x:64.0%""#));
+        assert!(!marks.contains("0-64%"));
         assert!(marks.contains(r#"class="beat-mark" role="img" tabindex="0""#));
-        assert!(FOOT.contains(r#"class="beat-mark" role="img" tabindex="0""#));
+        assert!(FOOT.contains("mark.className='beat-mark'"));
+        assert!(FOOT.contains("mark.setAttribute('role','img')"));
+        assert!(FOOT.contains("mark.tabIndex=0"));
     }
 
     #[test]
@@ -9393,13 +9420,14 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             shell("markus", true),
             true,
         );
-        assert!(applied.contains(r#"class="card has-settings""#));
+        assert!(applied.contains("has-settings"));
+        assert!(applied.contains("harbor-host"));
+        assert!(applied.contains(r#"class="card"#));
         assert!(applied.contains(
             r#"data-settings-state="applied" data-lifecycle-slot="quiet" data-lifecycle-level="clear" data-lifecycle-invoke="host_settings""#
         ));
-        assert!(
-            applied.contains(r#"<span data-host-lifecycle-chip-copy>Up to date</span></button>"#)
-        );
+        assert!(applied
+            .contains(r#"<span data-host-lifecycle-chip-copy>No pending changes</span></button>"#));
         assert!(applied.contains(r#"style="--host-color:#48b8a8""#));
         assert!(!applied.contains(r#"aria-label="Ready to apply""#));
     }
@@ -9428,6 +9456,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(drift_html.contains(
             r#"data-fresh-kind="nixpkgs-drift" tabindex="0" title="nixpkgs: nixpkgs differs from nixos-unstable" aria-label="nixpkgs: nixpkgs differs from nixos-unstable""#
         ));
+        assert!(
+            drift_html.contains(r#"<span data-host-lifecycle-chip-copy>No pending changes</span>"#)
+        );
+        assert!(!drift_html.contains(r#"data-host-lifecycle-chip-copy>Ready to apply"#));
+        assert!(drift_html.contains(r#"data-update-pending="false""#));
 
         let mut lifecycle = host_with_backups("lifecycle", 970, vec![]);
         lifecycle.requested_preferences = Some(HostPreferences {
@@ -14186,10 +14219,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             nixpkgs_warn_after_days: 45,
             heartbeat_grace_secs: Some(15),
         };
-        let no_header =
-            update_fleet_settings(State(state.clone()), HeaderMap::new(), Json(update))
-                .await
-                .into_response();
+        let no_header = update_fleet_settings(State(state.clone()), HeaderMap::new(), Json(update))
+            .await
+            .into_response();
         assert_eq!(no_header.status(), StatusCode::FORBIDDEN);
         let invalid = update_fleet_settings(
             State(state.clone()),
@@ -14291,29 +14323,44 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let mut overridden = host_with_backups("override-grace", 940, vec![]);
         overridden.heartbeat_interval_secs = Some(60);
         overridden.preferences.alerts.heartbeat_grace_secs = Some(20);
-        let payload = hosts_payload_with_grace(
-            vec![inherited, overridden],
-            &[],
-            &BTreeMap::new(),
-            &[],
-            None,
-            1000,
-            30,
-            state.fleet_settings.get().heartbeat_grace_secs,
-        );
+        let payload = hosts_payload_with_grace(HostsPayloadQuery {
+            runtime_hosts: vec![inherited, overridden],
+            manifests: &[],
+            declared_preferences: &BTreeMap::new(),
+            action_jobs: &[],
+            janus_action_hosts: None,
+            now: 1000,
+            fleet_threshold: 30,
+            fleet_grace_secs: state.fleet_settings.get().heartbeat_grace_secs,
+        });
         assert_eq!(payload["fleet_heartbeat_grace_secs"], 0);
         assert_eq!(payload["hosts"][0]["heartbeat_grace"]["source"], "fleet");
         assert_eq!(payload["hosts"][0]["heartbeat_grace"]["effective_secs"], 0);
-        assert_eq!(payload["hosts"][0]["heartbeat_grace"]["override_secs"], json!(null));
-        assert_eq!(payload["hosts"][0]["heartbeat_grace"]["late_after_secs"], 60);
-        assert_eq!(payload["hosts"][0]["heartbeat_grace"]["stale_after_secs"], 120);
-        assert_eq!(payload["hosts"][0]["heartbeat_grace"]["down_after_secs"], 300);
+        assert_eq!(
+            payload["hosts"][0]["heartbeat_grace"]["override_secs"],
+            json!(null)
+        );
+        assert_eq!(
+            payload["hosts"][0]["heartbeat_grace"]["late_after_secs"],
+            60
+        );
+        assert_eq!(
+            payload["hosts"][0]["heartbeat_grace"]["stale_after_secs"],
+            120
+        );
+        assert_eq!(
+            payload["hosts"][0]["heartbeat_grace"]["down_after_secs"],
+            300
+        );
         assert_eq!(payload["hosts"][0]["liveness"], "live");
         assert_eq!(payload["hosts"][1]["heartbeat_grace"]["source"], "host");
         assert_eq!(payload["hosts"][1]["heartbeat_grace"]["effective_secs"], 20);
         assert_eq!(payload["hosts"][1]["heartbeat_grace"]["override_secs"], 20);
         assert_eq!(payload["hosts"][1]["heartbeat_grace"]["fleet_secs"], 0);
-        assert_eq!(payload["hosts"][1]["heartbeat_grace"]["late_after_secs"], 80);
+        assert_eq!(
+            payload["hosts"][1]["heartbeat_grace"]["late_after_secs"],
+            80
+        );
         assert_eq!(
             payload["hosts"][1]["heartbeat_grace"]["on_time_through_secs"],
             80
@@ -14331,7 +14378,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             30,
         );
         assert_eq!(defaulted["fleet_heartbeat_grace_secs"], 15);
-        assert_eq!(defaulted["hosts"][0]["heartbeat_grace"]["late_after_secs"], 75);
+        assert_eq!(
+            defaulted["hosts"][0]["heartbeat_grace"]["late_after_secs"],
+            75
+        );
 
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();

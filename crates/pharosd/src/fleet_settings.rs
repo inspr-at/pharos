@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use pharos_core::{
-    DEFAULT_HEARTBEAT_GRACE_SECS, DEFAULT_NIXPKGS_WARN_AFTER_DAYS, HEARTBEAT_GRACE_RANGE_ERROR,
-    valid_heartbeat_grace_secs, valid_nixpkgs_warn_after_days,
+    valid_heartbeat_grace_secs, valid_nixpkgs_warn_after_days, DEFAULT_HEARTBEAT_GRACE_SECS,
+    DEFAULT_NIXPKGS_WARN_AFTER_DAYS, HEARTBEAT_GRACE_RANGE_ERROR,
 };
 use serde::{Deserialize, Serialize};
 
@@ -239,8 +239,11 @@ mod tests {
             FleetSettingsStore::new(Some(path.clone())).unwrap().get(),
             store.get()
         );
-        std::fs::write(&path, br#"{"nixpkgs_warn_after_days":30,"heartbeat_grace_secs":3601}"#)
-            .unwrap();
+        std::fs::write(
+            &path,
+            br#"{"nixpkgs_warn_after_days":30,"heartbeat_grace_secs":3601}"#,
+        )
+        .unwrap();
         assert!(FleetSettingsStore::new(Some(path.clone())).is_err());
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
