@@ -25,9 +25,12 @@ test("harbor fleet keeps the shell and shows real health, backup, and grace cont
       role: "server",
       is_nix: false,
       heartbeat_interval_secs: 60,
+      freshness: { applicable: false },
+      preferences: { accent: "#224466", kind: "server" },
     },
   });
-  expect(report.status()).toBe(204);
+  const reportBody = await report.text();
+  expect(report.status(), reportBody).toBe(204);
   try {
     await page.goto("/");
     const nav = page.locator("nav.side-nav");

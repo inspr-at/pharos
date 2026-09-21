@@ -148,7 +148,7 @@ test("history refresh keeps the same mark and arrival uses the grace scale", asy
   expect(probe.firstObservationMarks).toBe(0);
   expect(probe.firstObservationKept).toBe(false);
   const arrival = await page.evaluate(() => window.__timelineArrival);
-  expect(arrival.state).toBe("on-time");
+  expect(arrival.state).toBe("on_time");
   expect(arrival.beat).toBe("tracking");
   expect(arrival.x).toBe(arrival.expected);
 

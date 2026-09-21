@@ -47,6 +47,7 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
                 data-history-label="offline gap recovered"
                 data-history-detail="9 min after previous · 07:58"
                 aria-label="offline gap recovered · 9 min after previous · 07:58"
+                title="offline gap recovered · 9 min after previous · 07:58"
                 style="--mark-x:50%"
               ></span>
             </span>
@@ -71,6 +72,7 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
                     data-history-label="offline gap recovered"
                     data-history-detail="9 min after previous · 07:58 and a longer clause that must not stretch the row"
                     aria-label="offline gap recovered · 9 min after previous · 07:58 and a longer clause that must not stretch the row"
+                    title="offline gap recovered · 9 min after previous · 07:58 and a longer clause that must not stretch the row"
                     style="--mark-x:70%"
                   ></span>
                 </span>
@@ -79,6 +81,11 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
           </td>
         </tr>
       </tbody></table>`;
+    fixture.style.position = "relative";
+    fixture.style.zIndex = "5";
+    document.querySelectorAll(".empty-visual").forEach((node) => {
+      node.style.pointerEvents = "none";
+    });
     document.body.append(fixture);
     window.bindHistoryHints(fixture);
     return stamp;
