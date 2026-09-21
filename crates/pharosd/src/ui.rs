@@ -431,6 +431,7 @@ mod module_tests {
                 "rendered-fleet",
                 render_home(
                     RuntimeSnapshot {
+                        nixpkgs_warn_after_days: 30,
                         hosts: &[],
                         jobs: &[],
                         action_jobs: &[],
@@ -603,6 +604,74 @@ mod module_tests {
         }
     }
 
+    #[test]
+    fn age_policy_owns_attention_even_with_a_legacy_beacon_service_warning() {
+        let now = 1_800_000_000;
+        let mut freshness = proven_current("nixos-unstable");
+        freshness
+            .deployment_evidence
+            .as_mut()
+            .unwrap()
+            .nixpkgs_last_modified = now - 30 * 86_400;
+        freshness.nixpkgs_comparison.as_mut().unwrap().relation =
+            NixpkgsRevisionRelation::Different;
+        freshness
+            .nixpkgs_comparison
+            .as_mut()
+            .unwrap()
+            .upstream_revision = "4".repeat(40);
+        let observations = [ServiceObservation::nix_freshness(&freshness)];
+        assert_eq!(observations[0].state, ServiceObservationState::Warning);
+        let mut prefs = HostPreferences::default();
+        let reason = |freshness: &NixFreshness, prefs: &HostPreferences, limit| {
+            attention_reason(
+                Liveness::Live,
+                freshness,
+                None,
+                &observations,
+                prefs,
+                now,
+                limit,
+            )
+        };
+        assert_eq!(reason(&freshness, &prefs, 30).level, "ok");
+        assert_eq!(reason(&freshness, &prefs, 29).rank, 2);
+        assert!(freshness_alert(&freshness, now, 30).is_none());
+        assert!(freshness_alert(&freshness, now, 29).is_some());
+        prefs.alerts.nixpkgs_warn_after_days = Some(31);
+        assert_eq!(reason(&freshness, &prefs, 7).level, "ok");
+        prefs.alerts.nixpkgs_warn_after_days = Some(7);
+        assert_eq!(reason(&freshness, &prefs, 31).level, "warn");
+        prefs.alerts.suppress_nix_freshness = true;
+        assert_eq!(reason(&freshness, &prefs, 30).level, "ok");
+        prefs.alerts.suppress_nix_freshness = false;
+        freshness.nixpkgs_comparison = None;
+        assert_eq!(
+            reason(&freshness, &prefs, 30).label,
+            "nixpkgs comparison unknown"
+        );
+        freshness
+            .deployment_evidence
+            .as_mut()
+            .unwrap()
+            .nixpkgs_channel = "nixos-25.05".to_string();
+        assert!(reason(&freshness, &prefs, 3650)
+            .label
+            .contains("end of life"));
+        let actual_service = ServiceObservation {
+            id: "web".to_string(),
+            label: "Web".to_string(),
+            state: ServiceObservationState::Warning,
+            summary: "response slow".to_string(),
+        };
+        assert_eq!(
+            service_observation_attention_reason(&[actual_service])
+                .unwrap()
+                .rank,
+            3
+        );
+    }
+
     /// PHAROS-193: the fleet showed a reassuring `0d` while nixpkgs was frozen
     /// on an expired channel. The operator-visible signal must say so.
     #[test]
@@ -620,7 +689,7 @@ mod module_tests {
             relation: NixpkgsRevisionRelation::Different,
         });
 
-        let markup = freshness_markup(&frozen, false, now);
+        let markup = freshness_markup(&frozen, false, now, 30);
         assert!(
             markup.contains("218d"),
             "nixpkgs age must be shown: {markup}"
@@ -634,7 +703,8 @@ mod module_tests {
             "the label must name the value it shows: {markup}"
         );
 
-        let reason = freshness_attention_reason(&frozen).expect("frozen nixpkgs needs attention");
+        let reason = freshness_attention_reason(&frozen, now_unix(), 30)
+            .expect("frozen nixpkgs needs attention");
         assert!(reason.label.contains("end of life"), "{}", reason.label);
         assert_eq!(reason.level, "warn");
         assert_eq!(reason.rank, 1, "an expired channel outranks age drift");
@@ -765,8 +835,8 @@ mod module_tests {
     #[test]
     fn a_current_nixpkgs_raises_no_attention_and_keeps_the_lock_label() {
         let current = proven_current("nixos-26.05");
-        assert!(freshness_attention_reason(&current).is_none());
-        assert!(!freshness_markup(&current, false, 1_700_000_000).contains("EOL"));
+        assert!(freshness_attention_reason(&current, now_unix(), 30).is_none());
+        assert!(!freshness_markup(&current, false, 1_700_000_000, 30).contains("EOL"));
 
         // A beacon that has not rolled yet may report old numeric fields, but
         // those cannot prove the active generation and must remain unverified.
@@ -781,7 +851,7 @@ mod module_tests {
             nixcfg_comparison: None,
             nixpkgs_comparison: None,
         };
-        let markup = freshness_markup(&legacy, false, 1_700_000_000);
+        let markup = freshness_markup(&legacy, false, 1_700_000_000, 30);
         assert!(markup.contains("unverified"), "{markup}");
         assert!(!markup.contains("EOL"));
     }
@@ -795,7 +865,7 @@ mod module_tests {
             channel: Some("nixos-25.05".to_string()),
         });
 
-        let markup = freshness_markup(&current, false, 1_700_000_000);
+        let markup = freshness_markup(&current, false, 1_700_000_000, 30);
         assert!(markup.contains("Other root nixpkgs"), "{markup}");
         assert!(markup.contains("nixpkgs-stable"), "{markup}");
         assert!(markup.contains("nixos-25.05"), "{markup}");
@@ -804,7 +874,7 @@ mod module_tests {
             !markup.contains("218d · EOL"),
             "a side input must not look like host patch posture: {markup}"
         );
-        assert!(freshness_attention_reason(&current).is_none());
+        assert!(freshness_attention_reason(&current, now_unix(), 30).is_none());
         assert_eq!(
             ServiceObservation::nix_freshness_at(&current, Some((2026, 8))).state,
             ServiceObservationState::Healthy
@@ -821,7 +891,7 @@ mod module_tests {
         healthy_backup.label = "Protected".to_string();
 
         let (quiet, quiet_visible) =
-            card_freshness_fault_markup(&current, &healthy_backup, None, now);
+            card_freshness_fault_markup(&current, &healthy_backup, None, now, 30);
         assert!(!quiet_visible, "{quiet}");
         assert_eq!(quiet.matches(" hidden").count(), 6, "{quiet}");
         assert!(!quiet.contains("deployed-sha"), "{quiet}");
@@ -848,7 +918,7 @@ mod module_tests {
             ..healthy_backup
         };
         let (faults, faults_visible) =
-            card_freshness_fault_markup(&drift, &failed_backup, None, now);
+            card_freshness_fault_markup(&drift, &failed_backup, None, now, 30);
         assert!(faults_visible, "{faults}");
         assert!(faults.contains("nixos-25.05 end of life"), "{faults}");
         assert!(
@@ -962,6 +1032,7 @@ pub(super) async fn provider_settings_page(
                 public_base_path: &state.public_base_path,
             },
             access.can_manage_fleet(),
+            state.fleet_settings.get(),
         ),
     )
 }
@@ -1084,6 +1155,7 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
         crate::flow_host::inject_flow_shell(
             render_home_with_capabilities(
                 RuntimeSnapshot {
+                    nixpkgs_warn_after_days: state.fleet_settings.get().nixpkgs_warn_after_days,
                     hosts: &hosts,
                     jobs: &jobs,
                     action_jobs: &action_jobs,
@@ -1159,7 +1231,14 @@ pub(super) async fn map_data_json(
     let now = now_unix();
     let probes = map_connectivity_probes(&hosts, &manifests).await;
     let payload = {
-        let mut payload = map_data_payload(&hosts, &self_host(), now, &manifests, &probes);
+        let mut payload = map_data_payload(
+            &hosts,
+            &self_host(),
+            now,
+            &manifests,
+            &probes,
+            state.fleet_settings.get().nixpkgs_warn_after_days,
+        );
         for host in &mut payload.hosts {
             host.settings_href = state.public_base_path.href(&host.settings_href);
         }
@@ -1205,6 +1284,7 @@ pub(super) async fn alerts_page(
         &state,
         render_alerts(
             RuntimeSnapshot {
+                nixpkgs_warn_after_days: state.fleet_settings.get().nixpkgs_warn_after_days,
                 hosts: &hosts,
                 jobs: &jobs,
                 action_jobs: &[],
@@ -1270,6 +1350,7 @@ pub(super) async fn activity_page(
         &state,
         render_activity_with_focus(
             RuntimeSnapshot {
+                nixpkgs_warn_after_days: state.fleet_settings.get().nixpkgs_warn_after_days,
                 hosts: &hosts,
                 jobs: &jobs,
                 action_jobs: &action_jobs,
@@ -1540,7 +1621,12 @@ pub(super) fn freshness_row(
     }
 }
 
-pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool, now: i64) -> String {
+pub(super) fn freshness_markup(
+    freshness: &NixFreshness,
+    compact: bool,
+    now: i64,
+    threshold: u32,
+) -> String {
     if !freshness.applicable {
         return format!(
             "{}{}{}{}{}{}",
@@ -1611,8 +1697,10 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool, now: i64
             };
             let class = if comparison.relation == NixpkgsRevisionRelation::Current {
                 "ok"
-            } else {
+            } else if freshness.nixpkgs_age_warning_at(now, threshold) {
                 "warn"
+            } else {
+                "na"
             };
             (format!("{days}d · {suffix}"), class)
         }
@@ -1768,6 +1856,7 @@ pub(super) fn card_freshness_fault_markup(
     backup: &BackupUiSummary,
     kernel: Option<&KernelPosture>,
     now: i64,
+    threshold: u32,
 ) -> (String, bool) {
     let evidence_missing = freshness.applicable && freshness.deployment_evidence.is_none();
     let (year, month) = pharos_core::utc_year_month(now);
@@ -1788,7 +1877,10 @@ pub(super) fn card_freshness_fault_markup(
                 Some(comparison) if comparison.relation == NixpkgsRevisionRelation::Current => {
                     (String::new(), "ok", false)
                 }
-                Some(_) => (format!("nixpkgs differs from {channel}"), "warn", true),
+                Some(_) if freshness.nixpkgs_age_warning_at(now, threshold) => {
+                    (format!("nixpkgs differs from {channel}"), "warn", true)
+                }
+                Some(_) => (String::new(), "na", false),
                 None => ("nixpkgs comparison unknown".to_string(), "na", true),
             }
         };
@@ -1897,7 +1989,11 @@ pub(super) fn self_attention_reason() -> AttentionReason {
     }
 }
 
-pub(super) fn freshness_attention_reason(freshness: &NixFreshness) -> Option<AttentionReason> {
+pub(super) fn freshness_attention_reason(
+    freshness: &NixFreshness,
+    now: i64,
+    threshold: u32,
+) -> Option<AttentionReason> {
     if !freshness.applicable {
         return None;
     }
@@ -1913,7 +2009,7 @@ pub(super) fn freshness_attention_reason(freshness: &NixFreshness) -> Option<Att
     // PHAROS-193: an end-of-life channel outranks every age number, because no
     // age is small enough to make an unsupported release safe. The control
     // plane owns this calendar so an expiring release needs no beacon roll.
-    let (year, month) = pharos_core::utc_year_month(now_unix());
+    let (year, month) = pharos_core::utc_year_month(now);
     if freshness.channel_state(year, month) == Some(pharos_core::NixChannelState::EndOfLife) {
         let channel = evidence.nixpkgs_channel.as_str();
         return Some(AttentionReason {
@@ -1924,7 +2020,7 @@ pub(super) fn freshness_attention_reason(freshness: &NixFreshness) -> Option<Att
     }
 
     match freshness.nixpkgs_comparison.as_ref() {
-        Some(comparison) if comparison.relation == NixpkgsRevisionRelation::Different => {
+        Some(_) if freshness.nixpkgs_age_warning_at(now, threshold) => {
             return Some(AttentionReason {
                 label: format!("nixpkgs differs from {}", evidence.nixpkgs_channel),
                 level: "warn",
@@ -1972,7 +2068,6 @@ pub(super) fn freshness_attention_reason(freshness: &NixFreshness) -> Option<Att
 
 pub(super) fn service_observation_attention_reason(
     observations: &[ServiceObservation],
-    suppress_nix_freshness: bool,
 ) -> Option<AttentionReason> {
     if observations.is_empty() {
         return None;
@@ -1980,7 +2075,7 @@ pub(super) fn service_observation_attention_reason(
 
     let warnings = observations
         .iter()
-        .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
+        .filter(|observation| !is_nix_freshness_observation(observation))
         .filter(|obs| obs.state == ServiceObservationState::Warning)
         .count();
     if warnings > 0 {
@@ -1996,7 +2091,7 @@ pub(super) fn service_observation_attention_reason(
 
     let stale = observations
         .iter()
-        .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
+        .filter(|observation| !is_nix_freshness_observation(observation))
         .filter(|obs| obs.state == ServiceObservationState::Stale)
         .count();
     if stale > 0 {
@@ -2009,7 +2104,7 @@ pub(super) fn service_observation_attention_reason(
 
     let unknown = observations
         .iter()
-        .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
+        .filter(|observation| !is_nix_freshness_observation(observation))
         .filter(|observation| {
             !appliance_probes::is_appliance_observation(observation)
                 || !observation
@@ -3090,6 +3185,8 @@ pub(super) fn attention_reason(
     kernel: Option<&KernelPosture>,
     observations: &[ServiceObservation],
     preferences: &HostPreferences,
+    now: i64,
+    fleet_threshold: u32,
 ) -> AttentionReason {
     // The observation can only be published after startup validates the
     // server-owned appliance registry against an existing host record and its
@@ -3130,14 +3227,20 @@ pub(super) fn attention_reason(
             })
             .or_else(|| {
                 (!preferences.alerts.suppress_nix_freshness)
-                    .then(|| freshness_attention_reason(freshness))
+                    .then(|| {
+                        freshness_attention_reason(
+                            freshness,
+                            now,
+                            preferences.nixpkgs_warn_after_days(Some(fleet_threshold)),
+                        )
+                    })
                     .flatten()
             })
             .or_else(|| {
-                service_observation_attention_reason(
-                    observations,
-                    preferences.alerts.suppress_nix_freshness,
-                )
+                // The dedicated freshness policy already handled this signal.
+                // Old beacons also emit a coarse binary freshness observation;
+                // counting it as a service fault would bypass the age threshold.
+                service_observation_attention_reason(observations)
             })
             .unwrap_or_else(|| AttentionReason {
                 label: if appliance
@@ -3414,6 +3517,7 @@ pub(super) fn render_provider_connections_page(
     providers: &ProviderConnectionsPayload,
     shell: ShellContext<'_>,
     can_manage: bool,
+    fleet_settings: fleet_settings::FleetSettings,
 ) -> String {
     let access_path = if can_manage {
         String::new()
@@ -3427,9 +3531,14 @@ pub(super) fn render_provider_connections_page(
             render_provider_connection_row(provider, can_manage, shell.public_base_path)
         })
         .collect::<String>();
+    let fleet_policy = format!(
+        r#"<section class="appearance-settings" aria-labelledby="fleet-freshness-title"><h2 class="settings-section-title" id="fleet-freshness-title">Fleet freshness</h2><form data-fleet-settings><label class="appearance-row"><span class="appearance-copy"><strong>nixpkgs warning threshold (days)</strong><span id="fleet-threshold-note">Warn when deployed nixpkgs differs from its channel and is older than this limit. Host overrides take precedence.</span></span><input name="nixpkgs_warn_after_days" aria-label="nixpkgs warning threshold (days)" aria-describedby="fleet-threshold-note" type="number" min="1" max="3650" step="1" required value="{days}"{disabled}></label><button class="provider-secondary" type="submit"{disabled}>Save freshness settings</button><span data-fleet-settings-status role="status" aria-live="polite"></span></form></section>"#,
+        days = fleet_settings.nixpkgs_warn_after_days,
+        disabled = if can_manage { "" } else { " disabled" },
+    );
     let head = document_head(shell.public_base_path);
     format!(
-        r#"{head}{sidebar}<main class="providers-main">{header}{access_path}<section class="appearance-settings" aria-labelledby="appearance-settings-title"><h2 class="settings-section-title" id="appearance-settings-title">Appearance</h2><div class="appearance-row"><span class="appearance-copy"><strong>Still sidebar image</strong><span id="sidebar-still-note" data-sidebar-still-note>Gentle motion is on.</span></span><label class="appearance-toggle"><input type="checkbox" data-sidebar-still-toggle aria-label="Use a still sidebar image" aria-describedby="sidebar-still-note"><span class="appearance-switch" aria-hidden="true"></span></label></div></section><h2 class="settings-section-title">Provider connections</h2><section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
+        r#"{head}{sidebar}<main class="providers-main">{header}{access_path}{fleet_policy}<section class="appearance-settings" aria-labelledby="appearance-settings-title"><h2 class="settings-section-title" id="appearance-settings-title">Appearance</h2><div class="appearance-row"><span class="appearance-copy"><strong>Still sidebar image</strong><span id="sidebar-still-note" data-sidebar-still-note>Gentle motion is on.</span></span><label class="appearance-toggle"><input type="checkbox" data-sidebar-still-toggle aria-label="Use a still sidebar image" aria-describedby="sidebar-still-note"><span class="appearance-switch" aria-hidden="true"></span></label></div></section><h2 class="settings-section-title">Provider connections</h2><section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
         sidebar = sidebar(
             shell.public_base_path,
             shell.user_label,
@@ -3438,7 +3547,7 @@ pub(super) fn render_provider_connections_page(
         ),
         header = page_header(
             "Settings",
-            "Appearance and provider connections.",
+            "Fleet freshness, appearance and provider connections.",
             now_unix(),
         ),
         rows = rows,
@@ -3995,6 +4104,7 @@ pub(super) struct ShellContext<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RuntimeSnapshot<'a> {
+    pub(super) nixpkgs_warn_after_days: u32,
     pub(super) hosts: &'a [Host],
     pub(super) jobs: &'a [ProvisioningJob],
     pub(super) action_jobs: &'a [HostActionJob],
@@ -4970,6 +5080,9 @@ pub(super) fn manifest_by_host(manifests: &[HostManifest]) -> BTreeMap<&str, &Ho
 
 pub(super) fn preferences_summary(prefs: &HostPreferences) -> String {
     let mut parts = Vec::new();
+    if let Some(days) = prefs.alerts.nixpkgs_warn_after_days {
+        parts.push(format!("nixpkgs warning after {days}d"));
+    }
     if let Some(accent) = prefs.accent.as_deref() {
         parts.push(format!("accent {}", accent));
     }
@@ -5354,6 +5467,7 @@ pub(super) fn map_hosts(
     now: i64,
     manifests: &[HostManifest],
     probes: &BTreeMap<String, MapSignal>,
+    fleet_threshold: u32,
 ) -> Vec<MapHost> {
     let manifests = manifest_by_host(manifests);
     let mut mapped = hosts
@@ -5374,6 +5488,8 @@ pub(super) fn map_hosts(
                     host.kernel.as_ref(),
                     &host.service_observations,
                     &host.preferences,
+                    now,
+                    fleet_threshold,
                 )
             };
             let site = resolve_host_location(
@@ -5445,11 +5561,12 @@ pub(super) fn map_data_payload(
     now: i64,
     manifests: &[HostManifest],
     probes: &BTreeMap<String, MapSignal>,
+    fleet_threshold: u32,
 ) -> MapDataPayload {
     MapDataPayload {
         schema: "inspr.pharos.map-data.v1",
         as_of: now,
-        hosts: map_hosts(hosts, self_name, now, manifests, probes),
+        hosts: map_hosts(hosts, self_name, now, manifests, probes, fleet_threshold),
     }
 }
 
@@ -5550,7 +5667,11 @@ pub(super) fn seen_label(last_seen: Option<i64>, now: i64) -> String {
     }
 }
 
-pub(super) fn freshness_alert(freshness: &NixFreshness) -> Option<(&'static str, String, String)> {
+pub(super) fn freshness_alert(
+    freshness: &NixFreshness,
+    now: i64,
+    threshold: u32,
+) -> Option<(&'static str, String, String)> {
     if !freshness.applicable {
         return None;
     }
@@ -5562,7 +5683,7 @@ pub(super) fn freshness_alert(freshness: &NixFreshness) -> Option<(&'static str,
                 .to_string(),
         ));
     }
-    let (year, month) = pharos_core::utc_year_month(now_unix());
+    let (year, month) = pharos_core::utc_year_month(now);
     if freshness.channel_state(year, month) == Some(pharos_core::NixChannelState::EndOfLife) {
         let channel = freshness
             .deployment_evidence
@@ -5584,7 +5705,12 @@ pub(super) fn freshness_alert(freshness: &NixFreshness) -> Option<(&'static str,
                 .to_string(),
         ));
     }
-    if !freshness.has_verified_current_state() {
+    if freshness.nixpkgs_age_warning_at(now, threshold)
+        || freshness
+            .nixcfg_comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.relation != GitRevisionRelation::Current)
+    {
         return Some((
             "warning",
             freshness.tldr(),
@@ -5891,7 +6017,7 @@ pub(super) fn provisioning_job_alert(
 pub(super) fn alert_items(
     hosts: &[Host],
     jobs: &[ProvisioningJob],
-    _self_name: &str,
+    fleet_threshold: u32,
     now: i64,
     manifests: &[HostManifest],
     load_errors: &[ManifestLoadIssue],
@@ -6003,7 +6129,12 @@ pub(super) fn alert_items(
         }
 
         if !host.preferences.alerts.suppress_nix_freshness {
-            if let Some((level, issue, action)) = freshness_alert(&host.freshness) {
+            if let Some((level, issue, action)) = freshness_alert(
+                &host.freshness,
+                now,
+                host.preferences
+                    .nixpkgs_warn_after_days(Some(fleet_threshold)),
+            ) {
                 alerts.push(AlertItem {
                     level,
                     host: host.name.clone(),
@@ -6234,7 +6365,7 @@ pub(super) fn posture_panel(alerts: &[AlertItem], hosts: &[Host], base: &PublicB
 
 pub(super) fn render_alerts(
     runtime: RuntimeSnapshot<'_>,
-    self_name: &str,
+    _self_name: &str,
     now: i64,
     manifests: &[HostManifest],
     load_errors: &[ManifestLoadIssue],
@@ -6244,7 +6375,7 @@ pub(super) fn render_alerts(
     let alerts = alert_items(
         runtime.hosts,
         runtime.jobs,
-        self_name,
+        runtime.nixpkgs_warn_after_days,
         now,
         manifests,
         load_errors,
@@ -6816,7 +6947,12 @@ pub(super) fn activity_events(
         }
 
         if !host.preferences.alerts.suppress_nix_freshness {
-            if let Some((level, issue, _action)) = freshness_alert(&host.freshness) {
+            if let Some((level, issue, _action)) = freshness_alert(
+                &host.freshness,
+                now,
+                host.preferences
+                    .nixpkgs_warn_after_days(Some(runtime.nixpkgs_warn_after_days)),
+            ) {
                 events.push(ActivityEvent::new(
                     host.last_seen.unwrap_or(now),
                     host.name.clone(),
@@ -7464,6 +7600,8 @@ pub(super) fn render_home_with_capabilities(
             h.kernel.as_ref(),
             &h.service_observations,
             &h.preferences,
+            now,
+            runtime.nixpkgs_warn_after_days,
         )
         .rank;
         (rank, h.name.clone())
@@ -7482,17 +7620,30 @@ pub(super) fn render_home_with_capabilities(
         let name = html_escape(&h.name);
         let role = html_escape(&h.role);
         let fresh_tldr = h.freshness.tldr();
-        let list_fresh = freshness_markup(&h.freshness, false, now);
+        let list_fresh = freshness_markup(
+            &h.freshness,
+            false,
+            now,
+            h.preferences
+                .nixpkgs_warn_after_days(Some(runtime.nixpkgs_warn_after_days)),
+        );
         let attention = attention_reason(
             live,
             &h.freshness,
             h.kernel.as_ref(),
             &h.service_observations,
             &h.preferences,
+            now,
+            runtime.nixpkgs_warn_after_days,
         );
         let kernel_required = kernel_reboot_required(h.kernel.as_ref()).is_some();
-        let freshness_is_attention = freshness_attention_reason(&h.freshness)
-            .is_some_and(|freshness| freshness.label == attention.label);
+        let freshness_is_attention = freshness_attention_reason(
+            &h.freshness,
+            now,
+            h.preferences
+                .nixpkgs_warn_after_days(Some(runtime.nixpkgs_warn_after_days)),
+        )
+        .is_some_and(|freshness| freshness.label == attention.label);
         let card_reason = reason_markup(
             &attention,
             kernel_required || freshness_is_attention || attention.label == "all clear",
@@ -7500,8 +7651,14 @@ pub(super) fn render_home_with_capabilities(
         let list_reason = reason_markup(&attention, kernel_required);
         let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
-        let (card_fresh, card_fresh_visible) =
-            card_freshness_fault_markup(&h.freshness, &backup, h.kernel.as_ref(), now);
+        let (card_fresh, card_fresh_visible) = card_freshness_fault_markup(
+            &h.freshness,
+            &backup,
+            h.kernel.as_ref(),
+            now,
+            h.preferences
+                .nixpkgs_warn_after_days(Some(runtime.nixpkgs_warn_after_days)),
+        );
         let card_fresh_hidden = if card_fresh_visible { "" } else { " hidden" };
         let backup_chip = backup_chip_markup(&backup, &h.name, shell.public_base_path);
         let protection = protection_onboarding_status(h, runtime.jobs, now);

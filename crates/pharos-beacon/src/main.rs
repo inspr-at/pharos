@@ -4281,6 +4281,13 @@ mod tests {
         assert_eq!(preferences.kind, pharos_core::HostKind::Workstation);
         assert!(preferences.alerts.suppress_down);
         assert!(preferences.alerts.suppress_nix_freshness);
+        assert_eq!(preferences.alerts.nixpkgs_warn_after_days, None);
+        let mut registry: serde_json::Value = serde_json::from_str(raw).unwrap();
+        registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
+        let overridden = parse_host_preferences(&registry.to_string(), "gpc0").unwrap();
+        assert_eq!(overridden.alerts.nixpkgs_warn_after_days, Some(7));
+        registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(0);
+        assert!(parse_host_preferences(&registry.to_string(), "gpc0").is_err());
     }
 
     #[test]
@@ -4324,6 +4331,7 @@ mod tests {
                 suppress_down: false,
                 suppress_backup: true,
                 suppress_nix_freshness: false,
+                nixpkgs_warn_after_days: None,
             },
         };
         let response = HostReportResponse::pending("gpc0", preferences.clone())

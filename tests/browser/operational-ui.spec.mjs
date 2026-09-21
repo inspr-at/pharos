@@ -1698,6 +1698,117 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
     }
   }
 });
+test("nixpkgs age threshold persists in Settings and controls server and refreshed cards", async ({ page, browser }, testInfo) => {
+  const hosts = ["age-below", "age-equal", "age-above", "age-override"];
+  const serverNow = (await (await page.request.get("/hosts.json")).json()).as_of;
+  const setting = { nixpkgs_warn_after_days: 30 };
+  const save = await page.request.post("/settings/fleet.json", {
+    headers: { "x-pharos-action": "1" }, data: setting,
+  });
+  expect(save.status()).toBe(200);
+  const settingsPage = await page.context().newPage();
+  try {
+    for (const [index, days] of [29, 30, 31, 8].entries()) {
+      await reportRuntimeHost(page, hosts[index], {
+        is_nix: true,
+        preferences: { alerts: index === 3 ? { nixpkgs_warn_after_days: 7 } : {} },
+        service_observations: [{ id: "nix-freshness", label: "Nix freshness", state: "warning", summary: "nixpkgs differs from nixos-unstable" }],
+        backup_observations: [healthyBackupObservation()],
+        freshness: {
+          applicable: true, flake_lock_age_days: 0, commits_behind: 0,
+          nixpkgs_age_days: 0, nixpkgs_channel: "nixos-unstable",
+          deployment_evidence: {
+            schema: "inspr.pharos.nix-deployment-evidence.v1", version: 1,
+            source_revision: "a".repeat(40), flake_lock_sha256: "b".repeat(64),
+            nixpkgs_revision: "c".repeat(40), nixpkgs_channel: "nixos-unstable",
+            nixpkgs_last_modified: serverNow - days * 86400,
+          },
+          nixcfg_comparison: { upstream_revision: "a".repeat(40), relation: "current", commits_behind: 0 },
+          nixpkgs_comparison: { upstream_revision: "d".repeat(40), relation: "different" },
+        },
+      });
+    }
+    await page.goto("/");
+    const card = name => page.locator(`.card[data-host="${name}"]`);
+    const warning = name => card(name).locator('[data-fresh-kind="nixpkgs-drift"]');
+    for (const name of hosts.slice(0, 2)) {
+      await expect(warning(name)).toBeHidden();
+      await expect(card(name)).toHaveAttribute("data-sev", "4");
+    }
+    for (const name of hosts.slice(2)) {
+      await expect(warning(name)).toBeVisible();
+      await expect(warning(name)).toContainText("nixpkgs differs from nixos-unstable");
+      await expect(card(name)).toHaveAttribute("data-sev", "2");
+    }
+    const initial = await (await page.request.get("/hosts.json")).json();
+    // Browser clock and the legacy host-clock age mirror cannot affect policy.
+    expect(await page.evaluate(body => {
+      const original = Date.now;
+      Date.now = () => 0;
+      try { return applyFleetSnapshot(body); } finally { Date.now = original; }
+    }, initial)).toBe(true);
+    await expect(warning("age-below")).toBeHidden();
+    await expect(warning("age-above")).toBeVisible();
+    await settingsPage.goto("/settings/providers");
+    const input = settingsPage.getByRole("spinbutton", { name: "nixpkgs warning threshold (days)", exact: true });
+    await expect(input).toHaveValue("30");
+    await input.fill("0");
+    expect(await input.evaluate(node => node.checkValidity())).toBe(false);
+    await input.fill("31");
+    await settingsPage.getByRole("button", { name: "Save freshness settings" }).click();
+    await expect(settingsPage.locator("[data-fleet-settings-status]")).toContainText("Saved.");
+    await settingsPage.reload();
+    await expect(input).toHaveValue("31");
+    const screenshot = testInfo.outputPath("fleet-freshness-settings.png");
+    await settingsPage.screenshot({ path: screenshot, fullPage: true });
+    await testInfo.attach("fleet-freshness-settings", { path: screenshot, contentType: "image/png" });
+    const changed = await (await page.request.get("/hosts.json")).json();
+    expect(changed.hosts.find(host => host.name === "age-above").nixpkgs_warn_after_days).toBe(31);
+    expect(changed.hosts.find(host => host.name === "age-override").nixpkgs_warn_after_days).toBe(7);
+    expect(await page.evaluate(body => applyFleetSnapshot(body), changed)).toBe(true);
+    await expect(warning("age-above")).toBeHidden();
+    await expect(card("age-above")).toHaveAttribute("data-sev", "4");
+    await expect(warning("age-override")).toBeVisible();
+    await page.reload();
+    await expect(warning("age-above")).toBeHidden();
+    await expect(warning("age-override")).toBeVisible();
+
+    await settingsPage.goto("/hosts/age-override");
+    await settingsPage.getByText("Alert preferences", { exact: true }).click();
+    const override = settingsPage.getByRole("spinbutton", { name: "Host nixpkgs warning threshold (days)" });
+    await expect(override).toHaveValue("7");
+    await override.fill("");
+    await settingsPage.getByRole("button", { name: "Review changes", exact: true }).click();
+    await expect(settingsPage.locator("[data-settings-draft-review]")).toContainText("7 → fleet default");
+
+    const viewer = await newAuthedContext(browser, "read");
+    try {
+      const viewerPage = await viewer.newPage();
+      await viewerPage.goto("/settings/providers");
+      await expect(viewerPage.getByRole("spinbutton", { name: "nixpkgs warning threshold (days)", exact: true })).toBeDisabled();
+      expect((await viewer.request.post("/settings/fleet.json", { headers: { "x-pharos-action": "1" }, data: setting })).status()).toBe(403);
+    } finally { await viewer.close(); }
+    expect((await page.request.post("/settings/fleet.json", { data: setting })).status()).toBe(403);
+    for (const invalid of [0, 3651, -1, 1.5, "30"]) {
+      expect((await page.request.post("/settings/fleet.json", {
+        headers: { "x-pharos-action": "1" }, data: { nixpkgs_warn_after_days: invalid },
+      })).ok()).toBe(false);
+    }
+  } finally {
+    await settingsPage.close();
+    expect((await page.request.post("/settings/fleet.json", { headers: { "x-pharos-action": "1" }, data: setting })).status()).toBe(200);
+    for (const host of hosts) {
+      const removal = await page.request.post(`/host-actions/${host}/remove`, {
+        headers: { "x-pharos-action": "1" }, data: { confirmation: host, disposition: "unmanaged", successor: null },
+      });
+      expect(removal.status()).toBe(202);
+      expect((await page.request.post(`/host-actions/${host}/allow-reonboarding`, {
+        headers: { "x-pharos-action": "1" }, data: { confirmation: host },
+      })).ok()).toBe(true);
+    }
+  }
+});
+
 async function reportRuntimeHost(page, name, extra = {}) {
   const isNix = extra.is_nix ?? false;
   const freshness =

@@ -17,6 +17,7 @@ mod auth;
 #[path = "../build_support.rs"]
 mod build_support;
 mod durable_file;
+mod fleet_settings;
 mod flow_host;
 mod host_actions;
 mod http_probes;
@@ -148,6 +149,7 @@ const SETTINGS_APPLY_UNAVAILABLE_REASON: &str =
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
+    fleet_settings: Arc<fleet_settings::FleetSettingsStore>,
     provisioning_jobs: Arc<ProvisioningJobStore>,
     manifests: Arc<ManifestRegistry>,
     managed_setup_intents: Option<Arc<ManagedSetupIntentStore>>,
@@ -3614,6 +3616,7 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
         &action_jobs,
         Some(&janus_action_hosts),
         now,
+        state.fleet_settings.get().nixpkgs_warn_after_days,
     );
     if let Some(hosts) = payload
         .get_mut("hosts")
@@ -3661,6 +3664,7 @@ fn hosts_payload(
     action_jobs: &[HostActionJob],
     janus_action_hosts: Option<&BTreeSet<String>>,
     now: i64,
+    fleet_threshold: u32,
 ) -> serde_json::Value {
     let manifests = manifest_by_host(manifests);
     let hosts: Vec<_> = runtime_hosts
@@ -3725,8 +3729,7 @@ fn hosts_payload(
                 &h.freshness,
                 h.kernel.as_ref(),
                 &h.service_observations,
-                &h.preferences,
-            );
+                &h.preferences, now, fleet_threshold);
             let location = resolve_host_location(
                 Some(&h),
                 manifest,
@@ -3751,6 +3754,7 @@ fn hosts_payload(
                 "location": location_payload(&location),
                 "freshness": h.freshness,
                 "freshness_tldr": freshness_tldr,
+                "nixpkgs_warn_after_days": h.preferences.nixpkgs_warn_after_days(Some(fleet_threshold)),
                 "kernel": h.kernel,
                 "service_observations": h.service_observations,
                 "service_observations_summary": service_observations_summary(&h.service_observations),
@@ -5032,6 +5036,33 @@ async fn test_hetzner_provider_connection(
     )
 }
 
+async fn update_fleet_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<fleet_settings::FleetSettings>,
+) -> impl IntoResponse {
+    let access = access_for_headers(&state.auth, &headers);
+    let (status, body) = if !action_request_header(&headers) || !access.can_manage_fleet() {
+        (
+            StatusCode::FORBIDDEN,
+            json!({"error": "Fleet settings access is not granted"}),
+        )
+    } else if !settings.valid() {
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"error": "nixpkgs warning threshold must be between 1 and 3650 days"}),
+        )
+    } else if let Err(error) = state.fleet_settings.update(settings) {
+        (StatusCode::SERVICE_UNAVAILABLE, json!({"error": error}))
+    } else {
+        (
+            StatusCode::OK,
+            json!({"settings": state.fleet_settings.get()}),
+        )
+    };
+    (status, no_store_headers(), Json(body))
+}
+
 async fn update_hetzner_provider_preferences(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5226,6 +5257,12 @@ async fn main() {
     )
     .unwrap_or_else(|error| panic!("{error}"));
     let state = AppState {
+        fleet_settings: Arc::new(
+            fleet_settings::FleetSettingsStore::new(fleet_settings::FleetSettingsStore::path_for(
+                host_store_path.as_deref(),
+            ))
+            .expect("fleet settings store startup"),
+        ),
         store,
         provisioning_jobs,
         manifests,
@@ -5737,6 +5774,7 @@ mod tests {
 
     fn runtime<'a>(hosts: &'a [Host], jobs: &'a [ProvisioningJob]) -> RuntimeSnapshot<'a> {
         RuntimeSnapshot {
+            nixpkgs_warn_after_days: 30,
             hosts,
             jobs,
             action_jobs: &[],
@@ -7078,6 +7116,7 @@ mod tests {
             &action_jobs,
             None,
             1_700_000_130,
+            30,
         );
         let emitted = payload["hosts"][0].as_object().expect("host object");
         assert_eq!(emitted["update_restart_active"], true);
@@ -7242,7 +7281,7 @@ mod tests {
             deployed_artifact: None,
         };
 
-        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], None, 1000);
+        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], None, 1000, 30);
 
         assert_eq!(payload["as_of"], 1000);
         assert_eq!(
@@ -7303,6 +7342,7 @@ mod tests {
             &action_jobs,
             None,
             1000,
+            30,
         );
         let hosts = payload["hosts"].as_array().expect("hosts array");
         assert_eq!(hosts.len(), 4);
@@ -7360,7 +7400,15 @@ mod tests {
             .clone();
         let action_jobs = vec![cancelled_settings, proposal];
         let host = host_with_backups("diverge-host", 970, vec![]);
-        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &action_jobs, None, 1000);
+        let payload = hosts_payload(
+            vec![host],
+            &[],
+            &BTreeMap::new(),
+            &action_jobs,
+            None,
+            1000,
+            30,
+        );
         let emitted = payload["hosts"][0].as_object().expect("host object");
         let lifecycle = emitted["lifecycle"].as_object().expect("lifecycle object");
         let host_action = emitted["host_action"]
@@ -7389,6 +7437,7 @@ mod tests {
         let action_jobs = store.list();
         let html = render_home(
             RuntimeSnapshot {
+                nixpkgs_warn_after_days: 30,
                 hosts: std::slice::from_ref(&host),
                 jobs: &[],
                 action_jobs: &action_jobs,
@@ -7411,7 +7460,15 @@ mod tests {
         let mut staged = host_with_backups("csb0", 970, vec![]);
         staged.kernel = Some(reboot_required_kernel(965));
 
-        let payload = hosts_payload(vec![staged.clone()], &[], &BTreeMap::new(), &[], None, 1000);
+        let payload = hosts_payload(
+            vec![staged.clone()],
+            &[],
+            &BTreeMap::new(),
+            &[],
+            None,
+            1000,
+            30,
+        );
         assert_eq!(payload["hosts"][0]["kernel"]["state"], "reboot_required");
         assert_eq!(payload["hosts"][0]["kernel"]["running_version"], "6.18.26");
         assert_eq!(payload["hosts"][0]["kernel"]["expected_version"], "7.0.14");
@@ -7458,7 +7515,7 @@ mod tests {
         let hosts = [host];
         let probes = BTreeMap::new();
 
-        let alerts = alert_items(&hosts, &[], "csb1", 1000, &[], &[], &probes);
+        let alerts = alert_items(&hosts, &[], 30, 1000, &[], &[], &probes);
         let kernel_alerts = alerts
             .iter()
             .filter(|alert| alert.source == "kernel")
@@ -7977,6 +8034,7 @@ mod tests {
                 suppress_down: true,
                 suppress_backup: true,
                 suppress_nix_freshness: true,
+                nixpkgs_warn_after_days: None,
             },
             ..Default::default()
         };
@@ -8015,15 +8073,7 @@ mod tests {
             deployed_artifact: None,
         };
 
-        let alerts = alert_items(
-            &[host.clone()],
-            &[],
-            "csb1",
-            1000,
-            &[],
-            &[],
-            &BTreeMap::new(),
-        );
+        let alerts = alert_items(&[host.clone()], &[], 30, 1000, &[], &[], &BTreeMap::new());
         assert!(alerts.iter().any(|alert| alert.issue == "nginx: warning"));
         assert!(!alerts.iter().any(|alert| alert.source == "heartbeat"));
         assert!(!alerts.iter().any(|alert| alert.source == "freshness"));
@@ -8057,8 +8107,15 @@ mod tests {
         );
         assert!(fleet.contains("down, backup, Nix freshness muted"));
         assert!(fleet.contains(r#"class="mute-note""#));
-        let applied_payload =
-            hosts_payload(vec![host.clone()], &[], &BTreeMap::new(), &[], None, 1000);
+        let applied_payload = hosts_payload(
+            vec![host.clone()],
+            &[],
+            &BTreeMap::new(),
+            &[],
+            None,
+            1000,
+            30,
+        );
         assert_eq!(
             applied_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
             true
@@ -8069,15 +8126,8 @@ mod tests {
 
         host.preferences = HostPreferences::default();
         host.requested_preferences = Some(suppressed);
-        let pending_alerts = alert_items(
-            &[host.clone()],
-            &[],
-            "csb1",
-            1000,
-            &[],
-            &[],
-            &BTreeMap::new(),
-        );
+        let pending_alerts =
+            alert_items(&[host.clone()], &[], 30, 1000, &[], &[], &BTreeMap::new());
         assert!(pending_alerts
             .iter()
             .any(|alert| alert.source == "heartbeat"));
@@ -8096,7 +8146,7 @@ mod tests {
         );
         assert!(pending_fleet.contains(r#"class="mute-note" data-mute-note title="" hidden"#));
         assert!(!pending_fleet.contains("down, backup, Nix freshness muted"));
-        let pending_payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], None, 1000);
+        let pending_payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], None, 1000, 30);
         assert_eq!(
             pending_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
             false
@@ -8119,7 +8169,7 @@ mod tests {
         let alerts = alert_items(
             std::slice::from_ref(&workstation),
             &[],
-            "csb1",
+            30,
             1000,
             &[],
             &[],
@@ -8149,6 +8199,7 @@ mod tests {
             &[],
             None,
             1000,
+            30,
         );
         assert_eq!(payload["hosts"][0]["liveness"], "down");
         assert_eq!(
@@ -8175,6 +8226,7 @@ mod tests {
             1000,
             &[],
             &BTreeMap::new(),
+            30,
         );
         assert_eq!(map[0].live, "down");
         assert_eq!(map[0].attention, "offline as expected");
@@ -8193,7 +8245,7 @@ mod tests {
         let service_alerts = alert_items(
             std::slice::from_ref(&workstation),
             &[],
-            "csb1",
+            30,
             1000,
             &[],
             &[],
@@ -8210,7 +8262,7 @@ mod tests {
         let server_alerts = alert_items(
             std::slice::from_ref(&server),
             &[],
-            "csb1",
+            30,
             1000,
             &[],
             &[],
@@ -8241,7 +8293,7 @@ mod tests {
         let offline_alerts = alert_items(
             std::slice::from_ref(&appliance),
             &[],
-            "csb1",
+            30,
             1000,
             &[],
             &[],
@@ -8254,6 +8306,8 @@ mod tests {
             None,
             &appliance.service_observations,
             &appliance.preferences,
+            now_unix(),
+            30,
         );
         assert_eq!(offline_attention.label, "offline as expected");
         assert_eq!(offline_attention.level, "ok");
@@ -8278,7 +8332,7 @@ mod tests {
         let grace_alerts = alert_items(
             std::slice::from_ref(&appliance),
             &[],
-            "csb1",
+            30,
             1001,
             &[],
             &[],
@@ -8291,6 +8345,8 @@ mod tests {
             None,
             &appliance.service_observations,
             &appliance.preferences,
+            now_unix(),
+            30,
         );
         assert_eq!(grace_attention.label, "starting normally");
         assert_eq!(grace_attention.level, "ok");
@@ -8315,7 +8371,7 @@ mod tests {
         let unconverged_alerts = alert_items(
             std::slice::from_ref(&appliance),
             &[],
-            "csb1",
+            30,
             1002,
             &[],
             &[],
@@ -8566,7 +8622,7 @@ mod tests {
 
         let manifests = vec![manifest];
         let html = render_map(&hosts, "csb1", 1000, "markus", true, &PublicBasePath::ROOT);
-        let payload = map_data_payload(&hosts, "csb1", 1000, &manifests, &probes);
+        let payload = map_data_payload(&hosts, "csb1", 1000, &manifests, &probes, 30);
         let data_json = serde_json::to_string(&payload).expect("map payload serializes");
 
         let leaflet_css = html
@@ -9315,7 +9371,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn fleet_card_aligns_lifecycle_and_freshness_without_duplicate_attention() {
-        let mut drift = host_with_backups("drift", 970, vec![]);
+        let now = 1_800_000_000;
+        let mut drift = host_with_backups("drift", now - 30, vec![]);
         drift.freshness = proven_freshness(
             "nixos-unstable",
             GitRevisionRelation::Current,
@@ -9325,7 +9382,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let drift_html = render_home(
             runtime(&[drift], &[]),
             "csb1",
-            1000,
+            now,
             &[],
             shell("markus", true),
             true,
@@ -9406,6 +9463,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         let html = render_home(
             RuntimeSnapshot {
+                nixpkgs_warn_after_days: 30,
                 hosts: &hosts,
                 jobs: &[],
                 action_jobs: &action_jobs,
@@ -9446,6 +9504,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         let read_only_html = render_home(
             RuntimeSnapshot {
+                nixpkgs_warn_after_days: 30,
                 hosts: &hosts,
                 jobs: &[],
                 action_jobs: &action_jobs,
@@ -9495,6 +9554,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let hosts = [host.clone()];
         let html = render_home(
             RuntimeSnapshot {
+                nixpkgs_warn_after_days: 30,
                 hosts: &hosts,
                 jobs: &[],
                 action_jobs: &[],
@@ -9512,7 +9572,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"style="--pending-color:#9868d0""#));
         assert!(!html.contains(r#"--host-color:#9868d0""#));
 
-        let payload = hosts_payload(vec![host], &[], &declarations, &[], None, 1000);
+        let payload = hosts_payload(vec![host], &[], &declarations, &[], None, 1000, 30);
         assert_eq!(payload["hosts"][0]["declared_preferences"], json!(declared));
         assert_eq!(
             payload["hosts"][0]["preferences_state"],
@@ -14072,6 +14132,68 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         std::fs::remove_dir_all(path).expect("test destination removed");
     }
 
+    #[tokio::test]
+    async fn fleet_settings_endpoint_validates_and_exposes_only_durable_updates() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-fleet-settings-api-{}-{}",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("settings.json");
+        let mut state = report_test_state(true);
+        state.fleet_settings =
+            Arc::new(fleet_settings::FleetSettingsStore::new(Some(path.clone())).unwrap());
+        let settings = fleet_settings::FleetSettings {
+            nixpkgs_warn_after_days: 45,
+        };
+        let no_header =
+            update_fleet_settings(State(state.clone()), HeaderMap::new(), Json(settings))
+                .await
+                .into_response();
+        assert_eq!(no_header.status(), StatusCode::FORBIDDEN);
+        let invalid = update_fleet_settings(
+            State(state.clone()),
+            action_headers(),
+            Json(fleet_settings::FleetSettings {
+                nixpkgs_warn_after_days: 0,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.fleet_settings.get().nixpkgs_warn_after_days, 30);
+        let saved = update_fleet_settings(State(state.clone()), action_headers(), Json(settings))
+            .await
+            .into_response();
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert!(saved.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .split(',')
+            .any(|directive| directive.trim() == "no-store"));
+        assert_eq!(
+            fleet_settings::FleetSettingsStore::new(Some(path.clone()))
+                .unwrap()
+                .get(),
+            settings
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let failed = update_fleet_settings(
+            State(state.clone()),
+            action_headers(),
+            Json(fleet_settings::FleetSettings {
+                nixpkgs_warn_after_days: 60,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.fleet_settings.get(), settings);
+        std::fs::remove_dir(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
     #[test]
     fn human_provider_resource_names_remain_valid_through_paid_review() {
         assert!(valid_provider_resource_name("ops@workstation"));
@@ -14332,9 +14454,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 public_base_path: &PublicBasePath::ROOT,
             },
             true,
+            fleet_settings::FleetSettings::default(),
         );
         assert!(managed.contains("Settings"));
-        assert!(managed.contains("Appearance and provider connections."));
+        assert!(managed.contains("Fleet freshness, appearance and provider connections."));
         assert!(managed.contains("Still sidebar image"));
         assert!(managed.contains("Gentle motion is on."));
         assert!(managed.contains(r#"data-sidebar-still-toggle"#));
@@ -14356,6 +14479,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 public_base_path: &PublicBasePath::ROOT,
             },
             false,
+            fleet_settings::FleetSettings::default(),
         );
         assert_eq!(read_only.matches("Ask an administrator").count(), 5);
         assert!(!read_only.contains(r#"class="provider-action""#));
@@ -14781,6 +14905,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     fn report_test_state_with_auth(beacon_auth: BeaconAuth) -> AppState {
         AppState {
+            fleet_settings: Arc::new(fleet_settings::FleetSettingsStore::new(None).unwrap()),
             store: Arc::new(Store::new(None).expect("in-memory host store starts")),
             provisioning_jobs: Arc::new(ProvisioningJobStore::new(None)),
             manifests: Arc::new(ManifestRegistry::default()),
@@ -15524,6 +15649,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             &state.host_actions.list(),
             None,
             1_002,
+            30,
         );
         assert_eq!(
             fleet_payload["hosts"][0]["workflow_receipts"][0]["workflow_id"],
@@ -15964,6 +16090,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             &store.list(),
             Some(&no_janus_agents),
             1_000,
+            30,
         );
         let workflow = &payload["hosts"][0]["host_action"]["workflow"];
         assert_eq!(workflow["status_label"], "guarded apply unavailable");
@@ -17536,6 +17663,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             &state.host_actions.list(),
             None,
             916,
+            30,
         );
         assert_eq!(
             fleet_payload["hosts"][0]["lifecycle"]["label"],
@@ -17922,6 +18050,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             &state.host_actions.list(),
             None,
             923,
+            30,
         );
         assert_eq!(
             payload["hosts"][0]["lifecycle"]["label"],
@@ -18700,6 +18829,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 suppress_down: false,
                 suppress_backup: true,
                 suppress_nix_freshness: false,
+                nixpkgs_warn_after_days: None,
             },
         };
         state
