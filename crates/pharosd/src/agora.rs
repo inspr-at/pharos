@@ -558,7 +558,7 @@ fn render_host_workspace(
         services,
         protection: &protection,
         now,
-        nixpkgs_threshold: extras.fleet_nixpkgs_warn_days,
+        nixpkgs_threshold: applied.nixpkgs_warn_after_days(Some(extras.fleet_nixpkgs_warn_days)),
     });
     let grace = applied.heartbeat_grace_policy(Some(extras.fleet_grace_seconds), interval);
     let host_path = crate::url_query_escape(&host.name);
@@ -1735,16 +1735,42 @@ if(root){{
     const enabled=[down,backup,nix].filter(input=>input?.checked).length;
     if(alertSummary)alertSummary.textContent=enabled+' on';
   }}
-  function syncDownAlertPolicy(){{
-    if(!down)return;
-    const workstation=(kind?.value||root.dataset.kind)==='workstation';
-    down.disabled=root.dataset.hostReported!=='true'||workstation;
-    down.checked=workstation?false:!manualDownSuppressed;
-    if(downCopy)downCopy.textContent=workstation?'Off automatically for workstations.':'Warn when this host stops reporting.';
-    updateAlertSummary();
-  }}
+  function settingsControlsEnabled(){{return settingsCanManageFleet()&&root.dataset.hostReported==='true'}}
   function graceForm(){{return root.querySelector('[data-heartbeat-grace]')}}
-  function graceControlsEnabled(){{return settingsCanManageFleet()&&root.dataset.hostReported==='true'}}
+  function graceControlsEnabled(){{return settingsControlsEnabled()}}
+  function enforceSettingsControlAccess(){{
+    if(settingsControlsEnabled())return;
+    if(color)color.disabled=true;
+    root.querySelectorAll('[data-preset]').forEach(button=>{{button.disabled=true}});
+    if(kind)kind.disabled=true;
+    if(down)down.disabled=true;
+    if(backup)backup.disabled=true;
+    if(nix)nix.disabled=true;
+    if(nixAge)nixAge.disabled=true;
+    const grace=graceForm();
+    if(grace){{
+      const source=grace.querySelector('[data-grace-source]');
+      const seconds=grace.querySelector('[data-grace-seconds]');
+      const reset=grace.querySelector('[data-grace-reset]');
+      if(source)source.disabled=true;
+      if(seconds)seconds.disabled=true;
+      if(reset)reset.disabled=true;
+    }}
+    const review=root.querySelector('[data-review-settings]');
+    const discard=root.querySelector('[data-discard-settings]');
+    if(review)review.disabled=true;
+    if(discard)discard.disabled=true;
+  }}
+  function syncDownAlertPolicy(){{
+    if(down){{
+      const workstation=(kind?.value||root.dataset.kind)==='workstation';
+      down.disabled=!settingsControlsEnabled()||workstation;
+      down.checked=workstation?false:!manualDownSuppressed;
+      if(downCopy)downCopy.textContent=workstation?'Off automatically for workstations.':'Warn when this host stops reporting.';
+      updateAlertSummary();
+    }}
+    enforceSettingsControlAccess();
+  }}
   function refreshGraceRule(){{
     const form=graceForm();
     if(!form)return;
@@ -1815,17 +1841,19 @@ if(root){{
     return changes;
   }}
   function updateDraftState(){{
-    if(!savedPreferences)return;
+    if(!savedPreferences){{enforceSettingsControlAccess();return}}
     const changes=preferenceChanges(savedPreferences,draftPreferences());
     const dirty=changes.length>0;
     const summary=root.querySelector('[data-draft-summary]');
     const review=root.querySelector('[data-review-settings]');
     const discard=root.querySelector('[data-discard-settings]');
-    if(summary)summary.textContent=dirty?(changes.length+' unsent '+(changes.length===1?'change':'changes')):'Change a setting to prepare a review.';
-    if(review)review.disabled=!dirty||settingsWorkflow.confirming||!nixAge?.checkValidity()||!graceDraftValid();
-    if(discard)discard.disabled=!dirty||settingsWorkflow.confirming;
-    if(dirty)setStatus('draft','Draft only — no request sent.');
+    const editable=settingsControlsEnabled();
+    if(summary)summary.textContent=dirty&&editable?(changes.length+' unsent '+(changes.length===1?'change':'changes')):'Change a setting to prepare a review.';
+    if(review)review.disabled=!editable||!dirty||settingsWorkflow.confirming||!nixAge?.checkValidity()||!graceDraftValid();
+    if(discard)discard.disabled=!editable||!dirty||settingsWorkflow.confirming;
+    if(dirty&&editable)setStatus('draft','Draft only — no request sent.');
     else setStatus(persistedStatusState,persistedStatusText);
+    enforceSettingsControlAccess();
   }}
   function applyPreferences(preferences){{
     setPicked(preferences.accent||'{accent}');
@@ -1871,6 +1899,7 @@ if(root){{
     return section;
   }}
   function openDraftConfirmation(){{
+    if(!settingsControlsEnabled())return;
     if(!nixAge?.reportValidity())return;
     const changes=preferenceChanges(savedPreferences,draftPreferences());
     if(!changes.length)return;
@@ -1911,8 +1940,8 @@ if(root){{
     if(confirmationInput)confirmationInput.value='';
     if(attended)attended.hidden=true;
     if(attendedInput)attendedInput.checked=false;
-    if(primary){{primary.hidden=false;primary.disabled=false;primary.dataset.workflowAction='confirm-settings';primary.textContent='Send settings request'}}
-    if(discard){{discard.hidden=false;discard.disabled=false;discard.textContent='Discard draft'}}
+    if(primary){{primary.hidden=false;primary.disabled=!settingsControlsEnabled();primary.dataset.workflowAction='confirm-settings';primary.textContent='Send settings request'}}
+    if(discard){{discard.hidden=false;discard.disabled=!settingsControlsEnabled();discard.textContent='Discard draft'}}
     if(close)close.textContent='Keep editing';
     if(sheetStatus)sheetStatus.textContent='Send creates one saved request; applying still requires the recorded workflow and host evidence.';
     if(safe){{safe.dataset.workflowLive='false';safe.textContent='Draft only — confirmation required'}}
@@ -1936,7 +1965,7 @@ if(root){{
     }}catch(_){{output.textContent='Details unavailable'}}
   }}
   async function confirmSettingsDraft(button){{
-    if(settingsWorkflow.mode!=='confirm'||settingsWorkflow.confirming)return;
+    if(!settingsControlsEnabled()||settingsWorkflow.mode!=='confirm'||settingsWorkflow.confirming)return;
     settingsWorkflow.confirming=true;
     button.disabled=true;
     root.querySelector('[data-discard-settings]')?.setAttribute('disabled','');
@@ -1971,21 +2000,40 @@ if(root){{
       settingsWorkflow.confirming=false;
       setStatus('error',error.message||'Request failed');
       if(sheetStatus)sheetStatus.textContent=error.message||'Request failed';
-      button.disabled=false;
-      if(discard)discard.disabled=false;
+      enforceSettingsControlAccess();
+      if(settingsControlsEnabled()){{
+        button.disabled=false;
+        if(discard)discard.disabled=false;
+      }}
       updateDraftState();
     }}
   }}
-  color?.addEventListener('input',event=>{{setPicked(event.target.value);updateDraftState()}});
-  root.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>{{setPicked(button.dataset.preset);updateDraftState()}}));
+  color?.addEventListener('input',event=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    setPicked(event.target.value);updateDraftState()
+  }});
+  root.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    setPicked(button.dataset.preset);updateDraftState()
+  }}));
   root.querySelector('[data-review-settings]')?.addEventListener('click',openDraftConfirmation);
-  root.querySelector('[data-discard-settings]')?.addEventListener('click',discardDraft);
-  down?.addEventListener('change',()=>{{manualDownSuppressed=!down.checked;updateAlertSummary();updateDraftState()}});
-  nixAge?.addEventListener('input',updateDraftState);
+  root.querySelector('[data-discard-settings]')?.addEventListener('click',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    discardDraft()
+  }});
+  down?.addEventListener('change',()=>{{
+    if(!settingsControlsEnabled()||down.disabled){{enforceSettingsControlAccess();return}}
+    manualDownSuppressed=!down.checked;updateAlertSummary();updateDraftState()
+  }});
+  nixAge?.addEventListener('input',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    updateDraftState()
+  }});
   const grace=graceForm();
   const graceSource=grace?.querySelector('[data-grace-source]');
   const graceSeconds=grace?.querySelector('[data-grace-seconds]');
   graceSource?.addEventListener('change',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
     if(!grace||!graceSeconds)return;
     const hostOverride=graceSource.value==='host';
     graceSeconds.disabled=!hostOverride||!graceControlsEnabled();
@@ -1993,17 +2041,23 @@ if(root){{
     refreshGraceRule();
     updateDraftState();
   }});
-  graceSeconds?.addEventListener('input',()=>{{refreshGraceRule();updateDraftState()}});
+  graceSeconds?.addEventListener('input',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    refreshGraceRule();updateDraftState()
+  }});
   grace?.querySelector('[data-grace-reset]')?.addEventListener('click',()=>{{
-    if(!graceControlsEnabled())return;
+    if(!graceControlsEnabled()){{enforceSettingsControlAccess();return}}
     if(graceSource)graceSource.value='fleet';
     if(graceSeconds){{graceSeconds.value=grace.dataset.fleetGraceSeconds||'';graceSeconds.disabled=true}}
     refreshGraceRule();
     updateDraftState();
   }});
   refreshGraceRule();
-  [backup,nix].forEach(input=>input?.addEventListener('change',()=>{{updateAlertSummary();updateDraftState()}}));
-  kind?.addEventListener('change',()=>{{syncDownAlertPolicy();updateDraftState()}});
+  [backup,nix].forEach(input=>input?.addEventListener('change',()=>{{
+    if(!settingsControlsEnabled()){{enforceSettingsControlAccess();return}}
+    updateAlertSummary();updateDraftState()
+  }}));
+  kind?.addEventListener('change',()=>{{syncDownAlertPolicy();if(settingsControlsEnabled())updateDraftState()}});
   document.querySelector('[data-host-action-overlay]')?.addEventListener('click',event=>{{
     const primary=event.target.closest('[data-host-action-primary]');
     if(primary&&settingsWorkflow.mode==='confirm'){{event.preventDefault();confirmSettingsDraft(primary);return}}
@@ -2921,9 +2975,11 @@ mod tests {
     use super::*;
     use crate::host_actions::{HostLifecycleInvoke, HostWorkflowAction, HostWorkflowActionKind};
     use pharos_core::{
-        Host, HostAlertPreferences, HostKind, ManifestHost, ManifestLocationMode, ManifestPalette,
-        ManifestPolicy, NixFreshness, PrivilegedActionMode, PrivilegedActions, PublicBasePath,
-        RuntimeStateOwner, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+        GitRevisionRelation, Host, HostAlertPreferences, HostKind, ManifestHost,
+        ManifestLocationMode, ManifestPalette, ManifestPolicy, NixDeploymentEvidence, NixFreshness,
+        NixcfgGitComparison, NixpkgsGitComparison, NixpkgsRevisionRelation, PrivilegedActionMode,
+        PrivilegedActions, PublicBasePath, RuntimeStateOwner, HOST_MANIFEST_SCHEMA,
+        HOST_MANIFEST_VERSION, NIX_DEPLOYMENT_EVIDENCE_SCHEMA, NIX_DEPLOYMENT_EVIDENCE_VERSION,
     };
 
     fn manifest() -> HostManifest {
@@ -3013,6 +3069,152 @@ mod tests {
             requested_preferences: None,
             deployed_artifact: None,
         }
+    }
+
+    fn differing_nixpkgs(now: i64) -> NixFreshness {
+        let source = "1".repeat(40);
+        let deployed = "2".repeat(40);
+        let upstream = "4".repeat(40);
+        NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(10),
+            nixpkgs_channel: Some("nixos-unstable".to_string()),
+            secondary_nixpkgs: None,
+            deployment_evidence: Some(NixDeploymentEvidence {
+                schema: NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+                version: NIX_DEPLOYMENT_EVIDENCE_VERSION,
+                source_revision: source.clone(),
+                flake_lock_sha256: "3".repeat(64),
+                nixpkgs_revision: deployed,
+                nixpkgs_last_modified: now - 10 * 86_400,
+                nixpkgs_channel: "nixos-unstable".to_string(),
+            }),
+            nixcfg_comparison: Some(NixcfgGitComparison {
+                upstream_revision: source,
+                relation: GitRevisionRelation::Current,
+                commits_behind: Some(0),
+            }),
+            nixpkgs_comparison: Some(NixpkgsGitComparison {
+                upstream_revision: upstream,
+                relation: NixpkgsRevisionRelation::Different,
+            }),
+        }
+    }
+
+    fn workspace_with_freshness(runtime: &Host, now: i64, fleet_days: u32) -> String {
+        let manifests = [manifest()];
+        let runtime_hosts = [runtime.clone()];
+        let views = host_views(&manifests, &BTreeMap::new(), &runtime_hosts);
+        let host = views
+            .iter()
+            .find(|view| view.name == runtime.name)
+            .expect("host view");
+        let settings_state = crate::HostPreferencesState::Applied;
+        let lifecycle = host_lifecycle(&[], &host.name, settings_state, false);
+        let editor = render_ready_content(host, true, 45, Some(60));
+        render_host_workspace(
+            PublicBasePath::ROOT_REF,
+            host,
+            Some(runtime),
+            &lifecycle,
+            settings_state,
+            &editor,
+            WorkspaceExtras {
+                now,
+                fleet_nixpkgs_warn_days: fleet_days,
+                fleet_grace_seconds: 45,
+                section: WorkspaceSection::Overview,
+                can_manage_fleet: true,
+            },
+        )
+    }
+
+    fn fleet_warns_for_applied_threshold(runtime: &Host, now: i64, fleet_days: u32) -> bool {
+        let protection = crate::fleet_protection_view(&runtime.backup_observations, now);
+        let health = crate::host_health_view(crate::HostHealthQuery {
+            live: pharos_core::liveness(runtime.last_seen, runtime.heartbeat_interval_secs, now),
+            preferences: &runtime.preferences,
+            freshness: &runtime.freshness,
+            kernel: runtime.kernel.as_ref(),
+            services: &runtime.service_observations,
+            protection: &protection,
+            now,
+            nixpkgs_threshold: runtime
+                .preferences
+                .nixpkgs_warn_after_days(Some(fleet_days)),
+        });
+        health
+            .reasons
+            .iter()
+            .any(|reason| reason.label == "nixpkgs differs from nixos-unstable")
+    }
+
+    #[test]
+    fn workspace_health_follows_applied_nixpkgs_threshold() {
+        let now = 1_700_000_000;
+        let fleet_days = 30;
+        let warning = "nixpkgs differs from nixos-unstable";
+        let mut runtime = runtime_host("hsb8");
+        runtime.last_seen = Some(now);
+        runtime.freshness = differing_nixpkgs(now);
+
+        runtime.preferences.alerts.nixpkgs_warn_after_days = Some(7);
+        runtime.requested_preferences = None;
+        assert_eq!(
+            runtime
+                .preferences
+                .nixpkgs_warn_after_days(Some(fleet_days)),
+            7
+        );
+        let override_html = workspace_with_freshness(&runtime, now, fleet_days);
+        assert!(fleet_warns_for_applied_threshold(&runtime, now, fleet_days));
+        assert!(override_html.contains(warning), "{override_html}");
+        assert!(override_html.contains(r#"data-health-tone="amber""#));
+
+        runtime.preferences.alerts.nixpkgs_warn_after_days = None;
+        assert_eq!(
+            runtime
+                .preferences
+                .nixpkgs_warn_after_days(Some(fleet_days)),
+            fleet_days
+        );
+        let inherited_html = workspace_with_freshness(&runtime, now, fleet_days);
+        assert!(!fleet_warns_for_applied_threshold(
+            &runtime, now, fleet_days
+        ));
+        assert!(!inherited_html.contains(warning), "{inherited_html}");
+        assert!(!inherited_html.contains(r#"data-health-tone="amber""#));
+        assert!(inherited_html.contains(r#"data-health-tone="neutral""#));
+
+        runtime.requested_preferences = Some(HostPreferences {
+            alerts: HostAlertPreferences {
+                nixpkgs_warn_after_days: Some(7),
+                ..HostAlertPreferences::default()
+            },
+            ..HostPreferences::default()
+        });
+        let draft_html = workspace_with_freshness(&runtime, now, fleet_days);
+        assert!(!draft_html.contains(warning), "{draft_html}");
+        assert!(draft_html.contains(
+            r#"data-nixpkgs-warn-after-days aria-label="Host nixpkgs warning threshold (days)" type="number" min="1" max="3650" step="1" value="7""#
+        ));
+
+        runtime.preferences.alerts.nixpkgs_warn_after_days = Some(7);
+        runtime.requested_preferences = Some(HostPreferences {
+            alerts: HostAlertPreferences {
+                nixpkgs_warn_after_days: None,
+                ..HostAlertPreferences::default()
+            },
+            ..HostPreferences::default()
+        });
+        let applied_html = workspace_with_freshness(&runtime, now, fleet_days);
+        assert!(fleet_warns_for_applied_threshold(&runtime, now, fleet_days));
+        assert!(applied_html.contains(warning), "{applied_html}");
+        assert!(applied_html.contains(
+            r#"data-nixpkgs-warn-after-days aria-label="Host nixpkgs warning threshold (days)" type="number" min="1" max="3650" step="1" value="" placeholder="Fleet default""#
+        ));
     }
 
     #[test]
@@ -3446,7 +3648,7 @@ mod tests {
         );
         assert!(html.contains("suppress_down:manualDownSuppressed"));
         assert!(html.contains(
-            "kind?.addEventListener('change',()=>{syncDownAlertPolicy();updateDraftState()})"
+            "kind?.addEventListener('change',()=>{syncDownAlertPolicy();if(settingsControlsEnabled())updateDraftState()})"
         ));
 
         let server_html = render_page(
@@ -3575,6 +3777,23 @@ mod tests {
         assert!(html.contains(
             r##"data-color type="color" value="#e09051" aria-label="Choose a custom host color" disabled"##
         ));
+        assert!(html.contains(
+            "function settingsControlsEnabled(){return settingsCanManageFleet()&&root.dataset.hostReported==='true'}"
+        ));
+        assert!(html.contains("down.disabled=!settingsControlsEnabled()||workstation"));
+        assert!(!html.contains("down.disabled=root.dataset.hostReported!=='true'||workstation"));
+        assert!(html.contains("function enforceSettingsControlAccess()"));
+        assert!(html.contains(
+            "if(review)review.disabled=!editable||!dirty||settingsWorkflow.confirming||!nixAge?.checkValidity()||!graceDraftValid()"
+        ));
+        assert!(html.contains("if(!settingsControlsEnabled())return"));
+        assert!(html.contains(
+            "if(!settingsControlsEnabled()||settingsWorkflow.mode!=='confirm'||settingsWorkflow.confirming)return"
+        ));
+        assert!(html.contains(r#"<select data-host-kind aria-label="Host type" disabled>"#));
+        assert!(html.contains(r#"data-alert-down type="checkbox" checked disabled>"#));
+        assert!(html.contains(r#"data-alert-backup type="checkbox" checked disabled>"#));
+        assert!(html.contains(r#"data-review-settings disabled"#));
         assert!(html.contains(r##"data-preset="#1f7fb5""##));
         assert!(html.contains(r##"style="--preset-color:#1f7fb5" disabled"##));
     }
