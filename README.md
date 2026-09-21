@@ -76,18 +76,19 @@ control.
 The health badge aggregates problem reasons. Daily backup and selective
 restore stay independent, so a current daily success remains current when
 restore is overdue, and overdue restore still marks overall health. A
-selective restore is overdue only when its last successful test is strictly
-more than 30 days old. Unknown or missing evidence stays unknown and is not
-shown as healthy. A disabled backup is not an exemption and does not make
-restore unnecessary. The server's daily projection uses the existing 36-hour
-stale default: a recorded success strictly older than 36 hours is stale, and
-a success time more than two seconds in the future is not treated as fresh.
-Repository checks, snapshot existence, and similar observations are not a
-successful selective restore. No producer of that restore ships with Pharos;
-NIX-562 tracks it. PHAROS-304 tracks history that keeps the last success
-distinct from the latest attempt. How several backup jobs on one host combine
-is still an open clarification: nothing here adds a per-repository requirement
-or claims full-system recoverability.
+successful selective restore is a test that restored at least one file. For
+the host, that success is current until it is strictly more than 30 days old. Unknown or
+missing evidence stays unknown and is not shown as healthy. A disabled backup
+is not an exemption and does not make restore unnecessary. The server's daily
+projection uses the existing 36-hour stale default: a recorded success
+strictly older than 36 hours is stale, and a success time more than two
+seconds in the future is not treated as fresh. Repository checks, snapshot
+existence, and similar observations are not a successful selective restore.
+No producer of that restore ships with Pharos; NIX-562 tracks it. A history
+that keeps the last success distinct from the latest attempt is not shipped;
+PHAROS-304 tracks it. Whether several repositories on one host each need a
+test is still open. The rule in force is the host-level restore above, not a
+per-repository requirement, and the posture is not full-system recoverability.
 
 A quiet lifecycle says **No pending changes**. That means no pending work, not
 that packages are fresh. A channel-tip difference alone is not a deployable
@@ -849,20 +850,22 @@ does not mean inherit. **Use fleet default** clears the override in the draft
 in one click and does not itself move the live clock. The clock uses applied
 preferences, the value the beacon last reported. The fleet setting has no
 inherit: saving 15 is how the fleet default returns to 15. Stale and down
-stay at twice and five times the cadence. The current nixcfg workflow does
-not accept a populated `heartbeat_grace_secs` input until that change is
-reviewed (NIX-561). Omitting the input still matches today's workflow.
+stay at twice and five times the cadence. The nixcfg workflow accepts an
+optional `heartbeat_grace_secs` input (NIX-561). Empty or omitted inherits.
+Zero is an override only when it is the value sent. A populated host override
+is still withheld until every beacon that reads the shared registry has been
+upgraded.
 
 Rollout: upgrade pharosd and **every beacon reading the registry before
 publishing any override**. Old binaries reject unknown preference fields,
 including fields belonging to another host in a shared registry. With the
 field omitted, old/new preferences and the existing report versions remain
-compatible; populating it before the readers upgrade is not safe. The current
-nixcfg workflow already accepts optional `nixpkgs_warn_after_days` (a string
-integer 1–3650; empty or omitted removes that override). It does not yet
-accept `heartbeat_grace_secs` (NIX-561). Pharos omits a field when inheriting.
-An older workflow can still accept ordinary settings requests; a populated
-override requires a workflow and readers that accept that field. For rollback to
+compatible; populating it before the readers upgrade is not safe. The nixcfg
+workflow accepts optional `nixpkgs_warn_after_days` (a string integer 1–3650;
+empty or omitted removes that override) and optional `heartbeat_grace_secs`
+(NIX-561; empty or omitted removes that override). Pharos omits a field when
+inheriting. A populated override still waits until every registry reader
+accepts that field. For rollback to
 old binaries, first remove overrides from declarations and reports, drain
 pending preference requests/workflows, and verify value-free persisted state
 contains no new preference field. The fleet settings sidecar itself is ignored
@@ -1127,9 +1130,9 @@ Not provided today:
   of truth;
 - a selective file-restore producer (NIX-562 tracks that work);
 - separate last-success and latest-attempt history for a selective restore
-  (PHAROS-304);
-- a settled rule for several backup jobs on one host, or full-system
-  recoverability from backup posture.
+  (PHAROS-304; not shipped);
+- a per-repository restore requirement, or full-system recoverability from
+  backup posture.
 
 Provider APIs, SSH execution, nixcfg dispatch, alert delivery and target agents
 are external dependencies. Their availability and permissions affect the
@@ -1224,14 +1227,11 @@ origin is `https://auth.inspr.at`. Every other origin is denied, including
 path are fixed; environment overrides are refused. Credentials are typed only
 on the login-provider origin.
 
-The intended guard is Chromium Fetch at request stage, armed on the page
-session before navigation. Each hop, including a 307 or 308 that keeps POST,
-is failed unless that same allow decision continues the request. A
-response-stage event is not enforcement. An authentication challenge is
-cancelled and is not answered with a username or password. New pages and
-service workers are closed; the first page is kept and armed. Playwright
-`context.route` does not see redirected requests again, so it is not this
-guard.
+Each request is decided at request stage before that hop is sent, including a
+redirect that keeps POST. Recording a response is not the guard. A new page
+or worker stays paused until the same guard covers it, or it is closed. An
+authentication challenge is cancelled and is not answered with a username or
+password.
 
 Application methods other than `GET` and `HEAD` are denied, including
 settings apply, host actions, restart, remove, provider purchase and cleanup,
@@ -1291,18 +1291,12 @@ without Playwright. It is not part of `npm run test:browser`. The operator
 supplies the account and the files above when the session runs. This
 repository does not store them.
 
-This Fetch enforcement, the exact login posts, the encoded and short-secret
-redaction, and the full password screenshot check are the PHAROS-303 repair
-contract. That repair has not passed review; an earlier revision was
-rejected. In the repair runner as read, `installGuard` returns the page-arm
-function directly, while its caller expects `{ sessions, armPage }`, so that
-wiring is still unresolved. Login v2 session posts and a browser
-`POST /oauth/v2/token` stay denied and fail closed if the live issuer needs
-them. Cross-origin iframe targets sit outside the page Fetch session. A new
-target can send one request before it is closed. A password that is a
+Login v2 session posts, including `POST /ui/v2/login/password` and
+`POST /v2/sessions`, stay denied. A browser `POST /oauth/v2/token` stays
+denied; Pharos exchanges the authorization code on the server. If the live
+issuer needs one of those posts, the run fails closed. A password that is a
 substring of an ordinary path or of the username label fails closed. Hosts
-absent from the page's host data are not visited. No live browser proof is
-claimed here.
+that the page does not name are not visited.
 
 ## Contributing
 
