@@ -931,6 +931,18 @@ mod module_tests {
         );
         assert!(faults.contains("12 commits behind"), "{faults}");
         assert!(faults.contains("Backup failed"), "{faults}");
+        let backup_row = faults
+            .split(r#"data-fresh-kind="backup-fault""#)
+            .nth(1)
+            .expect("backup row");
+        assert!(
+            backup_row
+                .split('>')
+                .next()
+                .unwrap_or("")
+                .contains("hidden"),
+            "the protection fact already shows backup state: {backup_row}"
+        );
         assert!(!faults.contains("+N"), "{faults}");
     }
 
@@ -1186,6 +1198,106 @@ mod module_tests {
         assert_eq!(iso, "2023-11-14T22:13:20Z");
         assert_eq!(visible, "2023-11-14 22:13:20 UTC");
         assert!(utc_stamp(-1).is_none());
+        assert!(utc_stamp(0).is_none());
+    }
+
+    #[test]
+    fn unknown_backup_evidence_does_not_become_the_epoch() {
+        let now = 1_700_000_000;
+        let unknown = backup_observation(BackupPostureState::Unknown, None, None, None);
+        let missing = protection_markup(
+            &fleet_protection_view(std::slice::from_ref(&unknown), now),
+            "qa-harbor",
+            &PublicBasePath::ROOT,
+        );
+        assert!(
+            missing.contains(r#"data-protection-evidence hidden"#),
+            "{missing}"
+        );
+        assert!(!missing.contains("1970"));
+        assert!(!missing.contains("data-daily-backup-date"));
+        assert!(!missing.contains("data-restore-date"));
+        assert!(missing.contains(r#"data-daily-backup-at="""#));
+
+        let zero = backup_observation(BackupPostureState::Unknown, None, Some(0), None);
+        let coerced = protection_markup(
+            &fleet_protection_view(std::slice::from_ref(&zero), now),
+            "qa-harbor",
+            &PublicBasePath::ROOT,
+        );
+        assert!(!coerced.contains("1970"), "{coerced}");
+        assert!(!coerced.contains("data-daily-backup-date"));
+        assert!(coerced.contains(r#"data-daily-backup-at="""#));
+
+        let known = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now),
+            Some(restore_sample(
+                pharos_core::BackupValidationState::Passed,
+                Some(now - 10 * 86_400),
+            )),
+        );
+        let dated = protection_markup(
+            &fleet_protection_view(std::slice::from_ref(&known), now),
+            "qa-harbor",
+            &PublicBasePath::ROOT,
+        );
+        assert!(
+            dated.contains(r#"datetime="2023-11-14T22:13:20Z""#),
+            "{dated}"
+        );
+        assert!(dated.contains("2023-11-14 22:13:20 UTC"));
+        assert_eq!(dated.matches("data-daily-backup-date").count(), 1);
+        assert!(dated.contains(
+            r#"data-protection-evidence><summary>Exact times</summary>"#
+        ));
+        assert!(dated.contains("Daily OK"));
+        assert!(dated.contains("Passed"));
+        assert!(!dated.contains("1970"));
+    }
+
+    #[test]
+    fn generic_all_clear_is_hidden_on_every_scan_surface() {
+        assert!(scan_attention_hidden("all clear", false, false));
+        assert!(scan_attention_hidden("silent heartbeat", true, false));
+        assert!(scan_attention_hidden("nixpkgs differs", false, true));
+        assert!(!scan_attention_hidden("silent heartbeat", false, false));
+        assert!(!scan_attention_hidden("Backup failed", false, false));
+    }
+
+    #[test]
+    fn partial_delivery_keeps_the_percent_and_names_incomplete_coverage() {
+        let first = heartbeat_signal(&[1_000], None, 60, 1_000, "10m", 600);
+        assert_eq!(first.text, "100%");
+        assert_eq!(first.level, "good");
+        assert_eq!(first.coverage, "partial");
+        assert!(first.title.contains("Partial retention"));
+        assert!(first.title.contains("1 of 1 expected reports"));
+        let first_markup = availability_markup(&first);
+        assert!(first_markup.contains(r#"data-signal-coverage="partial""#));
+        assert!(first_markup.contains(">partial<"));
+        assert!(first_markup.contains(">100%<"));
+
+        let covered = heartbeat_signal(
+            &[400, 460, 520, 580, 640, 700, 760, 820, 880, 940, 1_000],
+            None,
+            60,
+            1_000,
+            "10m",
+            600,
+        );
+        assert_eq!(covered.text, "100%");
+        assert_eq!(covered.coverage, "full");
+        assert!(!covered.title.contains("Partial retention"));
+        let covered_markup = signal_markup(&covered);
+        assert!(covered_markup.contains(r#"data-signal-coverage="full" hidden"#));
+        assert!(!covered_markup.contains(">partial<"));
+
+        let empty = heartbeat_signal(&[0, -1], Some(0), 60, 1_000, "10m", 600);
+        assert_eq!(empty.text, "—");
+        assert_eq!(empty.coverage, "none");
+        assert!(availability_markup(&empty).contains(r#"data-signal-coverage="none" hidden"#));
     }
 
     #[test]
@@ -2399,7 +2511,8 @@ pub(super) fn card_freshness_fault_markup(
             None => ("nixcfg comparison unknown".to_string(), "na", true),
         }
     };
-    let backup_visible = backup.state != "healthy";
+    // Fleet cards already show this in the protection fact and backup chip.
+    let backup_visible = false;
     let backup_class = match backup.level {
         "critical" => "down",
         "warning" => "warn",
@@ -2972,7 +3085,7 @@ fn is_selective_restore(level: pharos_core::BackupValidationLevel) -> bool {
 }
 
 fn ago_note(at: Option<i64>, now: i64, prefix: &str) -> String {
-    match at {
+    match positive_instant(at) {
         Some(at) => format!("{prefix} {}", backup_age_text(at, now)),
         None => format!("{prefix} not recorded"),
     }
@@ -3000,8 +3113,12 @@ fn backup_success_is_stale(success_at: Option<i64>, now: i64) -> bool {
     now.saturating_sub(at) > BACKUP_RUN_STALE_AFTER_SECS
 }
 
+fn positive_instant(at: Option<i64>) -> Option<i64> {
+    at.filter(|stamp| *stamp > 0)
+}
+
 fn run_fact(observation: &BackupObservation, now: i64) -> ProtectionFact {
-    let success_at = observation.last_success_at;
+    let success_at = positive_instant(observation.last_success_at);
     let mut state = observation.state;
     if matches!(
         state,
@@ -3147,6 +3264,7 @@ fn check_state_fact(
         pharos_core::BackupValidationState::Stale => ("stale", "amber", "Check stale"),
         pharos_core::BackupValidationState::Unknown => ("unknown", "neutral", "Check unknown"),
     };
+    let at = positive_instant(at);
     ProtectionFact {
         state: key,
         tone,
@@ -3216,7 +3334,7 @@ fn restore_fact(
         _ => false,
     };
     if newer_failed {
-        let at = last_success.and_then(|validation| validation.checked_at);
+        let at = positive_instant(last_success.and_then(|validation| validation.checked_at));
         return (
             ProtectionFact {
                 state: "failed",
@@ -3242,7 +3360,7 @@ fn restore_fact(
             false,
         );
     };
-    let at = success.checked_at;
+    let at = positive_instant(success.checked_at);
     let age = now.saturating_sub(at.unwrap_or(now));
     if age > SELECTIVE_RESTORE_OVERDUE_AFTER_SECS {
         return (
@@ -3499,7 +3617,7 @@ pub(super) fn host_health_view(query: HostHealthQuery<'_>) -> HostHealthView {
 }
 
 fn utc_stamp(timestamp: i64) -> Option<(String, String)> {
-    if timestamp < 0 {
+    if timestamp <= 0 {
         return None;
     }
     let days = timestamp.div_euclid(86_400);
@@ -3525,19 +3643,35 @@ fn utc_stamp(timestamp: i64) -> Option<(String, String)> {
 }
 
 fn observed_time_markup(at: Option<i64>, kind: &str) -> String {
-    match at.and_then(utc_stamp) {
-        Some((iso, visible)) => format!(
-            r#"<time datetime="{iso}" data-{kind}-date>{visible}</time>"#,
-            iso = html_escape(&iso),
-            visible = html_escape(&visible),
-            kind = kind,
-        ),
-        None => String::new(),
-    }
+    let Some((iso, visible)) = positive_instant(at).and_then(utc_stamp) else {
+        return String::new();
+    };
+    format!(
+        r#"<time datetime="{iso}" data-{kind}-date>{visible}</time>"#,
+        iso = html_escape(&iso),
+        visible = html_escape(&visible),
+        kind = kind,
+    )
 }
 
-fn fact_markup(fact: &ProtectionFact, kind: &str, href: Option<&str>) -> String {
-    let at = fact.at.map(|at| at.to_string()).unwrap_or_default();
+fn fact_instant_attr(at: Option<i64>) -> String {
+    positive_instant(at)
+        .map(|stamp| stamp.to_string())
+        .unwrap_or_default()
+}
+
+fn fact_markup(
+    fact: &ProtectionFact,
+    kind: &str,
+    href: Option<&str>,
+    include_time: bool,
+) -> String {
+    let at = fact_instant_attr(fact.at);
+    let time = if include_time {
+        observed_time_markup(fact.at, kind)
+    } else {
+        String::new()
+    };
     let body = format!(
         r#"<span class="fact-label">{label_kind}</span><strong class="fact-value {tone}" data-{kind}-label>{label}</strong><span class="fact-note" data-{kind}-note>{note}</span>{time}"#,
         label_kind = html_escape(match kind {
@@ -3549,7 +3683,7 @@ fn fact_markup(fact: &ProtectionFact, kind: &str, href: Option<&str>) -> String 
         kind = kind,
         label = html_escape(&fact.label),
         note = html_escape(&fact.note),
-        time = observed_time_markup(fact.at, kind),
+        time = time,
     );
     let attrs = format!(
         r#"data-{kind} data-{kind}-state="{state}" data-{kind}-tone="{tone}" data-{kind}-at="{at}""#,
@@ -3571,7 +3705,7 @@ pub(super) fn protection_markup(
 ) -> String {
     let href = app_href(base, &format!("/backups?host={}", url_query_escape(host)));
     let check_fact = match &view.check {
-        Some(check) => fact_markup(check, "backup-check", Some(&href)),
+        Some(check) => fact_markup(check, "backup-check", Some(&href), true),
         None => {
             r#"<div class="protection-fact protection-check" data-backup-check data-backup-check-state="" data-backup-check-tone="" data-backup-check-at="" hidden><span class="fact-label">Repository check</span><strong class="fact-value neutral" data-backup-check-label></strong><span class="fact-note" data-backup-check-note></span></div>"#.to_string()
         }
@@ -3587,11 +3721,18 @@ pub(super) fn protection_markup(
     } else {
         "present"
     };
-    let restore_at = view.restore.at.map(|at| at.to_string()).unwrap_or_default();
+    let restore_at = fact_instant_attr(view.restore.at);
+    let backup_time = observed_time_markup(view.run.at, "daily-backup");
+    let restore_time = observed_time_markup(view.restore.at, "restore");
+    let evidence_hidden = if backup_time.is_empty() && restore_time.is_empty() {
+        " hidden"
+    } else {
+        ""
+    };
     format!(
-        r#"<div class="protection-pair" data-protection data-selective-restore-overdue-after-secs="{overdue_after}">{run}<div class="protection-fact" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="fact-label">Selective restore</span><strong class="fact-value {restore_tone}" data-restore-label>{restore_label}</strong><span class="fact-note" data-restore-note>{restore_note}</span>{restore_time}</div>{check}</div>"#,
+        r#"<div class="protection-pair" data-protection data-selective-restore-overdue-after-secs="{overdue_after}">{run}<div class="protection-fact" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="fact-label">Selective restore</span><strong class="fact-value {restore_tone}" data-restore-label>{restore_label}</strong><span class="fact-note" data-restore-note>{restore_note}</span></div><details class="protection-evidence" data-protection-evidence{evidence_hidden}><summary>Exact times</summary>{backup_time}{restore_time}</details>{check}</div>"#,
         overdue_after = SELECTIVE_RESTORE_OVERDUE_AFTER_SECS,
-        run = fact_markup(&view.run, "daily-backup", Some(&href)),
+        run = fact_markup(&view.run, "daily-backup", Some(&href), false),
         check = check,
         restore_state = html_escape(view.restore.state),
         restore_tone = html_escape(view.restore.tone),
@@ -3604,7 +3745,9 @@ pub(super) fn protection_markup(
         },
         restore_label = html_escape(&view.restore.label),
         restore_note = html_escape(&view.restore.note),
-        restore_time = observed_time_markup(view.restore.at, "restore"),
+        evidence_hidden = evidence_hidden,
+        backup_time = backup_time,
+        restore_time = restore_time,
     )
 }
 
@@ -3635,12 +3778,12 @@ pub(super) fn health_markup(health: &HostHealthView) -> String {
     };
     let scan = if health.problem_count == 0 {
         format!(
-            r#"<div class="attention-line"><span class="attention-icon" aria-hidden="true">{icon}</span><span data-health-summary>{summary}</span><span data-health-count hidden>0</span></div><ul class="health-reasons" data-health-reasons hidden></ul>"#,
+            r#"<div class="attention-line"><span class="attention-icon" aria-hidden="true">{icon}</span><span data-health-summary>{summary}</span><span class="health-count" data-health-count hidden>0</span></div><ul class="health-reasons" data-health-reasons hidden></ul>"#,
             summary = html_escape(&health.summary),
         )
     } else {
         format!(
-            r#"<details class="health-disclosure" data-health-disclosure><summary class="attention-line"><span class="attention-icon" aria-hidden="true">{icon}</span><span data-health-summary>{summary}</span><span data-health-count>{count}</span></summary><ul class="health-reasons" data-health-reasons>{reasons}</ul></details>"#,
+            r#"<details class="health-disclosure" data-health-disclosure><summary class="attention-line"><span class="attention-icon" aria-hidden="true">{icon}</span><span data-health-summary>{summary}</span><span class="health-count" data-health-count>{count}</span></summary><ul class="health-reasons" data-health-reasons>{reasons}</ul></details>"#,
             summary = html_escape(&health.summary),
             count = html_escape(&count_label),
         )
@@ -4626,6 +4769,10 @@ pub(super) fn attention_reason(
                 rank: 4,
             }),
     }
+}
+
+fn scan_attention_hidden(label: &str, kernel_required: bool, duplicate_freshness: bool) -> bool {
+    kernel_required || duplicate_freshness || label == "all clear"
 }
 
 pub(super) fn reason_markup(reason: &AttentionReason, hidden: bool) -> String {
@@ -6029,6 +6176,8 @@ pub(super) struct HeartbeatSignal {
     pub(super) level: &'static str,
     pub(super) window: &'static str,
     pub(super) title: String,
+    /// `full` covers the requested window, `partial` is still collecting, `none` has no usable reports.
+    pub(super) coverage: &'static str,
 }
 
 fn delivery_samples(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
@@ -6085,6 +6234,7 @@ pub(super) fn heartbeat_signal(
             level: "wait",
             window: window_label,
             title: format!("{base}no reports yet.{UPTIME}"),
+            coverage: "none",
         };
     }
 
@@ -6103,6 +6253,7 @@ pub(super) fn heartbeat_signal(
             level: "wait",
             window: window_label,
             title: format!("{base}reports are ahead of Pharos and were not counted.{UPTIME}"),
+            coverage: "none",
         };
     }
 
@@ -6133,11 +6284,13 @@ pub(super) fn heartbeat_signal(
     } else {
         "down"
     };
-    let partial = if usable[0] > requested_start + 1 {
+    let partial_window = usable[0] > requested_start + 1;
+    let partial = if partial_window {
         format!(" Partial retention from {}.", clock_label(usable[0]))
     } else {
         String::new()
     };
+    let coverage = if partial_window { "partial" } else { "full" };
     let skew = if future_count == 0 {
         String::new()
     } else {
@@ -6156,6 +6309,15 @@ pub(super) fn heartbeat_signal(
             "{base}{received} of {expected} expected reports after duplicate collapse.{partial}{skew} Longest gap {}.{UPTIME}",
             delivery_gap_label(longest_gap),
         ),
+        coverage,
+    }
+}
+
+fn signal_coverage_markup(coverage: &str) -> String {
+    if coverage == "partial" {
+        r#"<span class="signal-coverage" data-signal-coverage="partial">partial</span>"#.to_string()
+    } else {
+        format!(r#"<span class="signal-coverage" data-signal-coverage="{coverage}" hidden></span>"#)
     }
 }
 
@@ -6163,20 +6325,22 @@ pub(super) fn signal_markup(signal: &HeartbeatSignal) -> String {
     let title = html_escape(&signal.title);
     let window_tip = html_escape(&delivery_window_tip(signal.window));
     format!(
-        r#"<span class="signal" data-signal data-signal-level="{level}" data-signal-window-key="{window}" data-signal-kind="delivery" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-orb" aria-hidden="true"></span><button class="signal-window" type="button" data-signal-window title="{window_tip}" aria-label="{window_tip}">{window}</button></span>"#,
+        r#"<span class="signal" data-signal data-signal-level="{level}" data-signal-window-key="{window}" data-signal-kind="delivery" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-orb" aria-hidden="true"></span><button class="signal-window" type="button" data-signal-window title="{window_tip}" aria-label="{window_tip}">{window}</button>{coverage}</span>"#,
         level = html_escape(signal.level),
         text = html_escape(&signal.text),
         window = html_escape(signal.window),
+        coverage = signal_coverage_markup(signal.coverage),
     )
 }
 
 pub(super) fn availability_markup(signal: &HeartbeatSignal) -> String {
     let title = html_escape(&signal.title);
     format!(
-        r#"<span class="signal availability" data-signal data-signal-level="{level}" data-signal-window-key="{window}" data-signal-kind="delivery" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-label">delivery</span></span>"#,
+        r#"<span class="signal availability" data-signal data-signal-level="{level}" data-signal-window-key="{window}" data-signal-kind="delivery" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-label">delivery</span>{coverage}</span>"#,
         level = html_escape(signal.level),
         text = html_escape(&signal.text),
         window = html_escape(signal.window),
+        coverage = signal_coverage_markup(signal.coverage),
     )
 }
 
@@ -9055,7 +9219,7 @@ pub(super) fn heartbeat_card(card: HeartbeatCard<'_>) -> String {
         _ => "No heartbeat yet",
     };
     format!(
-        r#"<div class="beat" data-history-axis="time" data-beat="{beat_state}" data-heartbeat-timing="{timing}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-grace="{grace_secs}" data-grace-source="{grace_source}" data-late-after="{late_after_secs}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window_label}" style="--now-x:100%;--history-start-x:{history_start_x:.1}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="arrival" data-arrival data-arrival-state="{timing}"><span data-arrival-label>{arrival_label}</span><span class="arrival-track" aria-hidden="true"><span data-arrival-fill style="--arrival-x:{arrival_x:.2}%"></span></span></div><div class="beat-stage" aria-label="{history_window_label} heartbeat history by time"><span class="beat-floor"></span><span class="beat-fill" hidden></span><span class="beat-current" hidden></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected" hidden></span><span class="beat-threshold stale" hidden></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones">{history_window_control}<span>start</span><span>now</span></span></div></div>"#,
+        r#"<div class="beat" data-history-axis="time" data-beat="{beat_state}" data-heartbeat-timing="{timing}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-grace="{grace_secs}" data-grace-source="{grace_source}" data-late-after="{late_after_secs}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window_label}" style="--now-x:100%;--history-start-x:{history_start_x:.1}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="arrival" data-arrival data-arrival-state="{timing}"><span data-arrival-label>{arrival_label}</span><span class="arrival-track" aria-hidden="true"><span data-arrival-fill style="--arrival-x:{arrival_x:.2}%"></span></span></div><div class="beat-stage" aria-label="{history_window_label} heartbeat history by time"><span class="beat-floor"></span><span class="beat-fill" hidden></span><span class="beat-current" hidden></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected" hidden></span><span class="beat-threshold stale" hidden></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones">{history_window_control}<span data-history-anchor="now">now</span></span></div></div>"#,
         count = mark_beats.len(),
         arrival_x = now_x,
         arrival_label = arrival_label,
@@ -9198,11 +9362,10 @@ pub(super) fn render_home_with_grace(
                 .nixpkgs_warn_after_days(Some(runtime.nixpkgs_warn_after_days)),
         )
         .is_some_and(|freshness| freshness.label == attention.label);
-        let card_reason = reason_markup(
-            &attention,
-            kernel_required || freshness_is_attention || attention.label == "all clear",
-        );
-        let list_reason = reason_markup(&attention, kernel_required);
+        let attention_hidden =
+            scan_attention_hidden(&attention.label, kernel_required, freshness_is_attention);
+        let card_reason = reason_markup(&attention, attention_hidden);
+        let list_reason = reason_markup(&attention, attention_hidden);
         let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
         let (card_fresh, card_fresh_visible) = card_freshness_fault_markup(

@@ -288,6 +288,7 @@ globalThis.__pure = {
   dedupeHeartbeats,
   aggregateHistory,
   historyInfo,
+  signalInfo,
 };
 `;
   const context = vm.createContext({ console });
@@ -761,7 +762,7 @@ globalThis.__attention = { expectedOfflineHost, attentionFor };
 function appUrl(path){return path}
 const SELECTIVE_RESTORE_OVERDUE_SECS=2592000;
 ${fleetRuntimeSource.slice(factStart, factEnd)}
-globalThis.__facts = { updateBackupStatus };
+globalThis.__facts = { updateBackupStatus, utcObservedStamp, recordedUnix };
 `, factContext);
   const daily = factNode();
   daily.dataset.host = "alpha";
@@ -798,6 +799,42 @@ globalThis.__facts = { updateBackupStatus };
   assert.equal(times[0].textContent, "2023-11-14 22:13:20 UTC");
   assert.equal(note.childNodes.some((child) => String(child.className).includes("fact-exact")), false);
   assert.equal(created.filter((node) => Object.prototype.hasOwnProperty.call(node.attributes, "data-daily-backup-date")).length, 0);
+  assert.equal(factContext.__facts.utcObservedStamp(1_700_000_000).iso, "2023-11-14T22:13:20Z");
+  assert.equal(factContext.__facts.utcObservedStamp(1_700_000_000).visible, "2023-11-14 22:13:20 UTC");
+  for (const missing of [null, undefined, "", 0, "0"]) {
+    assert.equal(factContext.__facts.recordedUnix(missing), null);
+    assert.equal(factContext.__facts.utcObservedStamp(missing), null);
+  }
+
+  protection.daily.at = null;
+  factContext.__facts.updateBackupStatus(surface, protection);
+  const cleared = daily.childNodes.filter((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-daily-backup-date"));
+  assert.equal(cleared.length, 0);
+  assert.equal(daily.dataset.dailyBackupAt, undefined);
+  assert.equal(created.some((node) => String(node.textContent).includes("1970")), false);
+  assert.equal(String(daily.textContent).includes("1970"), false);
+
+  const evidence = factNode();
+  evidence.querySelector = factNode().querySelector;
+  const evidenceSurface = {
+    dataset: { host: "alpha" },
+    querySelector(selector) {
+      if (selector === "[data-daily-backup]") return daily;
+      if (selector === "[data-protection-evidence]") return evidence;
+      return null;
+    },
+  };
+  protection.daily.at = 1_700_000_000;
+  factContext.__facts.updateBackupStatus(evidenceSurface, protection);
+  const disclosed = evidence.childNodes.filter((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-daily-backup-date"));
+  assert.equal(disclosed.length, 1);
+  assert.equal(disclosed[0].textContent, "2023-11-14 22:13:20 UTC");
+  assert.equal(evidence.hidden, false);
+  protection.daily.at = null;
+  factContext.__facts.updateBackupStatus(evidenceSurface, protection);
+  assert.equal(evidence.childNodes.some((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-daily-backup-date")), false);
+  assert.equal(evidence.hidden, true);
+  assert.equal(created.some((node) => String(node.textContent).includes("1970")), false);
 });
 
 function controllableClock() {
@@ -1052,6 +1089,120 @@ test("the visible-page watchdog restarts a stranded page without waiting for foc
   assert.equal(queue.pending.length, 1);
   page.clock.advance(5000);
   assert.equal(queue.pending.length, 1);
+});
+
+test("delivery coverage qualifies a partial window without changing the percent", () => {
+  const api = loadPure();
+  const windowDef = { key: "10m", label: "10m", secs: 600 };
+  const first = api.signalInfo([1000], null, 60, 1000, windowDef);
+  assert.equal(first.text, "100%");
+  assert.equal(first.level, "good");
+  assert.equal(first.coverage, "partial");
+  assert.match(first.title, /Partial retention/);
+  assert.match(first.title, /1 of 1 expected reports/);
+
+  const covered = [];
+  for (let stamp = 400; stamp <= 1000; stamp += 60) covered.push(stamp);
+  const full = api.signalInfo(covered, null, 60, 1000, windowDef);
+  assert.equal(full.text, "100%");
+  assert.equal(full.coverage, "full");
+  assert.doesNotMatch(full.title, /Partial retention/);
+
+  const empty = api.signalInfo([0, -1], 0, 60, 1000, windowDef);
+  assert.equal(empty.text, "—");
+  assert.equal(empty.coverage, "none");
+});
+
+test("fleet return marker stores only the fleet pathname", () => {
+  const start = fleetRuntimeSource.indexOf("/* FLEET_MARKER_START */");
+  const end = fleetRuntimeSource.indexOf("/* FLEET_MARKER_END */");
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  assert.match(fleetRuntimeSource, /initControls\(\);\s*markFleetEntry\(\);/);
+  assert.match(fleetRuntimeSource, /function writeAssistantUrl[\s\S]*?replaceDocumentUrl\(/);
+
+  function loadMarker({ fleet, pathname, search, prior }) {
+    const updates = [];
+    const history = {
+      state: prior,
+      url: "",
+      replaceState(state, _title, url) {
+        this.state = state;
+        this.url = url;
+      },
+    };
+    const navigation = {
+      currentEntry: {
+        getState() {
+          return history.state;
+        },
+      },
+      updateCurrentEntry(update) {
+        updates.push(update);
+        history.state = update.state;
+      },
+    };
+    const main = fleet ? { dataset: { view: "list", fleetSyncState: "current" } } : null;
+    const document = {
+      querySelector(selector) {
+        if (selector === "main[data-fleet-sync-state]") return main;
+        if (selector === "main") return main;
+        if (selector === "[data-sort]") return { value: "name" };
+        if (selector === "[data-search]") return { value: "qa-return-diagnostic" };
+        return null;
+      },
+    };
+    const location = { pathname, search };
+    const context = vm.createContext({
+      console,
+      document,
+      location,
+      history,
+      navigation,
+      URLSearchParams,
+    });
+    vm.runInContext(`
+let activeLiveFilter='all';
+let signalWindow={key:'10m'};
+${fleetRuntimeSource.slice(start, end)}
+globalThis.__marker = { updateUrlState, markFleetEntry, withFleetMarker, replaceDocumentUrl };
+`, context);
+    return { context, history, updates };
+  }
+
+  const fleet = loadMarker({
+    fleet: true,
+    pathname: "/",
+    search: "?view=list&q=qa-return-diagnostic&sort=name",
+    prior: { scroll: 1 },
+  });
+  assert.equal(fleet.context.__marker.markFleetEntry(), true);
+  assert.deepEqual(vmPlain(fleet.history.state), { scroll: 1, pharosFleet: { path: "/" } });
+  assert.equal(fleet.updates.at(-1).state.pharosFleet.path, "/");
+  assert.deepEqual(vmPlain(Object.keys(fleet.updates.at(-1).state.pharosFleet)), ["path"]);
+
+  fleet.context.__marker.updateUrlState();
+  assert.equal(fleet.history.state.pharosFleet.path, "/");
+  assert.deepEqual(Object.keys(fleet.history.state.pharosFleet), ["path"]);
+  assert.equal(fleet.history.state.scroll, 1);
+  assert.match(fleet.history.url, /view=list/);
+  assert.match(fleet.history.url, /q=qa-return-diagnostic/);
+  assert.match(fleet.history.url, /sort=name/);
+  assert.equal(JSON.stringify(fleet.history.state).includes("qa-return-diagnostic"), false);
+  assert.equal(JSON.stringify(fleet.history.state).includes("view"), false);
+
+  const elsewhere = loadMarker({
+    fleet: false,
+    pathname: "/backups",
+    search: "",
+    prior: { scroll: 1 },
+  });
+  assert.equal(elsewhere.context.__marker.markFleetEntry(), false);
+  assert.equal(elsewhere.updates.length, 0);
+  elsewhere.context.__marker.replaceDocumentUrl("/backups?host=alpha");
+  assert.equal(elsewhere.history.state, null);
+  assert.equal(elsewhere.updates.length, 0);
+  assert.equal(elsewhere.history.url, "/backups?host=alpha");
 });
 
 test("a hidden page does not keep the watchdog looping", () => {
