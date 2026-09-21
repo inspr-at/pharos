@@ -549,22 +549,19 @@ test("shared history fixture keeps the worst bucket event in both projections", 
   }
 });
 
-test("history refresh leaves an ordered mark attached", () => {
-  const sourceStart = fleetRuntimeSource.indexOf("let activeHistoryMark=null;");
-  const sourceEnd = fleetRuntimeSource.indexOf("function updateHistoryEvents");
-  const reconcileBody = fleetRuntimeSource.slice(
-    fleetRuntimeSource.indexOf("function reconcileHistoryMarks"),
-    sourceEnd,
-  );
-  assert.equal(reconcileBody.includes("appendChild"), false);
-  assert.match(reconcileBody, /insertBefore/);
-
+function historyMarkDom() {
   function linkChildren(parent) {
     parent.childNodes.forEach((node, index) => {
       node.parentNode = parent;
       node.nextSibling = parent.childNodes[index + 1] || null;
     });
   }
+  const document = {
+    body: null,
+    activeElement: null,
+    getElementById() { return null; },
+    createElement: null,
+  };
   function element(tag) {
     return {
       tag,
@@ -580,10 +577,14 @@ test("history refresh leaves an ordered mark attached", () => {
       get firstChild() {
         return this.childNodes[0] || null;
       },
-      style: { setProperty() {} },
+      style: {
+        props: {},
+        setProperty(name, value) { this.props[name] = String(value); },
+      },
       setAttribute(name, value) { this.attributes[name] = String(value); },
       getAttribute(name) { return this.attributes[name]; },
       removeAttribute(name) { delete this.attributes[name]; },
+      focus() { document.activeElement = this; },
       blur() {
         if (document.activeElement === this) document.activeElement = document.body;
       },
@@ -596,6 +597,7 @@ test("history refresh leaves an ordered mark attached", () => {
         this.nextSibling = null;
       },
       insertBefore(child, ref) {
+        const movingFocused = !!(child.parentNode && document.activeElement === child);
         if (child.parentNode) {
           child.parentNode.childNodes = child.parentNode.childNodes.filter((node) => node !== child);
           linkChildren(child.parentNode);
@@ -604,6 +606,7 @@ test("history refresh leaves an ordered mark attached", () => {
         this.childNodes.splice(at, 0, child);
         linkChildren(this);
         this.inserts.push(child);
+        if (movingFocused) child.blur();
         return child;
       },
       querySelectorAll(selector) {
@@ -612,16 +615,40 @@ test("history refresh leaves an ordered mark attached", () => {
       },
     };
   }
-  const document = {
-    body: element("body"),
-    activeElement: null,
-    getElementById() { return null; },
-    createElement: element,
-  };
+  document.body = element("body");
+  document.createElement = element;
+  return { document, element };
+}
+
+function loadHistoryReconcile(document) {
+  const sourceStart = fleetRuntimeSource.indexOf("let activeHistoryMark=null;");
+  const sourceEnd = fleetRuntimeSource.indexOf("function updateHistoryEvents");
   const context = vm.createContext({ console, document });
-  vm.runInContext(`${fleetRuntimeSource.slice(sourceStart, sourceEnd)}
-globalThis.__history = { reconcileHistoryMarks };
+  vm.runInContext(`const CLOCK_SKEW_SECS=2;
+${fleetRuntimeSource.slice(sourceStart, sourceEnd)}
+globalThis.__history = {
+  reconcileHistoryMarks,
+  hover(mark){ activeHistoryMark=mark; historyPin=null; },
+  pin(mark, mode){ activeHistoryMark=mark; historyPin=mode; },
+  clear(){ activeHistoryMark=null; historyPin=null; },
+};
 `, context);
+  return context.__history;
+}
+
+test("history refresh leaves an ordered mark attached", () => {
+  const sourceEnd = fleetRuntimeSource.indexOf("function updateHistoryEvents");
+  const reconcileBody = fleetRuntimeSource.slice(
+    fleetRuntimeSource.indexOf("function reconcileHistoryMarks"),
+    sourceEnd,
+  );
+  assert.equal(reconcileBody.includes("appendChild"), false);
+  assert.match(reconcileBody, /insertBefore/);
+  assert.match(fleetRuntimeSource, /marks\.dataset\.historyStart=String\(view\.start\)/);
+  assert.match(fleetRuntimeSource, /marks\.dataset\.historyEnd=String\(view\.end\)/);
+
+  const { document, element } = historyMarkDom();
+  const history = loadHistoryReconcile(document);
   const container = element("span");
   const kept = element("span");
   kept.className = "beat-mark";
@@ -629,7 +656,7 @@ globalThis.__history = { reconcileHistoryMarks };
   container.insertBefore(kept, null);
   container.inserts = [];
   document.activeElement = kept;
-  context.__history.reconcileHistoryMarks(container, [{
+  history.reconcileHistoryMarks(container, [{
     key: "sample:50",
     x: 40,
     stamp: 50,
@@ -643,8 +670,7 @@ globalThis.__history = { reconcileHistoryMarks };
   assert.equal(kept.dataset.historyLabel, "late heartbeat");
   assert.match(kept.getAttribute("aria-label"), /after previous/);
 
-  const added = element("span");
-  context.__history.reconcileHistoryMarks(container, [
+  history.reconcileHistoryMarks(container, [
     {
       key: "sample:50",
       x: 40,
@@ -668,7 +694,7 @@ globalThis.__history = { reconcileHistoryMarks };
   assert.notEqual(container.inserts[0], kept);
   assert.equal(container.childNodes[0], kept);
 
-  context.__history.reconcileHistoryMarks(container, [{
+  history.reconcileHistoryMarks(container, [{
     key: "sample:80",
     x: 70,
     stamp: 80,
@@ -679,6 +705,266 @@ globalThis.__history = { reconcileHistoryMarks };
   assert.equal(kept.parentNode, null);
   assert.equal(document.activeElement, document.body);
   assert.equal(container.childNodes.some((node) => node.dataset.historyKey === "sample:50"), false);
+
+  const reorder = [
+    { key: "sample:10", x: 10, stamp: 10, level: "ok", label: "on cadence", detail: "20s after previous · 08:00" },
+    { key: "sample:20", x: 20, stamp: 20, level: "late", label: "late heartbeat", detail: "90s after previous · 08:01" },
+    { key: "sample:30", x: 30, stamp: 30, level: "ok", label: "on cadence", detail: "20s after previous · 08:02" },
+  ];
+  history.reconcileHistoryMarks(container, [reorder[0], reorder[2], reorder[1]]);
+  const moved = container.childNodes[2];
+  assert.equal(moved.dataset.historyKey, "sample:20");
+  document.activeElement = moved;
+  history.reconcileHistoryMarks(container, reorder);
+  assert.equal(document.activeElement, moved);
+  assert.equal(container.childNodes.map((node) => node.dataset.historyKey).join(","), "sample:10,sample:20,sample:30");
+  assert.equal(container.childNodes[1], moved);
+});
+
+test("daily and restore projections follow the shared evidence contract", () => {
+  const api = loadPure();
+  const now = 1_700_000_000;
+  const day = 24 * 60 * 60;
+  const fresh = { state: "healthy", schedule: "daily", last_success_at: now - 60 };
+  const stale = { state: "healthy", schedule: "daily", last_success_at: now - 129601 };
+  for (const jobs of [[fresh, stale], [stale, fresh]]) {
+    const daily = api.projectDailyBackup(jobs, now);
+    assert.equal(daily.state, "stale");
+    assert.equal(daily.tone, "amber");
+    assert.equal(daily.label, "Stale");
+    assert.equal(daily.at, now - 129601);
+    assert.notEqual(daily.label, "Daily OK");
+  }
+  const missingTime = { state: "healthy", schedule: "daily" };
+  for (const jobs of [[fresh, missingTime], [missingTime, fresh]]) {
+    const daily = api.projectDailyBackup(jobs, now);
+    assert.notEqual(daily.tone, "good");
+    assert.equal(daily.state, "unknown");
+    assert.equal(daily.label, "Success time unknown");
+    assert.equal(daily.at, null);
+  }
+  const disabled = { configured: "disabled", state: "unknown" };
+  for (const jobs of [[fresh, disabled], [disabled, fresh]]) {
+    const daily = api.projectDailyBackup(jobs, now);
+    assert.notEqual(daily.tone, "good");
+    assert.equal(daily.state, "disabled");
+    assert.equal(daily.tone, "amber");
+    assert.equal(daily.label, "Disabled");
+  }
+  const missing = api.projectDailyBackup([
+    fresh,
+    { state: "missing", last_success_at: now - 10 },
+  ], now);
+  assert.equal(missing.state, "missing");
+  assert.equal(missing.tone, "bad");
+  const failed = api.projectDailyBackup([
+    { state: "not-required", summary: "No backup is required" },
+    { state: "failed", last_success_at: now - 10 },
+  ], now);
+  assert.equal(failed.state, "failed");
+  assert.equal(failed.tone, "bad");
+  assert.equal(api.projectDailyBackup([
+    { state: "not-required", summary: "No backup is required" },
+  ], now).state, "not-required");
+
+  const restore = (records) => api.projectRestoreStatus(records.map((record) => ({
+    restore_validation: { level: "restore-sample", ...record },
+  })), now);
+  const futureOnly = restore([{ state: "passed", checked_at: now + 86400 }]);
+  assert.equal(futureOnly.state, "unknown");
+  assert.notEqual(futureOnly.tone, "good");
+  assert.notEqual(futureOnly.state, "passed");
+  for (const records of [
+    [{ state: "passed", checked_at: now - 10 }, { state: "passed", checked_at: now + 86400 }],
+    [{ state: "passed", checked_at: now + 86400 }, { state: "passed", checked_at: now - 10 }],
+  ]) {
+    const kept = restore(records);
+    assert.equal(kept.state, "passed");
+    assert.equal(kept.tone, "good");
+    assert.equal(kept.at, now - 10);
+    assert.equal(kept.overdue, false);
+  }
+  for (const adverse of ["stale", "unknown"]) {
+    for (const records of [
+      [{ state: "passed", checked_at: now - 100 }, { state: adverse, checked_at: now - 10 }],
+      [{ state: adverse, checked_at: now - 10 }, { state: "passed", checked_at: now - 100 }],
+    ]) {
+      const newer = restore(records);
+      assert.equal(newer.state, "unknown", adverse);
+      assert.equal(newer.tone, "neutral", adverse);
+      assert.equal(newer.label, "Unknown", adverse);
+      assert.equal(newer.at, now - 100, adverse);
+      assert.equal(newer.overdue, false, adverse);
+      assert.match(newer.detail, /last successful selective restore/);
+      assert.notEqual(newer.tone, "good");
+    }
+  }
+  for (const records of [
+    [{ state: "passed", checked_at: now - 100 }, { state: "failed", checked_at: now - 10 }],
+    [{ state: "failed", checked_at: now - 10 }, { state: "passed", checked_at: now - 100 }],
+  ]) {
+    const newerFailed = restore(records);
+    assert.equal(newerFailed.state, "failed");
+    assert.equal(newerFailed.tone, "bad");
+    assert.equal(newerFailed.at, now - 100);
+    assert.match(newerFailed.detail, /last successful selective restore/);
+  }
+  const exact = restore([{ state: "passed", checked_at: now - 30 * day }]);
+  assert.equal(exact.state, "passed");
+  assert.equal(exact.tone, "good");
+  assert.equal(exact.at, now - 30 * day);
+  assert.equal(exact.overdue, false);
+  const overdue = restore([{ state: "passed", checked_at: now - 30 * day - 1 }]);
+  assert.equal(overdue.state, "overdue");
+  assert.equal(overdue.tone, "amber");
+  assert.equal(overdue.at, now - 30 * day - 1);
+  assert.equal(overdue.overdue, true);
+  const agedStale = restore([
+    { state: "passed", checked_at: now - 30 * day - 1 },
+    { state: "stale", checked_at: now - 10 },
+  ]);
+  assert.equal(agedStale.state, "overdue");
+  assert.equal(agedStale.tone, "amber");
+  assert.equal(agedStale.at, now - 30 * day - 1);
+  const agedFailed = restore([
+    { state: "stale", checked_at: now - 10 },
+    { state: "passed", checked_at: now - 30 * day - 1 },
+    { state: "failed", checked_at: now - 10 },
+  ]);
+  assert.equal(agedFailed.state, "failed");
+  assert.equal(agedFailed.tone, "bad");
+  assert.equal(agedFailed.at, now - 30 * day - 1);
+  for (const checked_at of [0, -1, null, undefined, "", 1.5, Number.NaN, now + 3, "9223372036854775807", 253402300800]) {
+    const absent = restore([{ state: "passed", checked_at }]);
+    assert.notEqual(absent.state, "passed", String(checked_at));
+    assert.notEqual(absent.tone, "good", String(checked_at));
+    assert.equal(absent.at, null, String(checked_at));
+  }
+  assert.equal(restore([{ state: "passed", checked_at: now + 2 }]).state, "passed");
+  const futureFailed = restore([
+    { state: "failed", checked_at: now + 86400 },
+    { state: "passed", checked_at: now - 10 },
+  ]);
+  assert.equal(futureFailed.state, "passed");
+  assert.equal(futureFailed.tone, "good");
+  assert.equal(futureFailed.at, now - 10);
+  for (const adverse of ["failed", "stale", "unknown"]) {
+    for (const states of [["passed", adverse], [adverse, "passed"]]) {
+      const tied = restore(states.map((state) => ({ state, checked_at: now - 50 })));
+      assert.notEqual(tied.tone, "good", states.join(","));
+      assert.notEqual(tied.state, "passed", states.join(","));
+      assert.equal(tied.state, "unknown", states.join(","));
+      assert.equal(tied.tone, "neutral", states.join(","));
+      assert.equal(tied.label, "Unknown", states.join(","));
+      assert.equal(tied.at, now - 50, states.join(","));
+    }
+  }
+});
+
+test("advancing history buckets keep the engaged mark until interaction ends", () => {
+  const api = loadPure();
+  const now = 1_700_000_000;
+  const windowDef = { key: "10m", label: "10m", secs: 600 };
+  const samples = [];
+  for (let stamp = now - 600; stamp <= now; stamp += 20) samples.push(stamp);
+  const before = api.aggregateHistory(samples, windowDef, now, 60, 15);
+  const after = api.aggregateHistory(samples, windowDef, now + 10, 60, 15);
+  const afterKeys = new Set(after.marks.map((mark) => mark.key));
+  const dropped = before.marks.filter((mark) => !afterKeys.has(mark.key));
+  assert.equal(before.marks.length, 12);
+  assert.equal(after.marks.length, 12);
+  assert.equal(dropped.length, 5);
+  for (const mark of dropped) {
+    assert.ok(mark.stamp >= after.start && mark.stamp <= after.end + 2, String(mark.stamp));
+  }
+
+  const { document } = historyMarkDom();
+  const history = loadHistoryReconcile(document);
+  const container = document.createElement("span");
+  function publish(view) {
+    container.dataset.historyStart = String(view.start);
+    container.dataset.historyEnd = String(view.end);
+    history.reconcileHistoryMarks(container, view.marks);
+  }
+  function markFor(spec) {
+    return container.childNodes.find((node) => node.dataset.historyKey === spec.key);
+  }
+  function geometry(node, view) {
+    const stamp = Number(node.dataset.historyStamp);
+    const expected = ((stamp - view.start) / (view.end - view.start)) * 100;
+    return Math.abs(parseFloat(node.style.props["--mark-x"]) - Number(expected.toFixed(1))) < 0.001;
+  }
+
+  publish(before);
+  const focusedSpec = dropped[0];
+  const focused = markFor(focusedSpec);
+  const focusedDetail = focused.getAttribute("aria-label");
+  assert.match(focusedDetail, /after previous/);
+  document.activeElement = focused;
+  publish(after);
+  assert.equal(focused.parentNode, container);
+  assert.equal(document.activeElement, focused);
+  assert.equal(focused.getAttribute("aria-label"), focusedDetail);
+  assert.equal(focused.dataset.historyDetail, focusedSpec.detail);
+  assert.equal(geometry(focused, after), true);
+  assert.equal(container.childNodes.length, after.marks.length + 1);
+  assert.equal(container.childNodes.filter((node) => node.dataset.historyKey === focusedSpec.key).length, 1);
+  for (const spec of dropped.slice(1)) {
+    assert.equal(container.childNodes.some((node) => node.dataset.historyKey === spec.key), false);
+  }
+  for (const spec of after.marks) {
+    assert.equal(container.childNodes.some((node) => node.dataset.historyKey === spec.key), true);
+  }
+  document.activeElement = document.body;
+  history.clear();
+  publish(after);
+  assert.equal(focused.parentNode, null);
+  assert.equal(document.activeElement, document.body);
+  assert.equal(container.childNodes.length, after.marks.length);
+  assert.equal(container.childNodes.some((node) => node.dataset.historyKey === focusedSpec.key), false);
+
+  publish(before);
+  const hoveredSpec = dropped[1];
+  const hovered = markFor(hoveredSpec);
+  const hoveredDetail = hovered.getAttribute("aria-label");
+  document.activeElement = document.body;
+  history.hover(hovered);
+  publish(after);
+  assert.equal(hovered.parentNode, container);
+  assert.equal(document.activeElement, document.body);
+  assert.equal(hovered.getAttribute("aria-label"), hoveredDetail);
+  assert.equal(geometry(hovered, after), true);
+  assert.equal(container.childNodes.length, after.marks.length + 1);
+  history.clear();
+  publish(after);
+  assert.equal(hovered.parentNode, null);
+  assert.equal(container.childNodes.length, after.marks.length);
+
+  publish(before);
+  const pinnedSpec = dropped[2];
+  const pinned = markFor(pinnedSpec);
+  const pinnedDetail = pinned.getAttribute("aria-label");
+  document.activeElement = document.body;
+  history.pin(pinned, "touch");
+  publish(after);
+  assert.equal(pinned.parentNode, container);
+  assert.equal(pinned.getAttribute("aria-label"), pinnedDetail);
+  assert.equal(pinned.dataset.historyLabel, pinnedSpec.label);
+  assert.equal(container.childNodes.length, after.marks.length + 1);
+  history.clear();
+  publish(after);
+  assert.equal(pinned.parentNode, null);
+  assert.equal(container.childNodes.some((node) => node.dataset.historyKey === pinnedSpec.key), false);
+
+  publish(before);
+  const aged = markFor(dropped[3]);
+  document.activeElement = aged;
+  container.dataset.historyStart = String(Number(aged.dataset.historyStamp) + 10);
+  container.dataset.historyEnd = String(Number(aged.dataset.historyStamp) + 610);
+  history.reconcileHistoryMarks(container, after.marks);
+  assert.equal(aged.parentNode, null);
+  assert.equal(document.activeElement, document.body);
+  assert.ok(container.childNodes.length <= 12);
 });
 
 test("down-alert suppression and exact times follow the scan contract", () => {
