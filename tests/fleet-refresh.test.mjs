@@ -805,6 +805,27 @@ globalThis.__facts = { updateBackupStatus, utcObservedStamp, recordedUnix };
     assert.equal(factContext.__facts.recordedUnix(missing), null);
     assert.equal(factContext.__facts.utcObservedStamp(missing), null);
   }
+  for (const invalid of [1.5, Infinity, Number.NaN, true, "9223372036854775807", 1_700_000_000_000, 253402300800]) {
+    assert.doesNotThrow(() => factContext.__facts.utcObservedStamp(invalid));
+    assert.equal(factContext.__facts.recordedUnix(invalid), null);
+    assert.equal(factContext.__facts.utcObservedStamp(invalid), null);
+  }
+  assert.equal(factContext.__facts.utcObservedStamp(253402300799).iso, "9999-12-31T23:59:59Z");
+  assert.equal(factContext.__facts.utcObservedStamp(253402300799).visible, "9999-12-31 23:59:59 UTC");
+
+  protection.daily.at = "9223372036854775807";
+  assert.doesNotThrow(() => factContext.__facts.updateBackupStatus(surface, protection));
+  assert.equal(daily.childNodes.some((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-daily-backup-date")), false);
+  assert.equal(daily.dataset.dailyBackupAt, undefined);
+  assert.equal(String(daily.textContent).includes("1970"), false);
+  assert.equal(String(daily.textContent).includes("+"), false);
+
+  protection.daily.at = 1_700_000_000;
+  factContext.__facts.updateBackupStatus(surface, protection);
+  protection.daily.at = 1_700_000_000_000;
+  factContext.__facts.updateBackupStatus(surface, protection);
+  assert.equal(daily.childNodes.some((child) => Object.prototype.hasOwnProperty.call(child.attributes, "data-daily-backup-date")), false);
+  assert.equal(String(daily.textContent).includes("055840"), false);
 
   protection.daily.at = null;
   factContext.__facts.updateBackupStatus(surface, protection);
