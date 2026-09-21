@@ -163,11 +163,11 @@ function signalInfo(beats,last,interval,now,windowDef=signalWindow,grace){
   const samples=dedupeHeartbeats([].concat(beats||[],Number.isFinite(Number(last))&&Number(last)>0?[Number(last)]:[]));
   const base='Heartbeat delivery over '+windowLabel+': ';
   const uptime=' Not measured host or service uptime.';
-  if(!samples.length)return {text:'—',level:'wait',window:windowLabel,kind:'delivery',title:base+'no reports yet.'+uptime};
+  if(!samples.length)return {text:'—',level:'wait',window:windowLabel,kind:'delivery',title:base+'no reports yet.'+uptime,coverage:'none'};
   const requestedStart=Number(now)-windowSecs;
   const future=samples.filter(stamp=>stamp>Number(now)+CLOCK_SKEW_SECS);
   const usable=samples.filter(stamp=>stamp<=Number(now)+CLOCK_SKEW_SECS);
-  if(!usable.length)return {text:'—',level:'wait',window:windowLabel,kind:'delivery',title:base+'reports are ahead of Pharos and were not counted.'+uptime};
+  if(!usable.length)return {text:'—',level:'wait',window:windowLabel,kind:'delivery',title:base+'reports are ahead of Pharos and were not counted.'+uptime,coverage:'none'};
   const retainedStart=Math.max(requestedStart,usable[0]);
   const span=Math.max(bounds.cadence,Math.min(windowSecs,Number(now)-retainedStart));
   const expected=Math.max(1,Math.ceil(span/bounds.cadence));
@@ -182,9 +182,10 @@ function signalInfo(beats,last,interval,now,windowDef=signalWindow,grace){
   longest=Math.max(longest,Number(now)-previous);
   const percent=Math.max(0,Math.min(100,Math.round((received/expected)*100)));
   const level=percent>=95?'good':percent>=75?'warn':'down';
-  const partial=usable[0]>requestedStart+1?' Partial retention from '+clock(usable[0])+'.':'';
+  const partialWindow=usable[0]>requestedStart+1;
+  const partial=partialWindow?' Partial retention from '+clock(usable[0])+'.':'';
   const skew=future.length?' '+future.length+' clock-skewed report'+(future.length===1?'':'s')+' ignored.':'';
-  return {text:percent+'%',level,window:windowLabel,kind:'delivery',title:base+received+' of '+expected+' expected reports after duplicate collapse.'+partial+skew+' Longest gap '+dur(longest)+'.'+uptime};
+  return {text:percent+'%',level,window:windowLabel,kind:'delivery',title:base+received+' of '+expected+' expected reports after duplicate collapse.'+partial+skew+' Longest gap '+dur(longest)+'.'+uptime,coverage:partialWindow?'partial':'full'};
 }
 function arrivalPresentation(last,interval,grace,now){
   const bounds=cadenceBounds(interval,grace);
@@ -1606,9 +1607,14 @@ function setFactText(root,selector,value){
   const node=root?.querySelector(selector);
   if(node)node.textContent=value==null?'':String(value);
 }
-function utcObservedStamp(at){
+function recordedUnix(at){
+  if(at==null||at==='')return null;
   const stamp=Number(at);
-  if(!Number.isFinite(stamp)||stamp<0)return null;
+  return Number.isFinite(stamp)&&stamp>0?stamp:null;
+}
+function utcObservedStamp(at){
+  const stamp=recordedUnix(at);
+  if(stamp==null)return null;
   const iso=new Date(stamp*1000).toISOString().replace(/\.\d{3}Z$/,'Z');
   return {iso,visible:iso.slice(0,10)+' '+iso.slice(11,19)+' UTC'};
 }
@@ -1669,9 +1675,10 @@ function ensureHealthScan(surface,health){
     const item=document.createElement('li');
     item.setAttribute('data-health-reason','');
     item.dataset.healthTone=reason.tone;
-    if(reason.at!==''&&reason.at!=null)item.dataset.healthAt=String(reason.at);
+    const reasonAt=recordedUnix(reason.at);
+    if(reasonAt!=null)item.dataset.healthAt=String(reasonAt);
     item.textContent=reason.label;
-    upsertObservedTime(item,reason.at,'health');
+    upsertObservedTime(item,reasonAt,'health');
     list.appendChild(item);
   });
   list.hidden=problems.length===0;
@@ -1712,6 +1719,18 @@ function ensureHealthScan(surface,health){
   placeHealthScan(sum,icon,summary,count);
   if(list.parentElement!==details)details.appendChild(list);
 }
+function placeObservedTime(surface,node,at,hook){
+  const recorded=recordedUnix(at);
+  const evidence=surface?.querySelector?.('[data-protection-evidence]')||null;
+  if(evidence&&node&&evidence!==node&&typeof node.querySelectorAll==='function'){
+    node.querySelectorAll('[data-'+hook+'-date]').forEach(time=>{
+      if(typeof evidence.contains==='function'&&evidence.contains(time))return;
+      if(typeof time.remove==='function')time.remove();
+    });
+  }
+  upsertObservedTime(evidence||node,recorded,hook);
+  if(evidence)evidence.hidden=!(evidence.querySelector('[data-daily-backup-date]')||evidence.querySelector('[data-restore-date]'));
+}
 function updateBackupStatus(surface,protection){
   if(!surface||!protection)return;
   const daily=protection.daily;
@@ -1727,14 +1746,15 @@ function updateBackupStatus(surface,protection){
     dailyNode.hidden=false;
     dailyNode.dataset.dailyBackupState=daily.state;
     dailyNode.dataset.dailyBackupTone=daily.tone;
-    if(daily.at!=null)dailyNode.dataset.dailyBackupAt=String(daily.at);
+    const dailyAt=recordedUnix(daily.at);
+    if(dailyAt!=null)dailyNode.dataset.dailyBackupAt=String(dailyAt);
     else delete dailyNode.dataset.dailyBackupAt;
     const host=surface.dataset.host||'';
     if(typeof dailyNode.setAttribute==='function')dailyNode.setAttribute('href',appUrl('/backups?host='+encodeURIComponent(host)));
     setFactText(dailyNode,'[data-daily-backup-label]',daily.label);
     setFactText(dailyNode,'[data-daily-backup-note]',daily.detail);
     dailyNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
-    upsertObservedTime(dailyNode,daily.at,'daily-backup');
+    placeObservedTime(surface,dailyNode,dailyAt,'daily-backup');
   }
   const more=surface.querySelector('[data-protection-more]');
   if(more)more.hidden=!check;
@@ -1744,12 +1764,13 @@ function updateBackupStatus(surface,protection){
     if(check){
       checkNode.dataset.backupCheckState=check.state;
       checkNode.dataset.backupCheckTone=check.tone;
-      if(check.at!=null)checkNode.dataset.backupCheckAt=String(check.at);
+      const checkAt=recordedUnix(check.at);
+      if(checkAt!=null)checkNode.dataset.backupCheckAt=String(checkAt);
       else delete checkNode.dataset.backupCheckAt;
       setFactText(checkNode,'[data-backup-check-label]',check.label);
       setFactText(checkNode,'[data-backup-check-note]',check.detail);
       checkNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
-      upsertObservedTime(checkNode,check.at,'backup-check');
+      upsertObservedTime(checkNode,checkAt,'backup-check');
     }
   }
   const restoreNode=surface.querySelector('[data-restore]');
@@ -1759,12 +1780,13 @@ function updateBackupStatus(surface,protection){
     restoreNode.dataset.restoreTone=restore.tone;
     restoreNode.dataset.restoreOverdue=restore.overdue?'true':'false';
     restoreNode.dataset.restoreProducer=restore.producer||'';
-    if(restore.at!=null)restoreNode.dataset.restoreAt=String(restore.at);
+    const restoreAt=recordedUnix(restore.at);
+    if(restoreAt!=null)restoreNode.dataset.restoreAt=String(restoreAt);
     else delete restoreNode.dataset.restoreAt;
     setFactText(restoreNode,'[data-restore-label]',restore.label);
     setFactText(restoreNode,'[data-restore-note]',restore.detail);
     restoreNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
-    upsertObservedTime(restoreNode,restore.at,'restore');
+    placeObservedTime(surface,restoreNode,restoreAt,'restore');
   }
 }
 function updateHealthProjection(surface,health){
@@ -1796,7 +1818,7 @@ function updateBackup(surface,info){
     value:info.label,
     klass:info.level==='critical'?'down':info.level==='warning'?'warn':'na',
     label:'Backup',
-    visible:info.state!=='healthy'
+    visible:false
   });
   syncFreshnessRail(surface);
   updateBackupStatus(surface,info.protection);
@@ -1816,10 +1838,6 @@ function updateReasonVisibility(surface,reason,freshness,kernel,now,lifecycle,th
     return;
   }
   const restart=kernelNeedsRestart(kernel);
-  if(!surface.matches('.card')){
-    el.hidden=restart;
-    return;
-  }
   const freshnessReason=freshnessAttention(freshness,now,threshold);
   const duplicateFreshness=freshnessReason?.label===reason?.label;
   el.hidden=restart||duplicateFreshness||reason?.label==='all clear';
@@ -2120,6 +2138,20 @@ function updateSignal(surface,info){
   signal.setAttribute('aria-label',info.title);
   const text=signal.querySelector('[data-signal-percent]');
   if(text)text.textContent=info.text;
+  const coverage=info.coverage||'full';
+  let coverageNode=signal.querySelector('[data-signal-coverage]');
+  if(!coverageNode&&typeof document.createElement==='function'){
+    coverageNode=document.createElement('span');
+    coverageNode.className='signal-coverage';
+    const percent=signal.querySelector('[data-signal-percent]');
+    if(percent&&typeof percent.insertAdjacentElement==='function')percent.insertAdjacentElement('afterend',coverageNode);
+    else signal.appendChild(coverageNode);
+  }
+  if(coverageNode){
+    coverageNode.setAttribute('data-signal-coverage',coverage);
+    coverageNode.hidden=coverage!=='partial';
+    coverageNode.textContent=coverage==='partial'?'partial':'';
+  }
   const kind=signal.querySelector('.signal-label');
   if(kind)kind.textContent='delivery';
   const windowLabel=signal.querySelector('[data-signal-window]');
@@ -2381,8 +2413,14 @@ function setBeatHistory(beat,beats,interval,now,grace){
   if(zones)Array.from(zones.children).forEach(node=>{
     if(node.hasAttribute('data-history-window-label')||node.hasAttribute('data-signal-window'))return;
     const text=node.textContent.trim();
-    if(text==='expected'||text==='start')node.textContent='start';
-    if(text==='late'||text==='now')node.textContent='now';
+    if(text==='expected'||text==='start'||node.dataset.historyAnchor==='ago'){
+      node.hidden=true;
+      return;
+    }
+    if(text==='late'||text==='now'||node.dataset.historyAnchor==='now'){
+      node.hidden=false;
+      node.textContent='now';
+    }
   });
   beat.querySelectorAll('.beat-threshold,.beat-fill,.beat-current').forEach(node=>{node.hidden=true});
   const stage=beat.querySelector('.beat-stage');
@@ -2830,7 +2868,7 @@ function writeAssistantUrl(open,path='',provider='',template='',stage='choose'){
     params.delete(ASSISTANT_JOB_PARAM);
   }
   const query=params.toString();
-  history.replaceState(null,'',location.pathname+(query?'?'+query:''));
+  replaceDocumentUrl(location.pathname+(query?'?'+query:''));
 }
 function syncAssistantNext(overlay){
   const {path,provider,stage}=assistantState(overlay);
@@ -4627,6 +4665,45 @@ function initProviderConnection(){
     runProviderAction(event.currentTarget,'/settings/providers/hetzner-cloud/disconnect',{confirm:true});
   });
 }
+/* FLEET_MARKER_START */
+function fleetDocumentPath(){
+  if(typeof document==='undefined'||typeof document.querySelector!=='function')return '';
+  if(!document.querySelector('main[data-fleet-sync-state]'))return '';
+  const path=String(typeof location==='undefined'?'':location.pathname||'');
+  return path.startsWith('/')?path:'';
+}
+function navigationApi(){
+  const scope=typeof globalThis==='undefined'?null:globalThis;
+  return scope&&scope.navigation?scope.navigation:null;
+}
+function readNavigationState(){
+  const entry=navigationApi()?.currentEntry;
+  if(!entry||typeof entry.getState!=='function')return null;
+  try{return entry.getState()}catch(_){return null}
+}
+function withFleetMarker(existing){
+  const path=fleetDocumentPath();
+  if(!path)return null;
+  const state=existing&&typeof existing==='object'&&!Array.isArray(existing)?{...existing}:{};
+  state.pharosFleet={path};
+  return state;
+}
+function applyFleetMarker(state){
+  const nav=navigationApi();
+  if(!state||!nav||typeof nav.updateCurrentEntry!=='function')return false;
+  try{nav.updateCurrentEntry({state});return true}catch(_){return false}
+}
+function markFleetEntry(){
+  const existing=readNavigationState();
+  const prior=existing&&typeof existing==='object'?existing:(typeof history==='undefined'?null:history.state);
+  return applyFleetMarker(withFleetMarker(prior));
+}
+function replaceDocumentUrl(url){
+  const prior=readNavigationState()??(typeof history==='undefined'?null:history.state);
+  const state=withFleetMarker(prior);
+  history.replaceState(state,'',url);
+  if(state)applyFleetMarker(state);
+}
 function updateUrlState(){
   const main=document.querySelector('main');
   const sort=document.querySelector('[data-sort]')?.value||'attention';
@@ -4638,9 +4715,9 @@ function updateUrlState(){
   const search=document.querySelector('[data-search]')?.value||'';
   if(search)params.set('q',search);
   else params.delete('q');
-  const url=location.pathname+'?'+params.toString();
-  history.replaceState(null,'',url);
+  replaceDocumentUrl(location.pathname+'?'+params.toString());
 }
+/* FLEET_MARKER_END */
 function initControls(){
   clearLegacyUiCookies();
   const params=new URLSearchParams(location.search);
@@ -5132,6 +5209,7 @@ armFleetWatchdog();
 initFreshnessChipScroll();
 initHostDrawer();
 initControls();
+markFleetEntry();
 initProviderConnection();
 initProviderSetupGuide();
 setFleetSyncState('current');
