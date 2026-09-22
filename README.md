@@ -1245,6 +1245,27 @@ persists a settings workflow, so it is not a client draft. The server
 mutation allowlist is empty. Machine routes such as `/report`, `/register`,
 `/agent`, and `/metrics` are denied. External map tiles stay unloaded.
 `draft` fills ordinary page fields and does not send an application mutation.
+A host settings draft may name `/pharos/hosts/{name}?section=settings`. That fill
+is still DOM-only. Its screenshot is `host-NN-settings-draft.png`, separate
+from the inventory shot, and the confirm sheet is counted rather than accepted.
+
+After an authenticated inventory, one Fleet manager session also runs
+`scripts/live-ui-inspect.mjs` on the same guarded page. It keeps `?view=list`
+and host `?section=backups`, `?section=activity`, and `?section=settings`, and
+it screenshots those through the existing guarded shot. For one representative
+host it opens Exact times, Quick preview, and the Actions menu, then closes
+each without activating Review, Confirm, Save, or a menu item. A host grace
+edit and Use fleet default stay in the page; a reload checks that the saved
+value did not change. Fleet freshness is scrolled into view and not saved.
+Missing controls on an older release are `not-supported`. Channel-only update
+review stays `unobservable` from this one host. Focus evidence dispatches
+synthetic blur and focus while the document stays visible, waits one fleet
+poll, and records `productionWindowSwitchReproduced` as false. It is not a
+physical Chrome window switch. Denied map tiles are a harness limit. Fleet
+search text in `q` is not stored. A viewer session records `not-manager` and
+does not click. Evidence is `clientInspection` inside the existing
+`evidence.json`. This repository does not launch that browser from the unit
+test.
 
 On the login provider, `GET` and `HEAD` stay on the existing read prefixes
 and still deny console, management, admin, system, and debug paths. `POST`
@@ -1331,10 +1352,12 @@ base-path, and URL overrides, `DEBUG`, `PWDEBUG`, proxy variables, and
 `account-setup-required` (exit 5). Stdout also reports
 `server-role=unchanged`.
 
-`node --test tests/live-ui-guard.test.mjs` and
-`node --test tests/live-ui-totp.test.mjs` cover the guard. The CI check job
-runs them beside `tests/fleet-refresh.test.mjs`, on the same Node runtime and
-without Playwright. It is not part of `npm run test:browser`. The operator
+`node --test tests/live-ui-guard.test.mjs`,
+`node --test tests/live-ui-totp.test.mjs`, and
+`node --test tests/live-ui-inspect.test.mjs` cover the guard and the
+inspection planner. The CI check job runs them beside
+`tests/fleet-refresh.test.mjs`, on the same Node runtime and without
+Playwright. It is not part of `npm run test:browser`. The operator
 supplies the account and the files above when the session runs. This
 repository does not store them.
 

@@ -52,6 +52,11 @@ import {
   loadOptionalTotpSecret,
   revokeTotpGrant,
 } from "./live-ui-totp.mjs";
+import {
+  countVisibleConfirmSheets,
+  inspectAuthenticatedClient,
+  inspectionSkipped,
+} from "./live-ui-inspect.mjs";
 
 const EMPTY_PROBE = Object.freeze({
   passwordCount: 0,
@@ -446,7 +451,7 @@ async function shoot(page, outputDir, route, secrets) {
   } catch {
     return "";
   }
-  const fileName = screenshotName(route.path, route.hostIndex);
+  const fileName = screenshotName(route.path, route.hostIndex, route.substep || "");
   if (!fileName) return "";
   const file = path.join(outputDir, fileName);
   let written = false;
@@ -505,6 +510,8 @@ function writeEvidence(dir, body, secrets) {
       serverRole: "unchanged",
       serverMutationAllowlist: SERVER_MUTATION_ALLOWLIST,
       clientDraft: body.clientDraft,
+      ...(body.clientInspection ? { clientInspection: body.clientInspection } : {}),
+      ...(Number.isInteger(body.draftConfirmSheets) ? { draftConfirmSheets: body.draftConfirmSheets } : {}),
       class: body.class,
       appOrigin: body.appOrigin,
       routes: body.routes,
@@ -516,12 +523,16 @@ function writeEvidence(dir, body, secrets) {
   fs.chmodSync(file, 0o600);
 }
 
-function report(overall, routes, blocked, secrets) {
+function report(overall, routes, blocked, secrets, clientInspection = null) {
   process.stdout.write(`class=${overall}\n`);
   for (const route of routes) {
     const routePath = publicPath(route.path, secrets);
     process.stdout.write(`route=${routePath} status=${route.status} class=${route.class}\n`);
     if (route.screenshot) process.stdout.write(`screenshot=${route.screenshot}\n`);
+    if (route.draftScreenshot) process.stdout.write(`screenshot=${route.draftScreenshot}\n`);
+  }
+  if (clientInspection?.role) {
+    process.stdout.write(`client-inspection=${clientInspection.role} focus=${clientInspection.focusMethod}\n`);
   }
   process.stdout.write(`blocked=${blocked.length}\n`);
   process.stdout.write("server-role=unchanged\n");
@@ -620,11 +631,13 @@ async function run(command) {
     if (pending.length === 0) pending.push(...INVENTORY_ROUTES);
     const visited = [];
     let jsonFetched = true;
+    let managerShell = false;
     while (pending.length > 0 && seen.size < 48) {
       const routePath = pending.shift();
       if (!routePath || seen.has(routePath)) continue;
       seen.add(routePath);
       const viewed = await visitRoute(page, appOrigin, routePath, policy, true);
+      if (viewed.probe?.managerShell) managerShell = true;
       visited.push(viewed);
       if (
         viewed.class === "mfa-required" ||
@@ -662,6 +675,7 @@ async function run(command) {
       let screenshot = "";
       if (viewed.class === "authenticated") {
         current = await visitRoute(page, appOrigin, viewed.path, policy, true);
+        if (current.probe?.managerShell) managerShell = true;
         if (current.class === "authenticated") {
           screenshot = await shoot(page, outputDir, {
             path: current.path,
@@ -680,20 +694,60 @@ async function run(command) {
       if (screenshot) record.screenshot = screenshot;
       routes.push(record);
     }
-    if (draft && routes.length > 0 && routes.every((route) => route.class === "authenticated")) {
+    let clientInspection = null;
+    let inspectionHalt = "";
+    const inventoryAuthenticated = routes.length > 0 && routes.every((route) => route.class === "authenticated");
+    try {
+      if (inventoryAuthenticated) {
+        const inspected = await inspectAuthenticatedClient({
+          page,
+          managerShell,
+          hostPaths: routes.map((route) => route.path),
+          openRoute: (routePath) => visitRoute(page, appOrigin, routePath, policy, true),
+          shoot: (routePath, substep = "") =>
+            shoot(
+              page,
+              outputDir,
+              {
+                path: routePath,
+                classification: "authenticated",
+                location: { origin: appOrigin, pathname: String(routePath).split("?")[0] },
+                hostIndex: hostIndexFor(routePath),
+                substep,
+              },
+              secrets,
+            ),
+        });
+        clientInspection = inspected.evidence;
+        inspectionHalt = inspected.halt || "";
+      } else {
+        clientInspection = inspectionSkipped(managerShell ? "partial" : "not-manager");
+      }
+    } catch {
+      clientInspection = inspectionSkipped("partial");
+    }
+    let draftConfirmSheets = null;
+    if (draft && inventoryAuthenticated && !inspectionHalt) {
       const drafted = await visitRoute(page, appOrigin, draft.path, policy, true);
       const applied = drafted.class === "authenticated" ? await applyClientDraft(page, draft) : { applied: 0, result: "refused" };
       clientDraft = applied.result;
       if (applied.result === "dom-only") {
+        const counted = await page.evaluate(countVisibleConfirmSheets).catch(() => 0);
+        draftConfirmSheets = Number.isInteger(counted) && counted >= 0 && counted <= 8 ? counted : 0;
+        const settingsDraft = publicPath(draft.path, secrets).endsWith("?section=settings");
         const shot = await shoot(page, outputDir, {
           path: draft.path,
           classification: "authenticated",
           location: drafted.location,
           probe: drafted.probe,
           hostIndex: hostIndexFor(draft.path),
+          substep: settingsDraft ? "settings-draft" : "",
         }, secrets);
-        const existing = routes.find((route) => route.path === draft.path);
-        if (existing && shot) existing.screenshot = shot;
+        const existing = routes.find((route) => route.path === publicPath(draft.path, secrets));
+        if (existing && shot) {
+          if (settingsDraft) existing.draftScreenshot = shot;
+          else existing.screenshot = shot;
+        }
       }
       for (const field of draft.fields) field.value = "";
     }
@@ -704,8 +758,13 @@ async function run(command) {
     else if (routes.length === 0 || routes.some((route) => route.class !== "authenticated")) {
       overall = "broken-ui";
     } else overall = "authenticated";
-    writeEvidence(outputDir, { class: overall, appOrigin, clientDraft, routes, blocked }, secrets);
-    report(overall, routes, blocked, secrets);
+    if (inspectionHalt) overall = inspectionHalt;
+    writeEvidence(
+      outputDir,
+      { class: overall, appOrigin, clientDraft, clientInspection, draftConfirmSheets, routes, blocked },
+      secrets,
+    );
+    report(overall, routes, blocked, secrets, clientInspection);
     return EXIT_CODES[overall] ?? 1;
   } finally {
     if (policy?.totp?.bytes) policy.totp.bytes.fill(0);

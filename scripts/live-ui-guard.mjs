@@ -90,6 +90,8 @@ const BLOCKED_RESOURCES = new Set(["websocket", "serviceworker"]);
 const PROVIDER_PATH = /^\/pharos\/settings\/providers\/[a-z0-9-]{1,64}$/;
 const SERVICE_PATH = /^\/pharos\/services\/[A-Za-z0-9._-]{1,63}\/[A-Za-z0-9._-]{1,63}$/;
 const HOST_SETTINGS_PATH = /^\/pharos\/hosts\/[A-Za-z0-9._-]{1,63}\?section=settings$/;
+const HOST_SECTION_VALUES = new Set(["settings", "backups", "activity"]);
+const FLEET_HOME_PATHS = new Set(["/pharos", "/pharos/"]);
 const MAX_HOST_PAGES = 32;
 const SECRET_QUERY_KEYS = new Set([
   "password",
@@ -516,6 +518,28 @@ function hiddenPath(secrets = []) {
   return HIDDEN_PATH;
 }
 
+function retainedLiveQuery(path, query) {
+  if (!query.startsWith("?")) return "";
+  let params;
+  try {
+    params = new URLSearchParams(query.slice(1));
+  } catch {
+    return "";
+  }
+  if (isHostPath(path)) {
+    const sections = params.getAll("section");
+    if (sections.length === 1 && HOST_SECTION_VALUES.has(sections[0])) {
+      return `?section=${sections[0]}`;
+    }
+    return "";
+  }
+  if (FLEET_HOME_PATHS.has(path)) {
+    const views = params.getAll("view");
+    if (views.length === 1 && views[0] === "list") return "?view=list";
+  }
+  return "";
+}
+
 export function publicPath(pathName, secrets = []) {
   if (pathName === HIDDEN_PATH) return hiddenPath(secrets);
   let path = typeof pathName === "string" ? pathName : "/";
@@ -527,7 +551,6 @@ export function publicPath(pathName, secrets = []) {
     path = path.slice(0, cut);
   }
   if (!path.startsWith("/")) path = "/";
-  const settings = query === "?section=settings" && isHostPath(path);
   if (
     path.includes("%") ||
     path.includes("\\") ||
@@ -537,7 +560,9 @@ export function publicPath(pathName, secrets = []) {
   ) {
     return hiddenPath(secrets);
   }
-  return settings ? `${path}${query}` : path;
+  const kept = retainedLiveQuery(path, query);
+  if (kept === "?view=list") return `/pharos/?view=list`;
+  return kept ? `${path}${kept}` : path;
 }
 
 export function decideRequest(request, policy = {}) {
@@ -949,11 +974,34 @@ export function parseClientDraft(raw) {
   };
 }
 
+function draftSourceForParse(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { raw, restore: "" };
+  }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object" || typeof parsed.path !== "string") {
+    return { raw, restore: "" };
+  }
+  const cut = parsed.path.indexOf("?");
+  if (cut === -1) return { raw, restore: "" };
+  const bare = parsed.path.slice(0, cut);
+  if (parsed.path.slice(cut) !== "?section=settings" || !isHostPath(bare)) return { raw, restore: "" };
+  return {
+    raw: JSON.stringify({ ...parsed, path: bare }),
+    restore: `${bare}?section=settings`,
+  };
+}
+
 export function loadDraftFile(filePath, repoRoot) {
   try {
     assertOwnedRegularFile(filePath, repoRoot, 16 * 1024, "draft-file");
     const raw = fs.readFileSync(filePath, "utf8");
-    return parseClientDraft(raw);
+    const prepared = draftSourceForParse(raw);
+    const draft = parseClientDraft(prepared.raw);
+    if (prepared.restore) draft.path = prepared.restore;
+    return draft;
   } catch (error) {
     if (error instanceof LiveUiError) throw error;
     if (error && error.code === "ENOENT") throw new LiveUiError("draft-missing");
@@ -1163,6 +1211,7 @@ export function planInventory({
     paths.push(path);
   };
   for (const route of INVENTORY_ROUTES) add(route);
+  add("/pharos/?view=list");
   const names = new Set();
   const rememberHost = (name) => {
     if (typeof name !== "string" || !HOST_ROUTE.test(`/pharos/hosts/${name}`)) return;
@@ -1185,9 +1234,15 @@ export function planInventory({
     if (isHostPath(url.pathname)) rememberHost(url.pathname.slice("/pharos/hosts/".length));
     else if (PROVIDER_PATH.test(url.pathname) || SERVICE_PATH.test(url.pathname)) add(url.pathname);
   }
+  let representativeHost = true;
   for (const name of [...names].sort().slice(0, MAX_HOST_PAGES)) {
     add(`/pharos/hosts/${name}`);
     add(`/pharos/hosts/${name}?section=settings`);
+    if (representativeHost) {
+      add(`/pharos/hosts/${name}?section=backups`);
+      add(`/pharos/hosts/${name}?section=activity`);
+      representativeHost = false;
+    }
   }
   return paths;
 }
@@ -1855,15 +1910,35 @@ export async function shutdownLiveSession({ close, sessions = [], detach, secret
   return { released: true };
 }
 
-export function screenshotName(routePath, hostIndex = 1) {
+const FIXED_INSPECTION_SHOTS = Object.freeze({
+  "fleet-freshness": "10-fleet-freshness.png",
+  "card-exact-times": "11-card-exact-times.png",
+  "quick-preview": "12-quick-preview.png",
+  "actions-menu": "13-actions-menu.png",
+  "history-hint": "14-history-hint.png",
+});
+
+export function screenshotName(routePath, hostIndex = 1, substep = "") {
+  const step = typeof substep === "string" ? substep : "";
+  if (step && !/^[a-z-]{1,32}$/.test(step)) return "";
+  if (Object.hasOwn(FIXED_INSPECTION_SHOTS, step)) return FIXED_INSPECTION_SHOTS[step];
   const path = publicPath(routePath, []);
   if (!path.startsWith("/pharos") || path.includes("/auth/")) return "";
+  const index = Number.isInteger(hostIndex) && hostIndex > 0 && hostIndex < 100 ? hostIndex : 1;
+  const hostFile = (suffix) => `host-${String(index).padStart(2, "0")}${suffix}.png`;
+  if (step === "settings-draft") {
+    return HOST_SETTINGS_PATH.test(path) ? hostFile("-settings-draft") : "";
+  }
+  if (step) return "";
   if (SCREENSHOT_FILES[path]) return SCREENSHOT_FILES[path];
+  if (path === "/pharos/?view=list") return "01-home-list.png";
   const bare = path.split("?")[0];
   if (!isHostPath(bare)) return "";
-  const suffix = HOST_SETTINGS_PATH.test(path) ? "-settings" : "";
-  const index = Number.isInteger(hostIndex) && hostIndex > 0 && hostIndex < 100 ? hostIndex : 1;
-  return `host-${String(index).padStart(2, "0")}${suffix}.png`;
+  let suffix = "";
+  if (HOST_SETTINGS_PATH.test(path)) suffix = "-settings";
+  else if (path.endsWith("?section=backups")) suffix = "-backups";
+  else if (path.endsWith("?section=activity")) suffix = "-activity";
+  return hostFile(suffix);
 }
 
 export function repoRootFromScripts() {
