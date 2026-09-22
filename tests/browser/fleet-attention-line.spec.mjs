@@ -60,7 +60,9 @@ test("attention lines stay equal to the server text after load", async ({ page }
       backup_intent: "required",
     },
   });
-  expect(job.ok(), await job.text()).toBe(true);
+  const created = await job.json();
+  expect(job.ok(), JSON.stringify(created)).toBe(true);
+  const jobId = created.job.id;
   try {
     const html = await (await page.request.get("/")).text();
     const server = await page.evaluate(({ html, hosts }) => {
@@ -90,17 +92,45 @@ test("attention lines stay equal to the server text after load", async ({ page }
     expect(live[workstation]).toEqual(server[workstation]);
     expect(live[onboarding]).toEqual(server[onboarding]);
   } finally {
-    for (const host of [workstation, onboarding]) {
-      const removal = await page.request.post(`/host-actions/${host}/remove`, {
-        headers: { "x-pharos-action": "1" },
-        data: { confirmation: host, disposition: "unmanaged", successor: null },
-      });
-      expect(removal.status()).toBe(202);
-      const reonboard = await page.request.post(`/host-actions/${host}/allow-reonboarding`, {
-        headers: { "x-pharos-action": "1" },
-        data: { confirmation: host },
-      });
-      expect(reonboard.ok()).toBe(true);
+    try {
+      // The required-backup job stays on the fleet as a setup card once the
+      // runtime host is gone. A backup observation completes it first.
+      await report(onboarding, { kind: "server" }, [{
+        id: "restic-main",
+        label: "Restic main",
+        engine: "restic",
+        state: "healthy",
+        configured: "enabled",
+        summary: "last backup succeeded",
+        schedule: "daily",
+        last_success_at: now - 120,
+        last_attempt_at: now - 120,
+        last_attempt_state: "succeeded",
+        restore_validation: {
+          level: "restore-sample",
+          state: "passed",
+          checked_at: now - 86400,
+        },
+      }]);
+      const settled = await page.request.get(`/setup/provisioning-jobs/${encodeURIComponent(jobId)}`);
+      const payload = await settled.json();
+      expect(settled.ok(), JSON.stringify(payload)).toBe(true);
+      expect(payload.job.state).toBe("complete");
+    } finally {
+      for (const host of [workstation, onboarding]) {
+        const removal = await page.request.post(`/host-actions/${host}/remove`, {
+          headers: { "x-pharos-action": "1" },
+          data: { confirmation: host, disposition: "unmanaged", successor: null },
+        });
+        expect(removal.status()).toBe(202);
+        const reonboard = await page.request.post(`/host-actions/${host}/allow-reonboarding`, {
+          headers: { "x-pharos-action": "1" },
+          data: { confirmation: host },
+        });
+        expect(reonboard.ok()).toBe(true);
+      }
+      const home = await (await page.request.get("/")).text();
+      expect(home).not.toContain(`class="card setup-card" data-host="${onboarding}"`);
     }
   }
 });
