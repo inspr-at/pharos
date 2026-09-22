@@ -419,7 +419,7 @@ async function discoverInventory(page, origin, secrets, includeJson) {
         if (href) foundHrefs.push(href.slice(0, 200));
       }
       const foundNames = [];
-      for (const node of document.querySelectorAll("[data-host]")) {
+      for (const node of document.querySelectorAll("[data-host-surface='runtime'][data-host]")) {
         const name = node.getAttribute("data-host") || "";
         if (name) foundNames.push(name.slice(0, 63));
       }
