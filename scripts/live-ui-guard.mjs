@@ -2,6 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { FAMILY_ORIGIN, familyApp, familyReadAllowed, normalizeFamilyPath } from "./live-ui-apps.mjs";
 import { consumeTotpGrant, decodeTotpPostData, revokeTotpGrant, totpVerifyTarget } from "./live-ui-totp.mjs";
 
 // Browser-side request policy for the personal Pharos live UI harness.
@@ -551,6 +552,7 @@ export function publicPath(pathName, secrets = []) {
     path = path.slice(0, cut);
   }
   if (!path.startsWith("/")) path = "/";
+  path = normalizeFamilyPath(path);
   if (
     path.includes("%") ||
     path.includes("\\") ||
@@ -611,12 +613,18 @@ export function decideRequest(request, policy = {}) {
     return decision(false, "machine-route", method, pathname, secrets);
   }
   const origin = url.origin.toLowerCase();
-  if (APP_ORIGINS.has(origin)) {
-    if (!isUnderBasePath(pathname)) {
+  const family = policy.familyApp !== undefined;
+  const app = family ? familyApp(policy.familyApp) : null;
+  if (family && !app) return decision(false, "family-app", method, pathname, secrets);
+  if ((family && origin === FAMILY_ORIGIN) || (!family && APP_ORIGINS.has(origin))) {
+    if (family ? !(pathname === app.base || pathname.startsWith(`${app.base}/`)) : !isUnderBasePath(pathname)) {
       return decision(false, "outside-base-path", method, pathname, secrets);
     }
     if (!SAFE_METHODS.has(method)) {
       return decision(false, "app-mutation", method, pathname, secrets);
+    }
+    if (family && !familyReadAllowed(policy.familyApp, pathname)) {
+      return decision(false, "app-read-scope", method, pathname, secrets);
     }
     return decision(true, "app-read", method, pathname, secrets);
   }
@@ -655,7 +663,7 @@ export function decideIncidental(kind) {
 }
 
 function safePath(url) {
-  const pathname = url.pathname || "/";
+  const pathname = normalizeFamilyPath(url.pathname || "/");
   if (pathname.includes("%") || pathname.includes("\\") || pathname.includes("\0")) {
     return null;
   }
