@@ -708,6 +708,7 @@ test("screenshot secrets are compared in Node and never sent to the page", async
     assert.equal(collector.includes(String(SCREENSHOT_TEXT_LIMIT)), true);
     assert.equal(collector.includes(String(SCREENSHOT_FIELD_LIMIT)), true);
     assert.equal(collector.includes(String(SCREENSHOT_VALUE_LIMIT)), true);
+    assert.equal(collector.includes("textContent"), false);
     assert.equal(/evaluate\([^)]+,/.test(takeAuthenticatedShot.toString()), false);
 
     assert.equal(await shot(clean), true);
@@ -819,6 +820,81 @@ test("screenshot secrets are compared in Node and never sent to the page", async
     }), false);
     argsAreClean();
     assert.deepEqual(shots, []);
+  } finally {
+    globalThis.document = previous;
+  }
+});
+
+test("large nonvisual script and style do not block a small visible page", async () => {
+  const password = "Ab!cdEF12";
+  const seed = "synthetic-seed-value";
+  const code = "135790";
+  const script = `<script>${"script-payload ".repeat(20_000)}${password}${seed}${code}</script>`;
+  const style = `<style>${"style-payload ".repeat(5_000)}</style>`;
+  assert.ok(script.length + style.length > SCREENSHOT_TEXT_LIMIT);
+  const calls = [];
+  const shots = [];
+  const reasons = [];
+  const returned = [];
+  const previous = globalThis.document;
+  const page = {
+    async evaluate(fn, ...args) {
+      calls.push({ source: String(fn), args });
+      const value = fn(...args);
+      returned.push(value);
+      return value;
+    },
+    async screenshot() {
+      shots.push("screenshot");
+    },
+  };
+  const fields = [{ value: "ok" }];
+  const shot = async (innerText, value = "ok") => {
+    calls.length = 0;
+    shots.length = 0;
+    reasons.length = 0;
+    returned.length = 0;
+    fields[0].value = value;
+    globalThis.document = {
+      title: "Fleet",
+      body: { innerText, textContent: `${script}${style}${innerText}` },
+      querySelectorAll() {
+        return fields;
+      },
+    };
+    return takeAuthenticatedShot(page, {
+      permitted: true,
+      password,
+      material: [seed, code],
+      options: { path: "shot.png", type: "png" },
+      reasons,
+    });
+  };
+  try {
+    assert.equal(await shot("Fleet map"), true);
+    assert.deepEqual(shots, ["screenshot"]);
+    assert.deepEqual(reasons, ["clear"]);
+    assert.deepEqual(calls[0].args, []);
+    for (const secret of [password, seed, code]) {
+      assert.equal(calls[0].source.includes(secret), false);
+      assert.equal(JSON.stringify(reasons).includes(secret), false);
+    }
+
+    assert.equal(await shot(`Account ${password} shown`), false);
+    assert.deepEqual(shots, []);
+    assert.deepEqual(reasons, ["visible-secret"]);
+    assert.deepEqual(calls[0].args, []);
+
+    assert.equal(await shot("Fleet map", seed), false);
+    assert.deepEqual(shots, []);
+    assert.deepEqual(reasons, ["input-secret"]);
+    assert.deepEqual(calls[0].args, []);
+
+    const bulky = "v".repeat(SCREENSHOT_TEXT_LIMIT);
+    assert.equal(await shot(bulky), false);
+    assert.deepEqual(shots, []);
+    assert.deepEqual(reasons, ["oversized-text"]);
+    assert.equal(JSON.stringify(returned).includes(bulky), false);
   } finally {
     globalThis.document = previous;
   }

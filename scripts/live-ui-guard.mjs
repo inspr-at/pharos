@@ -1271,54 +1271,70 @@ export const SCREENSHOT_VALUE_LIMIT = 2048;
 
 // Runs in the page. Limits are literals so the serialized function does not
 // close over Node state, and it never receives a secret argument.
+// Only rendered text is collected. Inline script and style are not visible.
 export function collectScreenshotSurface() {
   const textLimit = 250000;
   const fieldLimit = 200;
   const valueLimit = 2048;
   const document = globalThis.document;
-  if (!document || typeof document.querySelectorAll !== "function") return null;
+  if (!document || typeof document.querySelectorAll !== "function") return { reason: "missing" };
   let nodes;
   try {
     nodes = [...document.querySelectorAll("input, textarea")];
   } catch {
-    return null;
+    return { reason: "missing" };
   }
-  if (nodes.length > fieldLimit) return null;
+  if (nodes.length > fieldLimit) return { reason: "oversized-fields" };
   const values = [];
   for (const node of nodes) {
     const value = String(node && node.value != null ? node.value : "");
-    if (value.length > valueLimit) return null;
+    if (value.length > valueLimit) return { reason: "oversized-value" };
     values.push(value);
   }
   const body = document.body;
+  if (!body || typeof body.innerText !== "string") return { reason: "missing" };
   const title = String(document.title || "");
-  const innerText = String(body ? body.innerText || "" : "");
-  const textContent = String(body ? body.textContent || "" : "");
-  if (title.length + innerText.length + textContent.length + 2 > textLimit) return null;
-  return { values, visible: `${title}\n${innerText}\n${textContent}` };
+  if (title.length + body.innerText.length + 1 > textLimit) return { reason: "oversized-text" };
+  return { reason: "clear", values, visible: `${title}\n${body.innerText}` };
+}
+
+const SCREENSHOT_PAGE_REASONS = new Set(["missing", "oversized-text", "oversized-fields", "oversized-value"]);
+
+export function screenshotScanReason(surface, needles) {
+  if (!surface || typeof surface !== "object") return "missing";
+  if (SCREENSHOT_PAGE_REASONS.has(surface.reason)) return surface.reason;
+  if (typeof surface.visible !== "string" || !Array.isArray(surface.values)) return "missing";
+  if (surface.visible.length > SCREENSHOT_TEXT_LIMIT) return "oversized-text";
+  if (surface.values.length > SCREENSHOT_FIELD_LIMIT) return "oversized-fields";
+  for (const value of surface.values) {
+    if (typeof value !== "string" || value.length > SCREENSHOT_VALUE_LIMIT) return "oversized-value";
+  }
+  const list = Array.isArray(needles) ? needles : [];
+  if (list.length < 1) return "empty-needles";
+  for (const needle of list) {
+    if (typeof needle !== "string" || needle.length < 1) return "empty-needles";
+    if (passwordAppearsInText(surface.visible, needle)) return "visible-secret";
+  }
+  for (const needle of list) {
+    for (const value of surface.values) {
+      if (passwordAppearsInText(value, needle)) return "input-secret";
+    }
+  }
+  return "clear";
 }
 
 export function screenshotContainsNeedle(surface, needles) {
-  if (!surface || typeof surface !== "object") return true;
-  if (typeof surface.visible !== "string" || surface.visible.length > SCREENSHOT_TEXT_LIMIT) return true;
-  if (!Array.isArray(surface.values) || surface.values.length > SCREENSHOT_FIELD_LIMIT) return true;
-  const list = Array.isArray(needles) ? needles : [];
-  if (list.length < 1) return true;
-  for (const value of surface.values) {
-    if (typeof value !== "string" || value.length > SCREENSHOT_VALUE_LIMIT) return true;
-  }
-  for (const needle of list) {
-    if (typeof needle !== "string" || needle.length < 1) return true;
-    if (passwordAppearsInText(surface.visible, needle)) return true;
-    for (const value of surface.values) {
-      if (passwordAppearsInText(value, needle)) return true;
-    }
-  }
-  return false;
+  return screenshotScanReason(surface, needles) !== "clear";
 }
 
-export async function takeAuthenticatedShot(page, { permitted, password, material, options }) {
-  if (!permitted) return false;
+export async function takeAuthenticatedShot(page, { permitted, password, material, options, reasons }) {
+  const note = (reason) => {
+    if (Array.isArray(reasons)) reasons.push(reason);
+  };
+  if (!permitted) {
+    note("not-permitted");
+    return false;
+  }
   const needles = [];
   if (typeof password === "string" && password.length > 0) needles.push(password);
   if (Array.isArray(material)) {
@@ -1326,14 +1342,20 @@ export async function takeAuthenticatedShot(page, { permitted, password, materia
       if (typeof item === "string" && item.length > 0 && !needles.includes(item)) needles.push(item);
     }
   }
-  if (needles.length === 0) return false;
+  if (needles.length === 0) {
+    note("empty-needles");
+    return false;
+  }
   let surface;
   try {
     surface = await page.evaluate(collectScreenshotSurface);
   } catch {
+    note("failed-read");
     return false;
   }
-  if (screenshotContainsNeedle(surface, needles)) return false;
+  const reason = screenshotScanReason(surface, needles);
+  note(reason);
+  if (reason !== "clear") return false;
   await page.screenshot(options);
   return true;
 }
