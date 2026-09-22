@@ -1474,8 +1474,9 @@ test("fleet card header keeps actions visible and backup shield only when not ok
 
 test("fault rail uses full card width, stays one line, and keeps quiet hashes in technical details", async ({
   page,
+  browser,
 }) => {
-  test.setTimeout(60_000);
+  test.slow();
   const quietHost = "freshness-rail-quiet";
   const faultHost = "freshness-rail-fault";
   const hosts = [quietHost, faultHost];
@@ -1679,18 +1680,29 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
     await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toHaveCount(1);
     await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toHaveCount(1);
   } finally {
+    // Cleanup runs on a fresh authed context so a test timeout that closed the page cannot
+    // leave these hosts behind for later specs; one failed removal must not skip the rest.
+    const cleanup = await newAuthedContext(browser, "write");
+    const cleanupRequest = (await cleanup.newPage()).request;
+    const failures = [];
     for (const host of hosts) {
-      const removal = await page.request.post(`/host-actions/${host}/remove`, {
-        headers: { "x-pharos-action": "1" },
-        data: { confirmation: host, disposition: "unmanaged", successor: null },
-      });
-      expect(removal.status()).toBe(202);
-      const reonboard = await page.request.post(
-        `/host-actions/${host}/allow-reonboarding`,
-        { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
-      );
-      expect(reonboard.ok()).toBe(true);
+      try {
+        const removal = await cleanupRequest.post(`/host-actions/${host}/remove`, {
+          headers: { "x-pharos-action": "1" },
+          data: { confirmation: host, disposition: "unmanaged", successor: null },
+        });
+        if (removal.status() !== 202) failures.push(`${host}: remove ${removal.status()}`);
+        const reonboard = await cleanupRequest.post(`/host-actions/${host}/allow-reonboarding`, {
+          headers: { "x-pharos-action": "1" },
+          data: { confirmation: host },
+        });
+        if (!reonboard.ok()) failures.push(`${host}: allow-reonboarding ${reonboard.status()}`);
+      } catch (error) {
+        failures.push(`${host}: ${error.message}`);
+      }
     }
+    await cleanup.close();
+    expect(failures).toEqual([]);
   }
 });
 test("nixpkgs age threshold persists in Settings and controls server and refreshed cards", async ({ page, browser }, testInfo) => {

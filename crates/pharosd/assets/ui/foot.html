@@ -214,7 +214,7 @@ function qualifyingSelectiveRestore(restore){
   if(files!=null&&files<1)return null;
   const at=Number(restore.checked_at);
   if(!Number.isFinite(at)||at<=0)return null;
-  return {at,files};
+  return {at};
 }
 function dailyLabel(schedule){
   const text=String(schedule||'').trim();
@@ -821,11 +821,18 @@ function positionHostActions(root){
   const top=origin.top+below+menuHeight<=window.innerHeight-margin?below:Math.max(margin-origin.top,above);
   menu.style.left=left+'px';
   menu.style.top=top+'px';
+  // Correct any viewport overflow in the same (absolute) coordinate system. Switching to
+  // position:fixed does not work here: .card has contain:layout, which makes the card the
+  // containing block for fixed descendants, so viewport coordinates land offset by the card.
   const box=menu.getBoundingClientRect();
-  if(box.left<margin||box.right>window.innerWidth-margin||box.top<margin||box.bottom>window.innerHeight-margin){
-    menu.style.position='fixed';
-    menu.style.left=Math.max(margin,Math.min(window.innerWidth-menuWidth-margin,anchor.right-menuWidth))+'px';
-    menu.style.top=(anchor.bottom+menuHeight<=window.innerHeight-margin?anchor.bottom+7:Math.max(margin,anchor.top-menuHeight-7))+'px';
+  let dx=0,dy=0;
+  if(box.right>window.innerWidth-margin)dx=window.innerWidth-margin-box.right;
+  if(box.left+dx<margin)dx=margin-box.left;
+  if(box.bottom>window.innerHeight-margin)dy=window.innerHeight-margin-box.bottom;
+  if(box.top+dy<margin)dy=margin-box.top;
+  if(dx||dy){
+    menu.style.left=(left+dx)+'px';
+    menu.style.top=(top+dy)+'px';
   }
 }
 function openHostActions(root){
@@ -1819,7 +1826,6 @@ function attentionFor(live,f,preferences,now,threshold=30){
   return {label:'all clear',level:'ok',rank:4};
 }
 const BACKUP_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
-const BACKUP_LEVEL={failed:'critical',missing:'critical',stale:'warning',warning:'warning',unknown:'watch','not-configured':'watch',healthy:'clear'};
 const BACKUP_LABEL={failed:'Backup failed',missing:'Backup missing',stale:'Backup stale',warning:'Review backup',unknown:'Backup pending','not-configured':'No backup',healthy:'Protected'};
 function backupRunLabel(state){
   return ({succeeded:'succeeded',failed:'failed',running:'running',unknown:'unknown'})[state]||String(state||'unknown');
@@ -1833,7 +1839,7 @@ function backupDetail(obs,now){
 function backupInfo(host,now){
   const observations=Array.isArray(host.backup_observations)?host.backup_observations:[];
   const protection=projectProtection(observations,now);
-  if(!observations.length)return {state:'unknown',level:'watch',label:'Not observed',detail:'No backup signal yet',search:'',total:0,protection};
+  if(!observations.length)return {state:'unknown',label:'Not observed',detail:'No backup signal yet',search:'',total:0,protection};
   const primary=[...observations].sort((a,b)=>(BACKUP_RANK[a.state]??4)-(BACKUP_RANK[b.state]??4))[0];
   const state=primary.state||'unknown';
   const label=BACKUP_LABEL[state]||'Backup pending';
@@ -1841,7 +1847,7 @@ function backupInfo(host,now){
   const last=Number.isFinite(Number(primary.last_success_at))?dur(now-Number(primary.last_success_at))+' ago':'not yet';
   const schedule=String(primary.schedule||'not declared');
   const target=String(primary.target_label||'not declared');
-  return {state,level:BACKUP_LEVEL[state]||'watch',label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' '),protection};
+  return {state,label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' '),protection};
 }
 function setFactText(root,selector,value){
   const node=root?.querySelector(selector);

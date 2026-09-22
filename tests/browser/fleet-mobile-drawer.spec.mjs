@@ -73,7 +73,10 @@ test("mobile fleet and the quick preview stay on screen", async ({ page }, testI
       }
       await expect(drawer.locator("[data-host-drawer-title]")).toHaveText(host);
       await expect(drawer.locator("[data-host-drawer-posture-title]")).toHaveText("Needs attention");
-      await expect(drawer.locator("[data-host-drawer-reasons]")).not.toBeEmpty();
+      const reasons = drawer.locator("[data-host-drawer-reasons]");
+      await expect(reasons).not.toContainText("Not recorded");
+      await expect(reasons.locator("li")).not.toHaveCount(0);
+      await expect(reasons).toContainText(/backup/i);
       expect(await pageFits(page)).toBe(true);
       const opened = await card.boundingBox();
       expect(Math.abs(opened.width - before.width)).toBeLessThanOrEqual(1);

@@ -60,8 +60,9 @@ test("attention lines stay equal to the server text after load", async ({ page }
       backup_intent: "required",
     },
   });
-  const created = await job.json();
-  expect(job.ok(), JSON.stringify(created)).toBe(true);
+  const createdBody = await job.text();
+  expect(job.ok(), createdBody).toBe(true);
+  const created = JSON.parse(createdBody);
   const jobId = created.job.id;
   try {
     const html = await (await page.request.get("/")).text();
