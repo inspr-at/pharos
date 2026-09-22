@@ -4328,20 +4328,41 @@ fn scan_age_label(note: &str) -> String {
     String::new()
 }
 
+fn fact_kind_label(kind: &str, card_face: bool) -> String {
+    let text = match (card_face, kind) {
+        (true, "daily-backup") => "Daily backup",
+        (true, "restore") => "Monthly restore test",
+        (_, "daily-backup") => "Backup run",
+        (_, "restore") => "Selective restore",
+        _ => "Repository check",
+    };
+    if !card_face {
+        return text.to_string();
+    }
+    let icon = match kind {
+        "daily-backup" => icons::SHIELD_CHECK,
+        "restore" => icons::HISTORY,
+        _ => "",
+    };
+    format!("{icon}{text}")
+}
+
 fn fact_markup(
     fact: &ProtectionFact,
     kind: &str,
     href: Option<&str>,
     include_time: bool,
     scan: bool,
+    card_face: bool,
 ) -> String {
+    let compact = scan && !card_face;
     let at = fact_instant_attr(fact.at);
     let time = if include_time {
         observed_time_markup(fact.at, kind)
     } else {
         String::new()
     };
-    let age = if scan {
+    let age = if compact {
         format!(
             r#"<span class="fact-age" data-{kind}-age>{age}</span>"#,
             kind = kind,
@@ -4350,14 +4371,10 @@ fn fact_markup(
     } else {
         String::new()
     };
-    let note_hidden = if scan { " hidden" } else { "" };
+    let note_hidden = if compact { " hidden" } else { "" };
     let body = format!(
-        r#"<span class="fact-label">{label_kind}</span><strong class="fact-value {tone}" data-{kind}-label>{label}</strong>{age}<span class="fact-note" data-{kind}-note{note_hidden}>{note}</span>{time}"#,
-        label_kind = html_escape(match kind {
-            "daily-backup" => "Backup run",
-            "restore" => "Selective restore",
-            _ => "Repository check",
-        }),
+        r#"<span class="fact-label">{label_kind}</span><strong class="fact-value {tone}" data-{kind}-label>{label}</strong>{age}<span class="fact-note" data-{kind}-note{note_hidden} title="{note}">{note}</span>{time}"#,
+        label_kind = fact_kind_label(kind, card_face),
         tone = html_escape(fact.tone),
         kind = kind,
         label = html_escape(&fact.label),
@@ -4384,7 +4401,7 @@ pub(super) fn protection_markup(
     host: &str,
     base: &PublicBasePath,
 ) -> String {
-    protection_markup_surface(view, host, base, false)
+    protection_markup_surface(view, host, base, false, false)
 }
 
 /// Fleet scan surfaces keep the two backup facts visible and park exact times
@@ -4395,7 +4412,17 @@ pub(super) fn protection_scan_markup(
     host: &str,
     base: &PublicBasePath,
 ) -> String {
-    protection_markup_surface(view, host, base, true)
+    protection_markup_surface(view, host, base, true, false)
+}
+
+/// Grid cards show the two protection facts and their short notes. Exact times
+/// and the repository check stay in the hidden store the drawer already reads.
+pub(super) fn protection_card_markup(
+    view: &FleetProtectionView,
+    host: &str,
+    base: &PublicBasePath,
+) -> String {
+    protection_markup_surface(view, host, base, true, true)
 }
 
 fn protection_markup_surface(
@@ -4403,10 +4430,11 @@ fn protection_markup_surface(
     host: &str,
     base: &PublicBasePath,
     scan: bool,
+    card_face: bool,
 ) -> String {
     let href = app_href(base, &format!("/backups?host={}", url_query_escape(host)));
     let check_fact = match &view.check {
-        Some(check) => fact_markup(check, "backup-check", Some(&href), true, scan),
+        Some(check) => fact_markup(check, "backup-check", Some(&href), true, scan, card_face),
         None => {
             r#"<div class="protection-fact protection-check" data-backup-check data-backup-check-state="" data-backup-check-tone="" data-backup-check-at="" hidden><span class="fact-label">Repository check</span><strong class="fact-value neutral" data-backup-check-label></strong><span class="fact-note" data-backup-check-note></span></div>"#.to_string()
         }
@@ -4434,7 +4462,8 @@ fn protection_markup_surface(
     } else {
         ""
     };
-    let restore_age = if scan {
+    let compact = scan && !card_face;
+    let restore_age = if compact {
         format!(
             r#"<span class="fact-age" data-restore-age>{}</span>"#,
             html_escape(&scan_age_label(&view.restore.note))
@@ -4442,7 +4471,8 @@ fn protection_markup_surface(
     } else {
         String::new()
     };
-    let restore_note_hidden = if scan { " hidden" } else { "" };
+    let restore_note_hidden = if compact { " hidden" } else { "" };
+    let restore_caption = fact_kind_label("restore", card_face);
     let evidence = if scan {
         format!(
             r#"<div class="scan-store" data-protection-evidence hidden>{backup_time}{restore_time}</div>"#
@@ -4453,9 +4483,17 @@ fn protection_markup_surface(
         )
     };
     format!(
-        r#"<div class="protection-pair" data-protection data-selective-restore-overdue-after-secs="{overdue_after}">{run}<div class="protection-fact" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="fact-label">Selective restore</span><strong class="fact-value {restore_tone}" data-restore-label>{restore_label}</strong>{restore_age}<span class="fact-note" data-restore-note{restore_note_hidden}>{restore_note}</span></div>{evidence}{check}</div>"#,
+        r#"<div class="protection-pair" data-protection data-selective-restore-overdue-after-secs="{overdue_after}">{run}<div class="protection-fact" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="fact-label">{restore_caption}</span><strong class="fact-value {restore_tone}" data-restore-label>{restore_label}</strong>{restore_age}<span class="fact-note" data-restore-note{restore_note_hidden} title="{restore_note}">{restore_note}</span></div>{evidence}{check}</div>"#,
         overdue_after = SELECTIVE_RESTORE_OVERDUE_AFTER_SECS,
-        run = fact_markup(&view.run, "daily-backup", Some(&href), false, scan),
+        run = fact_markup(
+            &view.run,
+            "daily-backup",
+            Some(&href),
+            false,
+            scan,
+            card_face
+        ),
+        restore_caption = restore_caption,
         restore_age = restore_age,
         restore_note_hidden = restore_note_hidden,
         check = check,
@@ -4558,6 +4596,158 @@ pub(super) fn health_scan_markup(health: &HostHealthView) -> String {
         count_hidden = count_hidden,
         reasons = reasons,
     )
+}
+
+fn card_attention_summary(health: &HostHealthView, extra: &str) -> String {
+    let mut parts: Vec<String> = health
+        .reasons
+        .iter()
+        .filter(|reason| reason.tone != "good")
+        .map(|reason| reason.label.clone())
+        .collect();
+    if !extra.is_empty() && !parts.iter().any(|part| part == extra) {
+        parts.insert(0, extra.to_string());
+    }
+    if parts.is_empty() {
+        "No action needed".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn card_attention_block(
+    health: &HostHealthView,
+    lifecycle_chip: &str,
+    extra: &str,
+    mute: &str,
+) -> String {
+    let summary = card_attention_summary(health, extra);
+    let icon = if health.problem_count == 0 && extra.is_empty() {
+        icons::SHIELD_CHECK
+    } else {
+        icons::BELL
+    };
+    let reasons = health
+        .reasons
+        .iter()
+        .map(|reason| {
+            let at = reason.at.map(|at| at.to_string()).unwrap_or_default();
+            format!(
+                r#"<li data-health-reason data-health-tone="{tone}" data-health-at="{at}">{label}{time}</li>"#,
+                tone = html_escape(reason.tone),
+                at = html_escape(&at),
+                label = html_escape(&reason.label),
+                time = observed_time_markup(reason.at, "health"),
+            )
+        })
+        .collect::<String>();
+    let count_label = if health.problem_count == 1 {
+        "1 reason".to_string()
+    } else {
+        format!("{} reasons", health.problem_count)
+    };
+    format!(
+        r#"<div class="harbor-health" data-health-block data-health-tone="{tone}"><div class="attention-line" title="{title}"><span class="attention-icon" aria-hidden="true">{icon}</span>{chip}<span data-health-summary>{summary}</span>{mute}<span class="health-count" data-health-count hidden>{count}</span></div><ul class="health-reasons" data-health-reasons hidden>{reasons}</ul></div>"#,
+        tone = html_escape(health.tone),
+        title = html_escape(&summary),
+        summary = html_escape(&summary),
+        chip = lifecycle_chip,
+        mute = mute,
+        count = html_escape(&count_label),
+        reasons = reasons,
+    )
+}
+
+fn card_role_line(kind: HostKind, role: &str) -> String {
+    let kind_label = match kind {
+        HostKind::Server => "Server",
+        HostKind::Workstation => "Workstation",
+    };
+    let role = role.trim();
+    if role.is_empty()
+        || role.eq_ignore_ascii_case(kind.label())
+        || role.eq_ignore_ascii_case(kind_label)
+    {
+        return kind_label.to_string();
+    }
+    let lower = role.to_ascii_lowercase();
+    if lower.starts_with(&kind.label().to_ascii_lowercase())
+        || lower.starts_with(&kind_label.to_ascii_lowercase())
+    {
+        role.to_string()
+    } else {
+        format!("{kind_label} · {role}")
+    }
+}
+
+fn ping_age_label(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        let mins = seconds / 60;
+        let secs = seconds % 60;
+        if secs == 0 {
+            format!("{mins}m")
+        } else {
+            format!("{mins}m {secs}s")
+        }
+    } else {
+        let hours = seconds / 3600;
+        let mins = (seconds % 3600) / 60;
+        if mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {mins}m")
+        }
+    }
+}
+
+struct HeartbeatFace {
+    status: String,
+    tone: &'static str,
+    explain: String,
+}
+
+fn heartbeat_face(
+    last_seen: Option<i64>,
+    now: i64,
+    interval: i64,
+    grace_secs: u64,
+) -> HeartbeatFace {
+    let Some(last) = last_seen.filter(|stamp| *stamp > 0) else {
+        return HeartbeatFace {
+            status: "No observations".to_string(),
+            tone: "neutral",
+            explain: "Awaiting first heartbeat".to_string(),
+        };
+    };
+    let age = (now - last).max(0);
+    let age_text = ping_age_label(age);
+    let timing = pharos_core::heartbeat_timing(age as u64, interval.max(1) as u64, grace_secs);
+    let explain = format!("Expected {interval}s + {grace_secs}s grace · last ping {age_text} ago");
+    match timing {
+        pharos_core::HeartbeatTiming::Down => HeartbeatFace {
+            status: format!("No ping · {age_text}"),
+            tone: "bad",
+            explain: "Host not reporting; current state unverified".to_string(),
+        },
+        pharos_core::HeartbeatTiming::Late => HeartbeatFace {
+            status: format!("Late · {age_text}"),
+            tone: "amber",
+            explain,
+        },
+        pharos_core::HeartbeatTiming::Stale => HeartbeatFace {
+            status: format!("Stale · {age_text}"),
+            tone: "amber",
+            explain,
+        },
+        pharos_core::HeartbeatTiming::OnTime => HeartbeatFace {
+            status: format!("On time · {age_text}"),
+            tone: "neutral",
+            explain,
+        },
+    }
 }
 
 pub(super) fn os_badge_markup(icon: &str, health: &HostHealthView) -> String {
@@ -10537,8 +10727,31 @@ pub(super) fn render_home_with_grace(
         let row_cls = format!("{light_cls}{settings_cls} harbor-host")
             .trim()
             .to_string();
+        let role_line = html_escape(&card_role_line(h.preferences.kind, &h.role));
+        let health_label_text = html_escape(health.label);
+        let onboarding_extra = protection
+            .as_ref()
+            .filter(|status| status.level != "clear")
+            .map(|status| status.label.clone())
+            .unwrap_or_default();
+        let attention_html =
+            card_attention_block(&health, &card_lifecycle_chip, &onboarding_extra, &muted);
+        let protection_html = protection_card_markup(&assurance, &h.name, shell.public_base_path);
+        let face = heartbeat_face(h.last_seen, now, interval, grace_view.effective_secs);
+        let heartbeat_status = html_escape(&face.status);
+        let heartbeat_explain = html_escape(&face.explain);
+        let heartbeat_tone = face.tone;
+        let window_start = format!("{} ago", SIGNAL_DEFAULT_WINDOW_LABEL);
+        let delivery_text = html_escape(&if heartbeat_signal.text == "—" {
+            "No delivery data".to_string()
+        } else {
+            format!(
+                "{} delivered · {}",
+                heartbeat_signal.text, SIGNAL_DEFAULT_WINDOW_LABEL
+            )
+        });
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls} harbor-host" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}>{beam}<header class="card-head">{card_identity}<div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}{health_html}{assurance_html}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}<div class="harbor-card-foot">{card_revision}{preview}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls} harbor-host" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}>{beam}<header class="card-head host-heading">{badge}<div class="host-title"><h2><a class="host-name name" href="{settings_href}" title="{name}">{name}</a></h2><p class="role">{role_line}</p></div><span class="health-label" data-health-label data-health-tone="{health_tone}">{health_label_text}</span><div class="card-actions">{drag_action}{card_host_actions}</div></header>{attention_html}{protection_html}<div class="heartbeat"><div class="heartbeat-heading"><span>Heartbeat</span><strong class="{heartbeat_tone}" data-heartbeat-status data-heartbeat-tone="{heartbeat_tone}">{heartbeat_status}</strong></div>{card_heartbeat}<p class="heartbeat-explain" data-heartbeat-explain title="{heartbeat_explain}">{heartbeat_explain}</p><div class="heartbeat-axis"><span data-heartbeat-window-start>{window_start}</span><span class="delivery" data-heartbeat-delivery>{delivery_text}</span><span>Now</span></div></div><div class="harbor-card-foot"><a class="configuration" href="{settings_href}">{config_summary}</a>{preview}</div><div class="scan-store" hidden>{backup_chip}<div class="card-maintenance"></div>{card_reason}{protection_card}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div><div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_revision}</div></article>"#,
             live_key = live_key(live),
         ));
         rows.push_str(&format!(
