@@ -1440,19 +1440,29 @@ test("fleet card header keeps actions visible and backup shield only when not ok
 
     await page.locator("[data-view-button='list']").click();
     await expect(page.locator("main")).toHaveAttribute("data-view", "list");
-    await expect(healthyRow.locator(".backup-chip")).toHaveCount(1);
-    await expect(healthyRow.locator(".backup-chip")).toHaveAttribute("hidden", "");
-    await expect(failedRow.locator(".backup-chip")).toHaveCount(1);
-    await expect(failedRow.locator(".backup-chip")).not.toHaveAttribute("hidden", "");
-    await expect(failedRow.locator(".backup-chip")).toHaveAttribute(
-      "href",
-      `/backups?host=${failedHost}`,
+    const healthyFact = healthyRow.locator("a[data-daily-backup]");
+    const failedFact = failedRow.locator("a[data-daily-backup]");
+    await expect(healthyRow.locator(".backup-chip")).toHaveCount(0);
+    await expect(failedRow.locator(".backup-chip")).toHaveCount(0);
+    await expect(healthyFact).toHaveCount(1);
+    await expect(healthyFact).toBeVisible();
+    await expect(healthyFact).not.toHaveAttribute("hidden", "");
+    await expect(healthyFact).toHaveAttribute("href", `/backups?host=${healthyHost}`);
+    await expect(healthyFact).toHaveAttribute(
+      "aria-label",
+      new RegExp(`Backup (healthy|stale) for ${healthyHost}`),
     );
+    await expect(failedFact).toHaveCount(1);
+    await expect(failedFact).toBeVisible();
+    await expect(failedFact).not.toHaveAttribute("hidden", "");
+    await expect(failedFact).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expect(failedFact).toHaveAttribute("aria-label", `Backup failed for ${failedHost}`);
+    await expect(failedFact).toHaveClass(/bad/);
     for (const width of [1440, 1024, 768, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
       await expect(healthyRow.locator("[data-host-actions-trigger]")).toBeVisible();
       await expect(failedRow.locator("[data-host-actions-trigger]")).toBeVisible();
-      await expect(failedRow.locator(".backup-chip")).toBeVisible();
+      await expect(failedFact).toBeVisible();
     }
   } finally {
     for (const host of hosts) {

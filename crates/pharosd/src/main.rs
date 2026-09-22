@@ -6534,23 +6534,16 @@ mod tests {
             true,
         );
 
-        assert!(html.contains(r#"data-backup-state="healthy""#));
-        assert_eq!(
-            html.matches(r#"data-backup-state="healthy" data-backup-level="clear""#)
-                .count(),
-            1
-        );
-        assert!(html.contains(
-            r#"aria-label="Backup for athena: Protected, last success 2m 00s ago" hidden>"#
-        ));
+        assert_eq!(html.matches(r#"class="header-chip backup-chip"#).count(), 0);
         assert!(html.contains(r#"href="/backups?host=athena""#));
-        assert!(html.contains(r#"data-backup-level="clear" data-backup-glyph="check""#));
-        assert!(
-            html.contains(r#"aria-label="Backup for athena: Protected, last success 2m 00s ago""#)
-        );
+        assert!(html.contains(r#"aria-label="Backup healthy for athena""#));
+        assert!(html.contains(r#"class="row-fact protection-fact good""#));
+        assert!(html.contains(r#"<span class="row-fact-k">Daily:</span>"#));
+        assert!(html.contains(r#"data-daily-backup-label>OK · 2m</strong>"#));
         assert!(!html.contains(r#"class="backup-mini backup-list clear""#));
+        assert!(html.contains(r#"<div class="list-actions">"#));
         assert!(
-            html.contains(r#"<div class="list-actions"><a class="header-chip backup-chip clear""#)
+            !html.contains(r#"<div class="list-actions"><a class="header-chip backup-chip clear""#)
         );
         assert!(html.contains("off-box repository"));
         assert!(!html.contains("restic-main-repository"));
@@ -6653,19 +6646,12 @@ mod tests {
                 .count(),
             4
         );
-        assert_eq!(
-            html.matches(r#"class="header-chip backup-chip clear""#)
-                .count(),
-            1
-        );
-        assert_eq!(
-            html.matches(r#"class="header-chip backup-chip critical""#)
-                .count(),
-            1
-        );
-        assert!(html.contains(
-            r#"aria-label="Backup for healthy-header: Protected, last success 2m 00s ago" hidden>"#
-        ));
+        assert_eq!(html.matches(r#"class="header-chip backup-chip"#).count(), 0);
+        assert!(html.contains(r#"aria-label="Backup healthy for healthy-header""#));
+        assert!(html.contains(r#"aria-label="Backup failed for failed-header""#));
+        assert!(html.contains(r#"href="/backups?host=healthy-header""#));
+        assert!(html.contains(r#"href="/backups?host=failed-header""#));
+        assert!(html.contains(r#"class="row-fact protection-fact bad""#));
         let failed_card = rendered_card(&html, "failed-header");
         assert!(!failed_card.contains("backup-chip"));
         assert!(failed_card.contains(r#"aria-label="Backup failed for failed-header""#));

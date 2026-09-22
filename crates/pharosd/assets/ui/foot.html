@@ -1919,8 +1919,11 @@ function cardAttentionText(health,surface){
   }
   return problems.length?problems.join(' · '):'No action needed';
 }
+function fleetAttentionSurface(surface){
+  return Boolean(surface?.matches?.('article.card, tr.harbor-host'));
+}
 function syncCardAttention(surface){
-  if(!surface?.matches?.('article.card'))return;
+  if(!fleetAttentionSurface(surface))return;
   const summary=surface.querySelector('[data-health-summary]');
   if(!summary)return;
   const text=cardAttentionText({reasons:Array.from(surface.querySelectorAll('[data-health-reason]')).map(node=>{
@@ -1941,7 +1944,7 @@ function ensureHealthScan(surface,health){
   if(!block||typeof document.createElement!=='function')return;
   const problems=(health.reasons||[]).filter(reason=>reason&&reason.tone&&reason.tone!=='good');
   let summaryText=health.summary||problems[0]?.label||'No action needed';
-  if(surface.matches&&surface.matches('article.card'))summaryText=cardAttentionText(health,surface);
+  if(fleetAttentionSurface(surface))summaryText=cardAttentionText(health,surface);
   const countLabel=problems.length===1?'1 reason':problems.length+' reasons';
   surface.dataset.healthCount=String(health.count!=null?health.count:problems.length);
   block.dataset.healthTone=health.tone||'';
@@ -2112,6 +2115,60 @@ function updateBackupStatus(surface,protection){
     restoreNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
     placeObservedTime(surface,restoreNode,restoreAt,'restore');
   }
+  if(dailyNode&&dailyNode.classList.contains('row-fact')&&daily)setFactText(dailyNode,'[data-daily-backup-label]',listDailyValue(daily));
+  if(restoreNode&&restoreNode.classList.contains('row-fact')&&restore)setFactText(restoreNode,'[data-restore-label]',listRestoreValue(restore));
+  const rowNote=surface.querySelector('[data-row-protection-note]');
+  if(rowNote&&(daily||restore)){
+    const text=listProtectionNote(daily,restore);
+    rowNote.textContent=text;
+    rowNote.title=text;
+  }
+}
+function listAgeToken(at){
+  const stamp=recordedUnix(at);
+  if(stamp==null)return '';
+  const now=Date.now()/1000;
+  if(stamp>now+2)return 'future';
+  const seconds=Math.max(0,Math.floor(now-stamp));
+  if(seconds>=86400)return Math.floor(seconds/86400)+'d';
+  if(seconds>=3600){
+    const hours=Math.floor(seconds/3600);
+    const mins=Math.floor((seconds%3600)/60);
+    return mins?hours+'h '+mins+'m':hours+'h';
+  }
+  if(seconds>=60){
+    const mins=Math.floor(seconds/60);
+    const secs=seconds%60;
+    return secs?mins+'m '+secs+'s':mins+'m';
+  }
+  return seconds+'s';
+}
+function withListAge(word,age){return age?word+' · '+age:word}
+function listDailyValue(daily){
+  const age=listAgeToken(daily&&daily.at);
+  const state=String(daily&&daily.state||'');
+  if(state==='ok'||state==='healthy')return withListAge('OK',age);
+  if(state==='failed')return 'Failed';
+  if(state==='missing')return 'Missing';
+  if(state==='stale')return withListAge('Stale',age);
+  if(state==='warning')return withListAge('Review',age);
+  if(state==='disabled')return 'Disabled';
+  return 'Not observed';
+}
+function listRestoreValue(restore){
+  const age=listAgeToken(restore&&restore.at);
+  const state=String(restore&&restore.state||'');
+  if(state==='passed')return withListAge('1 file',age);
+  if(state==='overdue')return 'Overdue';
+  if(state==='failed')return 'Failed';
+  if(state==='not-required')return 'Not required';
+  return 'Not observed';
+}
+function listProtectionNote(daily,restore){
+  const restoreNeeds=restore&&(restore.overdue||restore.state==='overdue'||(restore.tone&&restore.tone!=='good'));
+  const runGood=!daily||!daily.tone||daily.tone==='good';
+  if(restoreNeeds&&runGood)return String(restore.detail||restore.label||'');
+  return String((daily&&(daily.detail||daily.label))||(restore&&restore.detail)||'');
 }
 function updateHealthProjection(surface,health){
   if(!surface||!health)return;

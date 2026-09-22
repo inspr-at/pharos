@@ -4,6 +4,7 @@ import { chromium } from "@playwright/test";
 import { newAuthedContext, waitForHarnessTokens } from "./harness.mjs";
 
 const outDir = "/private/tmp/claude-501/-Users-markus-Code-pharos/0fea778f-cfc3-4e64-856c-5ac4218c2e27/scratchpad/shots-slice1";
+const listDir = "/private/tmp/claude-501/-Users-markus-Code-pharos/0fea778f-cfc3-4e64-856c-5ac4218c2e27/scratchpad/shots-slice2";
 const widths = [390, 768, 1280, 1440, 1920, 2560];
 
 const hosts = [
@@ -46,6 +47,7 @@ function backupObservation(kind, now) {
 async function main() {
   await waitForHarnessTokens();
   fs.mkdirSync(outDir, { recursive: true });
+  fs.mkdirSync(listDir, { recursive: true });
   const browser = await chromium.launch({ headless: true });
   const context = await newAuthedContext(browser, "write");
   const page = await context.newPage();
@@ -75,15 +77,23 @@ async function main() {
     await page.evaluate((samples) => {
       const now = Date.now() / 1000;
       for (const sample of samples) {
-        const beat = document.querySelector(`article.card[data-host="${sample.name}"] .beat`);
-        if (!beat) continue;
-        if (sample.age == null) {
-          delete beat.dataset.last;
-          beat.dataset.beat = "waiting";
-        } else {
-          beat.dataset.last = String(now - sample.age);
-        }
-        window.updateBeatClock(beat, now);
+        const seenText = sample.age == null
+          ? "never"
+          : sample.age < 60
+            ? `${sample.age}s ago`
+            : `${Math.floor(sample.age / 60)}m ago`;
+        document.querySelectorAll(`[data-host="${sample.name}"] [data-seen-compact]`).forEach((seen) => {
+          seen.textContent = seenText;
+        });
+        document.querySelectorAll(`[data-host="${sample.name}"] .beat`).forEach((beat) => {
+          if (sample.age == null) {
+            delete beat.dataset.last;
+            beat.dataset.beat = "waiting";
+          } else {
+            beat.dataset.last = String(now - sample.age);
+          }
+          window.updateBeatClock(beat, now);
+        });
       }
     }, hosts);
 
@@ -99,6 +109,13 @@ async function main() {
     await single.hover();
     await page.waitForTimeout(250);
     await page.screenshot({ path: path.join(outDir, "cards-hover.png") });
+
+    await page.locator('[data-view-button="list"]').click();
+    await page.locator("table.list tbody tr").first().waitFor();
+    for (const width of [1440, 1920, 768, 390]) {
+      await page.setViewportSize({ width, height: width < 800 ? 1400 : 1100 });
+      await page.screenshot({ path: path.join(listDir, `list-${width}.png`), fullPage: true });
+    }
   } finally {
     await context.close();
     await browser.close();

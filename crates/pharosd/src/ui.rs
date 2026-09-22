@@ -1472,6 +1472,30 @@ mod module_tests {
         );
         assert!(!configuration_face_label(&missing).contains("nix: n/a"));
         assert!(!configuration_face_label(&missing).contains("freshness"));
+        let failed_list = list_protection_markup(&view, "beacon", &PublicBasePath::ROOT, now);
+        assert!(failed_list.contains(r#"href="/backups?host=beacon""#));
+        assert!(failed_list.contains(r#"aria-label="Backup failed for beacon""#));
+        assert!(failed_list.contains(r#"<span class="row-fact-k">Daily:</span>"#));
+        assert!(failed_list.contains(r#"data-daily-backup-label>Failed</strong>"#));
+        assert!(failed_list.contains(r#"<span class="row-fact-k">Restore:</span>"#));
+        assert!(!failed_list.contains("backup-chip"));
+        let passed = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now - 7_200),
+            Some(pharos_core::BackupValidationObservation {
+                level: pharos_core::BackupValidationLevel::RestoreSample,
+                state: pharos_core::BackupValidationState::Passed,
+                checked_at: Some(now - 6 * 86_400),
+                evidence_label: Some("one file".to_string()),
+                summary: None,
+            }),
+        );
+        let passed_view = fleet_protection_view(std::slice::from_ref(&passed), now);
+        let passed_list = list_protection_markup(&passed_view, "atlas", &PublicBasePath::ROOT, now);
+        assert!(passed_list.contains(r#"data-daily-backup-label>OK · 2h</strong>"#));
+        assert!(passed_list.contains(r#"data-restore-label>1 file · 6d</strong>"#));
+        assert!(passed_list.contains(r#"aria-label="Backup healthy for atlas""#));
         let exact = r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="nixpkgs-drift"><strong class="warn" data-fresh-value>nixpkgs differs from nixos-unstable</strong></div>"#;
         assert!(
             mark_scan_duplicate_chip(exact, "nixpkgs differs from nixos-unstable")
@@ -4452,6 +4476,7 @@ pub(super) fn protection_markup(
 /// Fleet scan surfaces keep the two backup facts visible and park exact times
 /// and the repository check in a hidden store. Quick preview and the host page
 /// are the places that open them.
+#[cfg(test)]
 pub(super) fn protection_scan_markup(
     view: &FleetProtectionView,
     host: &str,
@@ -4468,6 +4493,140 @@ pub(super) fn protection_card_markup(
     base: &PublicBasePath,
 ) -> String {
     protection_markup_surface(view, host, base, true, true)
+}
+
+fn list_age_token(at: Option<i64>, now: i64) -> String {
+    let Some(at) = positive_instant(at) else {
+        return String::new();
+    };
+    if at > now.saturating_add(BACKUP_CLOCK_SKEW_SECS) {
+        return "future".to_string();
+    }
+    let seconds = now.saturating_sub(at).max(0);
+    if seconds >= 86_400 {
+        return format!("{}d", seconds / 86_400);
+    }
+    if seconds >= 3_600 {
+        let hours = seconds / 3_600;
+        let mins = (seconds % 3_600) / 60;
+        return if mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {mins}m")
+        };
+    }
+    if seconds >= 60 {
+        let mins = seconds / 60;
+        let secs = seconds % 60;
+        return if secs == 0 {
+            format!("{mins}m")
+        } else {
+            format!("{mins}m {secs}s")
+        };
+    }
+    format!("{seconds}s")
+}
+
+fn with_list_age(word: &str, age: &str) -> String {
+    if age.is_empty() {
+        word.to_string()
+    } else {
+        format!("{word} · {age}")
+    }
+}
+
+fn list_daily_value(fact: &ProtectionFact, now: i64) -> String {
+    let age = list_age_token(fact.at, now);
+    match fact.state {
+        "ok" => with_list_age("OK", &age),
+        "failed" => "Failed".to_string(),
+        "missing" => "Missing".to_string(),
+        "stale" => with_list_age("Stale", &age),
+        "warning" => with_list_age("Review", &age),
+        "disabled" => "Disabled".to_string(),
+        _ => "Not observed".to_string(),
+    }
+}
+
+fn list_restore_value(fact: &ProtectionFact, now: i64) -> String {
+    let age = list_age_token(fact.at, now);
+    match fact.state {
+        "passed" => with_list_age("1 file", &age),
+        "overdue" => "Overdue".to_string(),
+        "failed" => "Failed".to_string(),
+        "not-required" => "Not required".to_string(),
+        _ => "Not observed".to_string(),
+    }
+}
+
+fn list_protection_note(view: &FleetProtectionView) -> String {
+    let restore_needs_note =
+        view.restore_overdue || (view.restore.tone != "good" && view.run.tone == "good");
+    if restore_needs_note {
+        view.restore.note.clone()
+    } else {
+        view.run.note.clone()
+    }
+}
+
+/// List rows show the same two facts as the card, in one short line each.
+/// Exact times and the repository check stay in the hidden stores the drawer reads.
+fn list_protection_markup(
+    view: &FleetProtectionView,
+    host: &str,
+    base: &PublicBasePath,
+    now: i64,
+) -> String {
+    let href = app_href(base, &format!("/backups?host={}", url_query_escape(host)));
+    let check_fact = match &view.check {
+        Some(check) => fact_markup(check, "backup-check", Some(&href), true, true, false, None),
+        None => {
+            r#"<div class="protection-fact protection-check" data-backup-check data-backup-check-state="" data-backup-check-tone="" data-backup-check-at="" hidden><span class="fact-label">Repository check</span><strong class="fact-value neutral" data-backup-check-label></strong><span class="fact-note" data-backup-check-note></span></div>"#.to_string()
+        }
+    };
+    let backup_time = evidence_time_markup(view.run.at, "daily-backup");
+    let restore_time = evidence_time_markup(view.restore.at, "restore");
+    let note = list_protection_note(view);
+    let daily = list_daily_value(&view.run, now);
+    let restore = list_restore_value(&view.restore, now);
+    let run_at = fact_instant_attr(view.run.at);
+    let restore_at = fact_instant_attr(view.restore.at);
+    let producer = if view.restore.state == "not-required" {
+        "not-required"
+    } else if view.missing_restore_producer {
+        "missing"
+    } else {
+        "present"
+    };
+    format!(
+        r#"<div class="row-protection" data-protection data-selective-restore-overdue-after-secs="{overdue_after}"><a class="row-fact protection-fact {run_tone}" data-daily-backup data-daily-backup-state="{run_state}" data-daily-backup-tone="{run_tone}" data-daily-backup-at="{run_at}" href="{href}" aria-label="{aria}"><span class="row-fact-k">Daily:</span> <strong class="fact-value {run_tone}" data-daily-backup-label>{daily}</strong><span class="fact-note" data-daily-backup-note hidden title="{run_note}">{run_note}</span></a><div class="row-fact {restore_tone}" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="row-fact-k">Restore:</span> <strong class="fact-value {restore_tone}" data-restore-label>{restore}</strong><span class="fact-note" data-restore-note hidden title="{restore_note}">{restore_note}</span></div><small class="row-protection-note" data-row-protection-note title="{note}">{note}</small><div class="scan-store" data-protection-evidence hidden>{backup_time}{restore_time}</div><div class="scan-store" data-protection-more hidden>{check_fact}</div></div>"#,
+        overdue_after = SELECTIVE_RESTORE_OVERDUE_AFTER_SECS,
+        run_tone = html_escape(view.run.tone),
+        run_state = html_escape(view.run.state),
+        run_at = html_escape(&run_at),
+        href = href,
+        aria = html_escape(&format!(
+            "Backup {} for {host}",
+            backup_aria_state(&view.run)
+        )),
+        daily = html_escape(&daily),
+        run_note = html_escape(&view.run.note),
+        restore_tone = html_escape(view.restore.tone),
+        restore_state = html_escape(view.restore.state),
+        restore_at = html_escape(&restore_at),
+        producer = producer,
+        overdue = if view.restore_overdue {
+            "true"
+        } else {
+            "false"
+        },
+        restore = html_escape(&restore),
+        restore_note = html_escape(&view.restore.note),
+        note = html_escape(&note),
+        backup_time = backup_time,
+        restore_time = restore_time,
+        check_fact = check_fact,
+    )
 }
 
 fn protection_markup_surface(
@@ -4614,6 +4773,7 @@ pub(super) fn health_markup(health: &HostHealthView) -> String {
     )
 }
 
+#[cfg(test)]
 pub(super) fn health_scan_markup(health: &HostHealthView) -> String {
     let reasons = health
         .reasons
@@ -4675,10 +4835,16 @@ fn card_attention_summary(health: &HostHealthView, extra: &str) -> String {
 fn card_attention_block(
     health: &HostHealthView,
     lifecycle_chip: &str,
+    chip_label: &str,
     extra: &str,
     mute: &str,
 ) -> String {
     let summary = card_attention_summary(health, extra);
+    let title = if chip_label.is_empty() {
+        summary.clone()
+    } else {
+        format!("{chip_label} · {summary}")
+    };
     let icon = if health.problem_count == 0 && extra.is_empty() {
         icons::SHIELD_CHECK
     } else {
@@ -4706,7 +4872,7 @@ fn card_attention_block(
     format!(
         r#"<div class="harbor-health" data-health-block data-health-tone="{tone}"><div class="attention-line" title="{title}"><span class="attention-icon" aria-hidden="true">{icon}</span>{chip}<span class="attention-sep" aria-hidden="true"> · </span><span data-health-summary>{summary}</span>{mute}<span class="health-count" data-health-count hidden>{count}</span></div><ul class="health-reasons" data-health-reasons hidden>{reasons}</ul></div>"#,
         tone = html_escape(health.tone),
-        title = html_escape(&summary),
+        title = html_escape(&title),
         summary = html_escape(&summary),
         chip = lifecycle_chip,
         mute = mute,
@@ -4944,6 +5110,7 @@ pub(super) fn host_grace_presentation(
     }
 }
 
+#[cfg(test)]
 pub(super) fn backup_glyph(level: &str) -> &'static str {
     match level {
         "clear" => "check",
@@ -4953,6 +5120,7 @@ pub(super) fn backup_glyph(level: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(super) fn backup_chip_markup(
     summary: &BackupUiSummary,
     host: &str,
@@ -7186,7 +7354,7 @@ pub(super) fn render_setup_row(
         String::new()
     };
     format!(
-        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention"><div class="reason {reason_level}" data-reason><span>{reason}</span></div></div></td><td><div class="list-setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div></td><td><div class="list-seen"><span>{started}</span></div></td><td><span class="list-setup-state">{job_state}</span></td><td><div class="list-actions">{action}</div></td></tr>"#,
+        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention"><div class="reason {reason_level}" data-reason><span>{reason}</span></div></div></td><td><div class="list-setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div></td><td><span class="list-setup-state">{job_state}</span></td><td><div class="list-seen"><span>{started}</span></div></td><td><div class="list-actions">{action}</div></td></tr>"#,
         sort_name = html_escape(&raw_name.to_lowercase()),
         updated_at = job.updated_at,
         reason = html_escape(&reason),
@@ -10421,7 +10589,6 @@ pub(super) fn render_home_with_grace(
             icons::SERVER
         };
         let name = html_escape(&h.name);
-        let role = html_escape(&h.role);
         let fresh_tldr = h.freshness.tldr();
         let list_fresh = freshness_markup(
             &h.freshness,
@@ -10450,7 +10617,6 @@ pub(super) fn render_home_with_grace(
         let attention_hidden =
             scan_attention_hidden(&attention.label, kernel_required, freshness_is_attention);
         let card_reason = reason_markup(&attention, attention_hidden);
-        let list_reason = reason_markup(&attention, attention_hidden);
         let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
         let (card_fresh, card_fresh_visible) = card_freshness_fault_markup(
@@ -10461,15 +10627,10 @@ pub(super) fn render_home_with_grace(
             h.preferences
                 .nixpkgs_warn_after_days(Some(runtime.nixpkgs_warn_after_days)),
         );
-        let backup_chip = backup_chip_markup(&backup, &h.name, shell.public_base_path);
         let protection = protection_onboarding_status(h, runtime.jobs, now);
         let protection_card = protection
             .as_ref()
             .map(|status| protection_onboarding_markup(status, ""))
-            .unwrap_or_default();
-        let protection_list = protection
-            .as_ref()
-            .map(|status| protection_onboarding_markup(status, "protection-list"))
             .unwrap_or_default();
         let mut search_parts = vec![format!(
             "{} {} {} {}",
@@ -10742,8 +10903,7 @@ pub(super) fn render_home_with_grace(
                 None
             },
         );
-        let card_lifecycle_chip = chip.clone();
-        let row_lifecycle_chip = chip;
+        let lifecycle_chip = chip;
         let drag_action = format!(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP
@@ -10754,17 +10914,10 @@ pub(super) fn render_home_with_grace(
         let list_fresh = mark_scan_duplicate_chip(&list_fresh, &health.summary);
         let card_fresh_visible = card_fresh_visible && scan_rail_shows_chip(&card_fresh);
         let card_fresh_hidden = if card_fresh_visible { "" } else { " hidden" };
-        let health_html = health_scan_markup(&health);
-        let assurance_html = protection_scan_markup(&assurance, &h.name, shell.public_base_path);
         let badge = os_badge_markup(nix_icon, &health);
         let preview = quick_preview_markup(&name, nix_icon);
         let card_revision = revision_evidence_markup(&h.freshness);
-        let config_summary = html_escape(&h.freshness.tldr());
         let configuration_label = html_escape(&configuration_face_label(&h.freshness));
-        let card_identity = format!(
-            r#"<div class="harbor-identity">{badge}<div class="host-title"><h2><a class="host-name name" href="{settings_href}" title="{name}">{name}</a></h2><span class="role">{role}</span></div></div>"#,
-        );
-        let row_identity = card_identity.clone();
         let grace_view = host_grace_presentation(
             &h.preferences,
             h.requested_preferences.as_ref(),
@@ -10819,9 +10972,16 @@ pub(super) fn render_home_with_grace(
             .filter(|status| status.level != "clear")
             .map(|status| status.label.clone())
             .unwrap_or_default();
-        let attention_html =
-            card_attention_block(&health, &card_lifecycle_chip, &onboarding_extra, &muted);
+        let attention_html = card_attention_block(
+            &health,
+            &lifecycle_chip,
+            &lifecycle.label,
+            &onboarding_extra,
+            &muted,
+        );
         let protection_html = protection_card_markup(&assurance, &h.name, shell.public_base_path);
+        let list_protection =
+            list_protection_markup(&assurance, &h.name, shell.public_base_path, now);
         let face = heartbeat_face(h.last_seen, now, interval, grace_view.effective_secs);
         let heartbeat_status = html_escape(&face.status);
         let heartbeat_explain = html_escape(&face.explain);
@@ -10840,7 +11000,7 @@ pub(super) fn render_home_with_grace(
             live_key = live_key(live),
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}><td>{row_identity}</td><td><div class="list-attention">{row_lifecycle_chip}{list_reason}{muted}{health_html}{assurance_html}{protection_list}</div></td><td><details class="revision-evidence" data-revision-evidence><summary title="{config_summary}"><span data-config-summary>{config_summary}</span></summary><div class="revision-panel"><div class="fresh" data-fresh>{list_fresh}</div></div></details></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}{preview}</div></td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}><td><div class="host-heading list-host">{badge}<div class="host-title"><h2><a class="host-name name" href="{settings_href}" title="{name}">{name}</a></h2><p class="role">{role_line}</p><span class="health-label" data-health-label data-health-tone="{health_tone}">{health_label_text}</span></div></div></td><td><div class="list-attention">{attention_html}</div></td><td>{list_protection}</td><td class="list-heartbeat">{list_heartbeat}<div class="scan-store" hidden>{card_reason}<div class="fresh" data-fresh>{list_fresh}</div>{signal}{card_revision}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-actions">{preview}{row_host_actions}{settings_action}</div></td></tr>"#,
             live_key = live_key(live),
         ));
     }
@@ -10882,7 +11042,7 @@ pub(super) fn render_home_with_grace(
 
     let head = document_head(shell.public_base_path);
     format!(
-        "{head}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{access_path}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{host_drawer}{action_dialog}{FOOT}",
+        "{head}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{access_path}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\" role=\"region\" aria-label=\"Host list, scroll horizontally on small screens\" tabindex=\"0\"><table class=\"list\"><caption class=\"list-caption\">Fleet health, attention, backup and restore, heartbeat, last seen, and actions</caption><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"protection-col\"><col class=\"heartbeat-col\"><col class=\"seen-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host and health</th><th scope=\"col\">Attention</th><th scope=\"col\">Backup and restore</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Last seen</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section><p class=\"table-scroll-note\">Scroll the list horizontally for more columns. Cards fit smaller screens.</p>{lone}</main>{assistant}{host_drawer}{action_dialog}{FOOT}",
         sidebar = sidebar(shell.public_base_path, shell.user_label, shell.logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
