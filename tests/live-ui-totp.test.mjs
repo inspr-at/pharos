@@ -7,7 +7,9 @@ import {
   ISSUER_LOGIN_POST_PATHS,
   PERSONAL_ISSUER_ORIGIN,
   assertCommandArgv,
+  assertOutputDir,
   assertRuntimeEnvironment,
+  loadPasswordFile,
   classifyProbeSurface,
   decideFetchPause,
   decideRedirect,
@@ -277,6 +279,50 @@ test("secret files accept one owned base32 file and reject unsafe input", () => 
   } finally {
     if (fs.existsSync(inside)) fs.unlinkSync(inside);
     fs.rmdirSync(repoDir);
+  }
+});
+
+test("a repo child named ..private stays inside and a sibling stays outside", () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "pharos-path-boundary-"));
+  const repo = path.join(parent, "repo");
+  const insideDir = path.join(repo, "..private");
+  const outsideDir = path.join(parent, "outside");
+  const password = "path-boundary-pw";
+  const files = [];
+  const owned = (dir) => {
+    fs.mkdirSync(dir, { mode: 0o700 });
+    fs.chmodSync(dir, 0o700);
+  };
+  try {
+    owned(repo);
+    owned(insideDir);
+    owned(outsideDir);
+    const totpInside = writeSecret(insideDir, "seed", `${RFC_SECRET}\n`);
+    const passwordInside = writeSecret(insideDir, "password", `${password}\n`);
+    files.push(totpInside, passwordInside);
+    assert.throws(() => loadTotpSecretFile(totpInside, repo), (error) => error.code === "totp-file-repo");
+    assert.throws(() => loadPasswordFile(passwordInside, repo), (error) => {
+      assert.equal(error.code, "credential-file-repo");
+      assert.equal(error.message.includes(password), false);
+      return true;
+    });
+    assert.throws(() => assertOutputDir(insideDir, repo), (error) => error.code === "output-dir");
+
+    const totpOutside = writeSecret(outsideDir, "seed", `${RFC_SECRET}\n`);
+    const passwordOutside = writeSecret(outsideDir, "password", `${password}\n`);
+    files.push(totpOutside, passwordOutside);
+    const loaded = loadTotpSecretFile(totpOutside, repo);
+    assert.equal(loaded.redaction, RFC_SECRET);
+    loaded.bytes.fill(0);
+    assert.equal(loadPasswordFile(passwordOutside, repo), password);
+    assert.equal(assertOutputDir(outsideDir, repo), fs.realpathSync(outsideDir));
+  } finally {
+    for (const file of files) {
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    }
+    for (const dir of [insideDir, outsideDir, repo, parent]) {
+      if (fs.existsSync(dir)) fs.rmdirSync(dir);
+    }
   }
 });
 
