@@ -6368,6 +6368,7 @@ mod tests {
         assert!(html.contains(
             r#"<span data-signal-percent>100%</span><span class="signal-orb" aria-hidden="true"></span><button class="signal-window""#
         ));
+        assert!(html.contains(r#"<div class="list-signal"><span class="signal" data-signal"#));
         assert!(html.contains(r#"<button class="signal-window" type="button" data-signal-window"#));
         assert!(html.contains(r#"data-signal-window-key="10m""#));
         assert!(html.contains(r#"data-signal-kind="delivery""#));
