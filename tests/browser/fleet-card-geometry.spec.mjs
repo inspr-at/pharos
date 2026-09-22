@@ -154,6 +154,20 @@ test("fleet cards keep their box, route, and grid columns", async ({ page }, tes
         return cards.filter((node) => Math.abs(node.getBoundingClientRect().top - firstTop) < 8).length;
       });
     };
+    expect(await columnsAt(375)).toBe(1);
+    const phone = await page.evaluate(() => {
+      const card = document.querySelector("[data-grid] article.card");
+      const rect = card.getBoundingClientRect();
+      return {
+        scroll: document.documentElement.scrollWidth,
+        width: window.innerWidth,
+        right: rect.right,
+        left: rect.left,
+      };
+    });
+    expect(phone.scroll).toBeLessThanOrEqual(phone.width + 1);
+    expect(phone.right).toBeLessThanOrEqual(phone.width + 1);
+    expect(phone.left).toBeGreaterThanOrEqual(-1);
     expect(await columnsAt(390)).toBe(1);
     expect(await columnsAt(768)).toBe(2);
     expect(await columnsAt(1280)).toBe(2);
