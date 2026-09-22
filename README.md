@@ -1245,6 +1245,31 @@ persists a settings workflow, so it is not a client draft. The server
 mutation allowlist is empty. Machine routes such as `/report`, `/register`,
 `/agent`, and `/metrics` are denied. External map tiles stay unloaded.
 `draft` fills ordinary page fields and does not send an application mutation.
+A host settings draft may name `/pharos/hosts/{name}?section=settings`. That fill
+is still DOM-only. Its screenshot is `host-NN-settings-draft.png`, separate
+from the inventory shot, and the confirm sheet is counted rather than accepted.
+Host workspace pages come from `/hosts.json`, workspace links, and fleet
+`data-host` attributes. A declared-only configuration record is not turned
+into a workspace URL. A linked or observed host that the server denies stays
+a denied route, as does a denied application page.
+
+After an authenticated inventory, one Fleet manager session also runs
+`scripts/live-ui-inspect.mjs` on the same guarded page. It keeps `?view=list`
+and host `?section=backups`, `?section=activity`, and `?section=settings`, and
+it screenshots those through the existing guarded shot. For one representative
+host it opens Exact times, Quick preview, and the Actions menu, then closes
+each without activating Review, Confirm, Save, or a menu item. A host grace
+edit and Use fleet default stay in the page; a reload checks that the saved
+value did not change. Fleet freshness is scrolled into view and not saved.
+Missing controls on an older release are `not-supported`. Channel-only update
+review stays `unobservable` from this one host. Focus evidence dispatches
+synthetic blur and focus while the document stays visible, waits one fleet
+poll, and records `productionWindowSwitchReproduced` as false. It is not a
+physical Chrome window switch. Denied map tiles are a harness limit. Fleet
+search text in `q` is not stored. A viewer session records `not-manager` and
+does not click. Evidence is `clientInspection` inside the existing
+`evidence.json`. This repository does not launch that browser from the unit
+test.
 
 On the login provider, `GET` and `HEAD` stay on the existing read prefixes
 and still deny console, management, admin, system, and debug paths. `POST`
@@ -1258,7 +1283,8 @@ path. A visible reset, new-password, recovery, enrollment, or registration
 submit is not filled. A forgot-password link beside a current-password form
 is not that form. An optional passkey or security-key link is not
 `mfa-required`. A visible one-time-code field or a passwordless WebAuthn
-challenge stops as `mfa-required` and is not submitted.
+challenge stops as `mfa-required`. Without the optional TOTP seed file
+below, it is not submitted.
 
 The issuer's MFA enrollment prompt is account setup, not a verification
 challenge. It is recognized from visible provider choices
@@ -1272,6 +1298,30 @@ into the prompt, and takes no screenshot. Finish that enrollment in a
 private browser session before this inspection. Copy that merely mentions
 multi-factor authentication, without those provider controls, stays
 `mfa-required`. The request allowlist is unchanged.
+
+By default a TOTP prompt also stops as `mfa-required`. The runner does not
+ask for a code and does not read a password manager. One-time enrollment of
+the dedicated account is done separately. After that, later headless logins
+can be unattended.
+
+`PHAROS_LIVE_UI_TOTP_SECRET_FILE` is an optional absolute path to one Base32
+TOTP seed. It uses the same ownership rules as the password file. The value
+is a path. A raw seed, a current code, or an `otpauth` URI in the
+environment or the arguments is refused. The seed stays in the Node process.
+It is not typed into the page and it is not sent on the network. When the
+current top-level document on `https://auth.inspr.at` is the TOTP form that
+posts to `/ui/login/mfa/verify` with `mfaType` `0`, the runner generates one
+six-digit code in memory (SHA-1, 30-second step) and submits it once. If
+that code is about to expire, the runner waits at most five seconds and
+generates the next code instead. It then clears the field. A wrong code, a
+second submit, a different MFA form, or a lost guard stops the run. There
+is no retry and no per-run interaction. SMS and email verification
+(`/ui/login/mfa/otp/verify`), provider switching, enrollment, reset, and
+recovery stay denied. The unconditional login posts remain
+`/ui/login/loginname` and `/ui/login/password`. The seed file does not
+change saved credentials, enrollment, or the server role.
+
+Screenshots stay refused for a code or MFA form.
 
 After repeated safe percent-decoding, any substring of the username or
 password denies the request, including a short secret inside a larger path
@@ -1293,10 +1343,12 @@ arguments, the environment, URLs, screenshots, traces, or stored sessions.
 | --- | --- |
 | `PHAROS_LIVE_UI_USERNAME_FILE` | Absolute path to one login name. Mode `0600`, parent directory mode `0700`, no symlink, outside this repository |
 | `PHAROS_LIVE_UI_PASSWORD_FILE` | Absolute path to one password, same ownership rules |
+| `PHAROS_LIVE_UI_TOTP_SECRET_FILE` | Optional absolute path to one Base32 TOTP seed, same ownership rules. Unattended MFA. Never put the seed or a code in this variable |
 | `PHAROS_LIVE_UI_OUTPUT_DIR` | Absolute directory, mode `0700`, outside this repository. Receives `evidence.json` (`inspr.pharos.live-ui-evidence.v1`) and authenticated screenshots |
 | `PHAROS_LIVE_UI_DRAFT_FILE` | Required for `draft`. Same ownership rules. JSON `{"path":"/pharos/...","fields":[{"selector":"...","value":"..."}]}` |
 
-`PHAROS_LIVE_UI_USERNAME`, `PHAROS_LIVE_UI_PASSWORD`, origin, issuer,
+`PHAROS_LIVE_UI_USERNAME`, `PHAROS_LIVE_UI_PASSWORD`, a raw TOTP seed or code,
+an `otpauth` URI, origin, issuer,
 base-path, and URL overrides, `DEBUG`, `PWDEBUG`, proxy variables, and
 `NODE_TLS_REJECT_UNAUTHORIZED=0` are refused. Classes are `authenticated`
 (exit 0), `broken-ui` or `refused` (exit 1), `auth-required` (exit 2),
@@ -1304,9 +1356,12 @@ base-path, and URL overrides, `DEBUG`, `PWDEBUG`, proxy variables, and
 `account-setup-required` (exit 5). Stdout also reports
 `server-role=unchanged`.
 
-`node --test tests/live-ui-guard.test.mjs` covers the guard. The CI check job
-runs it beside `tests/fleet-refresh.test.mjs`, on the same Node runtime and
-without Playwright. It is not part of `npm run test:browser`. The operator
+`node --test tests/live-ui-guard.test.mjs`,
+`node --test tests/live-ui-totp.test.mjs`, and
+`node --test tests/live-ui-inspect.test.mjs` cover the guard and the
+inspection planner. The CI check job runs them beside
+`tests/fleet-refresh.test.mjs`, on the same Node runtime and without
+Playwright. It is not part of `npm run test:browser`. The operator
 supplies the account and the files above when the session runs. This
 repository does not store them.
 

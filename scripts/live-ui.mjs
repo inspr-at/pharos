@@ -44,6 +44,20 @@ import {
   takeAuthenticatedShot,
   LiveUiError,
 } from "./live-ui-guard.mjs";
+import {
+  armTotpGrant,
+  clearTotpCodeField,
+  freshTotpCode,
+  inspectTotpForm,
+  loadOptionalTotpSecret,
+  revokeTotpGrant,
+} from "./live-ui-totp.mjs";
+import {
+  countVisibleConfirmSheets,
+  inspectAuthenticatedClient,
+  inspectionSkipped,
+  settleLiveInspection,
+} from "./live-ui-inspect.mjs";
 
 const EMPTY_PROBE = Object.freeze({
   passwordCount: 0,
@@ -246,6 +260,88 @@ async function waitForReturnedApp(page) {
   return true;
 }
 
+function rethrowLive(error) {
+  if (error instanceof LiveUiError) throw error;
+  if (error && typeof error.code === "string" && /^totp-[a-z0-9-]+$/.test(error.code)) {
+    throw new LiveUiError(error.code);
+  }
+  throw error;
+}
+
+function blankInspection(inspected) {
+  if (!inspected || typeof inspected !== "object") return;
+  inspected.authRequestId = "";
+  inspected.csrf = "";
+}
+
+export async function submitUnattendedTotp(page, policy, deps = {}) {
+  if (!policy?.totp || policy.totpAttempted) return "mfa-required";
+  policy.totpAttempted = true;
+  if (policy?.gate?.compromised?.()) throw new LiveUiError("network-guard");
+  const inspected = await page.evaluate(inspectTotpForm);
+  const authRequestId = typeof inspected?.authRequestId === "string" ? inspected.authRequestId : "";
+  const csrf = typeof inspected?.csrf === "string" ? inspected.csrf : "";
+  blankInspection(inspected);
+  if (!inspected?.ok) return "mfa-required";
+  const nowMs = typeof deps.now === "number" ? deps.now : Date.now();
+  const clock = typeof deps.clock === "function" ? deps.clock : Date.now;
+  let code = "";
+  try {
+    code = await freshTotpCode(policy.totp.bytes, nowMs, deps.sleep);
+  } catch (error) {
+    rethrowLive(error);
+  } finally {
+    if (policy.totp.bytes) policy.totp.bytes.fill(0);
+  }
+  if (!policy.secrets.includes(code)) policy.secrets.push(code);
+  const again = await page.evaluate(inspectTotpForm);
+  const sameSession = again?.ok === true && again.authRequestId === authRequestId && again.csrf === csrf;
+  blankInspection(again);
+  if (!sameSession) return "mfa-required";
+  if (policy?.gate?.compromised?.()) throw new LiveUiError("network-guard");
+  try {
+    policy.totpGrant = armTotpGrant({ code, authRequestId, csrf, now: clock });
+  } catch (error) {
+    rethrowLive(error);
+  }
+  const field = page.locator("input#code[name='code']");
+  if ((await field.count()) !== 1) return "mfa-required";
+  await field.fill(code);
+  const button = page.locator("button#submit-button");
+  if ((await button.count()) !== 1) return "mfa-required";
+  const unnamed = await button.evaluate((element) => {
+    return (
+      element.tagName === "BUTTON" &&
+      String(element.getAttribute("type") || "").toLowerCase() === "submit" &&
+      element.getAttribute("id") === "submit-button" &&
+      !element.hasAttribute("name")
+    );
+  });
+  if (!unnamed) return "mfa-required";
+  await button.click({ timeout: 5000 });
+  await page.evaluate(clearTotpCodeField).catch(() => {});
+  return "submitted";
+}
+
+async function maybeAttendTotp(page, viewed, policy) {
+  if (viewed.classification !== "mfa-required" || !policy?.totp || policy.totpAttempted) return viewed;
+  if (policy?.gate?.compromised?.()) throw new LiveUiError("network-guard");
+  try {
+    const submitted = await submitUnattendedTotp(page, policy);
+    if (submitted !== "submitted") return viewed;
+    await waitForReturnedApp(page);
+    await page.evaluate(clearTotpCodeField).catch(() => {});
+    const probe = await readProbe(page);
+    const next = observe(page.url(), 0, probe, false, policy.secrets);
+    if (probe.accountSetup) next.classification = "account-setup-required";
+    else if (probe.mfa) next.classification = "mfa-required";
+    return next;
+  } finally {
+    revokeTotpGrant(policy.totpGrant);
+    await page.evaluate(clearTotpCodeField).catch(() => {});
+  }
+}
+
 async function signIn(page, username, password, policy) {
   const response = await openDocument(page, ENTRY_URL, policy);
   let probe = await readProbe(page);
@@ -260,21 +356,61 @@ async function signIn(page, username, password, policy) {
       } else {
         viewed.classification = filled === "mfa-required" || probe.mfa ? "mfa-required" : "auth-required";
       }
-      return viewed;
+    } else {
+      await waitForReturnedApp(page);
+      probe = await readProbe(page);
+      viewed = observe(page.url(), 0, probe, false, policy.secrets);
     }
-    await waitForReturnedApp(page);
-    probe = await readProbe(page);
-    viewed = observe(page.url(), 0, probe, false, policy.secrets);
   }
   if (probe.accountSetup) viewed.classification = "account-setup-required";
   else if (probe.mfa) viewed.classification = "mfa-required";
-  return viewed;
+  return maybeAttendTotp(page, viewed, policy);
+}
+
+export function observedHostNamesFromPayload(raw) {
+  let parsed = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.hosts)) {
+    return [];
+  }
+  return hostNamesFromPayload({ hosts: parsed.hosts });
+}
+
+export function planObservedInventory({
+  hrefs = [],
+  attributeNames = [],
+  hostsPayload = "",
+  origin,
+  secrets,
+} = {}) {
+  return planInventory({
+    hrefs,
+    hostNames: [...attributeNames, ...observedHostNamesFromPayload(hostsPayload)],
+    origin,
+    secrets,
+  });
+}
+
+export function settleInventoryClass(routes) {
+  const list = Array.isArray(routes) ? routes : [];
+  if (list.some((route) => route.class === "account-setup-required")) return "account-setup-required";
+  if (list.some((route) => route.class === "mfa-required")) return "mfa-required";
+  if (list.some((route) => route.class === "auth-required")) return "auth-required";
+  if (list.some((route) => route.class === "policy-denied")) return "policy-denied";
+  if (list.length === 0 || list.some((route) => route.class !== "authenticated")) return "broken-ui";
+  return "authenticated";
 }
 
 async function discoverInventory(page, origin, secrets, includeJson) {
   let hrefs = [];
-  let hostNames = [];
-  let payloads = [];
+  let attributeNames = [];
+  let hostsPayload = "";
   try {
     const found = await page.evaluate(async (withJson) => {
       const foundHrefs = [];
@@ -283,33 +419,34 @@ async function discoverInventory(page, origin, secrets, includeJson) {
         if (href) foundHrefs.push(href.slice(0, 200));
       }
       const foundNames = [];
-      for (const node of document.querySelectorAll("[data-host]")) {
+      for (const node of document.querySelectorAll("[data-host-surface='runtime'][data-host]")) {
         const name = node.getAttribute("data-host") || "";
         if (name) foundNames.push(name.slice(0, 63));
       }
-      const foundPayloads = [];
+      let foundPayload = "";
       if (withJson) {
-        for (const path of ["/pharos/hosts.json", "/pharos/declared-hosts.json"]) {
-          try {
-            const response = await fetch(path, { method: "GET", credentials: "same-origin", cache: "no-store" });
-            if (response.ok) foundPayloads.push((await response.text()).slice(0, 250000));
-          } catch {
-            // A missing inventory source stays empty.
-          }
+        try {
+          const response = await fetch("/pharos/hosts.json", {
+            method: "GET",
+            credentials: "same-origin",
+            cache: "no-store",
+          });
+          if (response.ok) foundPayload = (await response.text()).slice(0, 250000);
+        } catch {
+          // A missing inventory source stays empty.
         }
       }
-      return { hrefs: foundHrefs.slice(0, 300), hostNames: foundNames, payloads: foundPayloads };
+      return { hrefs: foundHrefs.slice(0, 300), hostNames: foundNames, hostsPayload: foundPayload };
     }, includeJson);
     hrefs = found.hrefs || [];
-    hostNames = found.hostNames || [];
-    payloads = found.payloads || [];
+    attributeNames = found.hostNames || [];
+    hostsPayload = found.hostsPayload || "";
   } catch {
     hrefs = [];
-    hostNames = [];
-    payloads = [];
+    attributeNames = [];
+    hostsPayload = "";
   }
-  for (const payload of payloads) hostNames.push(...hostNamesFromPayload(payload));
-  return planInventory({ hrefs, hostNames, origin, secrets });
+  return planObservedInventory({ hrefs, attributeNames, hostsPayload, origin, secrets });
 }
 
 async function visitRoute(page, origin, routePath, policy, managerConfirmed) {
@@ -347,14 +484,16 @@ async function waitForAuthUiHidden(page) {
 async function shoot(page, outputDir, route, secrets) {
   await waitForAuthUiHidden(page);
   const probe = await readProbe(page);
-  const password = Array.isArray(secrets) ? secrets[secrets.length - 1] : "";
+  const listed = Array.isArray(secrets) ? secrets.filter((item) => typeof item === "string") : [];
+  const password = listed.length >= 2 ? listed[1] : "";
+  const material = listed.length >= 2 ? listed.slice(2) : [];
   let location = route.location;
   try {
     location = publicLocation(page.url(), Array.isArray(secrets) ? secrets : []);
   } catch {
     return "";
   }
-  const fileName = screenshotName(route.path, route.hostIndex);
+  const fileName = screenshotName(route.path, route.hostIndex, route.substep || "");
   if (!fileName) return "";
   const file = path.join(outputDir, fileName);
   let written = false;
@@ -362,6 +501,7 @@ async function shoot(page, outputDir, route, secrets) {
     written = await takeAuthenticatedShot(page, {
       permitted: screenshotPermitted({ classification: route.classification, location, probe }),
       password,
+      material,
       options: {
         path: file,
         type: "png",
@@ -412,6 +552,8 @@ function writeEvidence(dir, body, secrets) {
       serverRole: "unchanged",
       serverMutationAllowlist: SERVER_MUTATION_ALLOWLIST,
       clientDraft: body.clientDraft,
+      ...(body.clientInspection ? { clientInspection: body.clientInspection } : {}),
+      ...(Number.isInteger(body.draftConfirmSheets) ? { draftConfirmSheets: body.draftConfirmSheets } : {}),
       class: body.class,
       appOrigin: body.appOrigin,
       routes: body.routes,
@@ -423,12 +565,16 @@ function writeEvidence(dir, body, secrets) {
   fs.chmodSync(file, 0o600);
 }
 
-function report(overall, routes, blocked, secrets) {
+function report(overall, routes, blocked, secrets, clientInspection = null) {
   process.stdout.write(`class=${overall}\n`);
   for (const route of routes) {
     const routePath = publicPath(route.path, secrets);
     process.stdout.write(`route=${routePath} status=${route.status} class=${route.class}\n`);
     if (route.screenshot) process.stdout.write(`screenshot=${route.screenshot}\n`);
+    if (route.draftScreenshot) process.stdout.write(`screenshot=${route.draftScreenshot}\n`);
+  }
+  if (clientInspection?.role) {
+    process.stdout.write(`client-inspection=${clientInspection.role} focus=${clientInspection.focusMethod}\n`);
   }
   process.stdout.write(`blocked=${blocked.length}\n`);
   process.stdout.write("server-role=unchanged\n");
@@ -445,12 +591,19 @@ async function run(command) {
   const outputDir = assertOutputDir(process.env.PHAROS_LIVE_UI_OUTPUT_DIR, repoRoot);
   const username = loadUsernameFile(process.env.PHAROS_LIVE_UI_USERNAME_FILE, repoRoot);
   const password = loadPasswordFile(process.env.PHAROS_LIVE_UI_PASSWORD_FILE, repoRoot);
+  let totpSecret = null;
+  try {
+    totpSecret = loadOptionalTotpSecret(process.env, repoRoot);
+  } catch (error) {
+    rethrowLive(error);
+  }
   const draft =
     command === "draft"
       ? loadDraftFile(process.env.PHAROS_LIVE_UI_DRAFT_FILE, repoRoot)
       : null;
   const secrets = [username, password];
-  const policy = { secrets, gate: null };
+  if (totpSecret) secrets.push(totpSecret.redaction);
+  const policy = { secrets, gate: null, totp: totpSecret, totpGrant: null, totpAttempted: false };
   const blocked = [];
   const routes = [];
   let browser;
@@ -520,11 +673,13 @@ async function run(command) {
     if (pending.length === 0) pending.push(...INVENTORY_ROUTES);
     const visited = [];
     let jsonFetched = true;
+    let managerShell = false;
     while (pending.length > 0 && seen.size < 48) {
       const routePath = pending.shift();
       if (!routePath || seen.has(routePath)) continue;
       seen.add(routePath);
       const viewed = await visitRoute(page, appOrigin, routePath, policy, true);
+      if (viewed.probe?.managerShell) managerShell = true;
       visited.push(viewed);
       if (
         viewed.class === "mfa-required" ||
@@ -562,6 +717,7 @@ async function run(command) {
       let screenshot = "";
       if (viewed.class === "authenticated") {
         current = await visitRoute(page, appOrigin, viewed.path, policy, true);
+        if (current.probe?.managerShell) managerShell = true;
         if (current.class === "authenticated") {
           screenshot = await shoot(page, outputDir, {
             path: current.path,
@@ -580,34 +736,76 @@ async function run(command) {
       if (screenshot) record.screenshot = screenshot;
       routes.push(record);
     }
-    if (draft && routes.length > 0 && routes.every((route) => route.class === "authenticated")) {
+    let clientInspection = null;
+    let inspectionHalt = "";
+    const inventoryAuthenticated = routes.length > 0 && routes.every((route) => route.class === "authenticated");
+    try {
+      if (inventoryAuthenticated) {
+        const inspected = await inspectAuthenticatedClient({
+          page,
+          managerShell,
+          hostPaths: routes.map((route) => route.path),
+          openRoute: (routePath) => visitRoute(page, appOrigin, routePath, policy, true),
+          shoot: (routePath, substep = "") =>
+            shoot(
+              page,
+              outputDir,
+              {
+                path: routePath,
+                classification: "authenticated",
+                location: { origin: appOrigin, pathname: String(routePath).split("?")[0] },
+                hostIndex: hostIndexFor(routePath),
+                substep,
+              },
+              secrets,
+            ),
+        });
+        clientInspection = inspected.evidence;
+        inspectionHalt = inspected.halt || "";
+      } else {
+        clientInspection = inspectionSkipped(managerShell ? "partial" : "not-manager");
+      }
+    } catch (error) {
+      clientInspection = inspectionSkipped("partial");
+      inspectionHalt = settleLiveInspection({ inventoryClass: "authenticated", error });
+    }
+    let draftConfirmSheets = null;
+    if (draft && inventoryAuthenticated && !inspectionHalt) {
       const drafted = await visitRoute(page, appOrigin, draft.path, policy, true);
       const applied = drafted.class === "authenticated" ? await applyClientDraft(page, draft) : { applied: 0, result: "refused" };
       clientDraft = applied.result;
       if (applied.result === "dom-only") {
+        const counted = await page.evaluate(countVisibleConfirmSheets).catch(() => 0);
+        draftConfirmSheets = Number.isInteger(counted) && counted >= 0 && counted <= 8 ? counted : 0;
+        const settingsDraft = publicPath(draft.path, secrets).endsWith("?section=settings");
         const shot = await shoot(page, outputDir, {
           path: draft.path,
           classification: "authenticated",
           location: drafted.location,
           probe: drafted.probe,
           hostIndex: hostIndexFor(draft.path),
+          substep: settingsDraft ? "settings-draft" : "",
         }, secrets);
-        const existing = routes.find((route) => route.path === draft.path);
-        if (existing && shot) existing.screenshot = shot;
+        const existing = routes.find((route) => route.path === publicPath(draft.path, secrets));
+        if (existing && shot) {
+          if (settingsDraft) existing.draftScreenshot = shot;
+          else existing.screenshot = shot;
+        }
       }
       for (const field of draft.fields) field.value = "";
     }
-    if (routes.some((route) => route.class === "account-setup-required")) overall = "account-setup-required";
-    else if (routes.some((route) => route.class === "mfa-required")) overall = "mfa-required";
-    else if (routes.some((route) => route.class === "auth-required")) overall = "auth-required";
-    else if (routes.some((route) => route.class === "policy-denied")) overall = "policy-denied";
-    else if (routes.length === 0 || routes.some((route) => route.class !== "authenticated")) {
-      overall = "broken-ui";
-    } else overall = "authenticated";
-    writeEvidence(outputDir, { class: overall, appOrigin, clientDraft, routes, blocked }, secrets);
-    report(overall, routes, blocked, secrets);
+    overall = settleInventoryClass(routes);
+    overall = settleLiveInspection({ inventoryClass: overall, halt: inspectionHalt });
+    writeEvidence(
+      outputDir,
+      { class: overall, appOrigin, clientDraft, clientInspection, draftConfirmSheets, routes, blocked },
+      secrets,
+    );
+    report(overall, routes, blocked, secrets, clientInspection);
     return EXIT_CODES[overall] ?? 1;
   } finally {
+    if (policy?.totp?.bytes) policy.totp.bytes.fill(0);
+    revokeTotpGrant(policy?.totpGrant);
     await shutdownLiveSession({
       close: async () => {
         if (gate && typeof gate.beginShutdown === "function") gate.beginShutdown();

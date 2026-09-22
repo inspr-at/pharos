@@ -2,6 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { consumeTotpGrant, decodeTotpPostData, revokeTotpGrant, totpVerifyTarget } from "./live-ui-totp.mjs";
 
 // Browser-side request policy for the personal Pharos live UI harness.
 // This does not change the server role of the signed-in Fleet manager account.
@@ -71,6 +72,8 @@ const ISSUER_DENY_PREFIXES = Object.freeze([
 ]);
 // Exact Zitadel login v1 credential posts. Reset, init, revoke, and any
 // broader auth prefix are not login. Unknown login-v2 session posts stay denied.
+// POST /ui/login/mfa/verify is not an allowlist entry. One unattended code is a
+// separate grant checked by the primary-frame route and by Fetch.
 export const ISSUER_LOGIN_POST_PATHS = Object.freeze([
   "/ui/login/loginname",
   "/ui/login/password",
@@ -87,6 +90,8 @@ const BLOCKED_RESOURCES = new Set(["websocket", "serviceworker"]);
 const PROVIDER_PATH = /^\/pharos\/settings\/providers\/[a-z0-9-]{1,64}$/;
 const SERVICE_PATH = /^\/pharos\/services\/[A-Za-z0-9._-]{1,63}\/[A-Za-z0-9._-]{1,63}$/;
 const HOST_SETTINGS_PATH = /^\/pharos\/hosts\/[A-Za-z0-9._-]{1,63}\?section=settings$/;
+const HOST_SECTION_VALUES = new Set(["settings", "backups", "activity"]);
+const FLEET_HOME_PATHS = new Set(["/pharos", "/pharos/"]);
 const MAX_HOST_PAGES = 32;
 const SECRET_QUERY_KEYS = new Set([
   "password",
@@ -101,6 +106,13 @@ const SECRET_QUERY_KEYS = new Set([
 const FORBIDDEN_ENV = Object.freeze([
   "PHAROS_LIVE_UI_USERNAME",
   "PHAROS_LIVE_UI_PASSWORD",
+  "PHAROS_LIVE_UI_TOTP",
+  "PHAROS_LIVE_UI_TOTP_SECRET",
+  "PHAROS_LIVE_UI_TOTP_CODE",
+  "PHAROS_LIVE_UI_TOTP_SEED",
+  "PHAROS_LIVE_UI_OTP",
+  "PHAROS_LIVE_UI_OTP_CODE",
+  "PHAROS_LIVE_UI_OTP_SECRET",
   "PHAROS_LIVE_UI_APP_ORIGIN",
   "PHAROS_LIVE_UI_ISSUER",
   "PHAROS_LIVE_UI_ISSUER_ORIGIN",
@@ -506,6 +518,28 @@ function hiddenPath(secrets = []) {
   return HIDDEN_PATH;
 }
 
+function retainedLiveQuery(path, query) {
+  if (!query.startsWith("?")) return "";
+  let params;
+  try {
+    params = new URLSearchParams(query.slice(1));
+  } catch {
+    return "";
+  }
+  if (isHostPath(path)) {
+    const sections = params.getAll("section");
+    if (sections.length === 1 && HOST_SECTION_VALUES.has(sections[0])) {
+      return `?section=${sections[0]}`;
+    }
+    return "";
+  }
+  if (FLEET_HOME_PATHS.has(path)) {
+    const views = params.getAll("view");
+    if (views.length === 1 && views[0] === "list") return "?view=list";
+  }
+  return "";
+}
+
 export function publicPath(pathName, secrets = []) {
   if (pathName === HIDDEN_PATH) return hiddenPath(secrets);
   let path = typeof pathName === "string" ? pathName : "/";
@@ -517,7 +551,6 @@ export function publicPath(pathName, secrets = []) {
     path = path.slice(0, cut);
   }
   if (!path.startsWith("/")) path = "/";
-  const settings = query === "?section=settings" && isHostPath(path);
   if (
     path.includes("%") ||
     path.includes("\\") ||
@@ -527,7 +560,9 @@ export function publicPath(pathName, secrets = []) {
   ) {
     return hiddenPath(secrets);
   }
-  return settings ? `${path}${query}` : path;
+  const kept = retainedLiveQuery(path, query);
+  if (kept === "?view=list") return `/pharos/?view=list`;
+  return kept ? `${path}${kept}` : path;
 }
 
 export function decideRequest(request, policy = {}) {
@@ -742,6 +777,7 @@ export function screenshotPermitted({ classification, location, probe }) {
     !probe ||
     probe.passwordCount > 0 ||
     probe.mfa ||
+    probe.codeField ||
     probe.accountSetup ||
     probe.loginForm ||
     probe.authUiVisible ||
@@ -758,9 +794,19 @@ export function screenshotPermitted({ classification, location, probe }) {
   return true;
 }
 
+function totpMaterialEnv(name) {
+  if (name === "PHAROS_LIVE_UI_TOTP_SECRET_FILE") return false;
+  return /(TOTP|OTP_CODE|OTP_SECRET|MFA_CODE|MFA_SEED|MFA_SECRET)/i.test(name);
+}
+
 export function assertRuntimeEnvironment(env) {
   for (const name of FORBIDDEN_ENV) {
     if (env[name] !== undefined && env[name] !== "") {
+      throw new LiveUiError("runtime-env");
+    }
+  }
+  for (const name of Object.keys(env)) {
+    if (totpMaterialEnv(name) && env[name] !== undefined && env[name] !== "") {
       throw new LiveUiError("runtime-env");
     }
   }
@@ -808,7 +854,9 @@ function assertOwnedRegularFile(filePath, repoRoot, maxBytes, prefix) {
 function assertOutsideRepo(candidate, repoRoot, code) {
   const root = fs.realpathSync(repoRoot);
   const relative = path.relative(root, candidate);
-  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+  // `..` must be its own segment. A child named `..private` stays inside the repo.
+  const segment = relative.split(path.sep)[0];
+  if (relative === "" || (segment !== ".." && !path.isAbsolute(relative))) {
     throw new LiveUiError(code);
   }
 }
@@ -928,11 +976,34 @@ export function parseClientDraft(raw) {
   };
 }
 
+function draftSourceForParse(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { raw, restore: "" };
+  }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object" || typeof parsed.path !== "string") {
+    return { raw, restore: "" };
+  }
+  const cut = parsed.path.indexOf("?");
+  if (cut === -1) return { raw, restore: "" };
+  const bare = parsed.path.slice(0, cut);
+  if (parsed.path.slice(cut) !== "?section=settings" || !isHostPath(bare)) return { raw, restore: "" };
+  return {
+    raw: JSON.stringify({ ...parsed, path: bare }),
+    restore: `${bare}?section=settings`,
+  };
+}
+
 export function loadDraftFile(filePath, repoRoot) {
   try {
     assertOwnedRegularFile(filePath, repoRoot, 16 * 1024, "draft-file");
     const raw = fs.readFileSync(filePath, "utf8");
-    return parseClientDraft(raw);
+    const prepared = draftSourceForParse(raw);
+    const draft = parseClientDraft(prepared.raw);
+    if (prepared.restore) draft.path = prepared.restore;
+    return draft;
   } catch (error) {
     if (error instanceof LiveUiError) throw error;
     if (error && error.code === "ENOENT") throw new LiveUiError("draft-missing");
@@ -1076,10 +1147,12 @@ export function collectProbeSurface(root) {
 
 export function classifyProbeSurface(surface = {}) {
   const accountSetup = Boolean(surface.accountSetup);
-  const mfa = !accountSetup && Boolean(surface.otpField || surface.webauthnChallenge);
+  const codeField = Boolean(surface.codeField || surface.otpField);
+  const mfa = !accountSetup && Boolean(codeField || surface.webauthnChallenge);
   return {
     passwordCount: Math.min(2, Number(surface.passwordCount) || 0),
     mfa,
+    codeField,
     accountSetup,
     enrollmentOptional: accountSetup && Boolean(surface.enrollmentOptional),
     passkeyAlternative: Boolean(surface.passkeyAlternative) && !mfa && !accountSetup,
@@ -1096,6 +1169,7 @@ export function classifyProbeSurface(surface = {}) {
     authUiVisible: Boolean(
       Number(surface.passwordCount) > 0 ||
         surface.usernameField ||
+        codeField ||
         surface.otpField ||
         surface.webauthnChallenge ||
         surface.accountSetup ||
@@ -1139,6 +1213,7 @@ export function planInventory({
     paths.push(path);
   };
   for (const route of INVENTORY_ROUTES) add(route);
+  add("/pharos/?view=list");
   const names = new Set();
   const rememberHost = (name) => {
     if (typeof name !== "string" || !HOST_ROUTE.test(`/pharos/hosts/${name}`)) return;
@@ -1161,9 +1236,15 @@ export function planInventory({
     if (isHostPath(url.pathname)) rememberHost(url.pathname.slice("/pharos/hosts/".length));
     else if (PROVIDER_PATH.test(url.pathname) || SERVICE_PATH.test(url.pathname)) add(url.pathname);
   }
+  let representativeHost = true;
   for (const name of [...names].sort().slice(0, MAX_HOST_PAGES)) {
     add(`/pharos/hosts/${name}`);
     add(`/pharos/hosts/${name}?section=settings`);
+    if (representativeHost) {
+      add(`/pharos/hosts/${name}?section=backups`);
+      add(`/pharos/hosts/${name}?section=activity`);
+      representativeHost = false;
+    }
   }
   return paths;
 }
@@ -1184,32 +1265,99 @@ export function passwordAppearsInText(text, password) {
   return String(text ?? "").includes(password);
 }
 
-export async function takeAuthenticatedShot(page, { permitted, password, options }) {
-  if (!permitted) return false;
-  let rendered = true;
-  try {
-    rendered = await page.evaluate(scanVisiblePassword, password);
-  } catch {
-    rendered = true;
-  }
-  if (rendered) return false;
-  await page.screenshot(options);
-  return true;
-}
+export const SCREENSHOT_TEXT_LIMIT = 250000;
+export const SCREENSHOT_FIELD_LIMIT = 200;
+export const SCREENSHOT_VALUE_LIMIT = 2048;
 
-export function scanVisiblePassword(secret) {
-  const appears = (text, password) =>
-    typeof password === "string" && password.length > 0 && String(text ?? "").includes(password);
-  if (typeof secret !== "string" || secret.length < 1) return true;
+// Runs in the page. Limits are literals so the serialized function does not
+// close over Node state, and it never receives a secret argument.
+// Only rendered text is collected. Inline script and style are not visible.
+export function collectScreenshotSurface() {
+  const textLimit = 250000;
+  const fieldLimit = 200;
+  const valueLimit = 2048;
   const document = globalThis.document;
-  if (!document || typeof document.querySelectorAll !== "function") return true;
-  const nodes = [...document.querySelectorAll("input, textarea")];
+  if (!document || typeof document.querySelectorAll !== "function") return { reason: "missing" };
+  let nodes;
+  try {
+    nodes = [...document.querySelectorAll("input, textarea")];
+  } catch {
+    return { reason: "missing" };
+  }
+  if (nodes.length > fieldLimit) return { reason: "oversized-fields" };
+  const values = [];
   for (const node of nodes) {
-    if (appears(node.value, secret)) return true;
+    const value = String(node && node.value != null ? node.value : "");
+    if (value.length > valueLimit) return { reason: "oversized-value" };
+    values.push(value);
   }
   const body = document.body;
-  const visible = `${document.title || ""}\n${body ? body.innerText || "" : ""}\n${body ? body.textContent || "" : ""}`;
-  return appears(visible, secret);
+  if (!body || typeof body.innerText !== "string") return { reason: "missing" };
+  const title = String(document.title || "");
+  if (title.length + body.innerText.length + 1 > textLimit) return { reason: "oversized-text" };
+  return { reason: "clear", values, visible: `${title}\n${body.innerText}` };
+}
+
+const SCREENSHOT_PAGE_REASONS = new Set(["missing", "oversized-text", "oversized-fields", "oversized-value"]);
+
+export function screenshotScanReason(surface, needles) {
+  if (!surface || typeof surface !== "object") return "missing";
+  if (SCREENSHOT_PAGE_REASONS.has(surface.reason)) return surface.reason;
+  if (typeof surface.visible !== "string" || !Array.isArray(surface.values)) return "missing";
+  if (surface.visible.length > SCREENSHOT_TEXT_LIMIT) return "oversized-text";
+  if (surface.values.length > SCREENSHOT_FIELD_LIMIT) return "oversized-fields";
+  for (const value of surface.values) {
+    if (typeof value !== "string" || value.length > SCREENSHOT_VALUE_LIMIT) return "oversized-value";
+  }
+  const list = Array.isArray(needles) ? needles : [];
+  if (list.length < 1) return "empty-needles";
+  for (const needle of list) {
+    if (typeof needle !== "string" || needle.length < 1) return "empty-needles";
+    if (passwordAppearsInText(surface.visible, needle)) return "visible-secret";
+  }
+  for (const needle of list) {
+    for (const value of surface.values) {
+      if (passwordAppearsInText(value, needle)) return "input-secret";
+    }
+  }
+  return "clear";
+}
+
+export function screenshotContainsNeedle(surface, needles) {
+  return screenshotScanReason(surface, needles) !== "clear";
+}
+
+export async function takeAuthenticatedShot(page, { permitted, password, material, options, reasons }) {
+  const note = (reason) => {
+    if (Array.isArray(reasons)) reasons.push(reason);
+  };
+  if (!permitted) {
+    note("not-permitted");
+    return false;
+  }
+  const needles = [];
+  if (typeof password === "string" && password.length > 0) needles.push(password);
+  if (Array.isArray(material)) {
+    for (const item of material) {
+      if (typeof item === "string" && item.length > 0 && !needles.includes(item)) needles.push(item);
+    }
+  }
+  if (needles.length === 0) {
+    note("empty-needles");
+    return false;
+  }
+  let surface;
+  try {
+    surface = await page.evaluate(collectScreenshotSurface);
+  } catch {
+    note("failed-read");
+    return false;
+  }
+  const reason = screenshotScanReason(surface, needles);
+  note(reason);
+  if (reason !== "clear") return false;
+  await page.screenshot(options);
+  return true;
 }
 
 export function fetchPausePatterns() {
@@ -1233,6 +1381,7 @@ function protocolLost(policy) {
 
 export function decideFetchPause(event, policy = {}) {
   if (protocolLost(policy)) {
+    revokeTotpGrant(policy?.totpGrant);
     return {
       action: "fail",
       verdict: decision(false, "network-guard", "?", "/", listedSecrets(policy.secrets)),
@@ -1260,10 +1409,32 @@ export function decideFetchPause(event, policy = {}) {
   } catch {
     verdict = decision(false, "guard-error", "?", "/", listedSecrets(policy.secrets));
   }
+  verdict = applyTotpGrant(verdict, {
+    method: request.method,
+    url: request.url,
+    postData: decodeTotpPostData(request),
+    redirected: Boolean(event?.redirectedRequestId),
+    isolated: false,
+    layer: "fetch",
+  }, policy);
   return {
     action: continuationAllowed(verdict) ? "continue" : "fail",
     verdict,
   };
+}
+
+function applyTotpGrant(verdict, observed, policy) {
+  if (!totpVerifyTarget(observed.method, observed.url)) return verdict;
+  if (verdict?.reason === "secret-in-url") {
+    revokeTotpGrant(policy?.totpGrant);
+    return verdict;
+  }
+  const effect = consumeTotpGrant(observed, policy);
+  if (effect === "ignore" || effect === "keep") return verdict;
+  const secrets = listedSecrets(policy?.secrets);
+  if (effect === "allow") return decision(true, "issuer-login", "POST", "/ui/login/mfa/verify", secrets);
+  const reason = effect === "network-guard" ? "network-guard" : "issuer-mutation";
+  return decision(false, reason, "POST", "/ui/login/mfa/verify", secrets);
 }
 
 export async function settleFetchPause(session, event, policy = {}, rememberFn) {
@@ -1711,11 +1882,26 @@ export function primaryFrameDecision(request, page, policy = {}) {
   } catch {
     primary = false;
   }
+  let redirected = false;
+  try {
+    if (typeof request?.redirectedFrom === "function") redirected = Boolean(request.redirectedFrom());
+  } catch {
+    redirected = true;
+  }
+  const observed = {
+    method,
+    url,
+    postData: typeof postData === "string" ? postData : "",
+    redirected,
+    isolated: !primary,
+    layer: "primary",
+  };
   if (!primary) {
+    consumeTotpGrant(observed, policy);
     if (verdict.reason === "secret-in-url") return { ...verdict, allow: false };
     return { ...verdict, allow: false, reason: "isolated-target" };
   }
-  return verdict;
+  return applyTotpGrant(verdict, observed, policy);
 }
 
 export async function installPrimaryFrameRoute(context, pageRef, policy, rememberFn, gate) {
@@ -1779,15 +1965,35 @@ export async function shutdownLiveSession({ close, sessions = [], detach, secret
   return { released: true };
 }
 
-export function screenshotName(routePath, hostIndex = 1) {
+const FIXED_INSPECTION_SHOTS = Object.freeze({
+  "fleet-freshness": "10-fleet-freshness.png",
+  "card-exact-times": "11-card-exact-times.png",
+  "quick-preview": "12-quick-preview.png",
+  "actions-menu": "13-actions-menu.png",
+  "history-hint": "14-history-hint.png",
+});
+
+export function screenshotName(routePath, hostIndex = 1, substep = "") {
+  const step = typeof substep === "string" ? substep : "";
+  if (step && !/^[a-z-]{1,32}$/.test(step)) return "";
+  if (Object.hasOwn(FIXED_INSPECTION_SHOTS, step)) return FIXED_INSPECTION_SHOTS[step];
   const path = publicPath(routePath, []);
   if (!path.startsWith("/pharos") || path.includes("/auth/")) return "";
+  const index = Number.isInteger(hostIndex) && hostIndex > 0 && hostIndex < 100 ? hostIndex : 1;
+  const hostFile = (suffix) => `host-${String(index).padStart(2, "0")}${suffix}.png`;
+  if (step === "settings-draft") {
+    return HOST_SETTINGS_PATH.test(path) ? hostFile("-settings-draft") : "";
+  }
+  if (step) return "";
   if (SCREENSHOT_FILES[path]) return SCREENSHOT_FILES[path];
+  if (path === "/pharos/?view=list") return "01-home-list.png";
   const bare = path.split("?")[0];
   if (!isHostPath(bare)) return "";
-  const suffix = HOST_SETTINGS_PATH.test(path) ? "-settings" : "";
-  const index = Number.isInteger(hostIndex) && hostIndex > 0 && hostIndex < 100 ? hostIndex : 1;
-  return `host-${String(index).padStart(2, "0")}${suffix}.png`;
+  let suffix = "";
+  if (HOST_SETTINGS_PATH.test(path)) suffix = "-settings";
+  else if (path.endsWith("?section=backups")) suffix = "-backups";
+  else if (path.endsWith("?section=activity")) suffix = "-activity";
+  return hostFile(suffix);
 }
 
 export function repoRootFromScripts() {
