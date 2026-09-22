@@ -1450,6 +1450,19 @@ mod module_tests {
     }
 
     #[test]
+    fn heartbeat_face_names_clock_skew_when_the_report_is_ahead() {
+        let now = 1_700_000_000;
+        let ahead = heartbeat_face(Some(now + BACKUP_CLOCK_SKEW_SECS + 1), now, 60, 15);
+        assert_eq!(ahead.status, "Clock skew");
+        assert_eq!(ahead.tone, "neutral");
+        assert_eq!(ahead.explain, "last report is ahead of Pharos");
+        let within = heartbeat_face(Some(now + BACKUP_CLOCK_SKEW_SECS), now, 60, 15);
+        assert!(within.status.starts_with("On time"), "{}", within.status);
+        let missing = heartbeat_face(None, now, 60, 15);
+        assert_eq!(missing.status, "No observations");
+    }
+
+    #[test]
     fn protection_pair_tone_follows_posture() {
         let now = 1_700_000_120;
         let cases = [
@@ -4975,6 +4988,13 @@ fn heartbeat_face(
             explain: "Awaiting first heartbeat".to_string(),
         };
     };
+    if last > now.saturating_add(BACKUP_CLOCK_SKEW_SECS) {
+        return HeartbeatFace {
+            status: "Clock skew".to_string(),
+            tone: "neutral",
+            explain: "last report is ahead of Pharos".to_string(),
+        };
+    }
     let age = (now - last).max(0);
     let age_text = ping_age_label(age);
     let timing = pharos_core::heartbeat_timing(age as u64, interval.max(1) as u64, grace_secs);

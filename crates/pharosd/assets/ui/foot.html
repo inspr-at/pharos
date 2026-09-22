@@ -2915,6 +2915,10 @@ function paintFleetCardHeartbeat(beat,presentation,interval,grace){
     label='On time · '+ageText;
     tone='neutral';
     detail='Expected '+cadence+'s + '+graceSecs+'s grace · last ping '+ageText+' ago';
+  }else if(arrival.state==='unknown'){
+    label='Clock skew';
+    tone='neutral';
+    detail='last report is ahead of Pharos';
   }
   if(status){
     status.textContent=label;

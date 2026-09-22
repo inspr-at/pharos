@@ -34,6 +34,55 @@ async function cardBox(page, host) {
   }, host);
 }
 
+test("a future heartbeat reads as clock skew", async ({ page }, testInfo) => {
+  const host = `clock-skew-${testInfo.project.name}`;
+  const report = await page.request.post("/report", {
+    data: {
+      schema: "inspr.pharos.host-report.v4",
+      version: 4,
+      name: host,
+      role: "server",
+      is_nix: false,
+      heartbeat_interval_secs: 60,
+      freshness: { applicable: false },
+      preferences: { kind: "server" },
+    },
+  });
+  expect(report.status(), await report.text()).toBe(204);
+  try {
+    await page.goto("/");
+    const card = page.locator(`article.card[data-host="${host}"]`);
+    await expect(card).toBeVisible();
+    const shown = await page.evaluate((name) => {
+      const node = document.querySelector(`article.card[data-host="${name}"]`);
+      const beat = node.querySelector(".beat");
+      const now = Date.now() / 1000;
+      beat.dataset.last = String(now + 30);
+      window.updateBeatClock(beat, now);
+      const status = node.querySelector("[data-heartbeat-status]");
+      return {
+        status: status?.textContent || "",
+        tone: status?.dataset.heartbeatTone || "",
+        explain: node.querySelector("[data-heartbeat-explain]")?.textContent || "",
+      };
+    }, host);
+    expect(shown.status).toBe("Clock skew");
+    expect(shown.tone).toBe("neutral");
+    expect(shown.explain).toBe("last report is ahead of Pharos");
+  } finally {
+    const removal = await page.request.post(`/host-actions/${host}/remove`, {
+      headers: { "x-pharos-action": "1" },
+      data: { confirmation: host, disposition: "unmanaged", successor: null },
+    });
+    expect(removal.status()).toBe(202);
+    const reonboard = await page.request.post(`/host-actions/${host}/allow-reonboarding`, {
+      headers: { "x-pharos-action": "1" },
+      data: { confirmation: host },
+    });
+    expect(reonboard.ok()).toBe(true);
+  }
+});
+
 test("fleet cards keep their box, route, and grid columns", async ({ page }, testInfo) => {
   const hosts = [0, 1, 2, 3, 4].map((index) => `card-geo-${index}-${testInfo.project.name}`);
   for (const host of hosts) {
