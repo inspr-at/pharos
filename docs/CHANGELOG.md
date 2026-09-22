@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## 260922214617.0.0 - 2026-09-22
+
+- Fleet cards, list and quick preview rebuilt on the approved Harbor design: fluid grid that fills the viewport (1 to 5 columns), fixed card regions with one attention line, a two-column protection panel, the moving heartbeat stage and a configuration footer; six-column list; 420px quick preview sheet with exact times and heartbeat history; phone and tablet layouts without horizontal scroll (PHAROS-310).
+
 ## Unreleased
 
 ## 260922141211.0.0 - 2026-09-22
