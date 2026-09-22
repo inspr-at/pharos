@@ -1586,9 +1586,18 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
     await expect(faultRail).toBeHidden();
     await expect(faultRail).toHaveAttribute("role", "group");
     await expect(visibleFaults).toHaveCount(4);
-    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toContainText(/end of life|nixpkgs/);
-    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toContainText(/nixpkgs|differs|unknown/);
-    await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toContainText(/behind|ahead|diverged|unknown/);
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toHaveCount(1);
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toHaveCount(1);
+    await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toHaveCount(1);
+    await faultCard.locator("[data-host-drawer-trigger]").click();
+    const drawerReasons = page.locator("#host-quick-drawer [data-host-drawer-reasons]");
+    await expect(drawerReasons).toBeVisible();
+    await expect(drawerReasons).toContainText("nixos-25.05 end of life");
+    await expect(drawerReasons).toContainText("nixpkgs differs from nixos-25.05");
+    await expect(drawerReasons).toContainText("12 commits behind");
+    await expect(drawerReasons).toContainText("restart required");
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#host-quick-drawer")).toBeHidden();
     const backupFault = faultRail.locator('[data-fresh-kind="backup-fault"]');
     await expect(backupFault).toHaveCount(1);
     await expect(backupFault).toBeHidden();
@@ -1615,7 +1624,7 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
       '[data-fresh-kind="backup-fault"] [data-fresh-value]',
     );
     await expect(failedBackupValue).toHaveClass("down");
-    await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toContainText("restart required");
+    await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toHaveCount(1);
     await expect(faultRail.locator('[data-fresh-kind="deployed-sha"]')).toHaveCount(0);
     await expect(faultRail.locator('[data-fresh-kind="nixcfg-sha"]')).toHaveCount(0);
     await expect(faultRail.locator('[data-fresh-kind="nixpkgs-sha"]')).toHaveCount(0);

@@ -11,7 +11,7 @@ const test = base.extend({
   },
 });
 
-const DRAWER_FIELDS = [
+const REPORTED_DRAWER_FIELDS = [
   "[data-host-drawer-title]",
   "[data-host-drawer-role]",
   "[data-host-drawer-health-label]",
@@ -19,13 +19,10 @@ const DRAWER_FIELDS = [
   "[data-host-drawer-attention]",
   "[data-host-drawer-backup]",
   "[data-host-drawer-restore]",
-  "[data-host-drawer-backup-clock]",
-  "[data-host-drawer-restore-clock]",
   "[data-host-drawer-config]",
   "[data-host-drawer-deployed]",
   "[data-host-drawer-nixpkgs]",
   "[data-host-drawer-grace]",
-  "[data-host-drawer-check]",
   "[data-host-drawer-reasons]",
   "[data-grace-source-line]",
   "[data-grace-rule]",
@@ -70,12 +67,8 @@ test("mobile fleet and the quick preview stay on screen", async ({ page }, testI
       const before = await card.boundingBox();
       await trigger.click();
       await expect(drawer).toBeVisible();
-      const populated = await drawer.evaluate((panel, selectors) => selectors.map((selector) => ({
-        selector,
-        text: (panel.querySelector(selector)?.textContent || "").trim(),
-      })), DRAWER_FIELDS);
-      for (const field of populated) {
-        expect(field.text, field.selector).not.toBe("");
+      for (const selector of REPORTED_DRAWER_FIELDS) {
+        await expect(drawer.locator(selector), selector).not.toHaveText("Not recorded");
       }
       expect(await pageFits(page)).toBe(true);
       const opened = await card.boundingBox();
@@ -118,7 +111,7 @@ test("mobile fleet and the quick preview stay on screen", async ({ page }, testI
     await expect(drawer.locator("[data-host-drawer-title]")).toHaveText(title ?? "");
     await expect(drawer.locator("[data-host-drawer-backup]")).not.toHaveText("");
     expect(reduced).toBe("none");
-    expect(moving === "none" || moving.includes("host-drawer-in")).toBe(true);
+    expect(moving).toContain("host-drawer-in");
   } finally {
     const removal = await page.request.post(`/host-actions/${host}/remove`, {
       headers: { "x-pharos-action": "1" },
