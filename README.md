@@ -1248,6 +1248,10 @@ mutation allowlist is empty. Machine routes such as `/report`, `/register`,
 A host settings draft may name `/pharos/hosts/{name}?section=settings`. That fill
 is still DOM-only. Its screenshot is `host-NN-settings-draft.png`, separate
 from the inventory shot, and the confirm sheet is counted rather than accepted.
+Host workspace pages come from `/hosts.json`, workspace links, and fleet
+`data-host` attributes. A declared-only configuration record is not turned
+into a workspace URL. A linked or observed host that the server denies stays
+a denied route, as does a denied application page.
 
 After an authenticated inventory, one Fleet manager session also runs
 `scripts/live-ui-inspect.mjs` on the same guarded page. It keeps `?view=list`

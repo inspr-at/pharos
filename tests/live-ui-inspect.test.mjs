@@ -32,6 +32,7 @@ import {
 } from "../scripts/live-ui-inspect.mjs";
 import {
   EXIT_CODES,
+  INVENTORY_ROUTES,
   LiveUiError,
   SCREENSHOT_FILES,
   SERVER_MUTATION_ALLOWLIST,
@@ -40,6 +41,11 @@ import {
   publicPath,
   screenshotName,
 } from "../scripts/live-ui-guard.mjs";
+import {
+  observedHostNamesFromPayload,
+  planObservedInventory,
+  settleInventoryClass,
+} from "../scripts/live-ui.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -284,6 +290,10 @@ test("inspection source stays bounded to fixed local actions", () => {
   assert.equal(runner.includes("context.on(\"response\""), false);
   assert.equal(runner.includes("settleLiveInspection({ inventoryClass: \"authenticated\", error })"), true);
   assert.equal(runner.includes("settleLiveInspection({ inventoryClass: overall, halt: inspectionHalt })"), true);
+  assert.equal(runner.includes("declared-hosts.json"), false);
+  assert.equal(runner.includes("planObservedInventory("), true);
+  assert.equal(runner.includes("settleInventoryClass(routes)"), true);
+  assert.equal(runner.includes("routes.every((route) => route.class === \"authenticated\")"), true);
   const order = ["step:fleet", "step:cards", "step:history", "step:exact-times", "step:preview", "step:actions", "step:focus", "step:list", "step:tabs", "step:draft", "step:freshness"];
   let cursor = -1;
   for (const step of order) {
@@ -534,4 +544,55 @@ test("fleet-default grace edits the settings select and resets locally", async (
     inventoryClass: "authenticated",
     halt: result.halt,
   }), "authenticated");
+});
+
+test("inventory plans observed workspaces and keeps a real denial", () => {
+  const observed = ["obs-01", "obs-02", "obs-03", "obs-04", "obs-05", "obs-06"];
+  const declaredOnly = ["dsc0", "lab-01"];
+  const hostsPayload = JSON.stringify({
+    hosts: observed.map((name) => ({ name })),
+    declared_hosts: declaredOnly.map((name) => ({ name, runtime: { state: "pending" } })),
+  });
+  assert.deepEqual(observedHostNamesFromPayload(hostsPayload), observed);
+  assert.deepEqual(
+    observedHostNamesFromPayload(JSON.stringify({
+      declared_hosts: declaredOnly.map((name) => ({ name })),
+    })),
+    [],
+  );
+
+  const planned = planObservedInventory({
+    hrefs: [
+      "/pharos/hosts/obs-03",
+      "/pharos/hosts/broken-link",
+    ],
+    attributeNames: ["obs-01", "obs-02", "card-only"],
+    hostsPayload,
+  });
+  for (const route of INVENTORY_ROUTES) assert.equal(planned.includes(route), true, route);
+  assert.equal(planned.includes("/pharos/?view=list"), true);
+  for (const name of [...observed, "card-only", "broken-link"]) {
+    assert.equal(planned.includes(`/pharos/hosts/${name}`), true, name);
+    assert.equal(planned.includes(`/pharos/hosts/${name}?section=settings`), true, name);
+  }
+  for (const name of declaredOnly) {
+    assert.equal(planned.some((route) => route.includes(`/${name}`)), false, name);
+  }
+  assert.equal(planned.includes("/pharos/hosts/broken-link?section=backups"), true);
+  assert.equal(planned.includes("/pharos/hosts/broken-link?section=activity"), true);
+  assert.equal(planned.includes("/pharos/hosts/obs-01?section=backups"), false);
+
+  const granted = planned.map((path) => ({ path, class: "authenticated" }));
+  assert.equal(settleInventoryClass(granted), "authenticated");
+  assert.equal(EXIT_CODES.authenticated, 0);
+  const deniedHost = granted.map((route) => (
+    route.path === "/pharos/hosts/obs-01" ? { ...route, class: "policy-denied" } : route
+  ));
+  assert.equal(settleInventoryClass(deniedHost), "policy-denied");
+  assert.equal(EXIT_CODES["policy-denied"], 4);
+  assert.equal(deniedHost.every((route) => route.class === "authenticated"), false);
+  const deniedNav = granted.map((route) => (
+    route.path === "/pharos/agora" ? { ...route, class: "policy-denied" } : route
+  ));
+  assert.equal(settleInventoryClass(deniedNav), "policy-denied");
 });

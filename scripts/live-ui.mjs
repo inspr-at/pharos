@@ -367,10 +367,50 @@ async function signIn(page, username, password, policy) {
   return maybeAttendTotp(page, viewed, policy);
 }
 
+export function observedHostNamesFromPayload(raw) {
+  let parsed = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.hosts)) {
+    return [];
+  }
+  return hostNamesFromPayload({ hosts: parsed.hosts });
+}
+
+export function planObservedInventory({
+  hrefs = [],
+  attributeNames = [],
+  hostsPayload = "",
+  origin,
+  secrets,
+} = {}) {
+  return planInventory({
+    hrefs,
+    hostNames: [...attributeNames, ...observedHostNamesFromPayload(hostsPayload)],
+    origin,
+    secrets,
+  });
+}
+
+export function settleInventoryClass(routes) {
+  const list = Array.isArray(routes) ? routes : [];
+  if (list.some((route) => route.class === "account-setup-required")) return "account-setup-required";
+  if (list.some((route) => route.class === "mfa-required")) return "mfa-required";
+  if (list.some((route) => route.class === "auth-required")) return "auth-required";
+  if (list.some((route) => route.class === "policy-denied")) return "policy-denied";
+  if (list.length === 0 || list.some((route) => route.class !== "authenticated")) return "broken-ui";
+  return "authenticated";
+}
+
 async function discoverInventory(page, origin, secrets, includeJson) {
   let hrefs = [];
-  let hostNames = [];
-  let payloads = [];
+  let attributeNames = [];
+  let hostsPayload = "";
   try {
     const found = await page.evaluate(async (withJson) => {
       const foundHrefs = [];
@@ -383,29 +423,30 @@ async function discoverInventory(page, origin, secrets, includeJson) {
         const name = node.getAttribute("data-host") || "";
         if (name) foundNames.push(name.slice(0, 63));
       }
-      const foundPayloads = [];
+      let foundPayload = "";
       if (withJson) {
-        for (const path of ["/pharos/hosts.json", "/pharos/declared-hosts.json"]) {
-          try {
-            const response = await fetch(path, { method: "GET", credentials: "same-origin", cache: "no-store" });
-            if (response.ok) foundPayloads.push((await response.text()).slice(0, 250000));
-          } catch {
-            // A missing inventory source stays empty.
-          }
+        try {
+          const response = await fetch("/pharos/hosts.json", {
+            method: "GET",
+            credentials: "same-origin",
+            cache: "no-store",
+          });
+          if (response.ok) foundPayload = (await response.text()).slice(0, 250000);
+        } catch {
+          // A missing inventory source stays empty.
         }
       }
-      return { hrefs: foundHrefs.slice(0, 300), hostNames: foundNames, payloads: foundPayloads };
+      return { hrefs: foundHrefs.slice(0, 300), hostNames: foundNames, hostsPayload: foundPayload };
     }, includeJson);
     hrefs = found.hrefs || [];
-    hostNames = found.hostNames || [];
-    payloads = found.payloads || [];
+    attributeNames = found.hostNames || [];
+    hostsPayload = found.hostsPayload || "";
   } catch {
     hrefs = [];
-    hostNames = [];
-    payloads = [];
+    attributeNames = [];
+    hostsPayload = "";
   }
-  for (const payload of payloads) hostNames.push(...hostNamesFromPayload(payload));
-  return planInventory({ hrefs, hostNames, origin, secrets });
+  return planObservedInventory({ hrefs, attributeNames, hostsPayload, origin, secrets });
 }
 
 async function visitRoute(page, origin, routePath, policy, managerConfirmed) {
@@ -753,13 +794,7 @@ async function run(command) {
       }
       for (const field of draft.fields) field.value = "";
     }
-    if (routes.some((route) => route.class === "account-setup-required")) overall = "account-setup-required";
-    else if (routes.some((route) => route.class === "mfa-required")) overall = "mfa-required";
-    else if (routes.some((route) => route.class === "auth-required")) overall = "auth-required";
-    else if (routes.some((route) => route.class === "policy-denied")) overall = "policy-denied";
-    else if (routes.length === 0 || routes.some((route) => route.class !== "authenticated")) {
-      overall = "broken-ui";
-    } else overall = "authenticated";
+    overall = settleInventoryClass(routes);
     overall = settleLiveInspection({ inventoryClass: overall, halt: inspectionHalt });
     writeEvidence(
       outputDir,
