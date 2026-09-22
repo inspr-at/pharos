@@ -6538,7 +6538,7 @@ mod tests {
         assert_eq!(
             html.matches(r#"data-backup-state="healthy" data-backup-level="clear""#)
                 .count(),
-            2
+            1
         );
         assert!(html.contains(
             r#"aria-label="Backup for athena: Protected, last success 2m 00s ago" hidden>"#
@@ -6656,22 +6656,21 @@ mod tests {
         assert_eq!(
             html.matches(r#"class="header-chip backup-chip clear""#)
                 .count(),
-            2
+            1
         );
         assert_eq!(
             html.matches(r#"class="header-chip backup-chip critical""#)
                 .count(),
-            2
+            1
         );
         assert!(html.contains(
             r#"aria-label="Backup for healthy-header: Protected, last success 2m 00s ago" hidden>"#
         ));
         let failed_card = rendered_card(&html, "failed-header");
-        let failed_chip = failed_card
-            .split_once(r#"class="header-chip backup-chip critical""#)
-            .map(|(_, tail)| tail.split_once('>').map_or(tail, |(tag, _)| tag))
-            .expect("failed backup chip rendered");
-        assert!(!failed_chip.contains(" hidden"));
+        assert!(!failed_card.contains("backup-chip"));
+        assert!(failed_card.contains(r#"aria-label="Backup failed for failed-header""#));
+        assert!(failed_card.contains(r#"href="/backups?host=failed-header""#));
+        assert!(failed_card.contains(r#"class="protection-fact bad""#));
         assert_eq!(
             html.matches(
                 r#"class="host-action-dot" data-host-action-dot aria-hidden="true"></span>"#
@@ -9565,7 +9564,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             shell("markus", true),
             true,
         );
-        assert!(lifecycle_html.contains(r#"<div class="card-maintenance">"#));
+        assert!(lifecycle_html.contains(r#"class="attention-sep" aria-hidden="true"> · </span>"#));
+        assert!(!rendered_card(&lifecycle_html, "lifecycle").contains("backup-chip"));
         assert!(lifecycle_html
             .contains(r#"<span data-host-lifecycle-chip-copy>Change requested</span></button>"#));
         assert!(!lifecycle_html.contains(r#"<span data-host-lifecycle-chip-copy>Continue:"#));
@@ -9587,8 +9587,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let menu = card
             .find("data-host-actions")
             .expect("actions menu rendered");
-        let backup = card.find("backup-chip").expect("backup control rendered");
+        let backup = card
+            .find("data-daily-backup")
+            .expect("backup fact rendered");
         assert!(menu < backup, "ellipsis menu must precede backup control");
+        assert!(card.contains(r#"aria-label="Backup "#));
     }
 
     #[test]

@@ -35,7 +35,7 @@ async function cardBox(page, host) {
 }
 
 test("fleet cards keep their box, route, and grid columns", async ({ page }, testInfo) => {
-  const hosts = [0, 1, 2].map((index) => `card-geo-${index}-${testInfo.project.name}`);
+  const hosts = [0, 1, 2, 3, 4].map((index) => `card-geo-${index}-${testInfo.project.name}`);
   for (const host of hosts) {
     const report = await page.request.post("/report", {
       data: {
@@ -105,8 +105,12 @@ test("fleet cards keep their box, route, and grid columns", async ({ page }, tes
         return cards.filter((node) => Math.abs(node.getBoundingClientRect().top - firstTop) < 8).length;
       });
     };
-    expect(await columnsAt(1440)).toBeGreaterThanOrEqual(3);
     expect(await columnsAt(390)).toBe(1);
+    expect(await columnsAt(768)).toBe(2);
+    expect(await columnsAt(1280)).toBe(2);
+    expect(await columnsAt(1440)).toBe(3);
+    expect(await columnsAt(1920)).toBe(4);
+    expect(await columnsAt(2560)).toBe(5);
   } finally {
     for (const host of hosts) {
       const removal = await page.request.post(`/host-actions/${host}/remove`, {

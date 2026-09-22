@@ -1445,6 +1445,33 @@ mod module_tests {
         let chip = r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="freshness-unverified"><strong class="na" data-fresh-value>unverified</strong></div>"#;
         assert!(mark_scan_duplicate_chip(chip, "freshness unverified").contains("scan-duplicate"));
         assert!(!mark_scan_duplicate_chip(chip, "Backup Failed").contains("scan-duplicate"));
+    }
+
+    #[test]
+    fn card_backup_fact_names_its_state_and_configuration_stays_off_freshness() {
+        let now = 2_000_000_000;
+        let failed = backup_observation(BackupPostureState::Failed, None, None, None);
+        let view = fleet_protection_view(std::slice::from_ref(&failed), now);
+        let card = protection_card_markup(&view, "beacon", &PublicBasePath::ROOT);
+        assert!(card.contains(r#"href="/backups?host=beacon""#));
+        assert!(card.contains(r#"aria-label="Backup failed for beacon""#));
+        assert!(card.contains(r#"class="protection-fact bad""#));
+        assert!(!card.contains("backup-chip"));
+        assert_eq!(
+            configuration_face_label(&proven_current("nixos-unstable")),
+            "Configuration exact"
+        );
+        let mut differs = proven_current("nixos-unstable");
+        differs.nixpkgs_comparison.as_mut().unwrap().relation = NixpkgsRevisionRelation::Different;
+        assert_eq!(configuration_face_label(&differs), "Configuration differs");
+        let mut missing = proven_current("nixos-unstable");
+        missing.applicable = false;
+        assert_eq!(
+            configuration_face_label(&missing),
+            "Configuration not observed"
+        );
+        assert!(!configuration_face_label(&missing).contains("nix: n/a"));
+        assert!(!configuration_face_label(&missing).contains("freshness"));
         let exact = r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="nixpkgs-drift"><strong class="warn" data-fresh-value>nixpkgs differs from nixos-unstable</strong></div>"#;
         assert!(
             mark_scan_duplicate_chip(exact, "nixpkgs differs from nixos-unstable")
@@ -4347,6 +4374,17 @@ fn fact_kind_label(kind: &str, card_face: bool) -> String {
     format!("{icon}{text}")
 }
 
+fn backup_aria_state(fact: &ProtectionFact) -> &'static str {
+    match fact.state {
+        "ok" | "healthy" => "healthy",
+        "failed" => "failed",
+        "stale" => "stale",
+        "warning" => "warning",
+        "disabled" => "disabled",
+        _ => "not observed",
+    }
+}
+
 fn fact_markup(
     fact: &ProtectionFact,
     kind: &str,
@@ -4354,6 +4392,7 @@ fn fact_markup(
     include_time: bool,
     scan: bool,
     card_face: bool,
+    aria_label: Option<&str>,
 ) -> String {
     let compact = scan && !card_face;
     let at = fact_instant_attr(fact.at);
@@ -4390,8 +4429,14 @@ fn fact_markup(
         tone = html_escape(fact.tone),
         at = html_escape(&at),
     );
+    let aria = aria_label
+        .map(|label| format!(r#" aria-label="{}""#, html_escape(label)))
+        .unwrap_or_default();
     match href {
-        Some(href) => format!(r#"<a class="protection-fact" {attrs} href="{href}">{body}</a>"#),
+        Some(href) => format!(
+            r#"<a class="protection-fact {tone}" {attrs} href="{href}"{aria}>{body}</a>"#,
+            tone = html_escape(fact.tone),
+        ),
         None => format!(r#"<div class="protection-fact" {attrs}>{body}</div>"#),
     }
 }
@@ -4434,7 +4479,15 @@ fn protection_markup_surface(
 ) -> String {
     let href = app_href(base, &format!("/backups?host={}", url_query_escape(host)));
     let check_fact = match &view.check {
-        Some(check) => fact_markup(check, "backup-check", Some(&href), true, scan, card_face),
+        Some(check) => fact_markup(
+            check,
+            "backup-check",
+            Some(&href),
+            true,
+            scan,
+            card_face,
+            None,
+        ),
         None => {
             r#"<div class="protection-fact protection-check" data-backup-check data-backup-check-state="" data-backup-check-tone="" data-backup-check-at="" hidden><span class="fact-label">Repository check</span><strong class="fact-value neutral" data-backup-check-label></strong><span class="fact-note" data-backup-check-note></span></div>"#.to_string()
         }
@@ -4491,7 +4544,11 @@ fn protection_markup_surface(
             Some(&href),
             false,
             scan,
-            card_face
+            card_face,
+            Some(&format!(
+                "Backup {} for {host}",
+                backup_aria_state(&view.run)
+            )),
         ),
         restore_caption = restore_caption,
         restore_age = restore_age,
@@ -4647,7 +4704,7 @@ fn card_attention_block(
         format!("{} reasons", health.problem_count)
     };
     format!(
-        r#"<div class="harbor-health" data-health-block data-health-tone="{tone}"><div class="attention-line" title="{title}"><span class="attention-icon" aria-hidden="true">{icon}</span>{chip}<span data-health-summary>{summary}</span>{mute}<span class="health-count" data-health-count hidden>{count}</span></div><ul class="health-reasons" data-health-reasons hidden>{reasons}</ul></div>"#,
+        r#"<div class="harbor-health" data-health-block data-health-tone="{tone}"><div class="attention-line" title="{title}"><span class="attention-icon" aria-hidden="true">{icon}</span>{chip}<span class="attention-sep" aria-hidden="true"> · </span><span data-health-summary>{summary}</span>{mute}<span class="health-count" data-health-count hidden>{count}</span></div><ul class="health-reasons" data-health-reasons hidden>{reasons}</ul></div>"#,
         tone = html_escape(health.tone),
         title = html_escape(&summary),
         summary = html_escape(&summary),
@@ -4763,6 +4820,33 @@ pub(super) fn quick_preview_markup(name: &str, nix_icon: &str) -> String {
         r#"<button class="preview-button" type="button" data-host-drawer-trigger aria-haspopup="dialog" aria-controls="host-quick-drawer" aria-expanded="false" title="Quick preview of {name}" aria-label="Quick preview of {name}"><span class="nix" hidden>{nix_icon}</span>{icon}<span>Quick preview</span></button>"#,
         icon = icons::PANEL_RIGHT,
     )
+}
+
+fn configuration_face_label(freshness: &NixFreshness) -> String {
+    if !freshness.applicable || freshness.deployment_evidence.is_none() {
+        return "Configuration not observed".to_string();
+    }
+    let nixpkgs_exact = matches!(
+        freshness
+            .nixpkgs_comparison
+            .as_ref()
+            .map(|comparison| comparison.relation),
+        Some(NixpkgsRevisionRelation::Current)
+    );
+    let nixcfg_exact = matches!(
+        freshness
+            .nixcfg_comparison
+            .as_ref()
+            .map(|comparison| comparison.relation),
+        Some(GitRevisionRelation::Current)
+    );
+    if nixpkgs_exact && nixcfg_exact {
+        "Configuration exact".to_string()
+    } else if freshness.nixpkgs_comparison.is_some() || freshness.nixcfg_comparison.is_some() {
+        "Configuration differs".to_string()
+    } else {
+        "Configuration not observed".to_string()
+    }
 }
 
 pub(super) fn revision_evidence_markup(freshness: &NixFreshness) -> String {
@@ -10676,6 +10760,7 @@ pub(super) fn render_home_with_grace(
         let preview = quick_preview_markup(&name, nix_icon);
         let card_revision = revision_evidence_markup(&h.freshness);
         let config_summary = html_escape(&h.freshness.tldr());
+        let configuration_label = html_escape(&configuration_face_label(&h.freshness));
         let card_identity = format!(
             r#"<div class="harbor-identity">{badge}<div class="host-title"><h2><a class="host-name name" href="{settings_href}" title="{name}">{name}</a></h2><span class="role">{role}</span></div></div>"#,
         );
@@ -10751,7 +10836,7 @@ pub(super) fn render_home_with_grace(
             )
         });
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls} harbor-host" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}>{beam}<header class="card-head host-heading">{badge}<div class="host-title"><h2><a class="host-name name" href="{settings_href}" title="{name}">{name}</a></h2><p class="role">{role_line}</p></div><span class="health-label" data-health-label data-health-tone="{health_tone}">{health_label_text}</span><div class="card-actions">{drag_action}{card_host_actions}</div></header>{attention_html}{protection_html}<div class="heartbeat"><div class="heartbeat-heading"><span>Heartbeat</span><strong class="{heartbeat_tone}" data-heartbeat-status data-heartbeat-tone="{heartbeat_tone}">{heartbeat_status}</strong></div>{card_heartbeat}<p class="heartbeat-explain" data-heartbeat-explain title="{heartbeat_explain}">{heartbeat_explain}</p><div class="heartbeat-axis"><span data-heartbeat-window-start>{window_start}</span><span class="delivery" data-heartbeat-delivery>{delivery_text}</span><span>Now</span></div></div><div class="harbor-card-foot"><a class="configuration" href="{settings_href}">{config_summary}</a>{preview}</div><div class="scan-store" hidden>{backup_chip}<div class="card-maintenance"></div>{card_reason}{protection_card}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div><div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_revision}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls} harbor-host" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}>{beam}<header class="card-head host-heading">{badge}<div class="host-title"><h2><a class="host-name name" href="{settings_href}" title="{name}">{name}</a></h2><p class="role">{role_line}</p></div><span class="health-label" data-health-label data-health-tone="{health_tone}">{health_label_text}</span><div class="card-actions">{drag_action}{card_host_actions}</div></header>{attention_html}{protection_html}<div class="heartbeat"><div class="heartbeat-heading"><span>Heartbeat</span><strong class="{heartbeat_tone}" data-heartbeat-status data-heartbeat-tone="{heartbeat_tone}">{heartbeat_status}</strong></div>{card_heartbeat}<p class="heartbeat-explain" data-heartbeat-explain title="{heartbeat_explain}">{heartbeat_explain}</p><div class="heartbeat-axis"><span data-heartbeat-window-start>{window_start}</span><span class="delivery" data-heartbeat-delivery>{delivery_text}</span><span>Now</span></div></div><div class="harbor-card-foot"><a class="configuration" href="{settings_href}" data-configuration-label>{configuration_label}</a>{preview}</div><div class="scan-store" hidden>{card_reason}{protection_card}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div><div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_revision}</div></article>"#,
             live_key = live_key(live),
         ));
         rows.push_str(&format!(

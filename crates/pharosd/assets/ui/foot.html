@@ -1697,11 +1697,22 @@ function updateConfigEvidence(surface,freshness){
   write('[data-nixcfg-sha]',nixcfg?shortRevision(nixcfg.upstream_revision):'');
   write('[data-nixpkgs-sha]',evidence?shortRevision(evidence.nixpkgs_revision):'');
   const summary=surface.querySelector('[data-config-summary]');
-  if(!summary)return;
-  if(!evidence&&!nixcfg)summary.textContent='Not observed';
-  else if(nixcfg?.relation==='current')summary.textContent=nixpkgs?.relation==='different'?'nixcfg current · nixpkgs differs':'Exact match';
-  else if(nixcfg?.relation)summary.textContent='nixcfg '+nixcfg.relation;
-  else summary.textContent='Not observed';
+  if(summary){
+    if(!evidence&&!nixcfg)summary.textContent='Not observed';
+    else if(nixcfg?.relation==='current')summary.textContent=nixpkgs?.relation==='different'?'nixcfg current · nixpkgs differs':'Exact match';
+    else if(nixcfg?.relation)summary.textContent='nixcfg '+nixcfg.relation;
+    else summary.textContent='Not observed';
+  }
+  const face=surface.querySelector('[data-configuration-label]');
+  if(!face)return;
+  let label='Configuration not observed';
+  if(applicable&&evidence){
+    const nixpkgsExact=nixpkgs?.relation==='current';
+    const nixcfgExact=nixcfg?.relation==='current';
+    if(nixpkgsExact&&nixcfgExact)label='Configuration exact';
+    else if(nixpkgs||nixcfg)label='Configuration differs';
+  }
+  face.textContent=label;
 }
 function kernelNeedsRestart(kernel){
   return kernel?.state==='reboot_required'&&typeof kernel.running_version==='string'&&typeof kernel.expected_version==='string';
@@ -1901,12 +1912,6 @@ function suppressDuplicateScanChips(surface){
 }
 function cardAttentionText(health,surface){
   const problems=(health?.reasons||[]).filter(reason=>reason&&reason.tone&&reason.tone!=='good').map(reason=>String(reason.label||'').replace(/\s+/g,' ').trim()).filter(Boolean);
-  surface?.querySelectorAll?.('.freshness-rail .fresh-row-compact:not([hidden]):not(.scan-duplicate)').forEach(chip=>{
-    const detail=String(chip.dataset.freshDetail||chip.querySelector?.('[data-fresh-value]')?.textContent||'').replace(/\s+/g,' ').trim();
-    if(!detail)return;
-    const low=detail.toLowerCase();
-    if(!problems.some(item=>item.toLowerCase()===low||item.toLowerCase().includes(low)))problems.push(detail);
-  });
   const mute=surface?.querySelector?.('[data-mute-note]');
   if(mute&&!mute.hidden){
     const label=String(mute.querySelector('span')?.textContent||'').replace(/\s+/g,' ').trim();
@@ -1929,8 +1934,7 @@ function syncCardAttention(surface){
   if(!line)return;
   const chip=line.querySelector('[data-host-lifecycle-chip]');
   const chipLabel=String(chip?.querySelector('[data-host-lifecycle-chip-copy]')?.textContent||'').trim();
-  const showChip=chip&&chip.dataset.lifecycleLevel&&chip.dataset.lifecycleLevel!=='clear'&&chipLabel;
-  line.title=showChip?chipLabel+' · '+text:text;
+  line.title=chipLabel?chipLabel+' · '+text:text;
 }
 function ensureHealthScan(surface,health){
   const block=surface.querySelector('[data-health-block]');
@@ -2065,6 +2069,12 @@ function updateBackupStatus(surface,protection){
     if(typeof dailyNode.setAttribute==='function')dailyNode.setAttribute('href',appUrl('/backups?host='+encodeURIComponent(host)));
     setFactText(dailyNode,'[data-daily-backup-label]',daily.label);
     setFactText(dailyNode,'[data-daily-backup-note]',daily.detail);
+    const dailyNote=dailyNode.querySelector('[data-daily-backup-note]');
+    if(dailyNote)dailyNote.title=daily.detail||'';
+    ['good','bad','amber','neutral'].forEach(tone=>dailyNode.classList.remove(tone));
+    if(daily.tone)dailyNode.classList.add(daily.tone);
+    const ariaState=daily.state==='ok'||daily.state==='healthy'?'healthy':daily.state==='failed'?'failed':daily.state==='stale'?'stale':daily.state==='warning'?'warning':daily.state==='disabled'?'disabled':'not observed';
+    dailyNode.setAttribute('aria-label','Backup '+ariaState+' for '+host);
     paintScanAge(dailyNode,'[data-daily-backup-age]',dailyAt);
     dailyNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
     placeObservedTime(surface,dailyNode,dailyAt,'daily-backup');

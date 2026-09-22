@@ -1321,14 +1321,28 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     const failedRail = failedCard.locator(".freshness-rail");
     const failedRailBackup = failedRail.locator('[data-fresh-kind="backup-fault"]');
 
-    await expect(healthyCard.locator(".card-head .backup-chip")).toHaveCount(0);
-    await expect(failedCard.locator(".card-head .backup-chip")).toHaveCount(0);
-    await expect(healthyCard.locator(".scan-store .backup-chip")).toHaveCount(1);
-    await expect(healthyCard.locator(".scan-store .backup-chip")).toBeHidden();
-    await expect(failedCard.locator(".scan-store .backup-chip")).toHaveCount(1);
-    await expect(failedCard.locator(".scan-store .backup-chip")).toBeHidden();
-    await expect(healthyRail).toHaveAttribute("hidden", "");
+    const healthyDaily = healthyCard.locator("a[data-daily-backup]");
     const failedDaily = failedCard.locator("a[data-daily-backup]");
+    await expect(healthyCard.locator(".backup-chip")).toHaveCount(0);
+    await expect(failedCard.locator(".backup-chip")).toHaveCount(0);
+    await expect(healthyDaily).toHaveCount(1);
+    await expect(healthyDaily).toBeVisible();
+    await expect(healthyDaily).not.toHaveAttribute("hidden", "");
+    await expect(healthyDaily).toHaveAttribute("href", `/backups?host=${healthyHost}`);
+    await expect(healthyDaily).toHaveAttribute(
+      "aria-label",
+      new RegExp(`Backup (healthy|stale) for ${healthyHost}`),
+    );
+    await expect(failedDaily).toHaveCount(1);
+    await expect(failedDaily).toBeVisible();
+    await expect(failedDaily).not.toHaveAttribute("hidden", "");
+    await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expect(failedDaily).toHaveAttribute(
+      "aria-label",
+      `Backup failed for ${failedHost}`,
+    );
+    await expect(failedDaily).toHaveClass(/bad/);
+    await expect(healthyRail).toHaveAttribute("hidden", "");
     await expect(failedDaily).toBeVisible();
     await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
     await expect(failedDaily.locator("[data-daily-backup-label]")).toHaveText("Failed");
@@ -1355,7 +1369,7 @@ test("fleet card header keeps actions visible and backup shield only when not ok
       const cardChrome = await failedCard.evaluate((card) => {
         const cardRect = card.getBoundingClientRect();
         const actions = card.querySelector("[data-host-actions-trigger]");
-        const backup = card.querySelector("a[data-daily-backup]");
+        const backup = card.querySelector("a[data-daily-backup].bad");
         const actionsRect = actions?.getBoundingClientRect();
         const backupRect = backup?.getBoundingClientRect();
         return {
@@ -1372,6 +1386,18 @@ test("fleet card header keeps actions visible and backup shield only when not ok
       expect(cardChrome).toEqual({ actionsInside: true, backupInside: true });
     }
 
+    const failedBackupChrome = await failedDaily.evaluate((el) => {
+      const style = getComputedStyle(el);
+      return {
+        borderColor: style.borderColor,
+        backgroundColor: style.backgroundColor,
+      };
+    });
+    expect(failedBackupChrome.borderColor).not.toBe("rgba(0, 0, 0, 0)");
+    expect(failedBackupChrome.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+    await failedDaily.focus();
+    await expect(failedDaily).toBeFocused();
+
     const snapshotResponse = await page.request.get("/hosts.json");
     expect(snapshotResponse.ok()).toBe(true);
     const snapshot = await snapshotResponse.json();
@@ -1384,13 +1410,26 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     };
 
     expect(await applyBackupSnapshot(healthyBackupObservation())).toBe(true);
+    await expect(failedDaily).toBeVisible();
+    await expect(failedDaily).not.toHaveAttribute("hidden", "");
+    await expect(failedDaily).toBeFocused();
+    await expect(failedDaily).toHaveAttribute(
+      "aria-label",
+      new RegExp(`Backup (healthy|stale) for ${failedHost}`),
+    );
     await expect(failedDaily.locator("[data-daily-backup-label]")).not.toHaveText("Failed");
     await expect(failedRail).toHaveAttribute("hidden", "");
     await expect(failedRailBackup).toHaveAttribute("hidden", "");
 
     expect(await applyBackupSnapshot(failedBackupObservation())).toBe(true);
     await expect(failedDaily).toBeVisible();
+    await expect(failedDaily).not.toHaveAttribute("hidden", "");
     await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expect(failedDaily).toHaveAttribute(
+      "aria-label",
+      `Backup failed for ${failedHost}`,
+    );
+    await expect(failedDaily).toHaveClass(/bad/);
     await expect(failedDaily.locator("[data-daily-backup-label]")).toHaveText("Failed");
     await expect(failedCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
       "Backup Failed",
@@ -1550,8 +1589,13 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
       "href",
       `/backups?host=${faultHost}`,
     );
-    await expect(faultCard.locator(".card-head .backup-chip")).toHaveCount(0);
-    await expect(faultCard.locator(".scan-store .backup-chip")).toBeHidden();
+    await expect(faultCard.locator(".backup-chip")).toHaveCount(0);
+    await expect(faultCard.locator("a[data-daily-backup]")).not.toHaveAttribute("hidden", "");
+    await expect(faultCard.locator("a[data-daily-backup]")).toHaveAttribute(
+      "aria-label",
+      `Backup failed for ${faultHost}`,
+    );
+    await expect(faultCard.locator("a[data-daily-backup]")).toHaveClass(/bad/);
     await expect(faultCard.locator(".attention-line")).toContainText("Backup Failed");
     await expect(faultCard.locator("details")).toHaveCount(0);
     await expect(faultCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
