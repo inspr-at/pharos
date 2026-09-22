@@ -14,8 +14,13 @@ import {
   decideRequest,
   primaryFrameDecision,
   repoRootFromScripts,
+  SCREENSHOT_FIELD_LIMIT,
+  SCREENSHOT_TEXT_LIMIT,
+  SCREENSHOT_VALUE_LIMIT,
+  collectScreenshotSurface,
   screenshotPermitted,
   settleFetchPause,
+  takeAuthenticatedShot,
 } from "../scripts/live-ui-guard.mjs";
 import { submitUnattendedTotp } from "../scripts/live-ui.mjs";
 import {
@@ -607,4 +612,168 @@ test("screenshots reject a code form and the runner does not prompt or send the 
   assert.equal(runner.includes("otpauth://"), false);
   assert.equal(guard.includes("ISSUER_LOGIN_POST_PATHS.push"), false);
   assert.equal(ISSUER_LOGIN_POST_PATHS.includes(TOTP_VERIFY_PATH), false);
+});
+
+test("screenshot secrets are compared in Node and never sent to the page", async () => {
+  const password = "Ab!cdEF12";
+  const seed = "synthetic-seed-value";
+  const code = "135790";
+  const username = "person@example.test";
+  const secrets = [username, password, seed, code];
+  const calls = [];
+  const shots = [];
+  const previous = globalThis.document;
+  const clean = {
+    title: "Fleet",
+    body: { innerText: "hosts", textContent: "hosts" },
+    querySelectorAll() {
+      return [{ value: "ok" }];
+    },
+  };
+  const page = {
+    async evaluate(fn, ...args) {
+      calls.push({ source: String(fn), args });
+      return fn(...args);
+    },
+    async screenshot() {
+      shots.push("screenshot");
+    },
+  };
+  const shot = (document) => {
+    calls.length = 0;
+    shots.length = 0;
+    globalThis.document = document;
+    return takeAuthenticatedShot(page, {
+      permitted: true,
+      password,
+      material: [seed, code],
+      options: { path: "shot.png", type: "png" },
+    });
+  };
+  const argsAreClean = () => {
+    assert.ok(calls.length >= 1);
+    for (const call of calls) {
+      assert.deepEqual(call.args, []);
+      for (const secret of secrets) assert.equal(call.source.includes(secret), false);
+    }
+  };
+  try {
+    const collector = collectScreenshotSurface.toString();
+    assert.equal(collector.includes(String(SCREENSHOT_TEXT_LIMIT)), true);
+    assert.equal(collector.includes(String(SCREENSHOT_FIELD_LIMIT)), true);
+    assert.equal(collector.includes(String(SCREENSHOT_VALUE_LIMIT)), true);
+    assert.equal(/evaluate\([^)]+,/.test(takeAuthenticatedShot.toString()), false);
+
+    assert.equal(await shot(clean), true);
+    argsAreClean();
+    assert.deepEqual(shots, ["screenshot"]);
+
+    assert.equal(await shot({
+      title: "Fleet",
+      body: { innerText: `shown ${seed}`, textContent: "hosts" },
+      querySelectorAll() {
+        return [];
+      },
+    }), false);
+    argsAreClean();
+    assert.deepEqual(shots, []);
+
+    assert.equal(await shot({
+      title: "Fleet",
+      body: { innerText: "hosts", textContent: "hosts" },
+      querySelectorAll() {
+        return [{ value: code }];
+      },
+    }), false);
+    argsAreClean();
+    assert.deepEqual(shots, []);
+
+    assert.equal(await shot({
+      title: "",
+      body: { innerText: `Account ${password} shown`, textContent: "hidden label" },
+      querySelectorAll() {
+        return [];
+      },
+    }), false);
+    argsAreClean();
+    assert.deepEqual(shots, []);
+
+    const returned = {
+      async evaluate(fn, ...args) {
+        calls.push({ source: String(fn), args });
+        return { values: [], visible: `Fleet ${seed}` };
+      },
+      async screenshot() {
+        shots.push("screenshot");
+      },
+    };
+    calls.length = 0;
+    shots.length = 0;
+    assert.equal(await takeAuthenticatedShot(returned, {
+      permitted: true,
+      password,
+      material: [seed, code],
+      options: {},
+    }), false);
+    argsAreClean();
+    assert.deepEqual(shots, []);
+
+    calls.length = 0;
+    shots.length = 0;
+    globalThis.document = undefined;
+    assert.equal(await takeAuthenticatedShot(page, {
+      permitted: true,
+      password,
+      material: [seed, code],
+      options: {},
+    }), false);
+    argsAreClean();
+    assert.deepEqual(shots, []);
+
+    calls.length = 0;
+    shots.length = 0;
+    assert.equal(await shot({
+      title: "x".repeat(SCREENSHOT_TEXT_LIMIT),
+      body: { innerText: "", textContent: "" },
+      querySelectorAll() {
+        return [];
+      },
+    }), false);
+    argsAreClean();
+    assert.deepEqual(shots, []);
+
+    calls.length = 0;
+    shots.length = 0;
+    assert.equal(await shot({
+      title: "Fleet",
+      body: { innerText: "hosts", textContent: "hosts" },
+      querySelectorAll() {
+        return [{ value: "v".repeat(SCREENSHOT_VALUE_LIMIT + 1) }];
+      },
+    }), false);
+    argsAreClean();
+    assert.deepEqual(shots, []);
+
+    const broken = {
+      async evaluate(fn, ...args) {
+        calls.push({ source: String(fn), args });
+        throw new Error("probe");
+      },
+      async screenshot() {
+        shots.push("screenshot");
+      },
+    };
+    calls.length = 0;
+    shots.length = 0;
+    assert.equal(await takeAuthenticatedShot(broken, {
+      permitted: true,
+      password,
+      material: [seed, code],
+      options: {},
+    }), false);
+    argsAreClean();
+    assert.deepEqual(shots, []);
+  } finally {
+    globalThis.document = previous;
+  }
 });

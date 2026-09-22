@@ -1208,6 +1208,58 @@ export function passwordAppearsInText(text, password) {
   return String(text ?? "").includes(password);
 }
 
+export const SCREENSHOT_TEXT_LIMIT = 250000;
+export const SCREENSHOT_FIELD_LIMIT = 200;
+export const SCREENSHOT_VALUE_LIMIT = 2048;
+
+// Runs in the page. Limits are literals so the serialized function does not
+// close over Node state, and it never receives a secret argument.
+export function collectScreenshotSurface() {
+  const textLimit = 250000;
+  const fieldLimit = 200;
+  const valueLimit = 2048;
+  const document = globalThis.document;
+  if (!document || typeof document.querySelectorAll !== "function") return null;
+  let nodes;
+  try {
+    nodes = [...document.querySelectorAll("input, textarea")];
+  } catch {
+    return null;
+  }
+  if (nodes.length > fieldLimit) return null;
+  const values = [];
+  for (const node of nodes) {
+    const value = String(node && node.value != null ? node.value : "");
+    if (value.length > valueLimit) return null;
+    values.push(value);
+  }
+  const body = document.body;
+  const title = String(document.title || "");
+  const innerText = String(body ? body.innerText || "" : "");
+  const textContent = String(body ? body.textContent || "" : "");
+  if (title.length + innerText.length + textContent.length + 2 > textLimit) return null;
+  return { values, visible: `${title}\n${innerText}\n${textContent}` };
+}
+
+export function screenshotContainsNeedle(surface, needles) {
+  if (!surface || typeof surface !== "object") return true;
+  if (typeof surface.visible !== "string" || surface.visible.length > SCREENSHOT_TEXT_LIMIT) return true;
+  if (!Array.isArray(surface.values) || surface.values.length > SCREENSHOT_FIELD_LIMIT) return true;
+  const list = Array.isArray(needles) ? needles : [];
+  if (list.length < 1) return true;
+  for (const value of surface.values) {
+    if (typeof value !== "string" || value.length > SCREENSHOT_VALUE_LIMIT) return true;
+  }
+  for (const needle of list) {
+    if (typeof needle !== "string" || needle.length < 1) return true;
+    if (passwordAppearsInText(surface.visible, needle)) return true;
+    for (const value of surface.values) {
+      if (passwordAppearsInText(value, needle)) return true;
+    }
+  }
+  return false;
+}
+
 export async function takeAuthenticatedShot(page, { permitted, password, material, options }) {
   if (!permitted) return false;
   const needles = [];
@@ -1217,37 +1269,16 @@ export async function takeAuthenticatedShot(page, { permitted, password, materia
       if (typeof item === "string" && item.length > 0 && !needles.includes(item)) needles.push(item);
     }
   }
-  const scan = async (needle) => {
-    try {
-      return await page.evaluate(scanVisiblePassword, needle);
-    } catch {
-      return true;
-    }
-  };
-  if (needles.length === 0) {
-    if (await scan(password)) return false;
-  } else {
-    for (const needle of needles) {
-      if (await scan(needle)) return false;
-    }
+  if (needles.length === 0) return false;
+  let surface;
+  try {
+    surface = await page.evaluate(collectScreenshotSurface);
+  } catch {
+    return false;
   }
+  if (screenshotContainsNeedle(surface, needles)) return false;
   await page.screenshot(options);
   return true;
-}
-
-export function scanVisiblePassword(secret) {
-  const appears = (text, password) =>
-    typeof password === "string" && password.length > 0 && String(text ?? "").includes(password);
-  if (typeof secret !== "string" || secret.length < 1) return true;
-  const document = globalThis.document;
-  if (!document || typeof document.querySelectorAll !== "function") return true;
-  const nodes = [...document.querySelectorAll("input, textarea")];
-  for (const node of nodes) {
-    if (appears(node.value, secret)) return true;
-  }
-  const body = document.body;
-  const visible = `${document.title || ""}\n${body ? body.innerText || "" : ""}\n${body ? body.textContent || "" : ""}`;
-  return appears(visible, secret);
 }
 
 export function fetchPausePatterns() {
