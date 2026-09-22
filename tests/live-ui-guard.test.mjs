@@ -863,6 +863,14 @@ test("screenshots require an authenticated application page without a credential
     }),
     false,
   );
+  assert.equal(
+    screenshotPermitted({
+      classification: "authenticated",
+      location: app,
+      probe: { ...ready, codeField: true, mfa: false, authUiVisible: false },
+    }),
+    false,
+  );
 });
 
 test("inventory includes nav, unlinked hosts, and host settings", () => {

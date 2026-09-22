@@ -2,6 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { consumeTotpGrant, decodeTotpPostData, revokeTotpGrant, totpVerifyTarget } from "./live-ui-totp.mjs";
 
 // Browser-side request policy for the personal Pharos live UI harness.
 // This does not change the server role of the signed-in Fleet manager account.
@@ -71,6 +72,8 @@ const ISSUER_DENY_PREFIXES = Object.freeze([
 ]);
 // Exact Zitadel login v1 credential posts. Reset, init, revoke, and any
 // broader auth prefix are not login. Unknown login-v2 session posts stay denied.
+// POST /ui/login/mfa/verify is not an allowlist entry. One unattended code is a
+// separate grant checked by the primary-frame route and by Fetch.
 export const ISSUER_LOGIN_POST_PATHS = Object.freeze([
   "/ui/login/loginname",
   "/ui/login/password",
@@ -101,6 +104,13 @@ const SECRET_QUERY_KEYS = new Set([
 const FORBIDDEN_ENV = Object.freeze([
   "PHAROS_LIVE_UI_USERNAME",
   "PHAROS_LIVE_UI_PASSWORD",
+  "PHAROS_LIVE_UI_TOTP",
+  "PHAROS_LIVE_UI_TOTP_SECRET",
+  "PHAROS_LIVE_UI_TOTP_CODE",
+  "PHAROS_LIVE_UI_TOTP_SEED",
+  "PHAROS_LIVE_UI_OTP",
+  "PHAROS_LIVE_UI_OTP_CODE",
+  "PHAROS_LIVE_UI_OTP_SECRET",
   "PHAROS_LIVE_UI_APP_ORIGIN",
   "PHAROS_LIVE_UI_ISSUER",
   "PHAROS_LIVE_UI_ISSUER_ORIGIN",
@@ -742,6 +752,7 @@ export function screenshotPermitted({ classification, location, probe }) {
     !probe ||
     probe.passwordCount > 0 ||
     probe.mfa ||
+    probe.codeField ||
     probe.accountSetup ||
     probe.loginForm ||
     probe.authUiVisible ||
@@ -758,9 +769,19 @@ export function screenshotPermitted({ classification, location, probe }) {
   return true;
 }
 
+function totpMaterialEnv(name) {
+  if (name === "PHAROS_LIVE_UI_TOTP_SECRET_FILE") return false;
+  return /(TOTP|OTP_CODE|OTP_SECRET|MFA_CODE|MFA_SEED|MFA_SECRET)/i.test(name);
+}
+
 export function assertRuntimeEnvironment(env) {
   for (const name of FORBIDDEN_ENV) {
     if (env[name] !== undefined && env[name] !== "") {
+      throw new LiveUiError("runtime-env");
+    }
+  }
+  for (const name of Object.keys(env)) {
+    if (totpMaterialEnv(name) && env[name] !== undefined && env[name] !== "") {
       throw new LiveUiError("runtime-env");
     }
   }
@@ -1076,10 +1097,12 @@ export function collectProbeSurface(root) {
 
 export function classifyProbeSurface(surface = {}) {
   const accountSetup = Boolean(surface.accountSetup);
-  const mfa = !accountSetup && Boolean(surface.otpField || surface.webauthnChallenge);
+  const codeField = Boolean(surface.codeField || surface.otpField);
+  const mfa = !accountSetup && Boolean(codeField || surface.webauthnChallenge);
   return {
     passwordCount: Math.min(2, Number(surface.passwordCount) || 0),
     mfa,
+    codeField,
     accountSetup,
     enrollmentOptional: accountSetup && Boolean(surface.enrollmentOptional),
     passkeyAlternative: Boolean(surface.passkeyAlternative) && !mfa && !accountSetup,
@@ -1096,6 +1119,7 @@ export function classifyProbeSurface(surface = {}) {
     authUiVisible: Boolean(
       Number(surface.passwordCount) > 0 ||
         surface.usernameField ||
+        codeField ||
         surface.otpField ||
         surface.webauthnChallenge ||
         surface.accountSetup ||
@@ -1184,32 +1208,77 @@ export function passwordAppearsInText(text, password) {
   return String(text ?? "").includes(password);
 }
 
-export async function takeAuthenticatedShot(page, { permitted, password, options }) {
-  if (!permitted) return false;
-  let rendered = true;
-  try {
-    rendered = await page.evaluate(scanVisiblePassword, password);
-  } catch {
-    rendered = true;
-  }
-  if (rendered) return false;
-  await page.screenshot(options);
-  return true;
-}
+export const SCREENSHOT_TEXT_LIMIT = 250000;
+export const SCREENSHOT_FIELD_LIMIT = 200;
+export const SCREENSHOT_VALUE_LIMIT = 2048;
 
-export function scanVisiblePassword(secret) {
-  const appears = (text, password) =>
-    typeof password === "string" && password.length > 0 && String(text ?? "").includes(password);
-  if (typeof secret !== "string" || secret.length < 1) return true;
+// Runs in the page. Limits are literals so the serialized function does not
+// close over Node state, and it never receives a secret argument.
+export function collectScreenshotSurface() {
+  const textLimit = 250000;
+  const fieldLimit = 200;
+  const valueLimit = 2048;
   const document = globalThis.document;
-  if (!document || typeof document.querySelectorAll !== "function") return true;
-  const nodes = [...document.querySelectorAll("input, textarea")];
+  if (!document || typeof document.querySelectorAll !== "function") return null;
+  let nodes;
+  try {
+    nodes = [...document.querySelectorAll("input, textarea")];
+  } catch {
+    return null;
+  }
+  if (nodes.length > fieldLimit) return null;
+  const values = [];
   for (const node of nodes) {
-    if (appears(node.value, secret)) return true;
+    const value = String(node && node.value != null ? node.value : "");
+    if (value.length > valueLimit) return null;
+    values.push(value);
   }
   const body = document.body;
-  const visible = `${document.title || ""}\n${body ? body.innerText || "" : ""}\n${body ? body.textContent || "" : ""}`;
-  return appears(visible, secret);
+  const title = String(document.title || "");
+  const innerText = String(body ? body.innerText || "" : "");
+  const textContent = String(body ? body.textContent || "" : "");
+  if (title.length + innerText.length + textContent.length + 2 > textLimit) return null;
+  return { values, visible: `${title}\n${innerText}\n${textContent}` };
+}
+
+export function screenshotContainsNeedle(surface, needles) {
+  if (!surface || typeof surface !== "object") return true;
+  if (typeof surface.visible !== "string" || surface.visible.length > SCREENSHOT_TEXT_LIMIT) return true;
+  if (!Array.isArray(surface.values) || surface.values.length > SCREENSHOT_FIELD_LIMIT) return true;
+  const list = Array.isArray(needles) ? needles : [];
+  if (list.length < 1) return true;
+  for (const value of surface.values) {
+    if (typeof value !== "string" || value.length > SCREENSHOT_VALUE_LIMIT) return true;
+  }
+  for (const needle of list) {
+    if (typeof needle !== "string" || needle.length < 1) return true;
+    if (passwordAppearsInText(surface.visible, needle)) return true;
+    for (const value of surface.values) {
+      if (passwordAppearsInText(value, needle)) return true;
+    }
+  }
+  return false;
+}
+
+export async function takeAuthenticatedShot(page, { permitted, password, material, options }) {
+  if (!permitted) return false;
+  const needles = [];
+  if (typeof password === "string" && password.length > 0) needles.push(password);
+  if (Array.isArray(material)) {
+    for (const item of material) {
+      if (typeof item === "string" && item.length > 0 && !needles.includes(item)) needles.push(item);
+    }
+  }
+  if (needles.length === 0) return false;
+  let surface;
+  try {
+    surface = await page.evaluate(collectScreenshotSurface);
+  } catch {
+    return false;
+  }
+  if (screenshotContainsNeedle(surface, needles)) return false;
+  await page.screenshot(options);
+  return true;
 }
 
 export function fetchPausePatterns() {
@@ -1233,6 +1302,7 @@ function protocolLost(policy) {
 
 export function decideFetchPause(event, policy = {}) {
   if (protocolLost(policy)) {
+    revokeTotpGrant(policy?.totpGrant);
     return {
       action: "fail",
       verdict: decision(false, "network-guard", "?", "/", listedSecrets(policy.secrets)),
@@ -1260,10 +1330,32 @@ export function decideFetchPause(event, policy = {}) {
   } catch {
     verdict = decision(false, "guard-error", "?", "/", listedSecrets(policy.secrets));
   }
+  verdict = applyTotpGrant(verdict, {
+    method: request.method,
+    url: request.url,
+    postData: decodeTotpPostData(request),
+    redirected: Boolean(event?.redirectedRequestId),
+    isolated: false,
+    layer: "fetch",
+  }, policy);
   return {
     action: continuationAllowed(verdict) ? "continue" : "fail",
     verdict,
   };
+}
+
+function applyTotpGrant(verdict, observed, policy) {
+  if (!totpVerifyTarget(observed.method, observed.url)) return verdict;
+  if (verdict?.reason === "secret-in-url") {
+    revokeTotpGrant(policy?.totpGrant);
+    return verdict;
+  }
+  const effect = consumeTotpGrant(observed, policy);
+  if (effect === "ignore" || effect === "keep") return verdict;
+  const secrets = listedSecrets(policy?.secrets);
+  if (effect === "allow") return decision(true, "issuer-login", "POST", "/ui/login/mfa/verify", secrets);
+  const reason = effect === "network-guard" ? "network-guard" : "issuer-mutation";
+  return decision(false, reason, "POST", "/ui/login/mfa/verify", secrets);
 }
 
 export async function settleFetchPause(session, event, policy = {}, rememberFn) {
@@ -1711,11 +1803,26 @@ export function primaryFrameDecision(request, page, policy = {}) {
   } catch {
     primary = false;
   }
+  let redirected = false;
+  try {
+    if (typeof request?.redirectedFrom === "function") redirected = Boolean(request.redirectedFrom());
+  } catch {
+    redirected = true;
+  }
+  const observed = {
+    method,
+    url,
+    postData: typeof postData === "string" ? postData : "",
+    redirected,
+    isolated: !primary,
+    layer: "primary",
+  };
   if (!primary) {
+    consumeTotpGrant(observed, policy);
     if (verdict.reason === "secret-in-url") return { ...verdict, allow: false };
     return { ...verdict, allow: false, reason: "isolated-target" };
   }
-  return verdict;
+  return applyTotpGrant(verdict, observed, policy);
 }
 
 export async function installPrimaryFrameRoute(context, pageRef, policy, rememberFn, gate) {
