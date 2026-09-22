@@ -12,10 +12,8 @@ const test = base.extend({
 });
 
 const REPORTED_DRAWER_FIELDS = [
-  "[data-host-drawer-title]",
   "[data-host-drawer-role]",
   "[data-host-drawer-health-label]",
-  "[data-host-drawer-posture-title]",
   "[data-host-drawer-attention]",
   "[data-host-drawer-backup]",
   "[data-host-drawer-restore]",
@@ -23,7 +21,6 @@ const REPORTED_DRAWER_FIELDS = [
   "[data-host-drawer-deployed]",
   "[data-host-drawer-nixpkgs]",
   "[data-host-drawer-grace]",
-  "[data-host-drawer-reasons]",
   "[data-grace-source-line]",
   "[data-grace-rule]",
 ];
@@ -48,7 +45,11 @@ test("mobile fleet and the quick preview stay on screen", async ({ page }, testI
   });
   expect(report.status(), await report.text()).toBe(204);
   try {
+    const snapshotReady = page.waitForResponse(
+      (response) => response.url().includes("/hosts.json") && response.ok(),
+    );
     await page.goto("/");
+    await snapshotReady;
     const card = page.locator(`article.card[data-host="${host}"]`);
     const trigger = card.locator("[data-host-drawer-trigger]");
     const drawer = page.locator("#host-quick-drawer");
@@ -70,6 +71,9 @@ test("mobile fleet and the quick preview stay on screen", async ({ page }, testI
       for (const selector of REPORTED_DRAWER_FIELDS) {
         await expect(drawer.locator(selector), selector).not.toHaveText("Not recorded");
       }
+      await expect(drawer.locator("[data-host-drawer-title]")).toHaveText(host);
+      await expect(drawer.locator("[data-host-drawer-posture-title]")).toHaveText("Needs attention");
+      await expect(drawer.locator("[data-host-drawer-reasons]")).not.toBeEmpty();
       expect(await pageFits(page)).toBe(true);
       const opened = await card.boundingBox();
       expect(Math.abs(opened.width - before.width)).toBeLessThanOrEqual(1);
@@ -110,13 +114,12 @@ test("mobile fleet and the quick preview stay on screen", async ({ page }, testI
     await trigger.click();
     await expect(drawer).toBeVisible();
     const moving = await drawer.evaluate((node) => getComputedStyle(node).animationName);
-    const title = await drawer.locator("[data-host-drawer-title]").textContent();
     await page.keyboard.press("Escape");
     await page.emulateMedia({ reducedMotion: "reduce" });
     await trigger.click();
     await expect(drawer).toBeVisible();
     const reduced = await drawer.evaluate((node) => getComputedStyle(node).animationName);
-    await expect(drawer.locator("[data-host-drawer-title]")).toHaveText(title ?? "");
+    await expect(drawer.locator("[data-host-drawer-title]")).toHaveText(host);
     await expect(drawer.locator("[data-host-drawer-backup]")).not.toHaveText("");
     expect(reduced).toBe("none");
     expect(moving).toContain("host-drawer-in");
