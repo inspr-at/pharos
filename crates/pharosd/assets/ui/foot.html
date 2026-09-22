@@ -521,6 +521,33 @@ function paintDrawerMark(surface){
     mark.innerHTML=mark.dataset.defaultMark||'';
     delete mark.dataset.healthTone;
   }
+  const health=hostDrawerField('[data-host-drawer-health-label]');
+  const source=surface.querySelector('[data-health-label]');
+  if(health){
+    health.textContent=String(source?.textContent||'').trim()||'Not recorded';
+    health.dataset.healthTone=source?.dataset.healthTone||badge?.dataset.healthTone||'neutral';
+  }
+}
+function paintDrawerPosture(assurance,surface){
+  const title=hostDrawerField('[data-host-drawer-posture-title]');
+  if(!title)return;
+  const problems=(assurance?.health?.reasons||[]).filter(reason=>reason&&reason.tone&&reason.tone!=='good');
+  const tone=assurance?.health?.tone||surface?.querySelector?.('[data-health-block]')?.dataset?.healthTone||surface?.querySelector?.('[data-health-label]')?.dataset?.healthTone||'';
+  title.textContent=(problems.length||tone==='amber'||tone==='bad')?'Needs attention':'Current observations';
+}
+function paintDrawerGrace(surface){
+  const node=hostDrawerField('[data-host-drawer-grace]');
+  const secs=String(surface?.dataset?.grace||'').trim();
+  const source=String(surface?.dataset?.graceSource||'');
+  if(node)node.textContent=secs?secs+'s · '+(source==='host'?'host override':'fleet default'):'Not recorded';
+  setHostDrawerText('[data-grace-source-line]',String(surface?.dataset?.graceSourceLine||'').trim());
+  setHostDrawerText('[data-grace-rule]',String(surface?.dataset?.graceRule||'').trim());
+  const pending=hostDrawerField('[data-grace-pending]');
+  const pendingText=String(surface?.dataset?.gracePendingLine||'').trim();
+  if(pending){
+    pending.textContent=pendingText||'Not recorded';
+    pending.hidden=!pendingText;
+  }
 }
 function updateOpenHostDrawer(host,now){
   if(!host||host.name!==hostDrawerContext.host)return;
@@ -536,11 +563,13 @@ function updateOpenHostDrawer(host,now){
   const surface=hostSurfaces(host.name)[0]||null;
   const assurance=projectHostAssurance(host,current);
   paintDrawerAssurance(assurance.protection,assurance.health,surface);
+  paintDrawerPosture(assurance,surface);
+  paintDrawerGrace(surface);
   fillDrawerEvidence(surface,host,current);
 }
 function drawerClock(at){
   const stamp=utcObservedStamp(recordedUnix(at));
-  return stamp?stamp.visible:'not recorded';
+  return stamp?stamp.visible:'Not recorded';
 }
 function fillDrawerEvidence(surface,host,now){
   const reasons=hostDrawerField('[data-host-drawer-reasons]');
@@ -596,6 +625,8 @@ function populateHostDrawer(surface){
   setHostDrawerText('[data-host-drawer-title]',host);
   setHostDrawerText('[data-host-drawer-role]',surface.querySelector('.role')?.textContent||'host');
   paintDrawerMark(surface);
+  paintDrawerPosture(assurance,surface);
+  paintDrawerGrace(surface);
   setHostDrawerText('[data-host-drawer-state]',String(surface.dataset.live||'unknown').replaceAll('_',' '));
   const state=hostDrawerField('[data-host-drawer-state]');
   if(state)state.dataset.level=String(lifecycle?.level||surface.dataset.live||'');
@@ -648,7 +679,12 @@ function parkHeartbeatHistory(surface){
   const beat=surface?.querySelector?.('.beat');
   const history=beat?.querySelector?.('.beat-history');
   const slot=hostDrawerField('[data-host-drawer-history]');
-  if(!history||!slot||typeof slot.appendChild!=='function')return;
+  if(!slot||typeof slot.appendChild!=='function')return;
+  if(!history){
+    if(!slot.querySelector('.beat-history'))slot.textContent='Not recorded';
+    return;
+  }
+  slot.textContent='';
   history.dataset.historyOwner=beatOwnerId(beat);
   history.dataset.historyHost=surface.dataset.host||'';
   slot.appendChild(history);
@@ -760,7 +796,7 @@ function closeHostActions(root=openHostActionsRoot,restore=false){
   if(!root)return;
   const trigger=root.querySelector('[data-host-actions-trigger]');
   const menu=root.querySelector('[data-host-actions-menu]');
-  if(menu){menu.hidden=true;menu.style.removeProperty('left');menu.style.removeProperty('top')}
+  if(menu){menu.hidden=true;menu.style.removeProperty('position');menu.style.removeProperty('left');menu.style.removeProperty('top')}
   if(trigger)trigger.setAttribute('aria-expanded','false');
   if(openHostActionsRoot===root){openHostActionsRoot=null;openHostActionsScrollPosition=null}
   if(restore)trigger?.focus();
@@ -775,12 +811,19 @@ function positionHostActions(root){
   const menuWidth=menu.offsetWidth;
   const menuHeight=menu.offsetHeight;
   const margin=12;
+  menu.style.position='absolute';
   const left=Math.max(margin-origin.left,Math.min(window.innerWidth-menuWidth-margin-origin.left,anchor.right-origin.left-menuWidth));
   const below=anchor.bottom-origin.top+7;
   const above=anchor.top-origin.top-menuHeight-7;
   const top=origin.top+below+menuHeight<=window.innerHeight-margin?below:Math.max(margin-origin.top,above);
   menu.style.left=left+'px';
   menu.style.top=top+'px';
+  const box=menu.getBoundingClientRect();
+  if(box.left<margin||box.right>window.innerWidth-margin||box.top<margin||box.bottom>window.innerHeight-margin){
+    menu.style.position='fixed';
+    menu.style.left=Math.max(margin,Math.min(window.innerWidth-menuWidth-margin,anchor.right-menuWidth))+'px';
+    menu.style.top=(anchor.bottom+menuHeight<=window.innerHeight-margin?anchor.bottom+7:Math.max(margin,anchor.top-menuHeight-7))+'px';
+  }
 }
 function openHostActions(root){
   if(openHostActionsRoot&&openHostActionsRoot!==root)closeHostActions(openHostActionsRoot);
@@ -3092,7 +3135,8 @@ function setSeen(card,last,now){
   if(!seen)return;
   const compact=seen.hasAttribute('data-seen-compact');
   const cardLabel=seen.hasAttribute('data-seen-card');
-  const text=last==null?(compact?'never':(cardLabel?'Never seen':'never seen')):(compact?dur(now-last)+' ago':(cardLabel?'Seen ':'last seen ')+dur(now-last)+' ago');
+  const whole=last==null?null:compactPingAge(Math.max(0,now-last));
+  const text=last==null?(compact?'never':(cardLabel?'Never seen':'never seen')):(compact?whole+' ago':(cardLabel?'Seen ':'last seen ')+dur(now-last)+' ago');
   seen.dataset.defaultText=text;
   if(card.dataset.historyHint!=='true')seen.textContent=text;
 }
