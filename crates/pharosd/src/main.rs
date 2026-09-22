@@ -6537,7 +6537,8 @@ mod tests {
 
         assert_eq!(html.matches(r#"class="header-chip backup-chip"#).count(), 0);
         assert!(html.contains(r#"href="/backups?host=athena""#));
-        assert!(html.contains(r#"aria-label="Backup healthy for athena""#));
+        assert!(!html.contains(r#"aria-label="Backup healthy for athena""#));
+        assert!(html.contains("Daily backup"));
         assert!(html.contains(r#"class="row-fact protection-fact good""#));
         assert!(html.contains(r#"<span class="row-fact-k">Daily:</span>"#));
         assert!(html.contains(r#"data-daily-backup-label>OK · 2m</strong>"#));
@@ -6604,14 +6605,17 @@ mod tests {
             4
         );
         assert_eq!(html.matches(r#"class="header-chip backup-chip"#).count(), 0);
-        assert!(html.contains(r#"aria-label="Backup healthy for healthy-header""#));
-        assert!(html.contains(r#"aria-label="Backup failed for failed-header""#));
+        assert!(!html.contains(r#"aria-label="Backup healthy for healthy-header""#));
+        assert!(!html.contains(r#"aria-label="Backup failed for failed-header""#));
+        assert!(html.contains(r#"data-daily-backup-label>Failed</strong>"#));
         assert!(html.contains(r#"href="/backups?host=healthy-header""#));
         assert!(html.contains(r#"href="/backups?host=failed-header""#));
         assert!(html.contains(r#"class="row-fact protection-fact bad""#));
         let failed_card = rendered_card(&html, "failed-header");
         assert!(!failed_card.contains("backup-chip"));
-        assert!(failed_card.contains(r#"aria-label="Backup failed for failed-header""#));
+        assert!(!failed_card.contains(r#"aria-label="Backup failed for failed-header""#));
+        assert!(failed_card.contains("Daily backup"));
+        assert!(failed_card.contains(r#"data-daily-backup-label>Failed</strong>"#));
         assert!(failed_card.contains(r#"href="/backups?host=failed-header""#));
         assert!(failed_card.contains(r#"class="protection-fact bad""#));
         assert_eq!(
@@ -9533,7 +9537,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .find("data-daily-backup")
             .expect("backup fact rendered");
         assert!(menu < backup, "ellipsis menu must precede backup control");
-        assert!(card.contains(r#"aria-label="Backup "#));
+        assert!(!card.contains(r#"aria-label="Backup "#));
+        assert!(card.contains("Daily backup"));
     }
 
     #[test]

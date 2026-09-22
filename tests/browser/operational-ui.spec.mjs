@@ -8,6 +8,13 @@ import {
 } from "./harness.mjs";
 import { requireFixtureManifest } from "./harness-fixture.mjs";
 
+async function expectAccessibleNameMatchesVisibleText(locator) {
+  await expect(locator).not.toHaveAttribute("aria-label");
+  const visible = (await locator.innerText()).replace(/\s+/g, " ").trim();
+  expect(visible.length).toBeGreaterThan(0);
+  await expect(locator).toHaveAccessibleName(visible);
+}
+
 const releaseCoordinate = JSON.parse(
   fs.readFileSync(new URL("../../RELEASE.json", import.meta.url), "utf8"),
 );
@@ -1329,18 +1336,12 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     await expect(healthyDaily).toBeVisible();
     await expect(healthyDaily).not.toHaveAttribute("hidden", "");
     await expect(healthyDaily).toHaveAttribute("href", `/backups?host=${healthyHost}`);
-    await expect(healthyDaily).toHaveAttribute(
-      "aria-label",
-      new RegExp(`Backup (healthy|stale) for ${healthyHost}`),
-    );
+    await expectAccessibleNameMatchesVisibleText(healthyDaily);
     await expect(failedDaily).toHaveCount(1);
     await expect(failedDaily).toBeVisible();
     await expect(failedDaily).not.toHaveAttribute("hidden", "");
     await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
-    await expect(failedDaily).toHaveAttribute(
-      "aria-label",
-      `Backup failed for ${failedHost}`,
-    );
+    await expectAccessibleNameMatchesVisibleText(failedDaily);
     await expect(failedDaily).toHaveClass(/bad/);
     await expect(healthyRail).toHaveAttribute("hidden", "");
     await expect(failedDaily).toBeVisible();
@@ -1413,10 +1414,7 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     await expect(failedDaily).toBeVisible();
     await expect(failedDaily).not.toHaveAttribute("hidden", "");
     await expect(failedDaily).toBeFocused();
-    await expect(failedDaily).toHaveAttribute(
-      "aria-label",
-      new RegExp(`Backup (healthy|stale) for ${failedHost}`),
-    );
+    await expectAccessibleNameMatchesVisibleText(failedDaily);
     await expect(failedDaily.locator("[data-daily-backup-label]")).not.toHaveText("Failed");
     await expect(failedRail).toHaveAttribute("hidden", "");
     await expect(failedRailBackup).toHaveAttribute("hidden", "");
@@ -1425,10 +1423,7 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     await expect(failedDaily).toBeVisible();
     await expect(failedDaily).not.toHaveAttribute("hidden", "");
     await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
-    await expect(failedDaily).toHaveAttribute(
-      "aria-label",
-      `Backup failed for ${failedHost}`,
-    );
+    await expectAccessibleNameMatchesVisibleText(failedDaily);
     await expect(failedDaily).toHaveClass(/bad/);
     await expect(failedDaily.locator("[data-daily-backup-label]")).toHaveText("Failed");
     await expect(failedCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
@@ -1448,15 +1443,12 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     await expect(healthyFact).toBeVisible();
     await expect(healthyFact).not.toHaveAttribute("hidden", "");
     await expect(healthyFact).toHaveAttribute("href", `/backups?host=${healthyHost}`);
-    await expect(healthyFact).toHaveAttribute(
-      "aria-label",
-      new RegExp(`Backup (healthy|stale) for ${healthyHost}`),
-    );
+    await expectAccessibleNameMatchesVisibleText(healthyFact);
     await expect(failedFact).toHaveCount(1);
     await expect(failedFact).toBeVisible();
     await expect(failedFact).not.toHaveAttribute("hidden", "");
     await expect(failedFact).toHaveAttribute("href", `/backups?host=${failedHost}`);
-    await expect(failedFact).toHaveAttribute("aria-label", `Backup failed for ${failedHost}`);
+    await expectAccessibleNameMatchesVisibleText(failedFact);
     await expect(failedFact).toHaveClass(/bad/);
     for (const width of [1440, 1024, 768, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
@@ -1610,10 +1602,7 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
     );
     await expect(faultCard.locator(".backup-chip")).toHaveCount(0);
     await expect(faultCard.locator("a[data-daily-backup]")).not.toHaveAttribute("hidden", "");
-    await expect(faultCard.locator("a[data-daily-backup]")).toHaveAttribute(
-      "aria-label",
-      `Backup failed for ${faultHost}`,
-    );
+    await expectAccessibleNameMatchesVisibleText(faultCard.locator("a[data-daily-backup]"));
     await expect(faultCard.locator("a[data-daily-backup]")).toHaveClass(/bad/);
     await expect(faultCard.locator(".attention-line")).toContainText("Backup Failed");
     await expect(faultCard.locator("details")).toHaveCount(0);

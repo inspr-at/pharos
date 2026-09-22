@@ -1530,7 +1530,9 @@ mod module_tests {
         let view = fleet_protection_view(std::slice::from_ref(&failed), now);
         let card = protection_card_markup(&view, "beacon", &PublicBasePath::ROOT);
         assert!(card.contains(r#"href="/backups?host=beacon""#));
-        assert!(card.contains(r#"aria-label="Backup failed for beacon""#));
+        assert!(!card.contains(r#"aria-label="Backup"#));
+        assert!(card.contains("Daily backup"));
+        assert!(card.contains(r#"data-daily-backup-label>Failed</strong>"#));
         assert!(card.contains(r#"class="protection-fact bad""#));
         assert!(!card.contains("backup-chip"));
         assert_eq!(
@@ -1550,7 +1552,7 @@ mod module_tests {
         assert!(!configuration_face_label(&missing).contains("freshness"));
         let failed_list = list_protection_markup(&view, "beacon", &PublicBasePath::ROOT, now);
         assert!(failed_list.contains(r#"href="/backups?host=beacon""#));
-        assert!(failed_list.contains(r#"aria-label="Backup failed for beacon""#));
+        assert!(!failed_list.contains(r#"aria-label="Backup"#));
         assert!(failed_list.contains(r#"<span class="row-fact-k">Daily:</span>"#));
         assert!(failed_list.contains(r#"data-daily-backup-label>Failed</strong>"#));
         assert!(failed_list.contains(r#"<span class="row-fact-k">Restore:</span>"#));
@@ -1580,7 +1582,7 @@ mod module_tests {
         several.restore_file_count = Some(4);
         let several_list = list_protection_markup(&several, "atlas", &PublicBasePath::ROOT, now);
         assert!(several_list.contains(r#"data-restore-label>4 files · 6d</strong>"#));
-        assert!(passed_list.contains(r#"aria-label="Backup healthy for atlas""#));
+        assert!(!passed_list.contains(r#"aria-label="Backup"#));
         let exact = r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="nixpkgs-drift"><strong class="warn" data-fresh-value>nixpkgs differs from nixos-unstable</strong></div>"#;
         assert!(
             mark_scan_duplicate_chip(exact, "nixpkgs differs from nixos-unstable")
@@ -4487,17 +4489,6 @@ fn fact_kind_label(kind: &str, card_face: bool) -> String {
     format!("{icon}{text}")
 }
 
-fn backup_aria_state(fact: &ProtectionFact) -> &'static str {
-    match fact.state {
-        "ok" | "healthy" => "healthy",
-        "failed" => "failed",
-        "stale" => "stale",
-        "warning" => "warning",
-        "disabled" => "disabled",
-        _ => "not observed",
-    }
-}
-
 fn fact_markup(
     fact: &ProtectionFact,
     kind: &str,
@@ -4505,7 +4496,6 @@ fn fact_markup(
     include_time: bool,
     scan: bool,
     card_face: bool,
-    aria_label: Option<&str>,
 ) -> String {
     let compact = scan && !card_face;
     let at = fact_instant_attr(fact.at);
@@ -4542,12 +4532,9 @@ fn fact_markup(
         tone = html_escape(fact.tone),
         at = html_escape(&at),
     );
-    let aria = aria_label
-        .map(|label| format!(r#" aria-label="{}""#, html_escape(label)))
-        .unwrap_or_default();
     match href {
         Some(href) => format!(
-            r#"<a class="protection-fact {tone}" {attrs} href="{href}"{aria}>{body}</a>"#,
+            r#"<a class="protection-fact {tone}" {attrs} href="{href}">{body}</a>"#,
             tone = html_escape(fact.tone),
         ),
         None => format!(r#"<div class="protection-fact" {attrs}>{body}</div>"#),
@@ -4664,7 +4651,7 @@ fn list_protection_markup(
 ) -> String {
     let href = app_href(base, &format!("/backups?host={}", url_query_escape(host)));
     let check_fact = match &view.check {
-        Some(check) => fact_markup(check, "backup-check", Some(&href), true, true, false, None),
+        Some(check) => fact_markup(check, "backup-check", Some(&href), true, true, false),
         None => {
             r#"<div class="protection-fact protection-check" data-backup-check data-backup-check-state="" data-backup-check-tone="" data-backup-check-at="" hidden><span class="fact-label">Repository check</span><strong class="fact-value neutral" data-backup-check-label></strong><span class="fact-note" data-backup-check-note></span></div>"#.to_string()
         }
@@ -4684,16 +4671,12 @@ fn list_protection_markup(
         "present"
     };
     format!(
-        r#"<div class="row-protection" data-protection data-selective-restore-overdue-after-secs="{overdue_after}"><a class="row-fact protection-fact {run_tone}" data-daily-backup data-daily-backup-state="{run_state}" data-daily-backup-tone="{run_tone}" data-daily-backup-at="{run_at}" href="{href}" aria-label="{aria}"><span class="row-fact-k">Daily:</span> <strong class="fact-value {run_tone}" data-daily-backup-label>{daily}</strong><span class="fact-note" data-daily-backup-note hidden title="{run_note}">{run_note}</span></a><div class="row-fact {restore_tone}" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="row-fact-k">Restore:</span> <strong class="fact-value {restore_tone}" data-restore-label>{restore}</strong><span class="fact-note" data-restore-note hidden title="{restore_note}">{restore_note}</span></div><small class="row-protection-note" data-row-protection-note title="{note}">{note}</small><div class="scan-store" data-protection-evidence hidden>{backup_time}{restore_time}</div><div class="scan-store" data-protection-more hidden>{check_fact}</div></div>"#,
+        r#"<div class="row-protection" data-protection data-selective-restore-overdue-after-secs="{overdue_after}"><a class="row-fact protection-fact {run_tone}" data-daily-backup data-daily-backup-state="{run_state}" data-daily-backup-tone="{run_tone}" data-daily-backup-at="{run_at}" href="{href}"><span class="row-fact-k">Daily:</span> <strong class="fact-value {run_tone}" data-daily-backup-label>{daily}</strong><span class="fact-note" data-daily-backup-note hidden title="{run_note}">{run_note}</span></a><div class="row-fact {restore_tone}" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="row-fact-k">Restore:</span> <strong class="fact-value {restore_tone}" data-restore-label>{restore}</strong><span class="fact-note" data-restore-note hidden title="{restore_note}">{restore_note}</span></div><small class="row-protection-note" data-row-protection-note title="{note}">{note}</small><div class="scan-store" data-protection-evidence hidden>{backup_time}{restore_time}</div><div class="scan-store" data-protection-more hidden>{check_fact}</div></div>"#,
         overdue_after = SELECTIVE_RESTORE_OVERDUE_AFTER_SECS,
         run_tone = html_escape(view.run.tone),
         run_state = html_escape(view.run.state),
         run_at = html_escape(&run_at),
         href = href,
-        aria = html_escape(&format!(
-            "Backup {} for {host}",
-            backup_aria_state(&view.run)
-        )),
         daily = html_escape(&daily),
         run_note = html_escape(&view.run.note),
         restore_tone = html_escape(view.restore.tone),
@@ -4723,15 +4706,7 @@ fn protection_markup_surface(
 ) -> String {
     let href = app_href(base, &format!("/backups?host={}", url_query_escape(host)));
     let check_fact = match &view.check {
-        Some(check) => fact_markup(
-            check,
-            "backup-check",
-            Some(&href),
-            true,
-            scan,
-            card_face,
-            None,
-        ),
+        Some(check) => fact_markup(check, "backup-check", Some(&href), true, scan, card_face),
         None => {
             r#"<div class="protection-fact protection-check" data-backup-check data-backup-check-state="" data-backup-check-tone="" data-backup-check-at="" hidden><span class="fact-label">Repository check</span><strong class="fact-value neutral" data-backup-check-label></strong><span class="fact-note" data-backup-check-note></span></div>"#.to_string()
         }
@@ -4789,10 +4764,6 @@ fn protection_markup_surface(
             false,
             scan,
             card_face,
-            Some(&format!(
-                "Backup {} for {host}",
-                backup_aria_state(&view.run)
-            )),
         ),
         restore_caption = restore_caption,
         restore_age = restore_age,

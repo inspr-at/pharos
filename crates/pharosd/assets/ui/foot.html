@@ -2115,8 +2115,7 @@ function updateBackupStatus(surface,protection){
     const dailyNote=dailyNode.querySelector('[data-daily-backup-note]');
     if(dailyNote)dailyNote.title=daily.detail||'';
     if(dailyNode.classList){['good','bad','amber','neutral'].forEach(tone=>dailyNode.classList.remove(tone));if(daily.tone)dailyNode.classList.add(daily.tone);}
-    const ariaState=daily.state==='ok'||daily.state==='healthy'?'healthy':daily.state==='failed'?'failed':daily.state==='stale'?'stale':daily.state==='warning'?'warning':daily.state==='disabled'?'disabled':'not observed';
-    if(typeof dailyNode.setAttribute==='function')dailyNode.setAttribute('aria-label','Backup '+ariaState+' for '+host);
+    if(typeof dailyNode.removeAttribute==='function')dailyNode.removeAttribute('aria-label');
     paintScanAge(dailyNode,'[data-daily-backup-age]',dailyAt);
     dailyNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
     placeObservedTime(surface,dailyNode,dailyAt,'daily-backup');
