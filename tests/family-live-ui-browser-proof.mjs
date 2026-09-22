@@ -6,7 +6,7 @@ import path from "node:path";
 import { chromium } from "@playwright/test";
 import { FAMILY_VIEWPORTS } from "../scripts/live-ui-apps.mjs";
 import { browserContextOptions, takeAuthenticatedShot, openGuardedBrowser, shutdownLiveSession } from "../scripts/live-ui-guard.mjs";
-import { installGuard } from "../scripts/live-ui.mjs";
+import { installGuard, readProbe } from "../scripts/live-ui.mjs";
 
 const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "family-browser-proof-")));
 fs.chmodSync(dir, 0o700);
@@ -24,6 +24,10 @@ try {
   pageRef.page = page;
   await guard.armPage(page);
   assert.equal(Boolean(opened.gate.compromised()), false);
+  await page.setContent("<main><h1>Ordinary vault</h1><form action='/janus/logout'><button>Sign out</button></form></main>");
+  assert.equal((await readProbe(page, policy)).familyShell, false);
+  await page.setContent("<main data-inspr-flow-reviewer><h1>Restricted Flow review</h1><form action='/janus/logout'><button>Sign out</button></form></main>");
+  assert.equal((await readProbe(page, policy)).familyShell, true);
   for (const [name, viewport] of Object.entries(FAMILY_VIEWPORTS)) {
     await page.setViewportSize(viewport);
     await page.setContent("<main><h1>Synthetic app surface</h1><p>No live identity is used.</p></main>");

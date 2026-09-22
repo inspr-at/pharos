@@ -32,7 +32,7 @@ const APPS = Object.freeze({
     base: "/janus",
     login: "/janus/login",
     callback: "/janus/oidc/callback",
-    shell: "form[action='/janus/logout']",
+    shell: "main[data-inspr-flow-reviewer] form[action='/janus/logout']",
     routes: Object.freeze([{ name: "landing", path: "/janus/" }]),
   }),
 });

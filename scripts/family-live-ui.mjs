@@ -33,7 +33,7 @@ export function captureFamilyCredentials(env, repoRoot, sourceFile = path.join(o
       ownedPrivateFile(sourceFile);
       if (values.some((value) => typeof value !== "string" || value.length === 0)) throw new LiveUiError("family-credentials");
       const [username, password, seed] = values;
-      if (!/^[A-Za-z0-9._%+@=-]{1,128}$/.test(username) || password.length > 4096 || /[\r\n\0]/.test(password)) throw new LiveUiError("family-credentials");
+      if (!/^[A-Za-z0-9._%+@=-]{1,128}$/.test(username) || password.length > 4096 || /[\x00-\x1f\x7f]/.test(password)) throw new LiveUiError("family-credentials");
       totp = { bytes: decodeBase32(seed), redaction: seed };
       return { username, password, totp, mode: "protected-env" };
     }
@@ -42,8 +42,9 @@ export function captureFamilyCredentials(env, repoRoot, sourceFile = path.join(o
     const password = loadPasswordFile(files[1], repoRoot);
     totp = loadTotpSecretFile(files[2], repoRoot);
     return { username, password, totp, mode: "protected-files" };
-  } catch {
+  } catch (error) {
     if (totp?.bytes) totp.bytes.fill(0);
+    if (error instanceof LiveUiError) throw error;
     throw new LiveUiError("family-credentials");
   } finally {
     values.fill("");
@@ -72,17 +73,23 @@ export function createFamilyOutput(appName, repoRoot, home = os.homedir(), now =
   return checked;
 }
 
-export function familyEvidence({ app, started, overall, routes, blocked, callbackConfirmed, credentialMode }) {
+export function observeFamilyAuthentication(policy, { origin, pathname, method }) {
+  if (origin !== "https://auth.inspr.at" || method !== "POST") return;
+  if (pathname === "/ui/login/password") policy.passwordSubmitted = true;
+  if (pathname === "/ui/login/mfa/verify" && policy.totpGrant?.uses?.primary === 1 && policy.totpGrant?.uses?.fetch === 1) policy.totpSubmitted = true;
+}
+
+export function familyEvidence({ app, started, overall, routes, blocked, callbackConfirmed, credentialMode, passwordSubmitted = false, totpSubmitted = false }) {
   return {
     schema: FAMILY_SCHEMA,
     instance: "inspr-flow",
     basePath: familyApp(app)?.base || "",
-    serverRole: "unchanged",
+    serverRole: app === "pharos" ? "fleet-manager" : app === "janus" ? "flow_viewer" : "scoped-human-reviewer",
     app,
     startedAt: started,
     class: overall,
     appOrigin: FAMILY_ORIGIN,
-    oidc: { issuer: "https://auth.inspr.at", callbackConfirmed: !!callbackConfirmed, method: "browser-password-totp", credentialMode },
+    oidc: { issuer: "https://auth.inspr.at", callbackConfirmed: !!callbackConfirmed, method: "browser-oidc", passwordSubmitted: !!passwordSubmitted, totpSubmitted: !!totpSubmitted, credentialMode },
     clientDraft: "none",
     serverMutationAllowlist: [],
     browserState: "memory-only",
@@ -107,8 +114,10 @@ export async function runFamily(appName) {
   let overall = "broken-ui";
   const started = new Date().toISOString();
   try {
-    const planned = familyRoutes(appName, process.env.INSPR_UXQA_PROJECT_REF || "");
     output = createFamilyOutput(appName, repoRoot);
+    let planned;
+    try { planned = familyRoutes(appName, process.env.INSPR_UXQA_PROJECT_REF || ""); }
+    catch { throw new LiveUiError("family-project"); }
     const opened = await openGuardedBrowser((options) => chromium.launch(options));
     browser = opened.browser;
     gate = opened.gate;
@@ -124,6 +133,7 @@ export async function runFamily(appName) {
     page.on("response", (response) => {
       // Do not retain URLs (OIDC responses carry single-use codes/state).
       const location = publicLocation(response.url(), secrets);
+      observeFamilyAuthentication(policy, { ...location, method: response.request().method() });
       if (location.origin === "https://auth.inspr.at") policy.issuerObserved = true;
       if (policy.issuerObserved && location.origin === FAMILY_ORIGIN && location.pathname === app.callback && response.status() >= 200 && response.status() < 400) policy.callbackConfirmed = true;
     });
@@ -138,7 +148,8 @@ export async function runFamily(appName) {
           await page.setViewportSize(size);
           const visited = await visitRoute(page, FAMILY_ORIGIN, route.path, policy, false);
           // SPA hydration is bounded; permission remains subject to a fresh probe.
-          if (visited.class !== "authenticated") await page.locator(app.shell).first().waitFor({ state: "attached", timeout: 5000 }).catch(() => {});
+          await page.locator(app.shell).first().waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
+          await page.waitForLoadState("networkidle", { timeout: 2500 }).catch(() => {});
           const probe = await readProbe(page, policy);
           const location = publicLocation(page.url(), secrets);
           const classification = classifyFamilyObservation({ app: appName, location, status: visited.status, probe, callbackConfirmed: policy.callbackConfirmed });
@@ -175,7 +186,7 @@ export async function runFamily(appName) {
     });
     if (!released.released) overall = "broken-ui";
     if (output) {
-      const evidence = redactEvidence(familyEvidence({ app: appName, started, overall, routes, blocked, callbackConfirmed: policy.callbackConfirmed, credentialMode: credentials.mode }), secrets);
+      const evidence = redactEvidence(familyEvidence({ app: appName, started, overall, routes, blocked, callbackConfirmed: policy.callbackConfirmed, credentialMode: credentials.mode, passwordSubmitted: policy.passwordSubmitted, totpSubmitted: policy.totpSubmitted }), secrets);
       fs.writeFileSync(path.join(output, "evidence.json"), `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600, flag: "wx" });
     }
     if (released.released) {

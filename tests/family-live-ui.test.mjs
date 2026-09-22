@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { FAMILY_ORIGIN, FAMILY_VIEWPORTS, familyApp, familyRoutes, classifyFamilyObservation } from "../scripts/live-ui-apps.mjs";
-import { captureFamilyCredentials, createFamilyOutput, familyEvidence } from "../scripts/family-live-ui.mjs";
+import { captureFamilyCredentials, createFamilyOutput, familyEvidence, observeFamilyAuthentication } from "../scripts/family-live-ui.mjs";
 import { decideRequest, decideRedirect, primaryFrameDecision, decideFetchPause, redactEvidence, assertRuntimeEnvironment, repoRootFromScripts } from "../scripts/live-ui-guard.mjs";
 
 const APP_NAMES = ["aithema", "paimos", "pharos", "janus"];
@@ -39,7 +39,8 @@ test("every family app is restricted to its Flow mount at both network layers an
   assert.equal(decideRequest({ method: "GET", url: FAMILY_ORIGIN + "/pharos/" }, { familyApp: "unknown" }).allow, false);
 });
 
-test("Janus secret catalog, values, setup and privileged metadata never enter the read scope", () => {
+test("Janus privileged routes are denied and screenshots require its restricted Flow-only shell", () => {
+  assert.match(familyApp("janus").shell, /main\[data-inspr-flow-reviewer\]/);
   for (const route of ["api/warden/descriptors", "api/warden/resolve", "api/posture", "api/audit/recent", "api/evidence", "vault/new", "settings", "managed-service/setup", "internal/credentials", "static/../api/warden/descriptors"]) {
     assert.equal(decideRequest({ method: "GET", url: `${FAMILY_ORIGIN}/janus/${route}` }, { familyApp: "janus" }).allow, false);
   }
@@ -89,14 +90,14 @@ test("source credentials are removed before child launch, including rejected inp
   assert.equal(material.username, "synthetic-qa");
   material.totp.bytes.fill(0);
   const rejected = { ...credentials(), HTTPS_PROXY: "https://proxy.invalid" };
-  assert.throws(() => captureFamilyCredentials(rejected, repo, file), /family-credentials/);
+  assert.throws(() => captureFamilyCredentials(rejected, repo, file), /runtime-env/);
   assert.deepEqual(Object.keys(rejected), ["HTTPS_PROXY"]);
   const extra = { ...credentials(), INSPR_UXQA_CLIENT_SECRET: "synthetic-unused-client-secret" };
-  assert.throws(() => captureFamilyCredentials(extra, repo, file), /family-credentials/);
+  assert.throws(() => captureFamilyCredentials(extra, repo, file), /family-credential-contract/);
   assert.deepEqual(extra, {});
   fs.chmodSync(file, 0o644);
   const weak = credentials();
-  assert.throws(() => captureFamilyCredentials(weak, repo, file), /family-credentials/);
+  assert.throws(() => captureFamilyCredentials(weak, repo, file), /family-credential-file/);
   assert.deepEqual(weak, {});
 });
 
@@ -120,4 +121,30 @@ test("family evidence records the two real viewport contracts without auth or mu
   assert.equal(evidence.routes.length, 2);
   assert.deepEqual(evidence.serverMutationAllowlist, []);
   assert.equal(evidence.browserState, "memory-only");
+  assert.equal(evidence.oidc.method, "browser-oidc");
+  assert.equal(evidence.oidc.totpSubmitted, false);
+  assert.equal(evidence.oidc.passwordSubmitted, false);
+});
+
+test("authentication evidence distinguishes observed submissions from callbacks or unconsumed MFA grants", () => {
+  const policy = {};
+  const password = { origin: "https://auth.inspr.at", pathname: "/ui/login/password", method: "POST" };
+  const totp = { ...password, pathname: "/ui/login/mfa/verify" };
+  observeFamilyAuthentication(policy, { ...password, method: "GET" });
+  observeFamilyAuthentication(policy, { ...password, origin: FAMILY_ORIGIN });
+  assert.equal(policy.passwordSubmitted, undefined);
+  observeFamilyAuthentication(policy, password);
+  assert.equal(policy.passwordSubmitted, true);
+  observeFamilyAuthentication(policy, totp);
+  assert.equal(policy.totpSubmitted, undefined);
+  policy.totpGrant = { uses: { primary: 1, fetch: 0 } };
+  observeFamilyAuthentication(policy, totp);
+  assert.equal(policy.totpSubmitted, undefined);
+  policy.totpGrant.uses.fetch = 1;
+  observeFamilyAuthentication(policy, totp);
+  assert.equal(policy.totpSubmitted, true);
+  const evidence = familyEvidence({ app: "pharos", callbackConfirmed: true, ...policy });
+  assert.equal(evidence.oidc.totpSubmitted, true);
+  assert.equal(evidence.oidc.passwordSubmitted, true);
+  assert.equal(evidence.serverRole, "fleet-manager");
 });

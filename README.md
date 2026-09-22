@@ -1216,9 +1216,14 @@ request, redirect, Chromium target, screenshot, password and TOTP guards. `APP`
 is one of `aithema`, `paimos`, `pharos`, or `janus`; each run stays on that app's
 fixed `https://flow.inspr.at/APP/` mount and the real `auth.inspr.at` login.
 A successful OIDC callback and the app's signed-in shell are both required.
-Every application mutation is blocked, including server-side drafts. Janus
-captures only the Flow landing page, its shell state, and static assets; secret
-catalog, posture, audit, setup, and secret-use routes stay denied.
+Every application mutation is blocked, including server-side drafts. Pharos
+requires the approved Fleet manager grant; its runner permits inspection only.
+Janus requires JANUS-476's exclusive `flow_viewer` role and an exact sandbox
+binding, with no core viewer, auditor or operator role. It captures the dedicated
+Flow landing page, shell state and static assets. Its unique restricted-page
+marker is required before screenshots; an ordinary vault dashboard is refused.
+The server role denies catalog, posture, audit, setup and secret-use routes;
+the harness additionally blocks requests to those routes.
 
 From a clean checkout, run `npm ci --ignore-scripts` and install Chromium with
 `npx playwright install chromium`. The dedicated identity must already have its
@@ -1242,11 +1247,14 @@ The unchanged Pharos-only runner below continues to accept its own file inputs.
 Evidence is created in a new private directory at
 `~/.inspr/runtime/inspr-uxqa/APP/UTC-STAMP/`: `evidence.json` uses
 `inspr.uxqa.live-ui-evidence.v1`, with named routes, classification, status,
-viewport and screenshot filenames. Both desktop `1440×1000` and mobile
-`390×844` landing captures are required for success. Pharos also captures its
+viewport and screenshot filenames. Observed password and TOTP submission are
+recorded independently; an OIDC callback never implies MFA was submitted.
+Both desktop `1440×1000` and mobile-size `390×844` landing captures are required
+for success. These are Chromium viewports, not mobile-device emulation. Pharos also captures its
 list view. Optional non-sensitive `INSPR_UXQA_PROJECT_REF` adds the already
 provisioned sandbox route (`project:ID` for Aithema, numeric ID for Paimos);
-it grants no server access.
+it grants no server access. Set this per command for Aithema/Paimos only, never
+in the shared credential file; omit it for Janus and Pharos.
 A failed login, denied role, missing shell, or refused screenshot exits nonzero
 and is recorded as a blocker, never a health-check success. Screenshots and
 evidence are owner-only; symlinked paths and nonempty output directories are
