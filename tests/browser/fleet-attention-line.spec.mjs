@@ -14,7 +14,8 @@ const test = base.extend({
 test("attention lines stay equal to the server text after load", async ({ page }, testInfo) => {
   const workstation = `attention-workstation-${testInfo.project.name}`;
   const onboarding = `attention-onboarding-${testInfo.project.name}`;
-  const report = async (name, preferences) => {
+  const now = Math.floor(Date.now() / 1000);
+  const report = async (name, preferences, backup) => {
     const response = await page.request.post("/report", {
       data: {
         schema: "inspr.pharos.host-report.v5",
@@ -25,12 +26,29 @@ test("attention lines stay equal to the server text after load", async ({ page }
         heartbeat_interval_secs: 60,
         freshness: { applicable: false },
         preferences,
+        backup_observations: backup,
       },
     });
     expect(response.status(), await response.text()).toBe(204);
   };
-  await report(workstation, { kind: "workstation" });
-  await report(onboarding, { kind: "server" });
+  await report(workstation, { kind: "workstation" }, [{
+    id: "restic-main",
+    label: "Restic main",
+    engine: "restic",
+    state: "healthy",
+    configured: "enabled",
+    summary: "last backup succeeded",
+    schedule: "daily",
+    last_success_at: now - 120,
+    last_attempt_at: now - 120,
+    last_attempt_state: "succeeded",
+    restore_validation: {
+      level: "restore-sample",
+      state: "passed",
+      checked_at: now - 86400,
+    },
+  }]);
+  await report(onboarding, { kind: "server" }, []);
   const job = await page.request.post("/setup/provisioning-jobs", {
     data: {
       provider: "existing-host",
