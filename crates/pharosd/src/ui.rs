@@ -775,6 +775,10 @@ mod module_tests {
     fn host_quick_drawer_is_a_local_draft_with_an_explicit_workspace_exit() {
         let drawer = host_quick_drawer(&PublicBasePath::ROOT, true);
         assert!(drawer.contains(r#"role="dialog" aria-modal="true""#));
+        let history_at = drawer.find("Heartbeat history").expect("history heading");
+        let reasons_at = drawer.find("<h4>Reasons</h4>").expect("reasons heading");
+        assert!(history_at < reasons_at, "heartbeat history leads Evidence");
+        assert!(drawer.matches("data-host-drawer-history").count() == 1);
         assert!(drawer.contains("data-host-drawer-workspace"));
         assert!(drawer.contains("Prepare a local draft"));
         assert!(drawer.contains("Closing or discarding removes the draft completely"));
@@ -782,8 +786,20 @@ mod module_tests {
         assert!(drawer.contains("it does not send or apply changes"));
         assert!(drawer.contains("data-host-grace"));
         assert!(drawer.contains("Use fleet default"));
+        assert!(drawer.contains("inherit the fleet grace"));
+        assert!(!drawer.contains("send null"));
+        assert!(!drawer.contains("Open full host page"));
+        assert_eq!(drawer.matches("data-restore-instant-label").count(), 1);
         assert!(!drawer.contains("awaiting-policy"));
         assert!(!drawer.contains("data-grace-reset disabled"));
+        assert!(
+            FOOT.contains("paintDrawerAssurance"),
+            "drawer must paint health from the card summary"
+        );
+        assert!(
+            !FOOT.contains("[data-host-drawer-trigger] .nix"),
+            "drawer mark must not copy the hidden preview icon"
+        );
 
         let runtime = FOOT
             .split("function initHostDrawer()")
@@ -1138,6 +1154,7 @@ mod module_tests {
             now: 1_000_000,
             is_self: false,
             window_control: false,
+            list_caption: false,
             grace_secs: 15,
             grace_source: "default",
             late_after_secs: 75,
@@ -1362,6 +1379,77 @@ mod module_tests {
         assert!(protection.contains(" UTC</time>"));
         assert!(!protection.contains("Daily OK"));
         assert!(protection.contains("data-protection-more"));
+    }
+
+    #[test]
+    fn scan_card_keeps_detail_off_the_expanding_surface() {
+        let now = 2_000_000_000;
+        let aged = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now - 3 * 86_400),
+            Some(restore_sample(
+                pharos_core::BackupValidationState::Passed,
+                Some(now - 10 * 86_400),
+            )),
+        );
+        let view = fleet_protection_view(std::slice::from_ref(&aged), now);
+        let scan = protection_scan_markup(&view, "qa-harbor", &PublicBasePath::ROOT);
+        assert!(scan.contains("Backup run"));
+        assert!(scan.contains("Selective restore"));
+        assert!(scan.contains(r#"class="scan-store" data-protection-evidence hidden"#));
+        assert!(!scan.contains("<summary>Exact times</summary>"));
+        assert!(!scan.contains("<summary>Repository check</summary>"));
+        assert!(scan.contains("data-daily-backup-date"));
+        let health = health_for(&view, &proven_current("nixos-unstable"), now);
+        let scan_health = health_scan_markup(&health);
+        assert!(!scan_health.contains("data-health-disclosure"));
+        assert!(scan_health.contains("data-health-summary"));
+        assert!(scan_health.contains(r#"data-health-reasons hidden"#));
+        assert!(scan_health.contains("data-health-reason"));
+        let beat = heartbeat_card(HeartbeatCard {
+            last_seen: Some(now - 30),
+            heartbeat_log: &[now - 90, now - 30],
+            interval_secs: Some(60),
+            now,
+            is_self: false,
+            window_control: true,
+            list_caption: false,
+            grace_secs: 15,
+            grace_source: "fleet",
+            late_after_secs: 75,
+        });
+        assert!(beat.contains("beat-cadence"));
+        assert!(beat.contains("data-history-zones"));
+        assert!(beat.contains("expected 60s"));
+        assert!(beat.contains("late 75s"));
+        assert!(beat.contains("60s plus 15s grace"));
+        assert!(beat.contains("--interval-x:51.20%"));
+        assert!(beat.contains("--expect-x:64%"));
+        assert!(!beat.contains(">expected<"));
+        assert!(!beat.contains(">late<"));
+        assert!(!beat.contains(">History<"));
+        assert!(beat.contains("beat-history"));
+        assert!(beat.contains("data-beat-live=\"true\""));
+        assert!(!beat.contains("arrival-track"));
+        assert!(beat.contains(r#"data-history-axis="time""#));
+        assert!(beat.contains("--now-x:100%"));
+        assert!(scan.contains(r#"class="fact-age" data-daily-backup-age>"#));
+        assert!(scan.contains(r#"data-daily-backup-note hidden"#));
+        assert!(scan.contains(r#"data-restore-note hidden"#));
+        assert!(scan.contains(r#"data-restore-age>"#));
+    }
+
+    #[test]
+    fn unverified_chip_repeats_only_the_same_health_summary() {
+        let chip = r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="freshness-unverified"><strong class="na" data-fresh-value>unverified</strong></div>"#;
+        assert!(mark_scan_duplicate_chip(chip, "freshness unverified").contains("scan-duplicate"));
+        assert!(!mark_scan_duplicate_chip(chip, "Backup Failed").contains("scan-duplicate"));
+        let exact = r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="nixpkgs-drift"><strong class="warn" data-fresh-value>nixpkgs differs from nixos-unstable</strong></div>"#;
+        assert!(
+            mark_scan_duplicate_chip(exact, "nixpkgs differs from nixos-unstable")
+                .contains("scan-duplicate")
+        );
     }
 
     #[test]
@@ -3015,6 +3103,50 @@ pub(super) fn card_freshness_fault_markup(
     (markup, any_visible)
 }
 
+fn fresh_chip_value(row: &str) -> Option<&str> {
+    let marker = "data-fresh-value>";
+    let start = row.find(marker)? + marker.len();
+    let rest = row.get(start..)?;
+    let end = rest.find("</strong>")?;
+    Some(rest[..end].trim())
+}
+
+fn scan_texts_repeat(summary: &str, value: &str) -> bool {
+    let summary = summary.trim().to_ascii_lowercase();
+    let value = value.trim().to_ascii_lowercase();
+    if summary.is_empty() || value.is_empty() {
+        return false;
+    }
+    summary == value || (value == "unverified" && summary == "freshness unverified")
+}
+
+fn mark_scan_duplicate_chip(markup: &str, summary: &str) -> String {
+    if summary.trim().is_empty() {
+        return markup.to_string();
+    }
+    let mut out = String::new();
+    for row in markup.split_inclusive("</div>") {
+        let repeats = fresh_chip_value(row).is_some_and(|value| scan_texts_repeat(summary, value));
+        if repeats && !row.contains(" hidden") {
+            out.push_str(&row.replacen(
+                r#"class="fresh-row fresh-row-compact""#,
+                r#"class="fresh-row fresh-row-compact scan-duplicate""#,
+                1,
+            ));
+        } else {
+            out.push_str(row);
+        }
+    }
+    out
+}
+
+fn scan_rail_shows_chip(markup: &str) -> bool {
+    markup.split("fresh-row-compact").skip(1).any(|row| {
+        let head = row.split('>').next().unwrap_or("");
+        !head.contains("hidden") && !head.contains("scan-duplicate")
+    })
+}
+
 pub(super) fn kernel_reboot_required(kernel: Option<&KernelPosture>) -> Option<&KernelPosture> {
     kernel.filter(|posture| posture.state == KernelPostureState::RebootRequired)
 }
@@ -4163,11 +4295,45 @@ fn fact_instant_attr(at: Option<i64>) -> String {
         .unwrap_or_default()
 }
 
+fn scan_age_label(note: &str) -> String {
+    if note.contains("time is in the future") {
+        return "time is in the future".to_string();
+    }
+    if let Some(pos) = note.find(" ago") {
+        let tokens: Vec<&str> = note[..pos].split_whitespace().collect();
+        let mut keep = 0usize;
+        for token in tokens.iter().rev() {
+            let starts_digit = token.chars().next().is_some_and(|c| c.is_ascii_digit());
+            let unit = token
+                .chars()
+                .last()
+                .is_some_and(|c| matches!(c, 'd' | 'h' | 'm' | 's'));
+            if starts_digit && unit && token.len() >= 2 {
+                keep += 1;
+            } else {
+                break;
+            }
+        }
+        if keep > 0 {
+            let from = tokens.len() - keep;
+            return format!("{} ago", tokens[from..].join(" "));
+        }
+    }
+    if note.contains("not yet") {
+        return "not yet".to_string();
+    }
+    if note.contains("not recorded") || note.contains("No successful") {
+        return "not recorded".to_string();
+    }
+    String::new()
+}
+
 fn fact_markup(
     fact: &ProtectionFact,
     kind: &str,
     href: Option<&str>,
     include_time: bool,
+    scan: bool,
 ) -> String {
     let at = fact_instant_attr(fact.at);
     let time = if include_time {
@@ -4175,8 +4341,18 @@ fn fact_markup(
     } else {
         String::new()
     };
+    let age = if scan {
+        format!(
+            r#"<span class="fact-age" data-{kind}-age>{age}</span>"#,
+            kind = kind,
+            age = html_escape(&scan_age_label(&fact.note)),
+        )
+    } else {
+        String::new()
+    };
+    let note_hidden = if scan { " hidden" } else { "" };
     let body = format!(
-        r#"<span class="fact-label">{label_kind}</span><strong class="fact-value {tone}" data-{kind}-label>{label}</strong><span class="fact-note" data-{kind}-note>{note}</span>{time}"#,
+        r#"<span class="fact-label">{label_kind}</span><strong class="fact-value {tone}" data-{kind}-label>{label}</strong>{age}<span class="fact-note" data-{kind}-note{note_hidden}>{note}</span>{time}"#,
         label_kind = html_escape(match kind {
             "daily-backup" => "Backup run",
             "restore" => "Selective restore",
@@ -4185,6 +4361,8 @@ fn fact_markup(
         tone = html_escape(fact.tone),
         kind = kind,
         label = html_escape(&fact.label),
+        age = age,
+        note_hidden = note_hidden,
         note = html_escape(&fact.note),
         time = time,
     );
@@ -4206,17 +4384,41 @@ pub(super) fn protection_markup(
     host: &str,
     base: &PublicBasePath,
 ) -> String {
+    protection_markup_surface(view, host, base, false)
+}
+
+/// Fleet scan surfaces keep the two backup facts visible and park exact times
+/// and the repository check in a hidden store. Quick preview and the host page
+/// are the places that open them.
+pub(super) fn protection_scan_markup(
+    view: &FleetProtectionView,
+    host: &str,
+    base: &PublicBasePath,
+) -> String {
+    protection_markup_surface(view, host, base, true)
+}
+
+fn protection_markup_surface(
+    view: &FleetProtectionView,
+    host: &str,
+    base: &PublicBasePath,
+    scan: bool,
+) -> String {
     let href = app_href(base, &format!("/backups?host={}", url_query_escape(host)));
     let check_fact = match &view.check {
-        Some(check) => fact_markup(check, "backup-check", Some(&href), true),
+        Some(check) => fact_markup(check, "backup-check", Some(&href), true, scan),
         None => {
             r#"<div class="protection-fact protection-check" data-backup-check data-backup-check-state="" data-backup-check-tone="" data-backup-check-at="" hidden><span class="fact-label">Repository check</span><strong class="fact-value neutral" data-backup-check-label></strong><span class="fact-note" data-backup-check-note></span></div>"#.to_string()
         }
     };
     let check_hidden = if view.check.is_some() { "" } else { " hidden" };
-    let check = format!(
-        r#"<details class="protection-more" data-protection-more{check_hidden}><summary>Repository check</summary>{check_fact}</details>"#
-    );
+    let check = if scan {
+        format!(r#"<div class="scan-store" data-protection-more hidden>{check_fact}</div>"#)
+    } else {
+        format!(
+            r#"<details class="protection-more" data-protection-more{check_hidden}><summary>Repository check</summary>{check_fact}</details>"#
+        )
+    };
     let producer = if view.restore.state == "not-required" {
         "not-required"
     } else if view.missing_restore_producer {
@@ -4232,10 +4434,30 @@ pub(super) fn protection_markup(
     } else {
         ""
     };
+    let restore_age = if scan {
+        format!(
+            r#"<span class="fact-age" data-restore-age>{}</span>"#,
+            html_escape(&scan_age_label(&view.restore.note))
+        )
+    } else {
+        String::new()
+    };
+    let restore_note_hidden = if scan { " hidden" } else { "" };
+    let evidence = if scan {
+        format!(
+            r#"<div class="scan-store" data-protection-evidence hidden>{backup_time}{restore_time}</div>"#
+        )
+    } else {
+        format!(
+            r#"<details class="protection-evidence" data-protection-evidence{evidence_hidden}><summary>Exact times</summary>{backup_time}{restore_time}</details>"#
+        )
+    };
     format!(
-        r#"<div class="protection-pair" data-protection data-selective-restore-overdue-after-secs="{overdue_after}">{run}<div class="protection-fact" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="fact-label">Selective restore</span><strong class="fact-value {restore_tone}" data-restore-label>{restore_label}</strong><span class="fact-note" data-restore-note>{restore_note}</span></div><details class="protection-evidence" data-protection-evidence{evidence_hidden}><summary>Exact times</summary>{backup_time}{restore_time}</details>{check}</div>"#,
+        r#"<div class="protection-pair" data-protection data-selective-restore-overdue-after-secs="{overdue_after}">{run}<div class="protection-fact" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="fact-label">Selective restore</span><strong class="fact-value {restore_tone}" data-restore-label>{restore_label}</strong>{restore_age}<span class="fact-note" data-restore-note{restore_note_hidden}>{restore_note}</span></div>{evidence}{check}</div>"#,
         overdue_after = SELECTIVE_RESTORE_OVERDUE_AFTER_SECS,
-        run = fact_markup(&view.run, "daily-backup", Some(&href), false),
+        run = fact_markup(&view.run, "daily-backup", Some(&href), false, scan),
+        restore_age = restore_age,
+        restore_note_hidden = restore_note_hidden,
         check = check,
         restore_state = html_escape(view.restore.state),
         restore_tone = html_escape(view.restore.tone),
@@ -4248,9 +4470,7 @@ pub(super) fn protection_markup(
         },
         restore_label = html_escape(&view.restore.label),
         restore_note = html_escape(&view.restore.note),
-        evidence_hidden = evidence_hidden,
-        backup_time = backup_time,
-        restore_time = restore_time,
+        evidence = evidence,
     )
 }
 
@@ -4299,6 +4519,47 @@ pub(super) fn health_markup(health: &HostHealthView) -> String {
     )
 }
 
+pub(super) fn health_scan_markup(health: &HostHealthView) -> String {
+    let reasons = health
+        .reasons
+        .iter()
+        .map(|reason| {
+            let at = reason.at.map(|at| at.to_string()).unwrap_or_default();
+            format!(
+                r#"<li data-health-reason data-health-tone="{tone}" data-health-at="{at}">{label}{time}</li>"#,
+                tone = html_escape(reason.tone),
+                at = html_escape(&at),
+                label = html_escape(&reason.label),
+                time = observed_time_markup(reason.at, "health"),
+            )
+        })
+        .collect::<String>();
+    let icon = if health.problem_count == 0 {
+        icons::SHIELD_CHECK
+    } else {
+        icons::BELL
+    };
+    let count_label = if health.problem_count == 1 {
+        "1 reason".to_string()
+    } else {
+        format!("{} reasons", health.problem_count)
+    };
+    let count_hidden = if health.problem_count == 0 {
+        " hidden"
+    } else {
+        ""
+    };
+    format!(
+        r#"<div class="harbor-health" data-health-block data-health-tone="{tone}"><span class="health-label" data-health-label data-health-tone="{tone}" hidden>{label}</span><div class="attention-line"><span class="attention-icon" aria-hidden="true">{icon}</span><span data-health-summary>{summary}</span><span class="health-count" data-health-count{count_hidden}>{count}</span></div><ul class="health-reasons" data-health-reasons hidden>{reasons}</ul></div>"#,
+        tone = html_escape(health.tone),
+        label = html_escape(health.label),
+        summary = html_escape(&health.summary),
+        count = html_escape(&count_label),
+        count_hidden = count_hidden,
+        reasons = reasons,
+    )
+}
+
 pub(super) fn os_badge_markup(icon: &str, health: &HostHealthView) -> String {
     format!(
         r#"<span class="os-badge" data-health-badge data-health-tone="{tone}" role="img" aria-label="{label}"><span class="os-badge-icon" aria-hidden="true">{icon}</span></span>"#,
@@ -4330,7 +4591,7 @@ pub(super) fn revision_evidence_markup(freshness: &NixFreshness) -> String {
         None => ("n/a".to_string(), "n/a".to_string(), "n/a".to_string()),
     };
     format!(
-        r#"<details class="revision-evidence" data-revision-evidence><summary>Configuration evidence</summary><dl class="revision-panel"><div><dt>Summary</dt><dd data-config-summary>{summary}</dd></div><div><dt>Deployed SHA</dt><dd data-deployed-sha>{deployed}</dd></div><div><dt>nixcfg SHA</dt><dd data-nixcfg-sha>{nixcfg}</dd></div><div><dt>nixpkgs SHA</dt><dd data-nixpkgs-sha>{nixpkgs}</dd></div></dl></details>"#,
+        r#"<div class="scan-store" data-revision-evidence hidden><span data-config-summary>{summary}</span><span data-deployed-sha>{deployed}</span><span data-nixcfg-sha>{nixcfg}</span><span data-nixpkgs-sha>{nixpkgs}</span></div>"#,
         summary = html_escape(&summary),
         deployed = html_escape(&deployed),
         nixcfg = html_escape(&nixcfg),
@@ -4636,7 +4897,7 @@ pub(super) fn host_actions_markup(
 
 fn host_quick_drawer(base: &PublicBasePath, can_manage_fleet: bool) -> String {
     format!(
-        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div><div><dt>Health</dt><dd data-host-drawer-health></dd></div><div><dt>Daily backup</dt><dd data-host-drawer-backup></dd></div><div><dt>Restore test</dt><dd data-host-drawer-restore></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="{home}">Open host workspace {arrow}</a><a class="full-page-link" data-host-drawer-full-page href="{home}">Open full host page {arrow}</a></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review settings</button></div><p class="host-drawer-effect">Opens the draft in this host workspace; it does not send or apply changes.</p><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form><section class="host-drawer-grace" data-host-grace aria-label="Heartbeat grace"><h3>Heartbeat grace</h3><p data-grace-source-line></p><p data-grace-rule></p><p data-grace-pending hidden></p><div class="host-drawer-grace-controls"><label>Source <select data-grace-mode{grace_disabled}><option value="inherit">Fleet default</option><option value="override">Override for this host</option></select></label><label>Extra grace after expected heartbeat <input data-grace-seconds-input type="number" min="0" max="3600" step="1" inputmode="numeric"{grace_disabled}></label><button type="button" data-grace-reset{grace_disabled}>Use fleet default</button></div><p>Use fleet default clears this host override through the existing settings review. Leave heartbeat grace out of that request, or send null. A number, including 0, is an override.</p></section></div></aside></div>"#,
+        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div><div><dt>Health</dt><dd data-host-drawer-health></dd></div><div><dt>Daily backup</dt><dd data-host-drawer-backup></dd></div><div><dt>Restore test</dt><dd data-host-drawer-restore></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="{home}">Open host workspace {arrow}</a></section><section class="host-drawer-evidence" aria-labelledby="host-drawer-evidence-title"><h3 id="host-drawer-evidence-title">Evidence</h3><h4>Heartbeat history</h4><div class="host-drawer-history" data-host-drawer-history></div><h4>Reasons</h4><ul data-host-drawer-reasons></ul><h4>Exact times</h4><p data-host-drawer-backup-time><span data-host-drawer-backup-label data-daily-backup-instant-label>Backup last success</span> <span data-host-drawer-backup-clock></span></p><p data-host-drawer-restore-time><span data-host-drawer-restore-label data-restore-instant-label>Selective restore last success</span> <span data-host-drawer-restore-clock></span></p><h4>Repository check</h4><p data-host-drawer-check></p><h4>Configuration</h4><dl class="host-drawer-config"><div><dt>Summary</dt><dd data-host-drawer-config></dd></div><div><dt>Deployed SHA</dt><dd data-host-drawer-deployed></dd></div><div><dt>nixcfg SHA</dt><dd data-host-drawer-nixcfg></dd></div><div><dt>nixpkgs SHA</dt><dd data-host-drawer-nixpkgs></dd></div></dl></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review settings</button></div><p class="host-drawer-effect">Opens the draft in this host workspace; it does not send or apply changes.</p><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form><section class="host-drawer-grace" data-host-grace aria-label="Heartbeat grace"><h3>Heartbeat grace</h3><p data-grace-source-line></p><p data-grace-rule></p><p data-grace-pending hidden></p><div class="host-drawer-grace-controls"><label>Source <select data-grace-mode{grace_disabled}><option value="inherit">Fleet default</option><option value="override">Override for this host</option></select></label><label>Extra grace after expected heartbeat <input data-grace-seconds-input type="number" min="0" max="3600" step="1" inputmode="numeric"{grace_disabled}></label><button type="button" data-grace-reset{grace_disabled}>Use fleet default</button></div><p>Use fleet default asks this host to inherit the fleet grace. Review that change with the other settings, then apply it. Until the host reports the result, the clock keeps the grace already in effect. A chosen number is an override for this host only.</p></section></div></aside></div>"#,
         can_manage = can_manage_fleet,
         grace_disabled = if can_manage_fleet { "" } else { " disabled" },
         server = icons::SERVER,
@@ -9615,6 +9876,7 @@ pub(super) struct HeartbeatCard<'a> {
     now: i64,
     is_self: bool,
     window_control: bool,
+    list_caption: bool,
     grace_secs: u64,
     grace_source: &'a str,
     late_after_secs: u64,
@@ -9628,6 +9890,7 @@ pub(super) fn heartbeat_card(card: HeartbeatCard<'_>) -> String {
         now,
         is_self,
         window_control,
+        list_caption,
         grace_secs,
         grace_source,
         late_after_secs,
@@ -9721,11 +9984,56 @@ pub(super) fn heartbeat_card(card: HeartbeatCard<'_>) -> String {
         "down" => "Down",
         _ => "No heartbeat yet",
     };
+    let arrival_state = if timing.is_empty() { "waiting" } else { timing };
+    let live_motion = if timing == "on_time" { "true" } else { "false" };
+    let age_text = match last_seen {
+        Some(last) => {
+            let age = (now - last).max(0);
+            if age < 60 {
+                format!("{age}s")
+            } else {
+                duration_label(age)
+            }
+        }
+        None => String::new(),
+    };
+    let caption = if timing.is_empty() {
+        format!("No heartbeat yet · late {late_after_secs}s")
+    } else {
+        format!("{arrival_label} · {age_text} · expected {interval}s · late {late_after_secs}s")
+    };
+    let visible_caption = if list_caption {
+        if timing.is_empty() || age_text.is_empty() {
+            arrival_label.to_string()
+        } else {
+            format!("{arrival_label} · {age_text} ago")
+        }
+    } else {
+        caption.clone()
+    };
+    let caption_mode = if list_caption {
+        r#" data-caption-mode="list""#
+    } else {
+        ""
+    };
+    let stale_after = interval.saturating_mul(2).max(1);
+    let down_after = interval.saturating_mul(5).max(1);
+    let interval_x = ((interval as f64) / (late_after_secs.max(1) as f64) * HEARTBEAT_EXPECT_X)
+        .clamp(0.0, HEARTBEAT_EXPECT_X);
+    let policy = format!(
+        "Expected every {interval}s. Late after {late_after_secs}s ({interval}s plus {grace_secs}s grace). Stale after {stale_after}s. Down after {down_after}s."
+    );
     format!(
-        r#"<div class="beat" data-history-axis="time" data-beat="{beat_state}" data-heartbeat-timing="{timing}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-grace="{grace_secs}" data-grace-source="{grace_source}" data-late-after="{late_after_secs}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window_label}" style="--now-x:100%;--history-start-x:{history_start_x:.1}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="arrival" data-arrival data-arrival-state="{timing}"><span data-arrival-label>{arrival_label}</span><span class="arrival-track" aria-hidden="true"><span data-arrival-fill style="--arrival-x:{arrival_x:.2}%"></span></span></div><div class="beat-stage" aria-label="{history_window_label} heartbeat history by time"><span class="beat-floor"></span><span class="beat-fill" hidden></span><span class="beat-current" hidden></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected" hidden></span><span class="beat-threshold stale" hidden></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones">{history_window_control}<span data-history-anchor="now">now</span></span></div></div>"#,
+        r#"<div class="beat" data-history-axis="time" data-beat="{beat_state}" data-heartbeat-timing="{timing}" data-beat-live="{live_motion}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-grace="{grace_secs}" data-grace-source="{grace_source}" data-late-after="{late_after_secs}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window_label}" style="--cadence-x:{cadence_x:.2}%;--interval-x:{interval_x:.2}%;--now-x:100%;--history-start-x:{history_start_x:.1}%;--expect-x:64%;--stale-x:82%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}{caption_mode}><div class="beat-readout" data-arrival data-arrival-state="{arrival_state}" title="{caption}"><span data-arrival-label title="{caption}">{visible_caption}</span></div><div class="beat-cadence" aria-label="{caption}" title="{caption}"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-threshold interval" title="Expected every {interval}s"></span><span class="beat-threshold late" title="Late after {late_after_secs}s"></span><span class="beat-threshold stale" title="Stale after twice the interval"></span><span class="beat-now"></span><span class="beat-hit"></span></div><div class="beat-history"><p class="beat-policy">{policy}</p><div class="beat-stage" aria-label="{history_window_label} heartbeat history by time"><span class="beat-floor"></span><span class="beat-marks">{marks}</span><span class="beat-zones" data-history-zones>{history_window_control}<span data-history-anchor="now">now</span></span></div></div></div>"#,
         count = mark_beats.len(),
-        arrival_x = now_x,
-        arrival_label = arrival_label,
+        cadence_x = now_x,
+        interval_x = interval_x,
+        caption = html_escape(&caption),
+        visible_caption = html_escape(&visible_caption),
+        caption_mode = caption_mode,
+        policy = html_escape(&policy),
+        arrival_state = arrival_state,
+        live_motion = live_motion,
     )
 }
 
@@ -9879,7 +10187,6 @@ pub(super) fn render_home_with_grace(
             h.preferences
                 .nixpkgs_warn_after_days(Some(runtime.nixpkgs_warn_after_days)),
         );
-        let card_fresh_hidden = if card_fresh_visible { "" } else { " hidden" };
         let backup_chip = backup_chip_markup(&backup, &h.name, shell.public_base_path);
         let protection = protection_onboarding_status(h, runtime.jobs, now);
         let protection_card = protection
@@ -10169,8 +10476,12 @@ pub(super) fn render_home_with_grace(
         );
         let health_tone = health.tone;
         let health_count = health.problem_count;
-        let health_html = health_markup(&health);
-        let assurance_html = protection_markup(&assurance, &h.name, shell.public_base_path);
+        let card_fresh = mark_scan_duplicate_chip(&card_fresh, &health.summary);
+        let list_fresh = mark_scan_duplicate_chip(&list_fresh, &health.summary);
+        let card_fresh_visible = card_fresh_visible && scan_rail_shows_chip(&card_fresh);
+        let card_fresh_hidden = if card_fresh_visible { "" } else { " hidden" };
+        let health_html = health_scan_markup(&health);
+        let assurance_html = protection_scan_markup(&assurance, &h.name, shell.public_base_path);
         let badge = os_badge_markup(nix_icon, &health);
         let preview = quick_preview_markup(&name, nix_icon);
         let card_revision = revision_evidence_markup(&h.freshness);
@@ -10192,6 +10503,7 @@ pub(super) fn render_home_with_grace(
             now,
             is_self,
             window_control: true,
+            list_caption: false,
             grace_secs: grace_view.effective_secs,
             grace_source: grace_view.source.as_str(),
             late_after_secs: grace_view.late_after_secs,
@@ -10203,6 +10515,7 @@ pub(super) fn render_home_with_grace(
             now,
             is_self,
             window_control: false,
+            list_caption: true,
             grace_secs: grace_view.effective_secs,
             grace_source: grace_view.source.as_str(),
             late_after_secs: grace_view.late_after_secs,

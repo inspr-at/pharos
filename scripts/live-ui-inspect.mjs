@@ -107,7 +107,7 @@ export function allowlistedArrival(text) {
 }
 
 export function arrivalPercent(style) {
-  const match = String(style ?? "").match(/--arrival-x:\s*(\d{1,3}(?:\.\d{1,2})?)%/);
+  const match = String(style ?? "").match(/--(?:arrival-x|cadence-x):\s*(\d{1,3}(?:\.\d{1,2})?)%/);
   if (!match) return "";
   const number = Number(match[1]);
   if (!Number.isFinite(number) || number < 0 || number > 100) return "";
@@ -217,11 +217,13 @@ export function applyFleetFocus(action) {
   else if (action === "focus") window.dispatchEvent(new Event("focus"));
   const document = globalThis.document;
   const label = document?.querySelector?.("[data-arrival-label]");
+  const beat = document?.querySelector?.(".beat");
+  const cadence = String(beat?.style?.getPropertyValue?.("--cadence-x") || "").trim();
   const fill = document?.querySelector?.("[data-arrival-fill]");
   const focus = String(document?.documentElement?.dataset?.fleetFocus || "");
   return {
     label: String(label?.textContent || "").slice(0, 48),
-    style: String(fill?.getAttribute?.("style") || "").slice(0, 80),
+    style: String(cadence ? `--cadence-x:${cadence}` : fill?.getAttribute?.("style") || "").slice(0, 80),
     hidden: document?.hidden === true,
     focus: focus === "focused" || focus === "unfocused" ? focus : "",
   };
@@ -535,6 +537,16 @@ async function markedHidden(locator) {
   }
 }
 
+async function recordedStamp(locator) {
+  try {
+    if ((await locator.count()) < 1) return false;
+    const text = await locator.first().innerText({ timeout: 1500 });
+    return /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC/.test(String(text));
+  } catch {
+    return false;
+  }
+}
+
 async function exactText(locator, expected) {
   try {
     if ((await locator.count()) < 1) return false;
@@ -721,7 +733,7 @@ export async function inspectAuthenticatedClient(options = {}) {
     const protection = card.locator(INSPECTION_SELECTORS.protection);
     const exact = card.locator(INSPECTION_SELECTORS.exactTimes);
     const exactHidden = await markedHidden(exact);
-    let exactClosed = false;
+    let exactClosed = exactHidden;
     try {
       if (!exactHidden) exactClosed = (await exact.evaluate((element) => element.open === true)) === false;
     } catch {
@@ -793,7 +805,16 @@ export async function inspectAuthenticatedClient(options = {}) {
         focusInside = false;
       }
       const reviewPresent = await isShown(page.locator(INSPECTION_SELECTORS.drawerReview));
-      if (drawerVisible) await capture("/pharos/", "quick-preview");
+      if (drawerVisible) {
+        await capture("/pharos/", "quick-preview");
+        const backupClock = await recordedStamp(drawer.locator("[data-host-drawer-backup-clock]"));
+        const restoreClock = await recordedStamp(drawer.locator("[data-host-drawer-restore-clock]"));
+        checks.cards.backupLastSuccess =
+          (await exactText(drawer.locator(INSPECTION_SELECTORS.backupInstant), "Backup last success")) && backupClock;
+        checks.cards.selectiveRestoreLastSuccess =
+          (await exactText(drawer.locator(INSPECTION_SELECTORS.restoreInstant), "Selective restore last success")) &&
+          restoreClock;
+      }
       const escaped = await pressEscape(page);
       let escapeClosed = (await isShown(page.locator(INSPECTION_SELECTORS.drawerLayer))) === false;
       if (!escapeClosed) {

@@ -98,6 +98,7 @@ function harness(fetch, { publicBasePath = "" } = {}) {
   const publicBaseMeta = publicBasePath
     ? { content: publicBasePath, getAttribute: (name) => (name === "content" ? publicBasePath : null) }
     : null;
+  const beats = [];
   const document = {
     hidden: false,
     body: { dataset: {} },
@@ -107,6 +108,10 @@ function harness(fetch, { publicBasePath = "" } = {}) {
       if (selector === "main[data-fleet-sync-state]") return main;
       const match = selector.match(/^\[data-summary-count="(all|live|stale|down)"\]$/);
       return match ? summary.get(match[1]) : null;
+    },
+    querySelectorAll(selector) {
+      if (selector === ".beat") return beats;
+      return [];
     },
   };
   const window = { location: { reload: () => events.push("reload") } };
@@ -135,6 +140,7 @@ function harness(fetch, { publicBasePath = "" } = {}) {
     activeTimers,
     asOf,
     document,
+    beats,
     events,
     main,
     summary,
@@ -192,6 +198,8 @@ test("failed foreground synchronization preserves state and reports stale data",
     throw new Error("must not apply an invalid response");
   });
 
+  const beat = { dataset: { beatLive: "true" } };
+  page.beats.push(beat);
   const recovery = page.api.recoverFleet("visible");
   queue.pending[0].resolve(
     jsonResponse({}, {
@@ -202,6 +210,7 @@ test("failed foreground synchronization preserves state and reports stale data",
 
   assert.equal(await recovery, false);
   assert.equal(page.main.dataset.fleetSyncState, "stale");
+  assert.equal(beat.dataset.beatLive, "false");
   assert.match(page.asOf.textContent, /^Data out of date/);
   assert.deepEqual(page.events, ["stop"]);
 });
@@ -1752,4 +1761,275 @@ test("a hidden page does not keep the watchdog looping", () => {
   assert.equal(queue.pending.length, 0);
   assert.equal(page.api.timers().beat, null);
   assert.equal(page.api.timers().refresh, null);
+});
+
+test("simulated document freeze suspends fleet work and document resume schedules recovery", async () => {
+  // Simulated DOM delivery of the production listener block only. freeze and
+  // resume are non-bubbling and are dispatched here on separate document and
+  // window targets. This does not observe a trusted browser Page Lifecycle event.
+  const queue = deferredFetchQueue();
+  const page = timelineHarness(queue.fetch);
+  let applied = null;
+  page.api.replaceApply((data) => {
+    applied = data.as_of;
+    return true;
+  });
+  page.api.resumeBeatClock();
+  page.api.scheduleRefresh(10_000);
+  page.api.armFleetWatchdog();
+  const armed = page.api.timers();
+  assert.notEqual(armed.beat, null);
+  assert.notEqual(armed.refresh, null);
+  assert.equal(page.document.hidden, false);
+  assert.equal(page.document.visibilityState, "visible");
+  assert.equal(page.api.pageFrozen(), false);
+
+  page.window.dispatch("freeze");
+  page.window.dispatch("resume");
+  assert.equal(page.document.body.dataset.fleetLifecycleFrozen, undefined);
+  assert.equal(page.api.pageFrozen(), false);
+  assert.equal(page.api.timers().beat, armed.beat);
+  assert.equal(page.api.timers().refresh, armed.refresh);
+  assert.equal(page.main.dataset.fleetSyncState, "current");
+  assert.equal(queue.pending.length, 0);
+
+  page.document.dispatch("freeze");
+  assert.equal(page.document.body.dataset.fleetLifecycleFrozen, "true");
+  assert.equal(page.document.hidden, false);
+  assert.equal(page.document.visibilityState, "visible");
+  assert.equal(page.api.pageFrozen(), true);
+  assert.equal(page.api.timers().beat, null);
+  assert.equal(page.api.timers().refresh, null);
+  assert.equal(page.main.dataset.fleetSyncState, "current");
+  page.clock.advance(20_000);
+  assert.equal(queue.pending.length, 0);
+  assert.equal(page.api.timers().beat, null);
+  assert.equal(page.api.timers().refresh, null);
+
+  page.window.dispatch("resume");
+  assert.equal(page.document.body.dataset.fleetLifecycleFrozen, "true");
+  assert.equal(page.api.pageFrozen(), true);
+  assert.equal(queue.pending.length, 0);
+  assert.equal(page.main.dataset.fleetSyncState, "current");
+
+  page.document.dispatch("resume");
+  assert.equal(page.document.body.dataset.fleetLifecycleFrozen, undefined);
+  assert.equal(page.api.pageFrozen(), false);
+  assert.equal(page.main.dataset.fleetSyncState, "syncing");
+  assert.equal(queue.pending.length, 1);
+  assert.equal(page.api.timers().beat, null);
+
+  queue.pending[0].resolve(jsonResponse(snapshot(91)));
+  assert.equal(await page.api.recoverFleet("resume"), true);
+  assert.equal(applied, 91);
+  assert.equal(page.main.dataset.fleetSyncState, "current");
+  assert.equal(page.api.pageFrozen(), false);
+  assert.notEqual(page.api.timers().beat, null);
+  assert.notEqual(page.api.timers().refresh, null);
+  assert.equal(queue.pending.length, 1);
+
+  page.window.dispatch("freeze");
+  assert.equal(page.document.body.dataset.fleetLifecycleFrozen, undefined);
+  assert.equal(page.api.pageFrozen(), false);
+  assert.notEqual(page.api.timers().beat, null);
+  assert.notEqual(page.api.timers().refresh, null);
+  assert.equal(queue.pending.length, 1);
+});
+
+test("drawer fallback uses the card summary before a snapshot and drops the previous host", () => {
+  const pureStart = fleetRuntimeSource.indexOf("const HISTORY_DOTS=12;");
+  const pureEnd = fleetRuntimeSource.indexOf("/* TIMELINE_PURE_END */");
+  const drawerStart = fleetRuntimeSource.indexOf("function hostSurfaces");
+  const drawerEnd = fleetRuntimeSource.indexOf("function hostDrawerFocusables");
+  const assuranceStart = fleetRuntimeSource.indexOf("function kernelNeedsRestart");
+  const assuranceEnd = fleetRuntimeSource.indexOf("function attentionFor");
+  const stampStart = fleetRuntimeSource.indexOf("const UTC_STAMP_EXCLUSIVE_END");
+  const stampEnd = fleetRuntimeSource.indexOf("function evidenceCaption");
+  const shortStart = fleetRuntimeSource.indexOf("function shortRevision");
+  const shortEnd = fleetRuntimeSource.indexOf("function updateConfigEvidence");
+  assert.ok(pureStart >= 0 && assuranceStart >= 0 && drawerStart >= 0 && stampStart >= 0 && shortStart >= 0);
+
+  function makeNode(spec = {}) {
+    const element = {
+      dataset: { ...(spec.dataset || {}) },
+      attributes: { ...(spec.attributes || {}) },
+      childNodes: [],
+      className: spec.className || "",
+      textContent: spec.text || "",
+      innerHTML: spec.html || "",
+      href: "",
+      value: "",
+      disabled: false,
+      checked: false,
+      setAttribute(name, value) {
+        this.attributes[name] = String(value);
+        if (name === "href") this.href = String(value);
+      },
+      getAttribute(name) {
+        return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+      },
+      appendChild(child) {
+        this.childNodes.push(child);
+        return child;
+      },
+      replaceChildren() {
+        this.childNodes = [];
+      },
+      querySelector(selector) {
+        return queryNodes(this, selector)[0] || null;
+      },
+      querySelectorAll(selector) {
+        return queryNodes(this, selector);
+      },
+    };
+    return element;
+  }
+  function selectorMatches(element, selector) {
+    if (selector.startsWith(".")) return element.className.split(/\s+/).includes(selector.slice(1));
+    if (!selector.startsWith("[") || !selector.endsWith("]")) return false;
+    const body = selector.slice(1, -1);
+    if (!body.includes("=")) return Object.prototype.hasOwnProperty.call(element.attributes, body);
+    const eq = body.indexOf("=");
+    const name = body.slice(0, eq);
+    const wanted = body.slice(eq + 1).replace(/^"|"$/g, "");
+    return element.attributes[name] === wanted;
+  }
+  function queryNodes(root, selector) {
+    const found = [];
+    for (const child of root.childNodes) {
+      if (selectorMatches(child, selector)) found.push(child);
+      found.push(...queryNodes(child, selector));
+    }
+    return found;
+  }
+  function labeled(attr, text, extra) {
+    return makeNode({ attributes: { [attr]: "" }, text, ...extra });
+  }
+
+  const panel = makeNode({ attributes: { "data-host-drawer": "" } });
+  panel.dataset.canManage = "false";
+  const fields = {};
+  for (const name of ["title", "role", "mark", "state", "attention", "guidance", "owner", "next", "settings-state", "health", "backup", "restore", "reasons", "workspace", "check", "config", "deployed", "nixcfg", "nixpkgs", "backup-clock", "restore-clock", "color", "kind", "draft-status", "discard", "review"]) {
+    const child = labeled(`data-host-drawer-${name}`, "");
+    if (name === "mark") child.innerHTML = "<svg>server</svg>";
+    panel.appendChild(child);
+    fields[name] = child;
+  }
+  fields.attention.textContent = "freshness unverified";
+  fields.health.textContent = "Previous host";
+  fields.backup.textContent = "Old backup";
+  fields.restore.textContent = "Old restore";
+
+  const reasonTime = labeled("data-health-date", "2026-08-18 12:46:51 UTC");
+  const reason = labeled("data-health-reason", "Restore Overdue2026-08-18 12:46:51 UTC", {
+    dataset: { healthAt: "1787050011" },
+  });
+  reason.appendChild(reasonTime);
+  const icon = makeNode({ className: "os-badge-icon", html: "<svg>nix</svg>" });
+  const badge = makeNode({ attributes: { "data-health-badge": "" }, dataset: { healthTone: "amber" } });
+  badge.appendChild(icon);
+  const beacon = makeNode({
+    attributes: { "data-host-surface": "runtime" },
+    dataset: { host: "beacon", live: "live", drawerWorkspaceHref: "/hosts/beacon" },
+  });
+  for (const child of [
+    makeNode({ className: "role", text: "server" }),
+    labeled("data-health-summary", "Restore Overdue"),
+    labeled("data-daily-backup-label", "Daily OK"),
+    labeled("data-daily-backup-note", "last success 12h ago"),
+    labeled("data-daily-backup-date", "2026-09-22 00:46:51 UTC"),
+    labeled("data-restore-label", "Overdue"),
+    labeled("data-restore-note", "last successful selective restore 35d ago"),
+    labeled("data-restore-date", "2026-08-18 12:46:51 UTC"),
+    reason,
+    badge,
+  ]) beacon.appendChild(child);
+
+  const harbor = makeNode({
+    attributes: { "data-host-surface": "runtime" },
+    dataset: { host: "harbor", live: "live" },
+  });
+  harbor.appendChild(makeNode({ className: "role", text: "server" }));
+  harbor.appendChild(labeled("data-health-summary", "No action needed"));
+
+  const surfaces = [beacon, harbor];
+  const document = {
+    createElement() { return makeNode(); },
+    querySelector(selector) {
+      return selector === "[data-host-drawer]" ? panel : null;
+    },
+    querySelectorAll(selector) {
+      return selector === '[data-host-surface="runtime"]' ? surfaces : [];
+    },
+  };
+  const context = vm.createContext({
+    Array,
+    Date,
+    JSON,
+    Map,
+    console,
+    document,
+    encodeURIComponent,
+  });
+  vm.runInContext(`
+function appUrl(path){return path}
+let fleetHostsByName=new Map();
+${fleetRuntimeSource.slice(pureStart, pureEnd)}
+${fleetRuntimeSource.slice(assuranceStart, assuranceEnd)}
+${fleetRuntimeSource.slice(stampStart, stampEnd)}
+${fleetRuntimeSource.slice(shortStart, shortEnd)}
+${fleetRuntimeSource.slice(drawerStart, drawerEnd)}
+globalThis.__drawer={
+  populateHostDrawer,
+  updateOpenHostDrawer,
+  projectHostAssurance,
+  setHosts(entries){fleetHostsByName=new Map(entries);}
+};
+`, context);
+
+  context.__drawer.populateHostDrawer(beacon);
+  assert.equal(fields.attention.textContent, "Restore Overdue");
+  assert.equal(fields.health.textContent, "Restore Overdue");
+  assert.match(fields.backup.textContent, /^Daily OK · /);
+  assert.match(fields.restore.textContent, /^Overdue · /);
+  assert.equal(fields.reasons.childNodes.length, 1);
+  assert.match(fields.reasons.childNodes[0].textContent, /^Restore Overdue · 2026-08-18 12:46:51 UTC$/);
+  assert.equal(fields.mark.dataset.healthTone, "amber");
+  assert.match(fields.mark.innerHTML, /nix/);
+  assert.equal(fields["backup-clock"].textContent, "2026-09-22 00:46:51 UTC");
+
+  context.__drawer.populateHostDrawer(harbor);
+  assert.equal(fields.attention.textContent, "No action needed");
+  assert.equal(fields.health.textContent, "No action needed");
+  assert.equal(fields.backup.textContent, "Not recorded");
+  assert.equal(fields.restore.textContent, "Not recorded");
+  assert.equal(fields.mark.dataset.healthTone, undefined);
+  assert.match(fields.mark.innerHTML, /server/);
+  assert.doesNotMatch(fields.reasons.childNodes[0].textContent, /Restore Overdue/);
+
+  const now = 1_700_000_000;
+  const liveHost = {
+    name: "beacon",
+    liveness: "live",
+    attention: { label: "freshness unverified" },
+    freshness: { applicable: true },
+    backup_observations: [{
+      state: "healthy",
+      schedule: "daily",
+      last_success_at: now - 3600,
+      restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 40 * 86400 },
+    }],
+  };
+  context.__drawer.populateHostDrawer(beacon);
+  context.__drawer.setHosts([["beacon", liveHost]]);
+  const projected = context.__drawer.projectHostAssurance(liveHost, now);
+  assert.equal(projected.health.summary, "Restore Overdue");
+  assert.notEqual(projected.health.summary, "freshness unverified");
+  context.__drawer.updateOpenHostDrawer(liveHost, now);
+  assert.equal(fields.attention.textContent, "Restore Overdue");
+  assert.equal(fields.health.textContent, "Restore Overdue");
+  assert.match(fields.backup.textContent, /^Daily OK · /);
+  assert.match(fields.restore.textContent, /^Overdue · /);
+  assert.match(fields.reasons.childNodes.map((item) => item.textContent).join("\n"), /Restore Overdue · \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC/);
+  assert.doesNotMatch(fields.attention.textContent, /freshness unverified/);
 });
