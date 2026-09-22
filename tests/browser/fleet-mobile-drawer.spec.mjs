@@ -87,14 +87,22 @@ test("mobile fleet and the quick preview stay on screen", async ({ page }, testI
     await card.locator("[data-host-actions-trigger]").click();
     const menu = page.locator("[data-host-actions-menu]:not([hidden])");
     await expect(menu).toBeVisible();
-    const inside = await menu.evaluate((node) => {
+    const placed = await menu.evaluate((node) => {
       const rect = node.getBoundingClientRect();
-      return rect.left >= -1
+      const button = node.closest("[data-host-surface]")?.querySelector("[data-host-actions-trigger]")?.getBoundingClientRect();
+      const inside = rect.left >= -1
         && rect.right <= window.innerWidth + 1
         && rect.top >= -1
         && rect.bottom <= window.innerHeight + 1;
+      const overlaps = Boolean(button)
+        && rect.left < button.right + 20
+        && rect.right > button.left - 20
+        && rect.top < button.bottom + 32
+        && rect.bottom > button.top - 12;
+      return { inside, overlaps };
     });
-    expect(inside).toBe(true);
+    expect(placed.inside).toBe(true);
+    expect(placed.overlaps).toBe(true);
     expect(await pageFits(page)).toBe(true);
     await page.keyboard.press("Escape");
 

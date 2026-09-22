@@ -792,12 +792,15 @@ function stopHostActionPoll(){
   hostActionPoll.terminal=false;
 }
 function visibleHostActionItems(menu){return Array.from(menu?.querySelectorAll('[role="menuitem"]')||[]).filter(item=>!item.hidden)}
+function hostActionsSurface(root){return root?.closest?.('[data-host-surface="runtime"]')||null}
 function closeHostActions(root=openHostActionsRoot,restore=false){
   if(!root)return;
   const trigger=root.querySelector('[data-host-actions-trigger]');
   const menu=root.querySelector('[data-host-actions-menu]');
   if(menu){menu.hidden=true;menu.style.removeProperty('position');menu.style.removeProperty('left');menu.style.removeProperty('top')}
   if(trigger)trigger.setAttribute('aria-expanded','false');
+  const surface=hostActionsSurface(root);
+  if(surface)delete surface.dataset.hostActionsOpen;
   if(openHostActionsRoot===root){openHostActionsRoot=null;openHostActionsScrollPosition=null}
   if(restore)trigger?.focus();
   flushFleetSortAfterInteraction();
@@ -834,6 +837,8 @@ function openHostActions(root){
   if(!opening){closeHostActions(root,true);return}
   menu.hidden=false;
   trigger.setAttribute('aria-expanded','true');
+  const surface=hostActionsSurface(root);
+  if(surface)surface.dataset.hostActionsOpen='true';
   openHostActionsRoot=root;
   openHostActionsScrollPosition={x:window.scrollX,y:window.scrollY};
   positionHostActions(root);
