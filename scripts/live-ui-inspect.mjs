@@ -1,4 +1,5 @@
 import {
+  LiveUiError,
   PERSONAL_APP_ORIGINS,
   SERVER_MUTATION_ALLOWLIST,
   isHostPath,
@@ -46,7 +47,7 @@ export const INSPECTION_SELECTORS = Object.freeze({
   breadcrumb: "a[data-fleet-return]",
   graceSeconds: "[data-grace-seconds]",
   graceReset: "[data-grace-reset]",
-  graceSource: "[data-grace-source]",
+  graceSource: "select[data-grace-source]",
   discardDraft: "[data-discard-settings]",
   reviewSettings: "[data-review-settings]",
   colorInput: "input[data-color]",
@@ -67,12 +68,25 @@ const CHIP_COPY = new Set(["No pending changes", "Up to date"]);
 const ARRIVAL_LABELS = new Set(["On time", "Late", "Stale", "Down", "No heartbeat yet"]);
 const SHOT_NAME =
   /^(?:01-home-list|10-fleet-freshness|11-card-exact-times|12-quick-preview|13-actions-menu|14-history-hint)\.png$|^host-\d{2}(?:-settings|-backups|-activity|-settings-draft)?\.png$/;
-const HALT_CLASSES = new Set([
+const FAILURE_HALTS = new Set([
+  "broken-ui",
+  "network-guard",
   "mfa-required",
   "auth-required",
   "account-setup-required",
   "policy-denied",
 ]);
+
+export function inspectionFailureClass(error) {
+  const code = error instanceof LiveUiError ? error.code : "";
+  return code === "network-guard" ? "network-guard" : "broken-ui";
+}
+
+export function settleLiveInspection({ inventoryClass, halt = "", error = null } = {}) {
+  if (error) return inspectionFailureClass(error);
+  if (FAILURE_HALTS.has(halt)) return halt;
+  return inventoryClass;
+}
 
 export function clickPermitted(action) {
   return CLICK_ALLOWLIST.includes(action);
@@ -644,7 +658,7 @@ export async function inspectAuthenticatedClient(options = {}) {
       screenshots,
       checks,
     }),
-    halt: HALT_CLASSES.has(halt) ? halt : "",
+    halt: FAILURE_HALTS.has(halt) ? halt : "",
   });
 
   const go = async (routePath) => {
@@ -656,12 +670,12 @@ export async function inspectAuthenticatedClient(options = {}) {
     try {
       const viewed = await openRoute(routePath);
       if (!viewed || viewed.class !== "authenticated") {
-        halt = viewed?.class || "broken-ui";
+        halt = FAILURE_HALTS.has(viewed?.class) ? viewed.class : "broken-ui";
         return false;
       }
       return true;
-    } catch {
-      halt = "broken-ui";
+    } catch (error) {
+      halt = inspectionFailureClass(error);
       return false;
     }
   };
@@ -679,7 +693,7 @@ export async function inspectAuthenticatedClient(options = {}) {
 
   // step:fleet
   if (!(await go("/pharos/"))) {
-    if (halt === "broken-ui") checks.shell.status = "partial";
+    if (halt) checks.shell.status = "partial";
     return finish();
   }
   const fleet = page.locator(INSPECTION_SELECTORS.fleetMain);

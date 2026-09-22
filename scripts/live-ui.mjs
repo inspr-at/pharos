@@ -56,6 +56,7 @@ import {
   countVisibleConfirmSheets,
   inspectAuthenticatedClient,
   inspectionSkipped,
+  settleLiveInspection,
 } from "./live-ui-inspect.mjs";
 
 const EMPTY_PROBE = Object.freeze({
@@ -723,8 +724,9 @@ async function run(command) {
       } else {
         clientInspection = inspectionSkipped(managerShell ? "partial" : "not-manager");
       }
-    } catch {
+    } catch (error) {
       clientInspection = inspectionSkipped("partial");
+      inspectionHalt = settleLiveInspection({ inventoryClass: "authenticated", error });
     }
     let draftConfirmSheets = null;
     if (draft && inventoryAuthenticated && !inspectionHalt) {
@@ -758,7 +760,7 @@ async function run(command) {
     else if (routes.length === 0 || routes.some((route) => route.class !== "authenticated")) {
       overall = "broken-ui";
     } else overall = "authenticated";
-    if (inspectionHalt) overall = inspectionHalt;
+    overall = settleLiveInspection({ inventoryClass: overall, halt: inspectionHalt });
     writeEvidence(
       outputDir,
       { class: overall, appOrigin, clientDraft, clientInspection, draftConfirmSheets, routes, blocked },

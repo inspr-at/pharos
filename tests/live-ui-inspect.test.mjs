@@ -8,6 +8,7 @@ import {
   CLICK_ALLOWLIST,
   DOM_ALLOWLIST,
   FOCUS_METHOD,
+  INSPECTION_SELECTORS,
   POLL_WAIT_MS,
   RETURN_WAIT_MS,
   allowlistedArrival,
@@ -27,8 +28,10 @@ import {
   representativeHostPath,
   sealInspection,
   searchQueryPresent,
+  settleLiveInspection,
 } from "../scripts/live-ui-inspect.mjs";
 import {
+  EXIT_CODES,
   LiveUiError,
   SCREENSHOT_FILES,
   SERVER_MUTATION_ALLOWLIST,
@@ -279,6 +282,8 @@ test("inspection source stays bounded to fixed local actions", () => {
   const runner = fs.readFileSync(new URL("../scripts/live-ui.mjs", import.meta.url), "utf8");
   assert.equal(runner.includes("inspectAuthenticatedClient"), true);
   assert.equal(runner.includes("context.on(\"response\""), false);
+  assert.equal(runner.includes("settleLiveInspection({ inventoryClass: \"authenticated\", error })"), true);
+  assert.equal(runner.includes("settleLiveInspection({ inventoryClass: overall, halt: inspectionHalt })"), true);
   const order = ["step:fleet", "step:cards", "step:history", "step:exact-times", "step:preview", "step:actions", "step:focus", "step:list", "step:tabs", "step:draft", "step:freshness"];
   let cursor = -1;
   for (const step of order) {
@@ -286,4 +291,247 @@ test("inspection source stays bounded to fixed local actions", () => {
     assert.equal(next > cursor, true, step);
     cursor = next;
   }
+});
+
+function emptyLocator() {
+  const loc = {
+    count: async () => 0,
+    first() { return loc; },
+    nth() { return loc; },
+    locator() { return loc; },
+    isVisible: async () => false,
+    isDisabled: async () => true,
+    getAttribute: async () => null,
+    inputValue: async () => "",
+    innerText: async () => "",
+    click: async () => {},
+    fill: async () => {},
+    selectOption: async () => { throw new Error("not a select"); },
+    hover: async () => {},
+    evaluate: async () => false,
+    boundingBox: async () => null,
+    scrollIntoViewIfNeeded: async () => {},
+  };
+  return loc;
+}
+
+test("inspection navigation failures override an authenticated inventory", async () => {
+  const guarded = await inspectAuthenticatedClient({
+    page: { locator: () => emptyLocator() },
+    managerShell: true,
+    hostPaths: ["/pharos/hosts/legacy-host"],
+    openRoute() {
+      throw new LiveUiError("network-guard");
+    },
+  });
+  assert.equal(guarded.halt, "network-guard");
+  const guardedClass = settleLiveInspection({
+    inventoryClass: "authenticated",
+    halt: guarded.halt,
+  });
+  assert.equal(guardedClass, "network-guard");
+  assert.equal(EXIT_CODES[guardedClass] ?? 1, 1);
+
+  const broken = await inspectAuthenticatedClient({
+    page: { locator: () => emptyLocator() },
+    managerShell: true,
+    hostPaths: ["/pharos/hosts/legacy-host"],
+    openRoute: async () => ({ class: "broken-ui" }),
+  });
+  assert.equal(broken.halt, "broken-ui");
+  assert.equal(settleLiveInspection({
+    inventoryClass: "authenticated",
+    halt: broken.halt,
+  }), "broken-ui");
+  assert.equal(EXIT_CODES["broken-ui"] ?? 1, 1);
+  assert.equal(EXIT_CODES.authenticated, 0);
+
+  const thrown = new Error("inspection crashed");
+  assert.equal(settleLiveInspection({
+    inventoryClass: "authenticated",
+    error: new LiveUiError("network-guard"),
+  }), "network-guard");
+  assert.equal(settleLiveInspection({
+    inventoryClass: "authenticated",
+    error: thrown,
+  }), "broken-ui");
+  assert.equal(settleLiveInspection({
+    inventoryClass: "authenticated",
+    halt: "",
+  }), "authenticated");
+  assert.equal(settleLiveInspection({
+    inventoryClass: "policy-denied",
+    halt: "",
+  }), "policy-denied");
+});
+
+test("missing old-release controls stay not-supported without failing the run", async () => {
+  const result = await inspectAuthenticatedClient({
+    page: {
+      locator: () => emptyLocator(),
+      url: () => "https://pharos.example/pharos/?view=list",
+    },
+    managerShell: true,
+    hostPaths: ["/pharos/hosts/legacy-host"],
+    openRoute: async () => ({ class: "authenticated" }),
+  });
+  assert.equal(result.halt, "");
+  assert.equal(result.evidence.checks.cards.status, "not-supported");
+  assert.equal(result.evidence.checks.draft.status, "not-supported");
+  assert.equal(result.evidence.checks.fleetFreshness.status, "not-supported");
+  assert.equal(settleLiveInspection({
+    inventoryClass: "authenticated",
+    halt: result.halt,
+  }), "authenticated");
+});
+
+test("fleet-default grace edits the settings select and resets locally", async () => {
+  const saved = { source: "fleet", seconds: "15", reviewEnabled: false };
+  const draft = { source: "fleet", seconds: "15", disabled: true, reviewEnabled: false };
+  const trace = [];
+  let broadSelects = 0;
+  let route = "/pharos/";
+
+  const control = (spec) => {
+    const loc = {
+      count: async () => 1,
+      first() { return loc; },
+      nth() { return loc; },
+      locator() { return emptyLocator(); },
+      isVisible: async () => spec.visible !== false,
+      isDisabled: async () => spec.disabled(),
+      getAttribute: async (name) => spec.attrs?.[name] ?? null,
+      inputValue: async () => spec.value(),
+      innerText: async () => spec.text || "",
+      click: async () => { if (spec.onClick) spec.onClick(); },
+      fill: async (value) => { if (spec.onFill) spec.onFill(value); },
+      selectOption: async (value) => { if (spec.onSelect) spec.onSelect(value); },
+      hover: async () => {},
+      evaluate: async () => false,
+      boundingBox: async () => null,
+      scrollIntoViewIfNeeded: async () => {},
+    };
+    return loc;
+  };
+
+  const page = {
+    url: () => `https://pharos.example${route}`,
+    locator(selector) {
+      if (selector === "[data-grace-source]") {
+        return control({
+          disabled: () => false,
+          value: () => "section",
+          onSelect() {
+            broadSelects += 1;
+            throw new Error("section precedes the select");
+          },
+        });
+      }
+      if (selector === INSPECTION_SELECTORS.fleetMain) {
+        return control({
+          disabled: () => false,
+          value: () => "",
+          attrs: { "data-view": "list" },
+          text: "",
+        });
+      }
+      if (selector === INSPECTION_SELECTORS.breadcrumb) {
+        return control({ disabled: () => false, value: () => "", text: "Fleet" });
+      }
+      if (selector === INSPECTION_SELECTORS.tabCurrent) {
+        const section = route.includes("section=backups")
+          ? "backups"
+          : route.includes("section=activity")
+            ? "activity"
+            : route.includes("section=settings")
+              ? "settings"
+              : "overview";
+        return control({
+          disabled: () => false,
+          value: () => "",
+          attrs: { "data-section": section },
+        });
+      }
+      if (selector === INSPECTION_SELECTORS.graceSeconds) {
+        return control({
+          disabled: () => draft.disabled,
+          value: () => draft.seconds,
+          onFill(value) {
+            if (draft.disabled) throw new Error("seconds stay disabled");
+            trace.push({ action: "fill", value });
+            draft.seconds = value;
+            draft.reviewEnabled = true;
+          },
+        });
+      }
+      if (selector === INSPECTION_SELECTORS.graceSource) {
+        return control({
+          disabled: () => false,
+          value: () => draft.source,
+          attrs: { "data-fleet-grace-seconds": saved.seconds },
+          onSelect(value) {
+            trace.push({ action: "select", value });
+            draft.source = value;
+            draft.disabled = value !== "host";
+            if (value !== "host") draft.seconds = saved.seconds;
+          },
+        });
+      }
+      if (selector === INSPECTION_SELECTORS.graceReset) {
+        return control({
+          disabled: () => false,
+          value: () => "",
+          onClick() {
+            trace.push({ action: "reset", from: draft.seconds });
+            draft.source = "fleet";
+            draft.seconds = saved.seconds;
+            draft.disabled = true;
+            draft.reviewEnabled = false;
+          },
+        });
+      }
+      if (selector === INSPECTION_SELECTORS.reviewSettings) {
+        return control({
+          disabled: () => !draft.reviewEnabled,
+          value: () => "",
+        });
+      }
+      return emptyLocator();
+    },
+  };
+
+  const result = await inspectAuthenticatedClient({
+    page,
+    managerShell: true,
+    hostPaths: ["/pharos/hosts/legacy-host"],
+    openRoute: async (routePath) => {
+      route = routePath;
+      if (routePath.includes("section=settings")) {
+        draft.source = saved.source;
+        draft.seconds = saved.seconds;
+        draft.disabled = saved.source !== "host";
+        draft.reviewEnabled = saved.reviewEnabled;
+      }
+      return { class: "authenticated" };
+    },
+  });
+
+  assert.equal(INSPECTION_SELECTORS.graceSource, "select[data-grace-source]");
+  assert.equal(broadSelects, 0);
+  assert.deepEqual(trace, [
+    { action: "select", value: "host" },
+    { action: "fill", value: "16" },
+    { action: "reset", from: "16" },
+  ]);
+  assert.equal(result.halt, "");
+  assert.equal(result.evidence.checks.draft.status, "observed");
+  assert.equal(result.evidence.checks.draft.persistedUnchanged, true);
+  assert.equal(result.evidence.checks.draft.resetPresent, true);
+  assert.equal(result.evidence.checks.draft.reviewEnabled, true);
+  assert.equal(result.evidence.checks.draft.confirmSheets, 0);
+  assert.equal(result.evidence.checks.fleetFreshness.status, "not-supported");
+  assert.equal(settleLiveInspection({
+    inventoryClass: "authenticated",
+    halt: result.halt,
+  }), "authenticated");
 });
