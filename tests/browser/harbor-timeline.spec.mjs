@@ -288,6 +288,14 @@ test("reduced motion stops heartbeat interpolation and keeps the clock truthful"
     const cardYoung = sample(card, 12);
     const cardOlder = sample(card, 40);
     const rowYoung = sample(row, 12);
+    const unrelatedNode = document.getElementById("unrelated-host-fixture");
+    const unrelated = {
+      hosts: [...unrelatedNode.querySelectorAll("[data-host]")].map((el) => el.dataset.host),
+      captions: [...unrelatedNode.querySelectorAll("[data-arrival-label]")].map((el) => el.textContent),
+      summary: unrelatedNode.querySelector("tr.harbor-host .revision-evidence > summary")?.textContent?.trim() || "",
+      lasts: [...unrelatedNode.querySelectorAll(".beat")].map((el) => el.dataset.last || ""),
+      flashes: [...unrelatedNode.querySelectorAll(".beat")].map((el) => el.dataset.flash || ""),
+    };
     return {
       card: duration(card),
       row: duration(row),
@@ -296,6 +304,7 @@ test("reduced motion stops heartbeat interpolation and keeps the clock truthful"
       cardYoung,
       cardOlder,
       rowYoung,
+      unrelated,
     };
   });
   expect(reduced.card).toBe("0s");
@@ -312,6 +321,13 @@ test("reduced motion stops heartbeat interpolation and keeps the clock truthful"
   expect(reduced.rowYoung.title).toContain("late 75s");
   expect(reduced.rowYoung.aria).toContain("expected 60s");
   expect(reduced.rowYoung.aria).toContain("late 75s");
+  expect(reduced.unrelated).toEqual({
+    hosts: ["unrelated-kept", "unrelated-kept"],
+    captions: ["Unrelated host stays", "Unrelated host stays"],
+    summary: "unrelated freshness",
+    lasts: ["", ""],
+    flashes: ["", ""],
+  });
 
   await page.emulateMedia({ reducedMotion: "no-preference" });
   const restored = await page.evaluate(() => {
@@ -324,14 +340,12 @@ test("reduced motion stops heartbeat interpolation and keeps the clock truthful"
   expect(restored).toEqual({ card: "0.45s", row: "0.45s" });
   const unrelated = await page.locator("#unrelated-host-fixture").evaluate((node) => ({
     hosts: [...node.querySelectorAll("[data-host]")].map((el) => el.dataset.host),
-    captions: [...node.querySelectorAll("[data-arrival-label]")].map((el) => el.textContent),
     summary: node.querySelector("tr.harbor-host .revision-evidence > summary")?.textContent?.trim() || "",
     lasts: [...node.querySelectorAll(".beat")].map((el) => el.dataset.last || ""),
     flashes: [...node.querySelectorAll(".beat")].map((el) => el.dataset.flash || ""),
   }));
   expect(unrelated).toEqual({
     hosts: ["unrelated-kept", "unrelated-kept"],
-    captions: ["Unrelated host stays", "Unrelated host stays"],
     summary: "unrelated freshness",
     lasts: ["", ""],
     flashes: ["", ""],
