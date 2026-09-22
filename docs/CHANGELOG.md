@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 260922101200.0.0 - 2026-09-22
+
+- Keep the hosting server’s list cells neutral like every other host while preserving its lighthouse identity marker; cover every card and cell border on desktop and mobile (PHAROS-302).
 - Publish a guarded family UI runner for real OIDC sign-in and private desktop/mobile-size evidence across Aithema, Paimos, Pharos and Janus; record observed MFA and require each app's approved restricted scope (PHAROS-308).
 
 ## 260921221314.0.0 - 2026-09-21
