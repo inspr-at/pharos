@@ -1955,11 +1955,8 @@ function suppressDuplicateScanChips(surface){
 }
 function cardAttentionText(health,surface){
   const problems=(health?.reasons||[]).filter(reason=>reason&&reason.tone&&reason.tone!=='good').map(reason=>String(reason.label||'').replace(/\s+/g,' ').trim()).filter(Boolean);
-  const mute=surface?.querySelector?.('[data-mute-note]');
-  if(mute&&!mute.hidden){
-    const label=String(mute.querySelector('span')?.textContent||'').replace(/\s+/g,' ').trim();
-    if(label&&!problems.includes(label))problems.push(label);
-  }
+  const extra=String(surface?.getAttribute?.('data-attention-extra')||'').replace(/\s+/g,' ').trim();
+  if(extra&&!problems.includes(extra))problems.unshift(extra);
   return problems.length?problems.join(' · '):'No action needed';
 }
 function fleetAttentionSurface(surface){

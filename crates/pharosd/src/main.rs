@@ -10063,6 +10063,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"data-protection-state="first-backup-overdue""#));
         assert!(html.contains(r#"data-protection-state="first-backup-failed""#));
         assert!(html.contains(r#"data-protection-state="first-backup-succeeded""#));
+        assert!(html.contains(r#"data-attention-extra="First backup pending""#));
+        assert!(html.contains(r#"data-attention-extra="First backup overdue""#));
+        assert!(html.contains(r#"data-attention-extra="First backup failed""#));
+        assert!(html.contains(r#"data-attention-extra="""#));
         assert!(html.contains("First backup pending"));
         assert!(html.contains("First backup overdue"));
         assert!(html.contains("First backup failed"));
