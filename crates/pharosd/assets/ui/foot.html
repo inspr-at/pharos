@@ -214,7 +214,7 @@ function qualifyingSelectiveRestore(restore){
   if(files!=null&&files<1)return null;
   const at=Number(restore.checked_at);
   if(!Number.isFinite(at)||at<=0)return null;
-  return {at,files};
+  return {at};
 }
 function dailyLabel(schedule){
   const text=String(schedule||'').trim();
@@ -314,7 +314,7 @@ function projectRestoreStatus(observations,now){
     }
     if(state!=='passed')continue;
     const qualified=qualifyingSelectiveRestore(restore);
-    if(qualified&&qualified.at===at&&(!passed||at>passed.at))passed={at,files:qualified.files};
+    if(qualified&&qualified.at===at&&(!passed||at>passed.at))passed={at};
   }
   if(latestFailed&&(!passed||latestAt>passed.at)){
     return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(passed?passed.at:null,current,'last successful selective restore'),at:passed?passed.at:null,overdue:false,producer:'failed'};
@@ -521,6 +521,33 @@ function paintDrawerMark(surface){
     mark.innerHTML=mark.dataset.defaultMark||'';
     delete mark.dataset.healthTone;
   }
+  const health=hostDrawerField('[data-host-drawer-health-label]');
+  const source=surface.querySelector('[data-health-label]');
+  if(health){
+    health.textContent=String(source?.textContent||'').trim()||'Not recorded';
+    health.dataset.healthTone=source?.dataset.healthTone||badge?.dataset.healthTone||'neutral';
+  }
+}
+function paintDrawerPosture(assurance,surface){
+  const title=hostDrawerField('[data-host-drawer-posture-title]');
+  if(!title)return;
+  const problems=(assurance?.health?.reasons||[]).filter(reason=>reason&&reason.tone&&reason.tone!=='good');
+  const tone=assurance?.health?.tone||surface?.querySelector?.('[data-health-block]')?.dataset?.healthTone||surface?.querySelector?.('[data-health-label]')?.dataset?.healthTone||'';
+  title.textContent=(problems.length||tone==='amber'||tone==='bad')?'Needs attention':'Current observations';
+}
+function paintDrawerGrace(surface){
+  const node=hostDrawerField('[data-host-drawer-grace]');
+  const secs=String(surface?.dataset?.grace||'').trim();
+  const source=String(surface?.dataset?.graceSource||'');
+  if(node)node.textContent=secs?secs+'s · '+(source==='host'?'host override':'fleet default'):'Not recorded';
+  setHostDrawerText('[data-grace-source-line]',String(surface?.dataset?.graceSourceLine||'').trim());
+  setHostDrawerText('[data-grace-rule]',String(surface?.dataset?.graceRule||'').trim());
+  const pending=hostDrawerField('[data-grace-pending]');
+  const pendingText=String(surface?.dataset?.gracePendingLine||'').trim();
+  if(pending){
+    pending.textContent=pendingText||'Not recorded';
+    pending.hidden=!pendingText;
+  }
 }
 function updateOpenHostDrawer(host,now){
   if(!host||host.name!==hostDrawerContext.host)return;
@@ -536,11 +563,13 @@ function updateOpenHostDrawer(host,now){
   const surface=hostSurfaces(host.name)[0]||null;
   const assurance=projectHostAssurance(host,current);
   paintDrawerAssurance(assurance.protection,assurance.health,surface);
+  paintDrawerPosture(assurance,surface);
+  paintDrawerGrace(surface);
   fillDrawerEvidence(surface,host,current);
 }
 function drawerClock(at){
   const stamp=utcObservedStamp(recordedUnix(at));
-  return stamp?stamp.visible:'not recorded';
+  return stamp?stamp.visible:'Not recorded';
 }
 function fillDrawerEvidence(surface,host,now){
   const reasons=hostDrawerField('[data-host-drawer-reasons]');
@@ -550,6 +579,16 @@ function fillDrawerEvidence(surface,host,now){
     const rows=live.length?live.map(reason=>reasonLine(reason.label,reason.at,'')):Array.from(surface?.querySelectorAll?.('[data-health-reason]')||[]).map(reasonFromNode);
     const lines=rows.length?rows:[reasonLine(surface?.querySelector?.('[data-health-summary]')?.textContent,'','')];
     lines.forEach(text=>{
+      const item=document.createElement('li');
+      item.textContent=text;
+      reasons.appendChild(item);
+    });
+    surface?.querySelectorAll?.('.freshness-rail .fresh-row-compact:not([hidden])').forEach(chip=>{
+      const detail=String(chip.dataset.freshDetail||chip.querySelector?.('[data-fresh-value]')?.textContent||'').replace(/\s+/g,' ').trim();
+      const label=String(chip.dataset.freshLabel||'').replace(/\s+/g,' ').trim();
+      const text=detail?(label&&!detail.toLowerCase().includes(label.toLowerCase())?label+' · '+detail:detail):label;
+      if(!text||lines.some(line=>line.toLowerCase().includes(text.toLowerCase())))return;
+      lines.push(text);
       const item=document.createElement('li');
       item.textContent=text;
       reasons.appendChild(item);
@@ -586,6 +625,8 @@ function populateHostDrawer(surface){
   setHostDrawerText('[data-host-drawer-title]',host);
   setHostDrawerText('[data-host-drawer-role]',surface.querySelector('.role')?.textContent||'host');
   paintDrawerMark(surface);
+  paintDrawerPosture(assurance,surface);
+  paintDrawerGrace(surface);
   setHostDrawerText('[data-host-drawer-state]',String(surface.dataset.live||'unknown').replaceAll('_',' '));
   const state=hostDrawerField('[data-host-drawer-state]');
   if(state)state.dataset.level=String(lifecycle?.level||surface.dataset.live||'');
@@ -638,16 +679,29 @@ function parkHeartbeatHistory(surface){
   const beat=surface?.querySelector?.('.beat');
   const history=beat?.querySelector?.('.beat-history');
   const slot=hostDrawerField('[data-host-drawer-history]');
-  if(!history||!slot||typeof slot.appendChild!=='function')return;
+  if(!slot||typeof slot.appendChild!=='function')return;
+  if(!history){
+    if(!slot.querySelector('.beat-history'))slot.textContent='Not recorded';
+    return;
+  }
+  slot.textContent='';
   history.dataset.historyOwner=beatOwnerId(beat);
   history.dataset.historyHost=surface.dataset.host||'';
   slot.appendChild(history);
   ensureHistoryWindowControl(history);
 }
+function lockDrawerScroll(){
+  const gap=Math.max(0,window.innerWidth-document.documentElement.clientWidth);
+  document.body.style.paddingRight=gap?gap+'px':'';
+}
+function unlockDrawerScroll(){
+  document.body.style.removeProperty('padding-right');
+}
 function openHostDrawer(surface){
   const layer=hostDrawerLayer();
   if(!layer||!surface)return;
   closeHostActions(openHostActionsRoot);
+  lockDrawerScroll();
   populateHostDrawer(surface);
   parkHeartbeatHistory(surface);
   layer.hidden=false;
@@ -661,6 +715,7 @@ function closeHostDrawer(restore=true){
   if(!layer||layer.hidden)return;
   layer.hidden=true;
   document.body.removeAttribute('data-host-drawer-open');
+  unlockDrawerScroll();
   hostSurfaces(hostDrawerContext.host).forEach(item=>item.querySelector('[data-host-drawer-trigger]')?.setAttribute('aria-expanded','false'));
   const returnFocus=hostDrawerContext.trigger;
   hostDrawerContext.host='';
@@ -737,12 +792,15 @@ function stopHostActionPoll(){
   hostActionPoll.terminal=false;
 }
 function visibleHostActionItems(menu){return Array.from(menu?.querySelectorAll('[role="menuitem"]')||[]).filter(item=>!item.hidden)}
+function hostActionsSurface(root){return root?.closest?.('[data-host-surface="runtime"]')||null}
 function closeHostActions(root=openHostActionsRoot,restore=false){
   if(!root)return;
   const trigger=root.querySelector('[data-host-actions-trigger]');
   const menu=root.querySelector('[data-host-actions-menu]');
-  if(menu){menu.hidden=true;menu.style.removeProperty('left');menu.style.removeProperty('top')}
+  if(menu){menu.hidden=true;menu.style.removeProperty('position');menu.style.removeProperty('left');menu.style.removeProperty('top')}
   if(trigger)trigger.setAttribute('aria-expanded','false');
+  const surface=hostActionsSurface(root);
+  if(surface)delete surface.dataset.hostActionsOpen;
   if(openHostActionsRoot===root){openHostActionsRoot=null;openHostActionsScrollPosition=null}
   if(restore)trigger?.focus();
   flushFleetSortAfterInteraction();
@@ -756,11 +814,25 @@ function positionHostActions(root){
   const menuWidth=menu.offsetWidth;
   const menuHeight=menu.offsetHeight;
   const margin=12;
-  const left=Math.max(margin-origin.left,Math.min(window.innerWidth-menuWidth-margin-origin.left,anchor.right-origin.left-menuWidth));
+  menu.style.position='absolute';
+  // Horizontal: hang the menu from the trigger's right edge (the trigger sits inside the card,
+  // inside the viewport), unless that would push its left edge past the viewport margin; then pin
+  // it to the margin. Everything is expressed relative to the root's layout box, never from a
+  // measured rect of the menu itself, and never with position:fixed (.card has contain:layout,
+  // which makes the card the containing block for fixed descendants).
+  if(anchor.right-menuWidth>=margin){
+    menu.style.left='auto';
+    menu.style.right=(origin.right-anchor.right)+'px';
+  }else{
+    menu.style.right='auto';
+    menu.style.left=(margin-origin.left)+'px';
+  }
+  // Vertical: below the trigger when it fits, else above, else pinned to the top margin.
   const below=anchor.bottom-origin.top+7;
   const above=anchor.top-origin.top-menuHeight-7;
-  const top=origin.top+below+menuHeight<=window.innerHeight-margin?below:Math.max(margin-origin.top,above);
-  menu.style.left=left+'px';
+  let top=origin.top+below+menuHeight<=window.innerHeight-margin?below:above;
+  if(origin.top+top<margin)top=margin-origin.top;
+  if(origin.top+top+menuHeight>window.innerHeight-margin)top=Math.max(margin-origin.top,window.innerHeight-margin-menuHeight-origin.top);
   menu.style.top=top+'px';
 }
 function openHostActions(root){
@@ -772,6 +844,8 @@ function openHostActions(root){
   if(!opening){closeHostActions(root,true);return}
   menu.hidden=false;
   trigger.setAttribute('aria-expanded','true');
+  const surface=hostActionsSurface(root);
+  if(surface)surface.dataset.hostActionsOpen='true';
   openHostActionsRoot=root;
   openHostActionsScrollPosition={x:window.scrollX,y:window.scrollY};
   positionHostActions(root);
@@ -1678,11 +1752,22 @@ function updateConfigEvidence(surface,freshness){
   write('[data-nixcfg-sha]',nixcfg?shortRevision(nixcfg.upstream_revision):'');
   write('[data-nixpkgs-sha]',evidence?shortRevision(evidence.nixpkgs_revision):'');
   const summary=surface.querySelector('[data-config-summary]');
-  if(!summary)return;
-  if(!evidence&&!nixcfg)summary.textContent='Not observed';
-  else if(nixcfg?.relation==='current')summary.textContent=nixpkgs?.relation==='different'?'nixcfg current · nixpkgs differs':'Exact match';
-  else if(nixcfg?.relation)summary.textContent='nixcfg '+nixcfg.relation;
-  else summary.textContent='Not observed';
+  if(summary){
+    if(!evidence&&!nixcfg)summary.textContent='Not observed';
+    else if(nixcfg?.relation==='current')summary.textContent=nixpkgs?.relation==='different'?'nixcfg current · nixpkgs differs':'Exact match';
+    else if(nixcfg?.relation)summary.textContent='nixcfg '+nixcfg.relation;
+    else summary.textContent='Not observed';
+  }
+  const face=surface.querySelector('[data-configuration-label]');
+  if(!face)return;
+  let label='Configuration not observed';
+  if(applicable&&evidence){
+    const nixpkgsExact=nixpkgs?.relation==='current';
+    const nixcfgExact=nixcfg?.relation==='current';
+    if(nixpkgsExact&&nixcfgExact)label='Configuration exact';
+    else if(nixpkgs||nixcfg)label='Configuration differs';
+  }
+  face.textContent=label;
 }
 function kernelNeedsRestart(kernel){
   return kernel?.state==='reboot_required'&&typeof kernel.running_version==='string'&&typeof kernel.expected_version==='string';
@@ -1741,7 +1826,6 @@ function attentionFor(live,f,preferences,now,threshold=30){
   return {label:'all clear',level:'ok',rank:4};
 }
 const BACKUP_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
-const BACKUP_LEVEL={failed:'critical',missing:'critical',stale:'warning',warning:'warning',unknown:'watch','not-configured':'watch',healthy:'clear'};
 const BACKUP_LABEL={failed:'Backup failed',missing:'Backup missing',stale:'Backup stale',warning:'Review backup',unknown:'Backup pending','not-configured':'No backup',healthy:'Protected'};
 function backupRunLabel(state){
   return ({succeeded:'succeeded',failed:'failed',running:'running',unknown:'unknown'})[state]||String(state||'unknown');
@@ -1755,7 +1839,7 @@ function backupDetail(obs,now){
 function backupInfo(host,now){
   const observations=Array.isArray(host.backup_observations)?host.backup_observations:[];
   const protection=projectProtection(observations,now);
-  if(!observations.length)return {state:'unknown',level:'watch',label:'Not observed',detail:'No backup signal yet',search:'',total:0,protection};
+  if(!observations.length)return {state:'unknown',label:'Not observed',detail:'No backup signal yet',search:'',total:0,protection};
   const primary=[...observations].sort((a,b)=>(BACKUP_RANK[a.state]??4)-(BACKUP_RANK[b.state]??4))[0];
   const state=primary.state||'unknown';
   const label=BACKUP_LABEL[state]||'Backup pending';
@@ -1763,7 +1847,7 @@ function backupInfo(host,now){
   const last=Number.isFinite(Number(primary.last_success_at))?dur(now-Number(primary.last_success_at))+' ago':'not yet';
   const schedule=String(primary.schedule||'not declared');
   const target=String(primary.target_label||'not declared');
-  return {state,level:BACKUP_LEVEL[state]||'watch',label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' '),protection};
+  return {state,label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' '),protection};
 }
 function setFactText(root,selector,value){
   const node=root?.querySelector(selector);
@@ -1858,23 +1942,60 @@ function scanTextsRepeat(summary,value){
   summary=String(summary||'').trim().toLowerCase();
   value=String(value||'').trim().toLowerCase();
   if(!summary||!value)return false;
-  return summary===value||(value==='unverified'&&summary==='freshness unverified');
+  if(summary===value)return true;
+  if(value==='unverified'&&summary==='freshness unverified')return true;
+  return summary.split(' · ').some(part=>part.trim()===value);
+}
+function healthReasonSummary(surface){
+  return Array.from(surface?.querySelectorAll?.('[data-health-reason]')||[]).map(node=>{
+    const time=node.querySelector('time');
+    let label=String(node.textContent||'');
+    if(time?.textContent)label=label.split(time.textContent).join(' ');
+    return label.replace(/\s+/g,' ').trim().toLowerCase();
+  }).filter(Boolean).join(' · ');
 }
 function suppressDuplicateScanChips(surface){
   const rail=surface?.querySelector?.('.freshness-rail')||surface?.querySelector?.('[data-fresh]');
   if(!rail)return;
-  const summary=String(surface.querySelector('[data-health-summary]')?.textContent||'').trim().toLowerCase();
+  const summary=healthReasonSummary(surface);
   rail.querySelectorAll('.fresh-row-compact').forEach(chip=>{
     const value=String(chip.querySelector('[data-fresh-value]')?.textContent||'').trim().toLowerCase();
-    chip.classList.toggle('scan-duplicate',scanTextsRepeat(summary,value));
+    chip.classList.toggle('scan-duplicate',summary?scanTextsRepeat(summary,value):false);
   });
   syncFreshnessRail(surface);
+}
+function cardAttentionText(health,surface){
+  const problems=(health?.reasons||[]).filter(reason=>reason&&reason.tone&&reason.tone!=='good').map(reason=>String(reason.label||'').replace(/\s+/g,' ').trim()).filter(Boolean);
+  const extra=String(surface?.getAttribute?.('data-attention-extra')||'').replace(/\s+/g,' ').trim();
+  if(extra&&!problems.includes(extra))problems.unshift(extra);
+  return problems.length?problems.join(' · '):'No action needed';
+}
+function fleetAttentionSurface(surface){
+  return Boolean(surface?.matches?.('article.card, tr.harbor-host'));
+}
+function syncCardAttention(surface){
+  if(!fleetAttentionSurface(surface))return;
+  const summary=surface.querySelector('[data-health-summary]');
+  if(!summary)return;
+  const text=cardAttentionText({reasons:Array.from(surface.querySelectorAll('[data-health-reason]')).map(node=>{
+    const time=node.querySelector('time');
+    let label=String(node.textContent||'');
+    if(time?.textContent)label=label.split(time.textContent).join(' ');
+    return {tone:node.dataset.healthTone||'',label};
+  })},surface);
+  if(summary.textContent!==text)summary.textContent=text;
+  const line=summary.closest('.attention-line');
+  if(!line)return;
+  const chip=line.querySelector('[data-host-lifecycle-chip]');
+  const chipLabel=String(chip?.querySelector('[data-host-lifecycle-chip-copy]')?.textContent||'').trim();
+  line.title=chipLabel?chipLabel+' · '+text:text;
 }
 function ensureHealthScan(surface,health){
   const block=surface.querySelector('[data-health-block]');
   if(!block||typeof document.createElement!=='function')return;
   const problems=(health.reasons||[]).filter(reason=>reason&&reason.tone&&reason.tone!=='good');
-  const summaryText=health.summary||problems[0]?.label||'No action needed';
+  let summaryText=health.summary||problems[0]?.label||'No action needed';
+  if(fleetAttentionSurface(surface))summaryText=cardAttentionText(health,surface);
   const countLabel=problems.length===1?'1 reason':problems.length+' reasons';
   surface.dataset.healthCount=String(health.count!=null?health.count:problems.length);
   block.dataset.healthTone=health.tone||'';
@@ -1927,6 +2048,7 @@ function ensureHealthScan(surface,health){
     placeHealthScan(line,icon,summary,count);
     if(list.parentElement!==block)block.appendChild(list);
     suppressDuplicateScanChips(surface);
+    syncCardAttention(surface);
     return;
   }
   list.hidden=problems.length===0;
@@ -2001,6 +2123,10 @@ function updateBackupStatus(surface,protection){
     if(typeof dailyNode.setAttribute==='function')dailyNode.setAttribute('href',appUrl('/backups?host='+encodeURIComponent(host)));
     setFactText(dailyNode,'[data-daily-backup-label]',daily.label);
     setFactText(dailyNode,'[data-daily-backup-note]',daily.detail);
+    const dailyNote=dailyNode.querySelector('[data-daily-backup-note]');
+    if(dailyNote)dailyNote.title=daily.detail||'';
+    if(dailyNode.classList){['good','bad','amber','neutral'].forEach(tone=>dailyNode.classList.remove(tone));if(daily.tone)dailyNode.classList.add(daily.tone);}
+    if(typeof dailyNode.removeAttribute==='function')dailyNode.removeAttribute('aria-label');
     paintScanAge(dailyNode,'[data-daily-backup-age]',dailyAt);
     dailyNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
     placeObservedTime(surface,dailyNode,dailyAt,'daily-backup');
@@ -2038,6 +2164,60 @@ function updateBackupStatus(surface,protection){
     restoreNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
     placeObservedTime(surface,restoreNode,restoreAt,'restore');
   }
+  if(dailyNode&&dailyNode.classList&&dailyNode.classList.contains('row-fact')&&daily)setFactText(dailyNode,'[data-daily-backup-label]',listDailyValue(daily));
+  if(restoreNode&&restoreNode.classList&&restoreNode.classList.contains('row-fact')&&restore)setFactText(restoreNode,'[data-restore-label]',listRestoreValue(restore));
+  const rowNote=surface.querySelector('[data-row-protection-note]');
+  if(rowNote&&(daily||restore)){
+    const text=listProtectionNote(daily,restore);
+    rowNote.textContent=text;
+    rowNote.title=text;
+  }
+}
+function listAgeToken(at){
+  const stamp=recordedUnix(at);
+  if(stamp==null)return '';
+  const now=Date.now()/1000;
+  if(stamp>now+2)return 'future';
+  const seconds=Math.max(0,Math.floor(now-stamp));
+  if(seconds>=86400)return Math.floor(seconds/86400)+'d';
+  if(seconds>=3600){
+    const hours=Math.floor(seconds/3600);
+    const mins=Math.floor((seconds%3600)/60);
+    return mins?hours+'h '+mins+'m':hours+'h';
+  }
+  if(seconds>=60){
+    const mins=Math.floor(seconds/60);
+    const secs=seconds%60;
+    return secs?mins+'m '+secs+'s':mins+'m';
+  }
+  return seconds+'s';
+}
+function withListAge(word,age){return age?word+' · '+age:word}
+function listDailyValue(daily){
+  const age=listAgeToken(daily&&daily.at);
+  const state=String(daily&&daily.state||'');
+  if(state==='ok'||state==='healthy')return withListAge('OK',age);
+  if(state==='failed')return 'Failed';
+  if(state==='missing')return 'Missing';
+  if(state==='stale')return withListAge('Stale',age);
+  if(state==='warning')return withListAge('Review',age);
+  if(state==='disabled')return 'Disabled';
+  return 'Not observed';
+}
+function listRestoreValue(restore){
+  const age=listAgeToken(restore&&restore.at);
+  const state=String(restore&&restore.state||'');
+  if(state==='passed')return withListAge('Passed',age);
+  if(state==='overdue')return 'Overdue';
+  if(state==='failed')return 'Failed';
+  if(state==='not-required')return 'Not required';
+  return 'Not observed';
+}
+function listProtectionNote(daily,restore){
+  const restoreNeeds=restore&&(restore.overdue||restore.state==='overdue'||(restore.tone&&restore.tone!=='good'));
+  const runGood=!daily||!daily.tone||daily.tone==='good';
+  if(restoreNeeds&&runGood)return String(restore.detail||restore.label||'');
+  return String((daily&&(daily.detail||daily.label))||(restore&&restore.detail)||'');
 }
 function updateHealthProjection(surface,health){
   if(!surface||!health)return;
@@ -2046,32 +2226,6 @@ function updateHealthProjection(surface,health){
   if(badge)badge.dataset.healthTone=health.tone;
   setFactText(surface,'[data-health-label]',health.label);
   ensureHealthScan(surface,health);
-}
-function updateBackup(surface,info){
-  const el=surface.querySelector('.backup-chip[data-backup-state]');
-  if(el&&el.classList.contains('backup-chip')){
-    const glyph={clear:'check',watch:'question',warning:'alert',critical:'x'}[info.level]||'question';
-    const host=surface.dataset.host||'';
-    el.classList.remove('clear','watch','warning','critical');
-    el.classList.add(info.level);
-    el.dataset.backupState=info.state;
-    el.dataset.backupLevel=info.level;
-    el.dataset.backupGlyph=glyph;
-    el.href=appUrl('/backups?host='+encodeURIComponent(host));
-    el.title='Backup: '+info.label+' - '+info.detail;
-    el.setAttribute('aria-label','Backup for '+host+': '+info.label+', '+info.detail);
-    const shouldHide=info.state==='healthy';
-    if(shouldHide&&document.activeElement===el)surface.querySelector('[data-host-actions-trigger]')?.focus();
-    el.hidden=shouldHide;
-  }
-  setFreshRow(surface,'backup-fault',{
-    value:info.label,
-    klass:info.level==='critical'?'down':info.level==='warning'?'warn':'na',
-    label:'Backup',
-    visible:false
-  });
-  syncFreshnessRail(surface);
-  updateBackupStatus(surface,info.protection);
 }
 function setReason(surface,reason){
   const el=surface.querySelector('[data-reason]');
@@ -2112,6 +2266,7 @@ function updateMuted(surface,info){
   el.title=info.label;
   const text=el.querySelector('span');
   if(text)text.textContent=info.label;
+  syncCardAttention(surface);
 }
 function formatPreferencesSummary(prefs){
   if(!prefs||typeof prefs!=='object')return 'not reported';
@@ -2358,6 +2513,7 @@ function updateHostLifecycle(surface,host){
   const dot=actionsRoot?.querySelector('[data-host-action-dot]');
   if(dot)dot.hidden=String(lifecycle?.slot||'quiet')==='quiet';
   if(actionsRoot&&openHostActionsRoot===actionsRoot)positionHostActions(actionsRoot);
+  syncCardAttention(surface);
 }
 function updatePreferenceState(surface,host){
   const applied=host.preferences||{};
@@ -2404,6 +2560,8 @@ function updateSignal(surface,info){
   }
   const kind=signal.querySelector('.signal-label');
   if(kind)kind.textContent='delivery';
+  const beat=surface.querySelector?.('.beat');
+  if(beat)paintFleetCardHeartbeat(beat);
   const windowLabel=signal.querySelector('[data-signal-window]');
   if(windowLabel){
     const next=SIGNAL_WINDOWS[(SIGNAL_WINDOWS.findIndex(w=>w.label===info.window)+1)%SIGNAL_WINDOWS.length]||SIGNAL_WINDOWS[0];
@@ -2479,8 +2637,33 @@ function dismissHistoryHint(){
   hideHistoryHint(true);
   if(mark&&document.activeElement===mark)mark.blur();
 }
+function bindCardStageReadout(){
+  if(document.documentElement?.dataset?.cardStageReadout==='true')return;
+  if(document.documentElement)document.documentElement.dataset.cardStageReadout='true';
+  document.addEventListener('pointerover',event=>{
+    const stage=event.target?.closest?.('article.card .beat-cadence');
+    if(!stage)return;
+    const explain=stage.closest('article.card')?.querySelector('[data-heartbeat-explain]');
+    if(!explain)return;
+    if(!explain.dataset.heartbeatExplainDefault)explain.dataset.heartbeatExplainDefault=explain.textContent||'';
+    explain.dataset.heartbeatHover='true';
+    const text=stage.getAttribute('aria-label')||stage.getAttribute('title')||explain.dataset.heartbeatExplainDefault;
+    explain.textContent=text;
+    explain.title=text;
+  });
+  document.addEventListener('pointerout',event=>{
+    const stage=event.target?.closest?.('article.card .beat-cadence');
+    if(!stage||(event.relatedTarget&&stage.contains(event.relatedTarget)))return;
+    const explain=stage.closest('article.card')?.querySelector('[data-heartbeat-explain]');
+    if(!explain)return;
+    delete explain.dataset.heartbeatHover;
+    const text=explain.dataset.heartbeatExplainDefault||'';
+    if(text){explain.textContent=text;explain.title=text}
+  });
+}
 function bindHistoryHints(){
   installHistoryChrome();
+  bindCardStageReadout();
   if(document.documentElement?.dataset?.historyHints==='true')return;
   if(document.documentElement)document.documentElement.dataset.historyHints='true';
   document.addEventListener('pointerover',event=>{
@@ -2665,6 +2848,70 @@ function conciseHeartbeatAge(seconds){
   if(age<3600)return Math.floor(age/60)+'m '+String(age%60).padStart(2,'0')+'s';
   return Math.floor(age/3600)+'h '+String(Math.floor((age%3600)/60)).padStart(2,'0')+'m';
 }
+function compactPingAge(seconds){
+  const age=Math.max(0,Math.floor(Number(seconds)||0));
+  if(age<60)return age+'s';
+  if(age<3600){
+    const mins=Math.floor(age/60);
+    const secs=age%60;
+    return secs?mins+'m '+secs+'s':mins+'m';
+  }
+  const hours=Math.floor(age/3600);
+  const mins=Math.floor((age%3600)/60);
+  return mins?hours+'h '+mins+'m':hours+'h';
+}
+function paintFleetCardHeartbeat(beat,presentation,interval,grace){
+  const card=beat?.closest?.('article.card');
+  if(!card)return;
+  const status=card.querySelector('[data-heartbeat-status]');
+  const explain=card.querySelector('[data-heartbeat-explain]');
+  const delivery=card.querySelector('[data-heartbeat-delivery]');
+  const start=card.querySelector('[data-heartbeat-window-start]');
+  const last=Number(beat.dataset.last);
+  const cadence=Math.max(1,Number(interval)||Number(beat.dataset.interval)||60);
+  const graceSecs=grace==null?beatGraceSecs(beat):Number(grace);
+  const now=Date.now()/1000;
+  const arrival=presentation||arrivalPresentation(last,cadence,graceSecs,now);
+  const age=arrival.age!=null?arrival.age:(Number.isFinite(last)&&last>0?Math.max(0,now-last):0);
+  const ageText=compactPingAge(age);
+  let label='No observations';
+  let tone='neutral';
+  let detail='Awaiting first heartbeat';
+  if(arrival.state==='down'){
+    label='No ping · '+ageText;
+    tone='bad';
+    detail='Host not reporting; current state unverified';
+  }else if(arrival.state==='late'||arrival.state==='stale'){
+    label=(arrival.state==='stale'?'Stale':'Late')+' · '+ageText;
+    tone='amber';
+    detail='Expected '+cadence+'s + '+graceSecs+'s grace · last ping '+ageText+' ago';
+  }else if(arrival.state==='on-time'){
+    label='On time · '+ageText;
+    tone='neutral';
+    detail='Expected '+cadence+'s + '+graceSecs+'s grace · last ping '+ageText+' ago';
+  }else if(arrival.state==='unknown'){
+    label='Clock skew';
+    tone='neutral';
+    detail='last report is ahead of Pharos';
+  }
+  if(status){
+    status.textContent=label;
+    status.className=tone;
+    status.dataset.heartbeatTone=tone;
+  }
+  if(explain&&explain.dataset.heartbeatHover!=='true'){
+    explain.textContent=detail;
+    explain.title=detail;
+  }
+  const signal=card.querySelector('[data-signal]');
+  const percent=String(signal?.querySelector('[data-signal-percent]')?.textContent||'').trim();
+  const windowLabel=String(beat.dataset.historyWindow||signal?.dataset.signalWindowKey||'').trim();
+  if(start)start.textContent=(windowLabel||'10m')+' ago';
+  if(delivery){
+    const empty=!percent||percent==='—'||percent==='-';
+    delivery.textContent=empty?'No delivery data':percent+' delivered · '+(windowLabel||'10m');
+  }
+}
 function cadenceCaption(presentation,interval,grace,ageSeconds){
   const bounds=cadenceBounds(interval,grace);
   if(presentation.state==='waiting'||presentation.state==='unknown')return presentation.label+' · late '+bounds.lateAfter+'s';
@@ -2719,6 +2966,7 @@ function updateArrival(beat,last,interval,grace,now){
   arrival.querySelectorAll('.beat-scale-label,.beat-grace').forEach(node=>{node.hidden=true;node.textContent=''});
   beat.style.setProperty('--cadence-x',presentation.x.toFixed(2)+'%');
   paintCadenceScale(beat,interval,grace);
+  paintFleetCardHeartbeat(beat,presentation,interval,grace);
   const fleet=fleetMain()?.dataset?.fleetSyncState;
   const alive=presentation.state==='on-time'&&(fleet==null||fleet==='current');
   beat.dataset.beatLive=alive?'true':'false';
@@ -2871,7 +3119,8 @@ function setSeen(card,last,now){
   if(!seen)return;
   const compact=seen.hasAttribute('data-seen-compact');
   const cardLabel=seen.hasAttribute('data-seen-card');
-  const text=last==null?(compact?'never':(cardLabel?'Never seen':'never seen')):(compact?dur(now-last)+' ago':(cardLabel?'Seen ':'last seen ')+dur(now-last)+' ago');
+  const whole=last==null?null:compactPingAge(Math.max(0,now-last));
+  const text=last==null?(compact?'never':(cardLabel?'Never seen':'never seen')):(compact?whole+' ago':(cardLabel?'Seen ':'last seen ')+dur(now-last)+' ago');
   seen.dataset.defaultText=text;
   if(card.dataset.historyHint!=='true')seen.textContent=text;
 }
@@ -5241,7 +5490,7 @@ function applyFleetSnapshot(data){
       updateMuted(card,muted);
       updateKernelFault(card,h);
       updateFreshness(card,h.freshness,now,h.nixpkgs_warn_after_days);
-      updateBackup(card,backup);
+      updateBackupStatus(card,backup.protection);
       updateHealthProjection(card,assurance.health);
       setSeen(card,h.last_seen,now);
       setCardAsOf(card,now);
@@ -5434,6 +5683,7 @@ function syncFreshnessRail(surface){
   if(rail.hidden&&rail.contains(document.activeElement))focusFreshnessFallback(surface,document.activeElement);
   if(rail.hidden&&activeFreshPopoverChip&&rail.contains(activeFreshPopoverChip))hideFreshPopover();
   if(!rail.hidden)requestAnimationFrame(()=>updateFreshnessRailOverflow(rail));
+  syncCardAttention(surface);
 }
 function initFreshnessChipScroll(){
   const chevronLeftIcon='<svg class="ico" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>';

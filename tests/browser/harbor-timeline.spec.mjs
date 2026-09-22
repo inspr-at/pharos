@@ -233,7 +233,7 @@ test("reduced motion stops heartbeat interpolation and keeps the clock truthful"
       </article>
       <table class="list"><tbody>
         <tr class="harbor-host" data-host="motion-row">
-          <td><details class="revision-evidence"><summary><span data-config-summary>nixpkgs current</span></summary></details></td>
+          <td><div class="row-fact"><span class="row-fact-k">Daily:</span> OK</div><details class="revision-evidence"><summary><span data-config-summary>nixpkgs current</span></summary></details></td>
           <td><div class="beat" data-caption-mode="list" data-interval="60" data-grace="15" data-beat-live="true">
             <div class="beat-readout" data-arrival><span data-arrival-label></span></div>
             <div class="beat-cadence"><span class="beat-now"></span><span class="beat-hit"></span></div>
@@ -245,11 +245,11 @@ test("reduced motion stops heartbeat interpolation and keeps the clock truthful"
   const fixture = page.locator("#reduced-motion-fixture");
   expect(await page.locator("tr.harbor-host .revision-evidence > summary").count()).toBeGreaterThan(1);
   await expect(fixture.locator("tr.harbor-host .revision-evidence > summary")).toHaveCount(1);
-  const summaryStyle = await fixture.locator("tr.harbor-host .revision-evidence > summary").evaluate((node) => {
+  const factStyle = await fixture.locator("tr.harbor-host .row-fact").evaluate((node) => {
     const style = getComputedStyle(node);
     return { size: style.fontSize, weight: style.fontWeight };
   });
-  expect(summaryStyle).toEqual({ size: "12px", weight: "400" });
+  expect(factStyle).toEqual({ size: "11px", weight: "400" });
 
   await page.emulateMedia({ reducedMotion: "no-preference" });
   const moving = await page.evaluate(() => {

@@ -775,9 +775,18 @@ mod module_tests {
     fn host_quick_drawer_is_a_local_draft_with_an_explicit_workspace_exit() {
         let drawer = host_quick_drawer(&PublicBasePath::ROOT, true);
         assert!(drawer.contains(r#"role="dialog" aria-modal="true""#));
-        let history_at = drawer.find("Heartbeat history").expect("history heading");
-        let reasons_at = drawer.find("<h4>Reasons</h4>").expect("reasons heading");
-        assert!(history_at < reasons_at, "heartbeat history leads Evidence");
+        let reasons_at = drawer
+            .find("data-host-drawer-reasons")
+            .expect("observations list");
+        let history_at = drawer
+            .find("data-host-drawer-history")
+            .expect("heartbeat history");
+        let workspace_at = drawer.find("Open full host page").expect("host page link");
+        assert!(reasons_at < history_at, "observations lead the heartbeat");
+        assert!(
+            history_at < workspace_at,
+            "heartbeat leads the host page link"
+        );
         assert!(drawer.matches("data-host-drawer-history").count() == 1);
         assert!(drawer.contains("data-host-drawer-workspace"));
         assert!(drawer.contains("Prepare a local draft"));
@@ -788,7 +797,7 @@ mod module_tests {
         assert!(drawer.contains("Use fleet default"));
         assert!(drawer.contains("inherit the fleet grace"));
         assert!(!drawer.contains("send null"));
-        assert!(!drawer.contains("Open full host page"));
+        assert!(drawer.contains("Open full host page"));
         assert_eq!(drawer.matches("data-restore-instant-label").count(), 1);
         assert!(!drawer.contains("awaiting-policy"));
         assert!(!drawer.contains("data-grace-reset disabled"));
@@ -1394,19 +1403,21 @@ mod module_tests {
             )),
         );
         let view = fleet_protection_view(std::slice::from_ref(&aged), now);
-        let scan = protection_scan_markup(&view, "qa-harbor", &PublicBasePath::ROOT);
-        assert!(scan.contains("Backup run"));
-        assert!(scan.contains("Selective restore"));
-        assert!(scan.contains(r#"class="scan-store" data-protection-evidence hidden"#));
-        assert!(!scan.contains("<summary>Exact times</summary>"));
-        assert!(!scan.contains("<summary>Repository check</summary>"));
-        assert!(scan.contains("data-daily-backup-date"));
+        let card = protection_card_markup(&view, "qa-harbor", &PublicBasePath::ROOT);
+        assert!(card.contains("Daily backup"));
+        assert!(card.contains("Monthly restore test"));
+        assert!(card.contains(r#"class="scan-store" data-protection-evidence hidden"#));
+        assert!(!card.contains("<summary>Exact times</summary>"));
+        assert!(!card.contains("<summary>Repository check</summary>"));
+        assert!(card.contains("data-daily-backup-date"));
+        assert!(card.contains("data-daily-backup-note"));
+        assert!(!card.contains(r#"class="fact-age""#));
         let health = health_for(&view, &proven_current("nixos-unstable"), now);
-        let scan_health = health_scan_markup(&health);
-        assert!(!scan_health.contains("data-health-disclosure"));
-        assert!(scan_health.contains("data-health-summary"));
-        assert!(scan_health.contains(r#"data-health-reasons hidden"#));
-        assert!(scan_health.contains("data-health-reason"));
+        let attention = card_attention_block(&health, "", "", "", "");
+        assert!(!attention.contains("data-health-disclosure"));
+        assert!(attention.contains("data-health-summary"));
+        assert!(attention.contains(r#"data-health-reasons hidden"#));
+        assert!(attention.contains("data-health-reason"));
         let beat = heartbeat_card(HeartbeatCard {
             last_seen: Some(now - 30),
             heartbeat_log: &[now - 90, now - 30],
@@ -1434,10 +1445,75 @@ mod module_tests {
         assert!(!beat.contains("arrival-track"));
         assert!(beat.contains(r#"data-history-axis="time""#));
         assert!(beat.contains("--now-x:100%"));
-        assert!(scan.contains(r#"class="fact-age" data-daily-backup-age>"#));
-        assert!(scan.contains(r#"data-daily-backup-note hidden"#));
-        assert!(scan.contains(r#"data-restore-note hidden"#));
-        assert!(scan.contains(r#"data-restore-age>"#));
+        assert!(card.contains(r#"data-restore-note"#));
+        assert!(!card.contains("backup-chip"));
+    }
+
+    #[test]
+    fn heartbeat_face_names_clock_skew_when_the_report_is_ahead() {
+        let now = 1_700_000_000;
+        let ahead = heartbeat_face(Some(now + BACKUP_CLOCK_SKEW_SECS + 1), now, 60, 15);
+        assert_eq!(ahead.status, "Clock skew");
+        assert_eq!(ahead.tone, "neutral");
+        assert_eq!(ahead.explain, "last report is ahead of Pharos");
+        let within = heartbeat_face(Some(now + BACKUP_CLOCK_SKEW_SECS), now, 60, 15);
+        assert!(within.status.starts_with("On time"), "{}", within.status);
+        let missing = heartbeat_face(None, now, 60, 15);
+        assert_eq!(missing.status, "No observations");
+    }
+
+    #[test]
+    fn protection_pair_tone_follows_posture() {
+        let now = 1_700_000_120;
+        let cases = [
+            (
+                BackupPostureState::Healthy,
+                Some("daily"),
+                Some(now - 120),
+                "good",
+                "Daily OK",
+            ),
+            (
+                BackupPostureState::Unknown,
+                None,
+                None,
+                "neutral",
+                "Unknown",
+            ),
+            (
+                BackupPostureState::Stale,
+                Some("daily"),
+                Some(now - 3 * 86_400),
+                "amber",
+                "Stale",
+            ),
+            (
+                BackupPostureState::Failed,
+                Some("daily"),
+                Some(now - 120),
+                "bad",
+                "Failed",
+            ),
+        ];
+        let mut tones = Vec::new();
+        for (state, schedule, at, tone, label) in cases {
+            let observation = backup_observation(state, schedule, at, None);
+            let view = fleet_protection_view(std::slice::from_ref(&observation), now);
+            let card = protection_card_markup(&view, "athena", &PublicBasePath::ROOT);
+            assert!(
+                card.contains(&format!(r#"class="protection-fact {tone}""#)),
+                "{state:?} card missing tone {tone}"
+            );
+            assert!(
+                card.contains(&format!(r#"data-daily-backup-label>{label}</strong>"#)),
+                "{state:?} card missing label {label}"
+            );
+            assert!(!card.contains("backup-chip"));
+            tones.push(tone);
+        }
+        tones.sort_unstable();
+        tones.dedup();
+        assert_eq!(tones, ["amber", "bad", "good", "neutral"]);
     }
 
     #[test]
@@ -1445,6 +1521,60 @@ mod module_tests {
         let chip = r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="freshness-unverified"><strong class="na" data-fresh-value>unverified</strong></div>"#;
         assert!(mark_scan_duplicate_chip(chip, "freshness unverified").contains("scan-duplicate"));
         assert!(!mark_scan_duplicate_chip(chip, "Backup Failed").contains("scan-duplicate"));
+    }
+
+    #[test]
+    fn card_backup_fact_names_its_state_and_configuration_stays_off_freshness() {
+        let now = 2_000_000_000;
+        let failed = backup_observation(BackupPostureState::Failed, None, None, None);
+        let view = fleet_protection_view(std::slice::from_ref(&failed), now);
+        let card = protection_card_markup(&view, "beacon", &PublicBasePath::ROOT);
+        assert!(card.contains(r#"href="/backups?host=beacon""#));
+        assert!(!card.contains(r#"aria-label="Backup"#));
+        assert!(card.contains("Daily backup"));
+        assert!(card.contains(r#"data-daily-backup-label>Failed</strong>"#));
+        assert!(card.contains(r#"class="protection-fact bad""#));
+        assert!(!card.contains("backup-chip"));
+        assert_eq!(
+            configuration_face_label(&proven_current("nixos-unstable")),
+            "Configuration exact"
+        );
+        let mut differs = proven_current("nixos-unstable");
+        differs.nixpkgs_comparison.as_mut().unwrap().relation = NixpkgsRevisionRelation::Different;
+        assert_eq!(configuration_face_label(&differs), "Configuration differs");
+        let mut missing = proven_current("nixos-unstable");
+        missing.applicable = false;
+        assert_eq!(
+            configuration_face_label(&missing),
+            "Configuration not observed"
+        );
+        assert!(!configuration_face_label(&missing).contains("nix: n/a"));
+        assert!(!configuration_face_label(&missing).contains("freshness"));
+        let failed_list = list_protection_markup(&view, "beacon", &PublicBasePath::ROOT, now);
+        assert!(failed_list.contains(r#"href="/backups?host=beacon""#));
+        assert!(!failed_list.contains(r#"aria-label="Backup"#));
+        assert!(failed_list.contains(r#"<span class="row-fact-k">Daily:</span>"#));
+        assert!(failed_list.contains(r#"data-daily-backup-label>Failed</strong>"#));
+        assert!(failed_list.contains(r#"<span class="row-fact-k">Restore:</span>"#));
+        assert!(!failed_list.contains("backup-chip"));
+        let passed = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now - 7_200),
+            Some(pharos_core::BackupValidationObservation {
+                level: pharos_core::BackupValidationLevel::RestoreSample,
+                state: pharos_core::BackupValidationState::Passed,
+                checked_at: Some(now - 6 * 86_400),
+                evidence_label: Some("one file".to_string()),
+                summary: None,
+            }),
+        );
+        let passed_view = fleet_protection_view(std::slice::from_ref(&passed), now);
+        let passed_list = list_protection_markup(&passed_view, "atlas", &PublicBasePath::ROOT, now);
+        assert!(passed_list.contains(r#"data-daily-backup-label>OK · 2h</strong>"#));
+        assert!(passed_list.contains(r#"data-restore-label>Passed · 6d</strong>"#));
+        assert!(!passed_list.contains("1 file"));
+        assert!(!passed_list.contains(r#"aria-label="Backup"#));
         let exact = r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="nixpkgs-drift"><strong class="warn" data-fresh-value>nixpkgs differs from nixos-unstable</strong></div>"#;
         assert!(
             mark_scan_duplicate_chip(exact, "nixpkgs differs from nixos-unstable")
@@ -4328,20 +4458,41 @@ fn scan_age_label(note: &str) -> String {
     String::new()
 }
 
+fn fact_kind_label(kind: &str, card_face: bool) -> String {
+    let text = match (card_face, kind) {
+        (true, "daily-backup") => "Daily backup",
+        (true, "restore") => "Monthly restore test",
+        (_, "daily-backup") => "Backup run",
+        (_, "restore") => "Selective restore",
+        _ => "Repository check",
+    };
+    if !card_face {
+        return text.to_string();
+    }
+    let icon = match kind {
+        "daily-backup" => icons::SHIELD_CHECK,
+        "restore" => icons::HISTORY,
+        _ => "",
+    };
+    format!("{icon}{text}")
+}
+
 fn fact_markup(
     fact: &ProtectionFact,
     kind: &str,
     href: Option<&str>,
     include_time: bool,
     scan: bool,
+    card_face: bool,
 ) -> String {
+    let compact = scan && !card_face;
     let at = fact_instant_attr(fact.at);
     let time = if include_time {
         observed_time_markup(fact.at, kind)
     } else {
         String::new()
     };
-    let age = if scan {
+    let age = if compact {
         format!(
             r#"<span class="fact-age" data-{kind}-age>{age}</span>"#,
             kind = kind,
@@ -4350,14 +4501,10 @@ fn fact_markup(
     } else {
         String::new()
     };
-    let note_hidden = if scan { " hidden" } else { "" };
+    let note_hidden = if compact { " hidden" } else { "" };
     let body = format!(
-        r#"<span class="fact-label">{label_kind}</span><strong class="fact-value {tone}" data-{kind}-label>{label}</strong>{age}<span class="fact-note" data-{kind}-note{note_hidden}>{note}</span>{time}"#,
-        label_kind = html_escape(match kind {
-            "daily-backup" => "Backup run",
-            "restore" => "Selective restore",
-            _ => "Repository check",
-        }),
+        r#"<span class="fact-label">{label_kind}</span><strong class="fact-value {tone}" data-{kind}-label>{label}</strong>{age}<span class="fact-note" data-{kind}-note{note_hidden} title="{note}">{note}</span>{time}"#,
+        label_kind = fact_kind_label(kind, card_face),
         tone = html_escape(fact.tone),
         kind = kind,
         label = html_escape(&fact.label),
@@ -4374,7 +4521,10 @@ fn fact_markup(
         at = html_escape(&at),
     );
     match href {
-        Some(href) => format!(r#"<a class="protection-fact" {attrs} href="{href}">{body}</a>"#),
+        Some(href) => format!(
+            r#"<a class="protection-fact {tone}" {attrs} href="{href}">{body}</a>"#,
+            tone = html_escape(fact.tone),
+        ),
         None => format!(r#"<div class="protection-fact" {attrs}>{body}</div>"#),
     }
 }
@@ -4384,18 +4534,147 @@ pub(super) fn protection_markup(
     host: &str,
     base: &PublicBasePath,
 ) -> String {
-    protection_markup_surface(view, host, base, false)
+    protection_markup_surface(view, host, base, false, false)
 }
 
-/// Fleet scan surfaces keep the two backup facts visible and park exact times
-/// and the repository check in a hidden store. Quick preview and the host page
-/// are the places that open them.
-pub(super) fn protection_scan_markup(
+/// Grid cards show the two protection facts and their short notes. Exact times
+/// and the repository check stay in the hidden store the drawer already reads.
+pub(super) fn protection_card_markup(
     view: &FleetProtectionView,
     host: &str,
     base: &PublicBasePath,
 ) -> String {
-    protection_markup_surface(view, host, base, true)
+    protection_markup_surface(view, host, base, true, true)
+}
+
+fn list_age_token(at: Option<i64>, now: i64) -> String {
+    let Some(at) = positive_instant(at) else {
+        return String::new();
+    };
+    if at > now.saturating_add(BACKUP_CLOCK_SKEW_SECS) {
+        return "future".to_string();
+    }
+    let seconds = now.saturating_sub(at).max(0);
+    if seconds >= 86_400 {
+        return format!("{}d", seconds / 86_400);
+    }
+    if seconds >= 3_600 {
+        let hours = seconds / 3_600;
+        let mins = (seconds % 3_600) / 60;
+        return if mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {mins}m")
+        };
+    }
+    if seconds >= 60 {
+        let mins = seconds / 60;
+        let secs = seconds % 60;
+        return if secs == 0 {
+            format!("{mins}m")
+        } else {
+            format!("{mins}m {secs}s")
+        };
+    }
+    format!("{seconds}s")
+}
+
+fn with_list_age(word: &str, age: &str) -> String {
+    if age.is_empty() {
+        word.to_string()
+    } else {
+        format!("{word} · {age}")
+    }
+}
+
+fn list_daily_value(fact: &ProtectionFact, now: i64) -> String {
+    let age = list_age_token(fact.at, now);
+    match fact.state {
+        "ok" => with_list_age("OK", &age),
+        "failed" => "Failed".to_string(),
+        "missing" => "Missing".to_string(),
+        "stale" => with_list_age("Stale", &age),
+        "warning" => with_list_age("Review", &age),
+        "disabled" => "Disabled".to_string(),
+        _ => "Not observed".to_string(),
+    }
+}
+
+fn list_restore_value(fact: &ProtectionFact, now: i64) -> String {
+    let age = list_age_token(fact.at, now);
+    match fact.state {
+        "passed" => with_list_age("Passed", &age),
+        "overdue" => "Overdue".to_string(),
+        "failed" => "Failed".to_string(),
+        "not-required" => "Not required".to_string(),
+        _ => "Not observed".to_string(),
+    }
+}
+
+fn list_protection_note(view: &FleetProtectionView) -> String {
+    let restore_needs_note =
+        view.restore_overdue || (view.restore.tone != "good" && view.run.tone == "good");
+    if restore_needs_note {
+        view.restore.note.clone()
+    } else {
+        view.run.note.clone()
+    }
+}
+
+/// List rows show the same two facts as the card, in one short line each.
+/// Exact times and the repository check stay in the hidden stores the drawer reads.
+fn list_protection_markup(
+    view: &FleetProtectionView,
+    host: &str,
+    base: &PublicBasePath,
+    now: i64,
+) -> String {
+    let href = app_href(base, &format!("/backups?host={}", url_query_escape(host)));
+    let check_fact = match &view.check {
+        Some(check) => fact_markup(check, "backup-check", Some(&href), true, true, false),
+        None => {
+            r#"<div class="protection-fact protection-check" data-backup-check data-backup-check-state="" data-backup-check-tone="" data-backup-check-at="" hidden><span class="fact-label">Repository check</span><strong class="fact-value neutral" data-backup-check-label></strong><span class="fact-note" data-backup-check-note></span></div>"#.to_string()
+        }
+    };
+    let backup_time = evidence_time_markup(view.run.at, "daily-backup");
+    let restore_time = evidence_time_markup(view.restore.at, "restore");
+    let note = list_protection_note(view);
+    let daily = list_daily_value(&view.run, now);
+    let restore = list_restore_value(&view.restore, now);
+    let run_at = fact_instant_attr(view.run.at);
+    let restore_at = fact_instant_attr(view.restore.at);
+    let producer = if view.restore.state == "not-required" {
+        "not-required"
+    } else if view.missing_restore_producer {
+        "missing"
+    } else {
+        "present"
+    };
+    format!(
+        r#"<div class="row-protection" data-protection data-selective-restore-overdue-after-secs="{overdue_after}"><a class="row-fact protection-fact {run_tone}" data-daily-backup data-daily-backup-state="{run_state}" data-daily-backup-tone="{run_tone}" data-daily-backup-at="{run_at}" href="{href}"><span class="row-fact-k">Daily:</span> <strong class="fact-value {run_tone}" data-daily-backup-label>{daily}</strong><span class="fact-note" data-daily-backup-note hidden title="{run_note}">{run_note}</span></a><div class="row-fact {restore_tone}" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="row-fact-k">Restore:</span> <strong class="fact-value {restore_tone}" data-restore-label>{restore}</strong><span class="fact-note" data-restore-note hidden title="{restore_note}">{restore_note}</span></div><small class="row-protection-note" data-row-protection-note title="{note}">{note}</small><div class="scan-store" data-protection-evidence hidden>{backup_time}{restore_time}</div><div class="scan-store" data-protection-more hidden>{check_fact}</div></div>"#,
+        overdue_after = SELECTIVE_RESTORE_OVERDUE_AFTER_SECS,
+        run_tone = html_escape(view.run.tone),
+        run_state = html_escape(view.run.state),
+        run_at = html_escape(&run_at),
+        href = href,
+        daily = html_escape(&daily),
+        run_note = html_escape(&view.run.note),
+        restore_tone = html_escape(view.restore.tone),
+        restore_state = html_escape(view.restore.state),
+        restore_at = html_escape(&restore_at),
+        producer = producer,
+        overdue = if view.restore_overdue {
+            "true"
+        } else {
+            "false"
+        },
+        restore = html_escape(&restore),
+        restore_note = html_escape(&view.restore.note),
+        note = html_escape(&note),
+        backup_time = backup_time,
+        restore_time = restore_time,
+        check_fact = check_fact,
+    )
 }
 
 fn protection_markup_surface(
@@ -4403,10 +4682,11 @@ fn protection_markup_surface(
     host: &str,
     base: &PublicBasePath,
     scan: bool,
+    card_face: bool,
 ) -> String {
     let href = app_href(base, &format!("/backups?host={}", url_query_escape(host)));
     let check_fact = match &view.check {
-        Some(check) => fact_markup(check, "backup-check", Some(&href), true, scan),
+        Some(check) => fact_markup(check, "backup-check", Some(&href), true, scan, card_face),
         None => {
             r#"<div class="protection-fact protection-check" data-backup-check data-backup-check-state="" data-backup-check-tone="" data-backup-check-at="" hidden><span class="fact-label">Repository check</span><strong class="fact-value neutral" data-backup-check-label></strong><span class="fact-note" data-backup-check-note></span></div>"#.to_string()
         }
@@ -4434,7 +4714,8 @@ fn protection_markup_surface(
     } else {
         ""
     };
-    let restore_age = if scan {
+    let compact = scan && !card_face;
+    let restore_age = if compact {
         format!(
             r#"<span class="fact-age" data-restore-age>{}</span>"#,
             html_escape(&scan_age_label(&view.restore.note))
@@ -4442,7 +4723,8 @@ fn protection_markup_surface(
     } else {
         String::new()
     };
-    let restore_note_hidden = if scan { " hidden" } else { "" };
+    let restore_note_hidden = if compact { " hidden" } else { "" };
+    let restore_caption = fact_kind_label("restore", card_face);
     let evidence = if scan {
         format!(
             r#"<div class="scan-store" data-protection-evidence hidden>{backup_time}{restore_time}</div>"#
@@ -4453,9 +4735,17 @@ fn protection_markup_surface(
         )
     };
     format!(
-        r#"<div class="protection-pair" data-protection data-selective-restore-overdue-after-secs="{overdue_after}">{run}<div class="protection-fact" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="fact-label">Selective restore</span><strong class="fact-value {restore_tone}" data-restore-label>{restore_label}</strong>{restore_age}<span class="fact-note" data-restore-note{restore_note_hidden}>{restore_note}</span></div>{evidence}{check}</div>"#,
+        r#"<div class="protection-pair" data-protection data-selective-restore-overdue-after-secs="{overdue_after}">{run}<div class="protection-fact" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="fact-label">{restore_caption}</span><strong class="fact-value {restore_tone}" data-restore-label>{restore_label}</strong>{restore_age}<span class="fact-note" data-restore-note{restore_note_hidden} title="{restore_note}">{restore_note}</span></div>{evidence}{check}</div>"#,
         overdue_after = SELECTIVE_RESTORE_OVERDUE_AFTER_SECS,
-        run = fact_markup(&view.run, "daily-backup", Some(&href), false, scan),
+        run = fact_markup(
+            &view.run,
+            "daily-backup",
+            Some(&href),
+            false,
+            scan,
+            card_face,
+        ),
+        restore_caption = restore_caption,
         restore_age = restore_age,
         restore_note_hidden = restore_note_hidden,
         check = check,
@@ -4519,7 +4809,41 @@ pub(super) fn health_markup(health: &HostHealthView) -> String {
     )
 }
 
-pub(super) fn health_scan_markup(health: &HostHealthView) -> String {
+fn card_attention_summary(health: &HostHealthView, extra: &str) -> String {
+    let mut parts: Vec<String> = health
+        .reasons
+        .iter()
+        .filter(|reason| reason.tone != "good")
+        .map(|reason| reason.label.clone())
+        .collect();
+    if !extra.is_empty() && !parts.iter().any(|part| part == extra) {
+        parts.insert(0, extra.to_string());
+    }
+    if parts.is_empty() {
+        "No action needed".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn card_attention_block(
+    health: &HostHealthView,
+    lifecycle_chip: &str,
+    chip_label: &str,
+    extra: &str,
+    mute: &str,
+) -> String {
+    let summary = card_attention_summary(health, extra);
+    let title = if chip_label.is_empty() {
+        summary.clone()
+    } else {
+        format!("{chip_label} · {summary}")
+    };
+    let icon = if health.problem_count == 0 && extra.is_empty() {
+        icons::SHIELD_CHECK
+    } else {
+        icons::BELL
+    };
     let reasons = health
         .reasons
         .iter()
@@ -4534,30 +4858,120 @@ pub(super) fn health_scan_markup(health: &HostHealthView) -> String {
             )
         })
         .collect::<String>();
-    let icon = if health.problem_count == 0 {
-        icons::SHIELD_CHECK
-    } else {
-        icons::BELL
-    };
     let count_label = if health.problem_count == 1 {
         "1 reason".to_string()
     } else {
         format!("{} reasons", health.problem_count)
     };
-    let count_hidden = if health.problem_count == 0 {
-        " hidden"
-    } else {
-        ""
-    };
     format!(
-        r#"<div class="harbor-health" data-health-block data-health-tone="{tone}"><span class="health-label" data-health-label data-health-tone="{tone}" hidden>{label}</span><div class="attention-line"><span class="attention-icon" aria-hidden="true">{icon}</span><span data-health-summary>{summary}</span><span class="health-count" data-health-count{count_hidden}>{count}</span></div><ul class="health-reasons" data-health-reasons hidden>{reasons}</ul></div>"#,
+        r#"<div class="harbor-health" data-health-block data-health-tone="{tone}"><div class="attention-line" title="{title}"><span class="attention-icon" aria-hidden="true">{icon}</span>{chip}<span class="attention-sep" aria-hidden="true"> · </span><span data-health-summary>{summary}</span>{mute}<span class="health-count" data-health-count hidden>{count}</span></div><ul class="health-reasons" data-health-reasons hidden>{reasons}</ul></div>"#,
         tone = html_escape(health.tone),
-        label = html_escape(health.label),
-        summary = html_escape(&health.summary),
+        title = html_escape(&title),
+        summary = html_escape(&summary),
+        chip = lifecycle_chip,
+        mute = mute,
         count = html_escape(&count_label),
-        count_hidden = count_hidden,
         reasons = reasons,
     )
+}
+
+fn card_role_line(kind: HostKind, role: &str) -> String {
+    let kind_label = match kind {
+        HostKind::Server => "Server",
+        HostKind::Workstation => "Workstation",
+    };
+    let role = role.trim();
+    if role.is_empty()
+        || role.eq_ignore_ascii_case(kind.label())
+        || role.eq_ignore_ascii_case(kind_label)
+    {
+        return kind_label.to_string();
+    }
+    let lower = role.to_ascii_lowercase();
+    if lower.starts_with(&kind.label().to_ascii_lowercase())
+        || lower.starts_with(&kind_label.to_ascii_lowercase())
+    {
+        role.to_string()
+    } else {
+        format!("{kind_label} · {role}")
+    }
+}
+
+fn ping_age_label(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        let mins = seconds / 60;
+        let secs = seconds % 60;
+        if secs == 0 {
+            format!("{mins}m")
+        } else {
+            format!("{mins}m {secs}s")
+        }
+    } else {
+        let hours = seconds / 3600;
+        let mins = (seconds % 3600) / 60;
+        if mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {mins}m")
+        }
+    }
+}
+
+struct HeartbeatFace {
+    status: String,
+    tone: &'static str,
+    explain: String,
+}
+
+fn heartbeat_face(
+    last_seen: Option<i64>,
+    now: i64,
+    interval: i64,
+    grace_secs: u64,
+) -> HeartbeatFace {
+    let Some(last) = last_seen.filter(|stamp| *stamp > 0) else {
+        return HeartbeatFace {
+            status: "No observations".to_string(),
+            tone: "neutral",
+            explain: "Awaiting first heartbeat".to_string(),
+        };
+    };
+    if last > now.saturating_add(BACKUP_CLOCK_SKEW_SECS) {
+        return HeartbeatFace {
+            status: "Clock skew".to_string(),
+            tone: "neutral",
+            explain: "last report is ahead of Pharos".to_string(),
+        };
+    }
+    let age = (now - last).max(0);
+    let age_text = ping_age_label(age);
+    let timing = pharos_core::heartbeat_timing(age as u64, interval.max(1) as u64, grace_secs);
+    let explain = format!("Expected {interval}s + {grace_secs}s grace · last ping {age_text} ago");
+    match timing {
+        pharos_core::HeartbeatTiming::Down => HeartbeatFace {
+            status: format!("No ping · {age_text}"),
+            tone: "bad",
+            explain: "Host not reporting; current state unverified".to_string(),
+        },
+        pharos_core::HeartbeatTiming::Late => HeartbeatFace {
+            status: format!("Late · {age_text}"),
+            tone: "amber",
+            explain,
+        },
+        pharos_core::HeartbeatTiming::Stale => HeartbeatFace {
+            status: format!("Stale · {age_text}"),
+            tone: "amber",
+            explain,
+        },
+        pharos_core::HeartbeatTiming::OnTime => HeartbeatFace {
+            status: format!("On time · {age_text}"),
+            tone: "neutral",
+            explain,
+        },
+    }
 }
 
 pub(super) fn os_badge_markup(icon: &str, health: &HostHealthView) -> String {
@@ -4573,6 +4987,33 @@ pub(super) fn quick_preview_markup(name: &str, nix_icon: &str) -> String {
         r#"<button class="preview-button" type="button" data-host-drawer-trigger aria-haspopup="dialog" aria-controls="host-quick-drawer" aria-expanded="false" title="Quick preview of {name}" aria-label="Quick preview of {name}"><span class="nix" hidden>{nix_icon}</span>{icon}<span>Quick preview</span></button>"#,
         icon = icons::PANEL_RIGHT,
     )
+}
+
+fn configuration_face_label(freshness: &NixFreshness) -> String {
+    if !freshness.applicable || freshness.deployment_evidence.is_none() {
+        return "Configuration not observed".to_string();
+    }
+    let nixpkgs_exact = matches!(
+        freshness
+            .nixpkgs_comparison
+            .as_ref()
+            .map(|comparison| comparison.relation),
+        Some(NixpkgsRevisionRelation::Current)
+    );
+    let nixcfg_exact = matches!(
+        freshness
+            .nixcfg_comparison
+            .as_ref()
+            .map(|comparison| comparison.relation),
+        Some(GitRevisionRelation::Current)
+    );
+    if nixpkgs_exact && nixcfg_exact {
+        "Configuration exact".to_string()
+    } else if freshness.nixpkgs_comparison.is_some() || freshness.nixcfg_comparison.is_some() {
+        "Configuration differs".to_string()
+    } else {
+        "Configuration not observed".to_string()
+    }
 }
 
 pub(super) fn revision_evidence_markup(freshness: &NixFreshness) -> String {
@@ -4668,42 +5109,6 @@ pub(super) fn host_grace_presentation(
         source: policy.source.as_str().to_string(),
         late_after_secs: policy.late_after_secs,
     }
-}
-
-pub(super) fn backup_glyph(level: &str) -> &'static str {
-    match level {
-        "clear" => "check",
-        "warning" => "alert",
-        "critical" => "x",
-        _ => "question",
-    }
-}
-
-pub(super) fn backup_chip_markup(
-    summary: &BackupUiSummary,
-    host: &str,
-    base: &PublicBasePath,
-) -> String {
-    let title = format!("Backup: {} - {}", summary.label, summary.detail);
-    let aria_label = format!("Backup for {host}: {}, {}", summary.label, summary.detail);
-    let hidden = if summary.state == "healthy" {
-        " hidden"
-    } else {
-        ""
-    };
-    format!(
-        r#"<a class="header-chip backup-chip {level}" href="{href}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"{hidden}><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span class="header-chip-label" aria-hidden="true">Backup</span></a>"#,
-        href = app_href(base, &format!("/backups?host={}", url_query_escape(host))),
-        level = html_escape(summary.level),
-        state = html_escape(summary.state),
-        glyph = backup_glyph(summary.level),
-        title = html_escape(&title),
-        aria_label = html_escape(&aria_label),
-        check = icons::SHIELD_CHECK,
-        question = icons::SHIELD_QUESTION,
-        alert = icons::SHIELD_ALERT,
-        x = icons::SHIELD_X,
-    )
 }
 
 pub(super) fn host_actions_markup(
@@ -4897,7 +5302,7 @@ pub(super) fn host_actions_markup(
 
 fn host_quick_drawer(base: &PublicBasePath, can_manage_fleet: bool) -> String {
     format!(
-        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div><div><dt>Health</dt><dd data-host-drawer-health></dd></div><div><dt>Daily backup</dt><dd data-host-drawer-backup></dd></div><div><dt>Restore test</dt><dd data-host-drawer-restore></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="{home}">Open host workspace {arrow}</a></section><section class="host-drawer-evidence" aria-labelledby="host-drawer-evidence-title"><h3 id="host-drawer-evidence-title">Evidence</h3><h4>Heartbeat history</h4><div class="host-drawer-history" data-host-drawer-history></div><h4>Reasons</h4><ul data-host-drawer-reasons></ul><h4>Exact times</h4><p data-host-drawer-backup-time><span data-host-drawer-backup-label data-daily-backup-instant-label>Backup last success</span> <span data-host-drawer-backup-clock></span></p><p data-host-drawer-restore-time><span data-host-drawer-restore-label data-restore-instant-label>Selective restore last success</span> <span data-host-drawer-restore-clock></span></p><h4>Repository check</h4><p data-host-drawer-check></p><h4>Configuration</h4><dl class="host-drawer-config"><div><dt>Summary</dt><dd data-host-drawer-config></dd></div><div><dt>Deployed SHA</dt><dd data-host-drawer-deployed></dd></div><div><dt>nixcfg SHA</dt><dd data-host-drawer-nixcfg></dd></div><div><dt>nixpkgs SHA</dt><dd data-host-drawer-nixpkgs></dd></div></dl></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review settings</button></div><p class="host-drawer-effect">Opens the draft in this host workspace; it does not send or apply changes.</p><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form><section class="host-drawer-grace" data-host-grace aria-label="Heartbeat grace"><h3>Heartbeat grace</h3><p data-grace-source-line></p><p data-grace-rule></p><p data-grace-pending hidden></p><div class="host-drawer-grace-controls"><label>Source <select data-grace-mode{grace_disabled}><option value="inherit">Fleet default</option><option value="override">Override for this host</option></select></label><label>Extra grace after expected heartbeat <input data-grace-seconds-input type="number" min="0" max="3600" step="1" inputmode="numeric"{grace_disabled}></label><button type="button" data-grace-reset{grace_disabled}>Use fleet default</button></div><p>Use fleet default asks this host to inherit the fleet grace. Review that change with the other settings, then apply it. Until the host reports the result, the clock keeps the grace already in effect. A chosen number is an override for this host only.</p></section></div></aside></div>"#,
+        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark data-health-tone="neutral">{server}</span><div class="host-title"><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p class="role" data-host-drawer-role>Not recorded</p><span class="health-label" data-host-drawer-health-label data-health-tone="neutral">Not recorded</span></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="panel host-drawer-posture" aria-labelledby="host-drawer-posture-title"><h2 id="host-drawer-posture-title" data-host-drawer-posture-title>Current observations</h2><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance>Not recorded</p><ul class="host-drawer-reasons" data-host-drawer-reasons><li>Not recorded</li></ul><dl class="evidence-list"><div><dt>Attention</dt><dd data-host-drawer-attention>Not recorded</dd></div><div><dt>Health</dt><dd data-host-drawer-health>Not recorded</dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner>Not recorded</dd></div><div><dt>Next action</dt><dd data-host-drawer-next>Not recorded</dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state>Not recorded</dd></div><div><dt>State</dt><dd data-host-drawer-state>Not recorded</dd></div></dl></section><section class="panel" aria-label="Protection"><h2>Protection</h2><div class="protection-pair"><div class="protection-fact"><span class="fact-label">Daily backup</span><strong class="fact-value" data-host-drawer-backup>Not recorded</strong><span class="fact-note" data-host-drawer-backup-time><span data-host-drawer-backup-label data-daily-backup-instant-label>Backup last success</span> <span data-host-drawer-backup-clock>Not recorded</span></span></div><div class="protection-fact"><span class="fact-label">Monthly restore test</span><strong class="fact-value" data-host-drawer-restore>Not recorded</strong><span class="fact-note" data-host-drawer-restore-time><span data-host-drawer-restore-label data-restore-instant-label>Selective restore last success</span> <span data-host-drawer-restore-clock>Not recorded</span></span></div></div></section><section class="panel" aria-labelledby="host-drawer-heartbeat-title"><h2 id="host-drawer-heartbeat-title">Heartbeat history</h2><div class="host-drawer-history" data-host-drawer-history><p>Not recorded</p></div></section><section class="panel" aria-label="Configuration"><h2>Configuration</h2><dl class="evidence-list"><div><dt>Deployed revision</dt><dd data-host-drawer-deployed>Not recorded</dd></div><div><dt>nixpkgs</dt><dd data-host-drawer-nixpkgs>Not recorded</dd></div><div><dt>nixcfg</dt><dd data-host-drawer-nixcfg>Not recorded</dd></div><div><dt>Summary</dt><dd data-host-drawer-config>Not recorded</dd></div><div><dt>Late-ping grace</dt><dd data-host-drawer-grace>Not recorded</dd></div></dl></section><form class="panel host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review settings</button></div><p class="host-drawer-effect">Opens the draft in this host workspace; it does not send or apply changes.</p><section class="host-drawer-grace" data-host-grace aria-label="Heartbeat grace"><h3>Heartbeat grace</h3><p data-grace-source-line>Not recorded</p><p data-grace-rule>Not recorded</p><p data-grace-pending hidden>Not recorded</p><div class="host-drawer-grace-controls"><label>Source <select data-grace-mode{grace_disabled}><option value="inherit">Fleet default</option><option value="override">Override for this host</option></select></label><label>Extra grace after expected heartbeat <input data-grace-seconds-input type="number" min="0" max="3600" step="1" inputmode="numeric"{grace_disabled}></label><button type="button" data-grace-reset{grace_disabled}>Use fleet default</button></div><p>Use fleet default asks this host to inherit the fleet grace. Review that change with the other settings, then apply it. Until the host reports the result, the clock keeps the grace already in effect. A chosen number is an override for this host only.</p></section><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form><a class="host-drawer-workspace" data-host-drawer-workspace href="{home}">Open full host page {arrow}</a><section class="panel host-drawer-evidence" aria-label="Repository check"><h2>Repository check</h2><p data-host-drawer-check>Not recorded</p></section></div></aside></div>"#,
         can_manage = can_manage_fleet,
         grace_disabled = if can_manage_fleet { "" } else { " disabled" },
         server = icons::SERVER,
@@ -6912,7 +7317,7 @@ pub(super) fn render_setup_row(
         String::new()
     };
     format!(
-        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention"><div class="reason {reason_level}" data-reason><span>{reason}</span></div></div></td><td><div class="list-setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div></td><td><div class="list-seen"><span>{started}</span></div></td><td><span class="list-setup-state">{job_state}</span></td><td><div class="list-actions">{action}</div></td></tr>"#,
+        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention"><div class="reason {reason_level}" data-reason><span>{reason}</span></div></div></td><td><div class="list-setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div></td><td><span class="list-setup-state">{job_state}</span></td><td><div class="list-seen"><span>{started}</span></div></td><td><div class="list-actions">{action}</div></td></tr>"#,
         sort_name = html_escape(&raw_name.to_lowercase()),
         updated_at = job.updated_at,
         reason = html_escape(&reason),
@@ -10147,7 +10552,6 @@ pub(super) fn render_home_with_grace(
             icons::SERVER
         };
         let name = html_escape(&h.name);
-        let role = html_escape(&h.role);
         let fresh_tldr = h.freshness.tldr();
         let list_fresh = freshness_markup(
             &h.freshness,
@@ -10176,7 +10580,6 @@ pub(super) fn render_home_with_grace(
         let attention_hidden =
             scan_attention_hidden(&attention.label, kernel_required, freshness_is_attention);
         let card_reason = reason_markup(&attention, attention_hidden);
-        let list_reason = reason_markup(&attention, attention_hidden);
         let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
         let (card_fresh, card_fresh_visible) = card_freshness_fault_markup(
@@ -10187,15 +10590,10 @@ pub(super) fn render_home_with_grace(
             h.preferences
                 .nixpkgs_warn_after_days(Some(runtime.nixpkgs_warn_after_days)),
         );
-        let backup_chip = backup_chip_markup(&backup, &h.name, shell.public_base_path);
         let protection = protection_onboarding_status(h, runtime.jobs, now);
         let protection_card = protection
             .as_ref()
             .map(|status| protection_onboarding_markup(status, ""))
-            .unwrap_or_default();
-        let protection_list = protection
-            .as_ref()
-            .map(|status| protection_onboarding_markup(status, "protection-list"))
             .unwrap_or_default();
         let mut search_parts = vec![format!(
             "{} {} {} {}",
@@ -10468,8 +10866,7 @@ pub(super) fn render_home_with_grace(
                 None
             },
         );
-        let card_lifecycle_chip = chip.clone();
-        let row_lifecycle_chip = chip;
+        let lifecycle_chip = chip;
         let drag_action = format!(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP
@@ -10480,16 +10877,10 @@ pub(super) fn render_home_with_grace(
         let list_fresh = mark_scan_duplicate_chip(&list_fresh, &health.summary);
         let card_fresh_visible = card_fresh_visible && scan_rail_shows_chip(&card_fresh);
         let card_fresh_hidden = if card_fresh_visible { "" } else { " hidden" };
-        let health_html = health_scan_markup(&health);
-        let assurance_html = protection_scan_markup(&assurance, &h.name, shell.public_base_path);
         let badge = os_badge_markup(nix_icon, &health);
         let preview = quick_preview_markup(&name, nix_icon);
         let card_revision = revision_evidence_markup(&h.freshness);
-        let config_summary = html_escape(&h.freshness.tldr());
-        let card_identity = format!(
-            r#"<div class="harbor-identity">{badge}<div class="host-title"><h2><a class="host-name name" href="{settings_href}" title="{name}">{name}</a></h2><span class="role">{role}</span></div></div>"#,
-        );
-        let row_identity = card_identity.clone();
+        let configuration_label = html_escape(&configuration_face_label(&h.freshness));
         let grace_view = host_grace_presentation(
             &h.preferences,
             h.requested_preferences.as_ref(),
@@ -10537,12 +10928,43 @@ pub(super) fn render_home_with_grace(
         let row_cls = format!("{light_cls}{settings_cls} harbor-host")
             .trim()
             .to_string();
+        let role_line = html_escape(&card_role_line(h.preferences.kind, &h.role));
+        let health_label_text = html_escape(health.label);
+        let onboarding_extra = protection
+            .as_ref()
+            .filter(|status| status.level != "clear")
+            .map(|status| status.label.clone())
+            .unwrap_or_default();
+        let attention_extra = html_escape(&onboarding_extra);
+        let attention_html = card_attention_block(
+            &health,
+            &lifecycle_chip,
+            &lifecycle.label,
+            &onboarding_extra,
+            &muted,
+        );
+        let protection_html = protection_card_markup(&assurance, &h.name, shell.public_base_path);
+        let list_protection =
+            list_protection_markup(&assurance, &h.name, shell.public_base_path, now);
+        let face = heartbeat_face(h.last_seen, now, interval, grace_view.effective_secs);
+        let heartbeat_status = html_escape(&face.status);
+        let heartbeat_explain = html_escape(&face.explain);
+        let heartbeat_tone = face.tone;
+        let window_start = format!("{} ago", SIGNAL_DEFAULT_WINDOW_LABEL);
+        let delivery_text = html_escape(&if heartbeat_signal.text == "—" {
+            "No delivery data".to_string()
+        } else {
+            format!(
+                "{} delivered · {}",
+                heartbeat_signal.text, SIGNAL_DEFAULT_WINDOW_LABEL
+            )
+        });
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls} harbor-host" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}>{beam}<header class="card-head">{card_identity}<div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}{health_html}{assurance_html}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}<div class="harbor-card-foot">{card_revision}{preview}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls} harbor-host" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime" data-attention-extra="{attention_extra}"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}>{beam}<header class="card-head host-heading">{badge}<div class="host-title"><h2><a class="host-name name" href="{settings_href}" title="{name}">{name}</a></h2><p class="role">{role_line}</p></div><span class="health-label" data-health-label data-health-tone="{health_tone}">{health_label_text}</span><div class="card-actions">{drag_action}{card_host_actions}</div></header>{attention_html}{protection_html}<div class="heartbeat"><div class="heartbeat-heading"><span>Heartbeat</span><strong class="{heartbeat_tone}" data-heartbeat-status data-heartbeat-tone="{heartbeat_tone}">{heartbeat_status}</strong></div>{card_heartbeat}<p class="heartbeat-explain" data-heartbeat-explain title="{heartbeat_explain}">{heartbeat_explain}</p><div class="heartbeat-axis"><span data-heartbeat-window-start>{window_start}</span><span class="delivery" data-heartbeat-delivery>{delivery_text}</span><span>Now</span></div></div><div class="harbor-card-foot"><a class="configuration" href="{settings_href}" data-configuration-label>{configuration_label}</a>{preview}</div><div class="scan-store" hidden>{card_reason}{protection_card}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div><div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_revision}</div></article>"#,
             live_key = live_key(live),
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}><td>{row_identity}</td><td><div class="list-attention">{row_lifecycle_chip}{list_reason}{muted}{health_html}{assurance_html}{protection_list}</div></td><td><details class="revision-evidence" data-revision-evidence><summary title="{config_summary}"><span data-config-summary>{config_summary}</span></summary><div class="revision-panel"><div class="fresh" data-fresh>{list_fresh}</div></div></details></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}{preview}</div></td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime" data-attention-extra="{attention_extra}"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}><td><div class="host-heading list-host">{badge}<div class="host-title"><h2><a class="host-name name" href="{settings_href}" title="{name}">{name}</a></h2><p class="role">{role_line}</p><span class="health-label" data-health-label data-health-tone="{health_tone}">{health_label_text}</span></div></div></td><td><div class="list-attention">{attention_html}</div></td><td>{list_protection}</td><td class="list-heartbeat">{list_heartbeat}<div class="list-signal">{signal}</div><div class="scan-store" hidden>{card_reason}<div class="fresh" data-fresh>{list_fresh}</div>{card_revision}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-actions">{preview}{row_host_actions}{settings_action}</div></td></tr>"#,
             live_key = live_key(live),
         ));
     }
@@ -10584,7 +11006,7 @@ pub(super) fn render_home_with_grace(
 
     let head = document_head(shell.public_base_path);
     format!(
-        "{head}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{access_path}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{host_drawer}{action_dialog}{FOOT}",
+        "{head}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{access_path}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\" role=\"region\" aria-label=\"Host list, scroll horizontally on small screens\" tabindex=\"0\"><table class=\"list\"><caption class=\"list-caption\">Fleet health, attention, backup and restore, heartbeat, last seen, and actions</caption><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"protection-col\"><col class=\"heartbeat-col\"><col class=\"seen-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host and health</th><th scope=\"col\">Attention</th><th scope=\"col\">Backup and restore</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Last seen</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section><p class=\"table-scroll-note\">Scroll the list horizontally for more columns. Cards fit smaller screens.</p>{lone}</main>{assistant}{host_drawer}{action_dialog}{FOOT}",
         sidebar = sidebar(shell.public_base_path, shell.user_label, shell.logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),

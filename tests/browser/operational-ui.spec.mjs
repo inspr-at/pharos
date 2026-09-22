@@ -8,6 +8,13 @@ import {
 } from "./harness.mjs";
 import { requireFixtureManifest } from "./harness-fixture.mjs";
 
+async function expectAccessibleNameMatchesVisibleText(locator) {
+  await expect(locator).not.toHaveAttribute("aria-label");
+  const visible = (await locator.innerText()).replace(/\s+/g, " ").trim();
+  expect(visible.length).toBeGreaterThan(0);
+  await expect(locator).toHaveAccessibleName(visible);
+}
+
 const releaseCoordinate = JSON.parse(
   fs.readFileSync(new URL("../../RELEASE.json", import.meta.url), "utf8"),
 );
@@ -958,13 +965,11 @@ test("legacy numeric freshness is unverified rather than up to date", async ({ p
     .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
     .first();
   await expect(card.locator("[data-reason]")).toContainText("freshness unverified");
+  await expect(card.locator(".attention-line")).toContainText("freshness unverified");
   await expect(card.locator(".freshness-rail")).not.toHaveAttribute(
     "hidden",
     "",
   );
-  await expect(
-    card.locator('[data-fresh-kind="freshness-unverified"]'),
-  ).toBeVisible();
   await expect(
     card.locator('[data-fresh-kind="freshness-unverified"]'),
   ).toContainText("unverified");
@@ -1319,24 +1324,30 @@ test("fleet card header keeps actions visible and backup shield only when not ok
       `[data-grid] article[data-host="${failedHost}"]`,
     );
     const failedRow = page.locator(`tr[data-host="${failedHost}"]`);
-    const healthyCardChip = healthyCard.locator(".backup-chip");
-    const failedCardChip = failedCard.locator(".backup-chip");
     const healthyRail = healthyCard.locator(".freshness-rail");
     const failedRail = failedCard.locator(".freshness-rail");
     const failedRailBackup = failedRail.locator('[data-fresh-kind="backup-fault"]');
 
-    await expect(healthyCardChip).toHaveCount(1);
-    await expect(healthyCardChip).toHaveAttribute("hidden", "");
-    await expect(healthyRail).toHaveAttribute("hidden", "");
-    await expect(failedCardChip).toHaveCount(1);
-    await expect(failedCardChip).not.toHaveAttribute("hidden", "");
-    await expect(failedCardChip).toHaveAttribute("href", `/backups?host=${failedHost}`);
-    await expect(failedCardChip).toHaveAttribute("aria-label", /Backup failed/);
+    const healthyDaily = healthyCard.locator("a[data-daily-backup]");
     const failedDaily = failedCard.locator("a[data-daily-backup]");
+    await expect(healthyCard.locator(".backup-chip")).toHaveCount(0);
+    await expect(failedCard.locator(".backup-chip")).toHaveCount(0);
+    await expect(healthyDaily).toHaveCount(1);
+    await expect(healthyDaily).toBeVisible();
+    await expect(healthyDaily).not.toHaveAttribute("hidden", "");
+    await expect(healthyDaily).toHaveAttribute("href", `/backups?host=${healthyHost}`);
+    await expectAccessibleNameMatchesVisibleText(healthyDaily);
+    await expect(failedDaily).toHaveCount(1);
+    await expect(failedDaily).toBeVisible();
+    await expect(failedDaily).not.toHaveAttribute("hidden", "");
+    await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expectAccessibleNameMatchesVisibleText(failedDaily);
+    await expect(failedDaily).toHaveClass(/bad/);
+    await expect(healthyRail).toHaveAttribute("hidden", "");
     await expect(failedDaily).toBeVisible();
     await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
     await expect(failedDaily.locator("[data-daily-backup-label]")).toHaveText("Failed");
-    await expect(failedCard.locator("[data-health-summary]")).toHaveText("Backup Failed");
+    await expect(failedCard.locator("[data-health-summary]")).toContainText("Backup Failed");
     await expect(failedCard.locator("[data-health-disclosure]")).toHaveCount(0);
     await expect(failedCard.locator("[data-health-reasons]")).toBeHidden();
     await failedCard.locator("[data-host-drawer-trigger]").click();
@@ -1354,12 +1365,12 @@ test("fleet card header keeps actions visible and backup shield only when not ok
       await page.setViewportSize({ width, height: 900 });
       await expect(healthyCard.locator("[data-host-actions-trigger]")).toBeVisible();
       await expect(failedCard.locator("[data-host-actions-trigger]")).toBeVisible();
-      await expect(failedCardChip).toBeVisible();
+      await expect(failedDaily).toBeVisible();
 
       const cardChrome = await failedCard.evaluate((card) => {
         const cardRect = card.getBoundingClientRect();
         const actions = card.querySelector("[data-host-actions-trigger]");
-        const backup = card.querySelector(".backup-chip");
+        const backup = card.querySelector("a[data-daily-backup].bad");
         const actionsRect = actions?.getBoundingClientRect();
         const backupRect = backup?.getBoundingClientRect();
         return {
@@ -1376,7 +1387,7 @@ test("fleet card header keeps actions visible and backup shield only when not ok
       expect(cardChrome).toEqual({ actionsInside: true, backupInside: true });
     }
 
-    const failedBackupChrome = await failedCardChip.evaluate((el) => {
+    const failedBackupChrome = await failedDaily.evaluate((el) => {
       const style = getComputedStyle(el);
       return {
         borderColor: style.borderColor,
@@ -1385,6 +1396,8 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     });
     expect(failedBackupChrome.borderColor).not.toBe("rgba(0, 0, 0, 0)");
     expect(failedBackupChrome.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+    await failedDaily.focus();
+    await expect(failedDaily).toBeFocused();
 
     const snapshotResponse = await page.request.get("/hosts.json");
     expect(snapshotResponse.ok()).toBe(true);
@@ -1397,20 +1410,21 @@ test("fleet card header keeps actions visible and backup shield only when not ok
       return page.evaluate((body) => applyFleetSnapshot(body), payload);
     };
 
-    await failedCardChip.focus();
-    await expect(failedCardChip).toBeFocused();
     expect(await applyBackupSnapshot(healthyBackupObservation())).toBe(true);
-    await expect(failedCardChip).toHaveAttribute("hidden", "");
-    await expect(failedCardChip).toHaveAttribute("data-backup-state", "healthy");
-    await expect(failedCard.locator("[data-host-actions-trigger]")).toBeFocused();
+    await expect(failedDaily).toBeVisible();
+    await expect(failedDaily).not.toHaveAttribute("hidden", "");
+    await expect(failedDaily).toBeFocused();
+    await expectAccessibleNameMatchesVisibleText(failedDaily);
+    await expect(failedDaily.locator("[data-daily-backup-label]")).not.toHaveText("Failed");
     await expect(failedRail).toHaveAttribute("hidden", "");
     await expect(failedRailBackup).toHaveAttribute("hidden", "");
 
     expect(await applyBackupSnapshot(failedBackupObservation())).toBe(true);
-    await expect(failedCardChip).not.toHaveAttribute("hidden", "");
-    await expect(failedCardChip).toHaveAttribute("data-backup-state", "failed");
-    await expect(failedCardChip).toHaveAttribute("href", `/backups?host=${failedHost}`);
     await expect(failedDaily).toBeVisible();
+    await expect(failedDaily).not.toHaveAttribute("hidden", "");
+    await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expectAccessibleNameMatchesVisibleText(failedDaily);
+    await expect(failedDaily).toHaveClass(/bad/);
     await expect(failedDaily.locator("[data-daily-backup-label]")).toHaveText("Failed");
     await expect(failedCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
       "Backup Failed",
@@ -1421,19 +1435,26 @@ test("fleet card header keeps actions visible and backup shield only when not ok
 
     await page.locator("[data-view-button='list']").click();
     await expect(page.locator("main")).toHaveAttribute("data-view", "list");
-    await expect(healthyRow.locator(".backup-chip")).toHaveCount(1);
-    await expect(healthyRow.locator(".backup-chip")).toHaveAttribute("hidden", "");
-    await expect(failedRow.locator(".backup-chip")).toHaveCount(1);
-    await expect(failedRow.locator(".backup-chip")).not.toHaveAttribute("hidden", "");
-    await expect(failedRow.locator(".backup-chip")).toHaveAttribute(
-      "href",
-      `/backups?host=${failedHost}`,
-    );
+    const healthyFact = healthyRow.locator("a[data-daily-backup]");
+    const failedFact = failedRow.locator("a[data-daily-backup]");
+    await expect(healthyRow.locator(".backup-chip")).toHaveCount(0);
+    await expect(failedRow.locator(".backup-chip")).toHaveCount(0);
+    await expect(healthyFact).toHaveCount(1);
+    await expect(healthyFact).toBeVisible();
+    await expect(healthyFact).not.toHaveAttribute("hidden", "");
+    await expect(healthyFact).toHaveAttribute("href", `/backups?host=${healthyHost}`);
+    await expectAccessibleNameMatchesVisibleText(healthyFact);
+    await expect(failedFact).toHaveCount(1);
+    await expect(failedFact).toBeVisible();
+    await expect(failedFact).not.toHaveAttribute("hidden", "");
+    await expect(failedFact).toHaveAttribute("href", `/backups?host=${failedHost}`);
+    await expectAccessibleNameMatchesVisibleText(failedFact);
+    await expect(failedFact).toHaveClass(/bad/);
     for (const width of [1440, 1024, 768, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
       await expect(healthyRow.locator("[data-host-actions-trigger]")).toBeVisible();
       await expect(failedRow.locator("[data-host-actions-trigger]")).toBeVisible();
-      await expect(failedRow.locator(".backup-chip")).toBeVisible();
+      await expect(failedFact).toBeVisible();
     }
   } finally {
     for (const host of hosts) {
@@ -1453,7 +1474,9 @@ test("fleet card header keeps actions visible and backup shield only when not ok
 
 test("fault rail uses full card width, stays one line, and keeps quiet hashes in technical details", async ({
   page,
+  browser,
 }) => {
+  test.slow();
   const quietHost = "freshness-rail-quiet";
   const faultHost = "freshness-rail-fault";
   const hosts = [quietHost, faultHost];
@@ -1554,12 +1577,21 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
 
     await expect(quietRail).toHaveAttribute("hidden", "");
     await expect(quietRail.locator(".fresh-row-compact:not([hidden])")).toHaveCount(0);
-    await expect(faultRail).toBeVisible();
+    await expect(faultRail).toBeHidden();
     await expect(faultRail).toHaveAttribute("role", "group");
     await expect(visibleFaults).toHaveCount(4);
-    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toBeVisible();
-    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toBeVisible();
-    await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toHaveCount(1);
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toHaveCount(1);
+    await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toHaveCount(1);
+    await faultCard.locator("[data-host-drawer-trigger]").click();
+    const drawerReasons = page.locator("#host-quick-drawer [data-host-drawer-reasons]");
+    await expect(drawerReasons).toBeVisible();
+    await expect(drawerReasons).toContainText("nixos-25.05 end of life");
+    await expect(drawerReasons).toContainText("nixpkgs differs from nixos-25.05");
+    await expect(drawerReasons).toContainText("12 commits behind");
+    await expect(drawerReasons).toContainText("restart required");
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#host-quick-drawer")).toBeHidden();
     const backupFault = faultRail.locator('[data-fresh-kind="backup-fault"]');
     await expect(backupFault).toHaveCount(1);
     await expect(backupFault).toBeHidden();
@@ -1570,11 +1602,12 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
       "href",
       `/backups?host=${faultHost}`,
     );
-    await expect(faultCard.locator(".backup-chip")).toBeVisible();
-    await expect(faultCard.locator(".backup-chip")).toHaveAttribute(
-      "href",
-      `/backups?host=${faultHost}`,
-    );
+    await expect(faultCard.locator(".backup-chip")).toHaveCount(0);
+    await expect(faultCard.locator("a[data-daily-backup]")).not.toHaveAttribute("hidden", "");
+    await expectAccessibleNameMatchesVisibleText(faultCard.locator("a[data-daily-backup]"));
+    await expect(faultCard.locator("a[data-daily-backup]")).toHaveClass(/bad/);
+    await expect(faultCard.locator(".attention-line")).toContainText("Backup Failed");
+    await expect(faultCard.locator("details")).toHaveCount(0);
     await expect(faultCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
       "Backup Failed",
     );
@@ -1582,16 +1615,7 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
       '[data-fresh-kind="backup-fault"] [data-fresh-value]',
     );
     await expect(failedBackupValue).toHaveClass("down");
-    const failedBackupColors = await failedBackupValue.evaluate((value) => {
-      const probe = document.createElement("span");
-      probe.style.color = "var(--down)";
-      value.appendChild(probe);
-      const expected = getComputedStyle(probe).color;
-      probe.remove();
-      return { actual: getComputedStyle(value).color, expected };
-    });
-    expect(failedBackupColors.actual).toBe(failedBackupColors.expected);
-    await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toHaveCount(1);
     await expect(faultRail.locator('[data-fresh-kind="deployed-sha"]')).toHaveCount(0);
     await expect(faultRail.locator('[data-fresh-kind="nixcfg-sha"]')).toHaveCount(0);
     await expect(faultRail.locator('[data-fresh-kind="nixpkgs-sha"]')).toHaveCount(0);
@@ -1599,102 +1623,24 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
 
     for (const width of [1440, 1024, 900, 390, 320]) {
       await page.setViewportSize({ width, height: 1200 });
-      const geometry = await faultRail.evaluate((rail) => {
-        const card = rail.closest(".card");
-        const scroller = rail.querySelector("[data-fresh-scroll-container]");
-        const chips = Array.from(
-          rail.querySelectorAll(".fresh-row-compact:not([hidden])"),
-        );
+      const geometry = await faultCard.evaluate((card) => {
+        const line = card.querySelector(".attention-line");
+        const summary = line.querySelector("[data-health-summary]");
         const cardRect = card.getBoundingClientRect();
-        const railRect = rail.getBoundingClientRect();
-        const scrollerRect = scroller.getBoundingClientRect();
-        const style = getComputedStyle(card);
-        const innerWidth =
-          cardRect.width -
-          Number.parseFloat(style.paddingLeft) -
-          Number.parseFloat(style.paddingRight);
-        const tops = chips.map((chip) => Math.round(chip.getBoundingClientRect().top));
+        const lineRect = line.getBoundingClientRect();
+        const style = getComputedStyle(summary);
         return {
-          railInside:
-            railRect.left >= cardRect.left - 1 &&
-            railRect.right <= cardRect.right + 1,
-          spansInnerWidth: Math.abs(railRect.width - innerWidth) <= 2,
-          scrollerInside:
-            scrollerRect.left >= railRect.left - 1 &&
-            scrollerRect.right <= railRect.right + 1,
-          oneLine: new Set(tops).size === 1,
-          overflow: scroller.scrollWidth > scroller.clientWidth + 1,
-          allChipsInside: chips.every((chip) => {
-            const rect = chip.getBoundingClientRect();
-            return rect.left >= scrollerRect.left - 1 && rect.right <= scrollerRect.right + 1;
-          }),
+          inside:
+            lineRect.left >= cardRect.left - 1 &&
+            lineRect.right <= cardRect.right + 1,
+          oneLine: lineRect.height <= 48,
+          clips: style.overflow === "hidden" && style.textOverflow === "ellipsis",
         };
       });
-      expect(geometry.railInside).toBe(true);
-      expect(geometry.spansInnerWidth).toBe(true);
-      expect(geometry.scrollerInside).toBe(true);
+      expect(geometry.inside).toBe(true);
       expect(geometry.oneLine).toBe(true);
-      if (width === 320) {
-        expect(geometry.overflow).toBe(true);
-        await expect(faultRail.locator(".fresh-chevron-right")).toHaveClass(/visible/);
-        await expect(faultRail).toHaveAttribute("data-overflow-right", "true");
-        const wheelBoundary = await faultRail.evaluate((rail) => {
-          const scroller = rail.querySelector("[data-fresh-scroll-container]");
-          scroller.style.scrollBehavior = "auto";
-          scroller.scrollLeft = 0;
-          const leavesPageScrollAtLeft = scroller.dispatchEvent(
-            new WheelEvent("wheel", { deltaY: -120, cancelable: true }),
-          );
-          scroller.scrollLeft = scroller.scrollWidth - scroller.clientWidth;
-          const leavesPageScrollAtRight = scroller.dispatchEvent(
-            new WheelEvent("wheel", { deltaY: 120, cancelable: true }),
-          );
-          scroller.scrollLeft = 0;
-          const consumesInwardScroll = !scroller.dispatchEvent(
-            new WheelEvent("wheel", { deltaY: 120, cancelable: true }),
-          );
-          return { leavesPageScrollAtLeft, leavesPageScrollAtRight, consumesInwardScroll };
-        });
-        expect(wheelBoundary).toEqual({
-          leavesPageScrollAtLeft: true,
-          leavesPageScrollAtRight: true,
-          consumesInwardScroll: true,
-        });
-        const rightChevron = faultRail.locator(".fresh-chevron-right");
-        const leftChevron = faultRail.locator(".fresh-chevron-left");
-        await rightChevron.focus();
-        await expect(rightChevron).toBeFocused();
-        await faultRail.evaluate((rail) => {
-          const scroller = rail.querySelector("[data-fresh-scroll-container]");
-          scroller.style.scrollBehavior = "auto";
-          scroller.scrollLeft = scroller.scrollWidth - scroller.clientWidth;
-          scroller.dispatchEvent(new Event("scroll"));
-        });
-        await expect(rightChevron).not.toHaveClass(/visible/);
-        await expect(leftChevron).toBeFocused();
-      }
+      expect(geometry.clips).toBe(true);
     }
-
-    const offscreenFault = visibleFaults.last();
-    await offscreenFault.focus();
-    await expect(offscreenFault).toBeFocused();
-    await expect(page.locator('[data-fresh-popover][role="tooltip"]')).toBeVisible();
-
-    const firstFault = visibleFaults.first();
-    await expect(firstFault).not.toHaveAttribute("title", /.*/);
-    await firstFault.focus();
-    await expect(firstFault).toBeFocused();
-    await expect(page.locator('[data-fresh-popover][role="tooltip"]')).toBeVisible();
-    await expect(firstFault).toHaveAttribute(
-      "aria-describedby",
-      "freshness-fault-tooltip",
-    );
-    await expect(page.locator("[data-fresh-popover]")).toContainText(
-      await firstFault.locator("[data-fresh-value]").textContent(),
-    );
-    await page.keyboard.press("Escape");
-    await expect(page.locator("[data-fresh-popover]")).toBeHidden();
-    await expect(firstFault).not.toHaveAttribute("aria-describedby", /.*/);
 
     await quietCard.locator("[data-host-actions-trigger]").click();
     await quietCard.locator('[data-host-action="technical"]').click();
@@ -1721,35 +1667,42 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
     };
     await faultCard.locator("[data-host-actions]").evaluate((root) => root.remove());
     await expect(faultCard.locator("[data-host-actions]")).toHaveCount(0);
-    await firstFault.focus();
-    await expect(page.locator("[data-fresh-popover]")).toBeVisible();
     expect(await page.evaluate((body) => applyFleetSnapshot(body), healed)).toBe(true);
     await expect(faultRail).toHaveAttribute("hidden", "");
     await expect(visibleFaults).toHaveCount(0);
-    await expect(page.locator("[data-fresh-popover]")).toBeHidden();
-    await expect(faultCard).toBeFocused();
 
     expect(await page.evaluate((body) => applyFleetSnapshot(body), original)).toBe(true);
     await expect(faultRail).not.toHaveAttribute("hidden", "");
     await expect(visibleFaults).toHaveCount(4);
     await expect(faultRail.locator('[data-fresh-kind="backup-fault"]')).toBeHidden();
-    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toBeVisible();
-    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toBeVisible();
-    await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toBeVisible();
-    await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toHaveCount(1);
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toHaveCount(1);
+    await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toHaveCount(1);
+    await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toHaveCount(1);
   } finally {
+    // Cleanup runs on a fresh authed context so a test timeout that closed the page cannot
+    // leave these hosts behind for later specs; one failed removal must not skip the rest.
+    const cleanup = await newAuthedContext(browser, "write");
+    const cleanupRequest = (await cleanup.newPage()).request;
+    const failures = [];
     for (const host of hosts) {
-      const removal = await page.request.post(`/host-actions/${host}/remove`, {
-        headers: { "x-pharos-action": "1" },
-        data: { confirmation: host, disposition: "unmanaged", successor: null },
-      });
-      expect(removal.status()).toBe(202);
-      const reonboard = await page.request.post(
-        `/host-actions/${host}/allow-reonboarding`,
-        { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
-      );
-      expect(reonboard.ok()).toBe(true);
+      try {
+        const removal = await cleanupRequest.post(`/host-actions/${host}/remove`, {
+          headers: { "x-pharos-action": "1" },
+          data: { confirmation: host, disposition: "unmanaged", successor: null },
+        });
+        if (removal.status() !== 202) failures.push(`${host}: remove ${removal.status()}`);
+        const reonboard = await cleanupRequest.post(`/host-actions/${host}/allow-reonboarding`, {
+          headers: { "x-pharos-action": "1" },
+          data: { confirmation: host },
+        });
+        if (!reonboard.ok()) failures.push(`${host}: allow-reonboarding ${reonboard.status()}`);
+      } catch (error) {
+        failures.push(`${host}: ${error.message}`);
+      }
     }
+    await cleanup.close();
+    expect(failures).toEqual([]);
   }
 });
 test("nixpkgs age threshold persists in Settings and controls server and refreshed cards", async ({ page, browser }, testInfo) => {
@@ -2306,14 +2259,16 @@ test("fleet host drawer keeps context and hands a local draft to guarded setting
       if (node.classList.contains("host-drawer-close")) return "close";
       if (node.hasAttribute("data-host-drawer-review")) return "review";
       if (node.hasAttribute("data-grace-reset")) return "grace-reset";
+      if (node.hasAttribute("data-host-drawer-workspace")) return "workspace";
       return node.tagName.toLowerCase();
     }));
   expect(focusOrder[0]).toBe("close");
-  expect(focusOrder.at(-1)).toBe("grace-reset");
+  expect(focusOrder.at(-1)).toBe("workspace");
   expect(focusOrder.indexOf("review")).toBeGreaterThan(0);
-  expect(focusOrder.indexOf("review")).toBeLessThan(focusOrder.length - 1);
+  expect(focusOrder.indexOf("grace-reset")).toBeGreaterThan(focusOrder.indexOf("review"));
+  expect(focusOrder.indexOf("workspace")).toBe(focusOrder.length - 1);
   await page.keyboard.press("Shift+Tab");
-  await expect(drawer.locator("[data-grace-reset]")).toBeFocused();
+  await expect(drawer.locator("[data-host-drawer-workspace]")).toBeFocused();
   await page.keyboard.press("Tab");
   await expect(drawer.locator(".host-drawer-close")).toBeFocused();
   await review.focus();

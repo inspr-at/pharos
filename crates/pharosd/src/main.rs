@@ -6368,6 +6368,7 @@ mod tests {
         assert!(html.contains(
             r#"<span data-signal-percent>100%</span><span class="signal-orb" aria-hidden="true"></span><button class="signal-window""#
         ));
+        assert!(html.contains(r#"<div class="list-signal"><span class="signal" data-signal"#));
         assert!(html.contains(r#"<button class="signal-window" type="button" data-signal-window"#));
         assert!(html.contains(r#"data-signal-window-key="10m""#));
         assert!(html.contains(r#"data-signal-kind="delivery""#));
@@ -6534,66 +6535,20 @@ mod tests {
             true,
         );
 
-        assert!(html.contains(r#"data-backup-state="healthy""#));
-        assert_eq!(
-            html.matches(r#"data-backup-state="healthy" data-backup-level="clear""#)
-                .count(),
-            2
-        );
-        assert!(html.contains(
-            r#"aria-label="Backup for athena: Protected, last success 2m 00s ago" hidden>"#
-        ));
+        assert_eq!(html.matches(r#"class="header-chip backup-chip"#).count(), 0);
         assert!(html.contains(r#"href="/backups?host=athena""#));
-        assert!(html.contains(r#"data-backup-level="clear" data-backup-glyph="check""#));
-        assert!(
-            html.contains(r#"aria-label="Backup for athena: Protected, last success 2m 00s ago""#)
-        );
+        assert!(!html.contains(r#"aria-label="Backup healthy for athena""#));
+        assert!(html.contains("Daily backup"));
+        assert!(html.contains(r#"class="row-fact protection-fact good""#));
+        assert!(html.contains(r#"<span class="row-fact-k">Daily:</span>"#));
+        assert!(html.contains(r#"data-daily-backup-label>OK · 2m</strong>"#));
         assert!(!html.contains(r#"class="backup-mini backup-list clear""#));
+        assert!(html.contains(r#"<div class="list-actions">"#));
         assert!(
-            html.contains(r#"<div class="list-actions"><a class="header-chip backup-chip clear""#)
+            !html.contains(r#"<div class="list-actions"><a class="header-chip backup-chip clear""#)
         );
         assert!(html.contains("off-box repository"));
         assert!(!html.contains("restic-main-repository"));
-    }
-
-    #[test]
-    fn backup_chip_maps_posture_to_distinct_glyphs() {
-        let cases = [
-            (BackupPostureState::Healthy, "clear", "check"),
-            (BackupPostureState::Unknown, "watch", "question"),
-            (BackupPostureState::Stale, "warning", "alert"),
-            (BackupPostureState::Failed, "critical", "x"),
-        ];
-
-        for (state, level, glyph) in cases {
-            let summary = backup_ui_summary(&[backup_observation(state)], 1_700_000_120);
-            let html = backup_chip_markup(&summary, "athena", &PublicBasePath::ROOT);
-            assert!(html.contains(&format!(r#"class="header-chip backup-chip {level}""#)));
-            assert!(html.contains(&format!(r#"data-backup-glyph="{glyph}""#)));
-            assert!(html.contains(r#"href="/backups?host=athena""#));
-            assert!(html.contains(
-                r#"<span class="header-chip-label" aria-hidden="true">Backup</span></a>"#
-            ));
-        }
-        let healthy_html = backup_chip_markup(
-            &backup_ui_summary(
-                &[backup_observation(BackupPostureState::Healthy)],
-                1_700_000_120,
-            ),
-            "athena",
-            &PublicBasePath::ROOT,
-        );
-        assert!(healthy_html.contains(r#"data-backup-state="healthy""#));
-        assert!(healthy_html.contains(" hidden>"));
-        let failed_html = backup_chip_markup(
-            &backup_ui_summary(
-                &[backup_observation(BackupPostureState::Failed)],
-                1_700_000_120,
-            ),
-            "athena",
-            &PublicBasePath::ROOT,
-        );
-        assert!(!failed_html.contains(" hidden>"));
     }
 
     #[test]
@@ -6602,10 +6557,6 @@ mod tests {
         assert!(HEAD.contains(".header-chip:hover,.header-chip:focus-visible{width:86px"));
         assert!(HEAD.contains(".header-chip-label{display:block;max-width:0;opacity:0"));
         assert!(HEAD.contains(".header-chip:hover .header-chip-label,.header-chip:focus-visible .header-chip-label{max-width:58px;opacity:1"));
-        assert!(HEAD.contains(".backup-chip[hidden]{display:none}"));
-        assert!(!HEAD.contains(
-            ".card .backup-chip:not(:hover):not(:focus-visible){border-color:transparent;background:transparent;box-shadow:none}"
-        ));
         assert!(HEAD.contains(
             ".host-actions-trigger{color:#4c6780;border-color:rgba(188,211,222,.92);background:rgba(255,255,255,.88)"
         ));
@@ -6653,25 +6604,20 @@ mod tests {
                 .count(),
             4
         );
-        assert_eq!(
-            html.matches(r#"class="header-chip backup-chip clear""#)
-                .count(),
-            2
-        );
-        assert_eq!(
-            html.matches(r#"class="header-chip backup-chip critical""#)
-                .count(),
-            2
-        );
-        assert!(html.contains(
-            r#"aria-label="Backup for healthy-header: Protected, last success 2m 00s ago" hidden>"#
-        ));
+        assert_eq!(html.matches(r#"class="header-chip backup-chip"#).count(), 0);
+        assert!(!html.contains(r#"aria-label="Backup healthy for healthy-header""#));
+        assert!(!html.contains(r#"aria-label="Backup failed for failed-header""#));
+        assert!(html.contains(r#"data-daily-backup-label>Failed</strong>"#));
+        assert!(html.contains(r#"href="/backups?host=healthy-header""#));
+        assert!(html.contains(r#"href="/backups?host=failed-header""#));
+        assert!(html.contains(r#"class="row-fact protection-fact bad""#));
         let failed_card = rendered_card(&html, "failed-header");
-        let failed_chip = failed_card
-            .split_once(r#"class="header-chip backup-chip critical""#)
-            .map(|(_, tail)| tail.split_once('>').map_or(tail, |(tag, _)| tag))
-            .expect("failed backup chip rendered");
-        assert!(!failed_chip.contains(" hidden"));
+        assert!(!failed_card.contains("backup-chip"));
+        assert!(!failed_card.contains(r#"aria-label="Backup failed for failed-header""#));
+        assert!(failed_card.contains("Daily backup"));
+        assert!(failed_card.contains(r#"data-daily-backup-label>Failed</strong>"#));
+        assert!(failed_card.contains(r#"href="/backups?host=failed-header""#));
+        assert!(failed_card.contains(r#"class="protection-fact bad""#));
         assert_eq!(
             html.matches(
                 r#"class="host-action-dot" data-host-action-dot aria-hidden="true"></span>"#
@@ -9565,14 +9511,14 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             shell("markus", true),
             true,
         );
-        assert!(lifecycle_html.contains(r#"<div class="card-maintenance">"#));
+        assert!(lifecycle_html.contains(r#"class="attention-sep" aria-hidden="true"> · </span>"#));
+        assert!(!rendered_card(&lifecycle_html, "lifecycle").contains("backup-chip"));
         assert!(lifecycle_html
             .contains(r#"<span data-host-lifecycle-chip-copy>Change requested</span></button>"#));
+        assert!(rendered_card(&lifecycle_html, "lifecycle").contains(r#"class="attention-line""#));
+        assert!(rendered_card(&lifecycle_html, "lifecycle").contains("data-host-lifecycle-chip"));
         assert!(!lifecycle_html.contains(r#"<span data-host-lifecycle-chip-copy>Continue:"#));
         assert!(!lifecycle_html.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
-        assert!(
-            HEAD.contains(".card-maintenance .host-lifecycle-chip{width:var(--lifecycle-width)")
-        );
         assert!(HEAD.contains(".card .fresh-row-compact{position:relative;display:flex"));
         assert!(HEAD.contains("width:max-content"));
 
@@ -9587,8 +9533,12 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let menu = card
             .find("data-host-actions")
             .expect("actions menu rendered");
-        let backup = card.find("backup-chip").expect("backup control rendered");
+        let backup = card
+            .find("data-daily-backup")
+            .expect("backup fact rendered");
         assert!(menu < backup, "ellipsis menu must precede backup control");
+        assert!(!card.contains(r#"aria-label="Backup "#));
+        assert!(card.contains("Daily backup"));
     }
 
     #[test]
@@ -10074,6 +10024,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"data-protection-state="first-backup-overdue""#));
         assert!(html.contains(r#"data-protection-state="first-backup-failed""#));
         assert!(html.contains(r#"data-protection-state="first-backup-succeeded""#));
+        assert!(html.contains(r#"data-attention-extra="First backup pending""#));
+        assert!(html.contains(r#"data-attention-extra="First backup overdue""#));
+        assert!(html.contains(r#"data-attention-extra="First backup failed""#));
+        assert!(html.contains(r#"data-attention-extra="""#));
         assert!(html.contains("First backup pending"));
         assert!(html.contains("First backup overdue"));
         assert!(html.contains("First backup failed"));

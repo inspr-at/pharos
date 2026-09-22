@@ -164,7 +164,7 @@ export async function newAuthedContext(browser, kind = "write") {
     throw new Error("PHAROS_BROWSER_ORIGIN is not set");
   }
   const authHeader = fleetAuthHeaders(kind);
-  const context = await browser.newContext();
+  const context = await browser.newContext({ baseURL: origin });
 
   await context.route("**/*", async (route) => {
     const requestUrl = route.request().url();
