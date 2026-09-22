@@ -815,25 +815,25 @@ function positionHostActions(root){
   const menuHeight=menu.offsetHeight;
   const margin=12;
   menu.style.position='absolute';
-  const left=Math.max(margin-origin.left,Math.min(window.innerWidth-menuWidth-margin-origin.left,anchor.right-origin.left-menuWidth));
+  // Horizontal: hang the menu from the trigger's right edge (the trigger sits inside the card,
+  // inside the viewport), unless that would push its left edge past the viewport margin; then pin
+  // it to the margin. Everything is expressed relative to the root's layout box, never from a
+  // measured rect of the menu itself, and never with position:fixed (.card has contain:layout,
+  // which makes the card the containing block for fixed descendants).
+  if(anchor.right-menuWidth>=margin){
+    menu.style.left='auto';
+    menu.style.right=(origin.right-anchor.right)+'px';
+  }else{
+    menu.style.right='auto';
+    menu.style.left=(margin-origin.left)+'px';
+  }
+  // Vertical: below the trigger when it fits, else above, else pinned to the top margin.
   const below=anchor.bottom-origin.top+7;
   const above=anchor.top-origin.top-menuHeight-7;
-  const top=origin.top+below+menuHeight<=window.innerHeight-margin?below:Math.max(margin-origin.top,above);
-  menu.style.left=left+'px';
+  let top=origin.top+below+menuHeight<=window.innerHeight-margin?below:above;
+  if(origin.top+top<margin)top=margin-origin.top;
+  if(origin.top+top+menuHeight>window.innerHeight-margin)top=Math.max(margin-origin.top,window.innerHeight-margin-menuHeight-origin.top);
   menu.style.top=top+'px';
-  // Correct any viewport overflow in the same (absolute) coordinate system. Switching to
-  // position:fixed does not work here: .card has contain:layout, which makes the card the
-  // containing block for fixed descendants, so viewport coordinates land offset by the card.
-  const box=menu.getBoundingClientRect();
-  let dx=0,dy=0;
-  if(box.right>window.innerWidth-margin)dx=window.innerWidth-margin-box.right;
-  if(box.left+dx<margin)dx=margin-box.left;
-  if(box.bottom>window.innerHeight-margin)dy=window.innerHeight-margin-box.bottom;
-  if(box.top+dy<margin)dy=margin-box.top;
-  if(dx||dy){
-    menu.style.left=(left+dx)+'px';
-    menu.style.top=(top+dy)+'px';
-  }
 }
 function openHostActions(root){
   if(openHostActionsRoot&&openHostActionsRoot!==root)closeHostActions(openHostActionsRoot);
