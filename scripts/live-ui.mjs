@@ -44,6 +44,14 @@ import {
   takeAuthenticatedShot,
   LiveUiError,
 } from "./live-ui-guard.mjs";
+import {
+  armTotpGrant,
+  clearTotpCodeField,
+  freshTotpCode,
+  inspectTotpForm,
+  loadOptionalTotpSecret,
+  revokeTotpGrant,
+} from "./live-ui-totp.mjs";
 
 const EMPTY_PROBE = Object.freeze({
   passwordCount: 0,
@@ -246,6 +254,88 @@ async function waitForReturnedApp(page) {
   return true;
 }
 
+function rethrowLive(error) {
+  if (error instanceof LiveUiError) throw error;
+  if (error && typeof error.code === "string" && /^totp-[a-z0-9-]+$/.test(error.code)) {
+    throw new LiveUiError(error.code);
+  }
+  throw error;
+}
+
+function blankInspection(inspected) {
+  if (!inspected || typeof inspected !== "object") return;
+  inspected.authRequestId = "";
+  inspected.csrf = "";
+}
+
+export async function submitUnattendedTotp(page, policy, deps = {}) {
+  if (!policy?.totp || policy.totpAttempted) return "mfa-required";
+  policy.totpAttempted = true;
+  if (policy?.gate?.compromised?.()) throw new LiveUiError("network-guard");
+  const inspected = await page.evaluate(inspectTotpForm);
+  const authRequestId = typeof inspected?.authRequestId === "string" ? inspected.authRequestId : "";
+  const csrf = typeof inspected?.csrf === "string" ? inspected.csrf : "";
+  blankInspection(inspected);
+  if (!inspected?.ok) return "mfa-required";
+  const nowMs = typeof deps.now === "number" ? deps.now : Date.now();
+  const clock = typeof deps.clock === "function" ? deps.clock : Date.now;
+  let code = "";
+  try {
+    code = await freshTotpCode(policy.totp.bytes, nowMs, deps.sleep);
+  } catch (error) {
+    rethrowLive(error);
+  } finally {
+    if (policy.totp.bytes) policy.totp.bytes.fill(0);
+  }
+  if (!policy.secrets.includes(code)) policy.secrets.push(code);
+  const again = await page.evaluate(inspectTotpForm);
+  const sameSession = again?.ok === true && again.authRequestId === authRequestId && again.csrf === csrf;
+  blankInspection(again);
+  if (!sameSession) return "mfa-required";
+  if (policy?.gate?.compromised?.()) throw new LiveUiError("network-guard");
+  try {
+    policy.totpGrant = armTotpGrant({ code, authRequestId, csrf, now: clock });
+  } catch (error) {
+    rethrowLive(error);
+  }
+  const field = page.locator("input#code[name='code']");
+  if ((await field.count()) !== 1) return "mfa-required";
+  await field.fill(code);
+  const button = page.locator("button#submit-button");
+  if ((await button.count()) !== 1) return "mfa-required";
+  const unnamed = await button.evaluate((element) => {
+    return (
+      element.tagName === "BUTTON" &&
+      String(element.getAttribute("type") || "").toLowerCase() === "submit" &&
+      element.getAttribute("id") === "submit-button" &&
+      !element.hasAttribute("name")
+    );
+  });
+  if (!unnamed) return "mfa-required";
+  await button.click({ timeout: 5000 });
+  await page.evaluate(clearTotpCodeField).catch(() => {});
+  return "submitted";
+}
+
+async function maybeAttendTotp(page, viewed, policy) {
+  if (viewed.classification !== "mfa-required" || !policy?.totp || policy.totpAttempted) return viewed;
+  if (policy?.gate?.compromised?.()) throw new LiveUiError("network-guard");
+  try {
+    const submitted = await submitUnattendedTotp(page, policy);
+    if (submitted !== "submitted") return viewed;
+    await waitForReturnedApp(page);
+    await page.evaluate(clearTotpCodeField).catch(() => {});
+    const probe = await readProbe(page);
+    const next = observe(page.url(), 0, probe, false, policy.secrets);
+    if (probe.accountSetup) next.classification = "account-setup-required";
+    else if (probe.mfa) next.classification = "mfa-required";
+    return next;
+  } finally {
+    revokeTotpGrant(policy.totpGrant);
+    await page.evaluate(clearTotpCodeField).catch(() => {});
+  }
+}
+
 async function signIn(page, username, password, policy) {
   const response = await openDocument(page, ENTRY_URL, policy);
   let probe = await readProbe(page);
@@ -260,15 +350,15 @@ async function signIn(page, username, password, policy) {
       } else {
         viewed.classification = filled === "mfa-required" || probe.mfa ? "mfa-required" : "auth-required";
       }
-      return viewed;
+    } else {
+      await waitForReturnedApp(page);
+      probe = await readProbe(page);
+      viewed = observe(page.url(), 0, probe, false, policy.secrets);
     }
-    await waitForReturnedApp(page);
-    probe = await readProbe(page);
-    viewed = observe(page.url(), 0, probe, false, policy.secrets);
   }
   if (probe.accountSetup) viewed.classification = "account-setup-required";
   else if (probe.mfa) viewed.classification = "mfa-required";
-  return viewed;
+  return maybeAttendTotp(page, viewed, policy);
 }
 
 async function discoverInventory(page, origin, secrets, includeJson) {
@@ -347,7 +437,9 @@ async function waitForAuthUiHidden(page) {
 async function shoot(page, outputDir, route, secrets) {
   await waitForAuthUiHidden(page);
   const probe = await readProbe(page);
-  const password = Array.isArray(secrets) ? secrets[secrets.length - 1] : "";
+  const listed = Array.isArray(secrets) ? secrets.filter((item) => typeof item === "string") : [];
+  const password = listed.length >= 2 ? listed[1] : "";
+  const material = listed.length >= 2 ? listed.slice(2) : [];
   let location = route.location;
   try {
     location = publicLocation(page.url(), Array.isArray(secrets) ? secrets : []);
@@ -362,6 +454,7 @@ async function shoot(page, outputDir, route, secrets) {
     written = await takeAuthenticatedShot(page, {
       permitted: screenshotPermitted({ classification: route.classification, location, probe }),
       password,
+      material,
       options: {
         path: file,
         type: "png",
@@ -445,12 +538,19 @@ async function run(command) {
   const outputDir = assertOutputDir(process.env.PHAROS_LIVE_UI_OUTPUT_DIR, repoRoot);
   const username = loadUsernameFile(process.env.PHAROS_LIVE_UI_USERNAME_FILE, repoRoot);
   const password = loadPasswordFile(process.env.PHAROS_LIVE_UI_PASSWORD_FILE, repoRoot);
+  let totpSecret = null;
+  try {
+    totpSecret = loadOptionalTotpSecret(process.env, repoRoot);
+  } catch (error) {
+    rethrowLive(error);
+  }
   const draft =
     command === "draft"
       ? loadDraftFile(process.env.PHAROS_LIVE_UI_DRAFT_FILE, repoRoot)
       : null;
   const secrets = [username, password];
-  const policy = { secrets, gate: null };
+  if (totpSecret) secrets.push(totpSecret.redaction);
+  const policy = { secrets, gate: null, totp: totpSecret, totpGrant: null, totpAttempted: false };
   const blocked = [];
   const routes = [];
   let browser;
@@ -608,6 +708,8 @@ async function run(command) {
     report(overall, routes, blocked, secrets);
     return EXIT_CODES[overall] ?? 1;
   } finally {
+    if (policy?.totp?.bytes) policy.totp.bytes.fill(0);
+    revokeTotpGrant(policy?.totpGrant);
     await shutdownLiveSession({
       close: async () => {
         if (gate && typeof gate.beginShutdown === "function") gate.beginShutdown();
