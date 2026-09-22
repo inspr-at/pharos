@@ -18,7 +18,7 @@ const APPS = Object.freeze({
     base: "/paimos",
     login: "/paimos/api/auth/oidc/login",
     callback: "/paimos/api/auth/oidc/callback",
-    shell: ".layout .logout-btn",
+    shell: ".layout button.logout-btn, .p6-shell.habitat-shell[data-shell='v6'] button[type='button'][aria-label='Log out']",
     routes: Object.freeze([{ name: "landing", path: "/paimos/" }]),
   }),
   pharos: Object.freeze({

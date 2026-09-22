@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 260922141211.0.0 - 2026-09-22
+
+- Restore compact host cards and list rows with consistent typography, spacing and centered health marks, retaining the sidebar, header and lighthouse artwork (PHAROS-302).
+- Show one moving heartbeat age indicator on each card and row; keep detailed history and policy in Quick preview. New reports reset the indicator, stale snapshots stop live motion, and reduced-motion preferences disable interpolation and arrival flashes (PHAROS-302).
+- Populate preview health and backup evidence immediately from the rendered host, preserve it across refresh and host changes, and keep one clear link to the full workspace (PHAROS-302).
+- Recover the refresh clock from document freeze and resume events. Physical Chrome window-focus recovery remains a separate live verification item (PHAROS-293).
+
 ## 260922101200.0.0 - 2026-09-22
 
 - Keep the hosting server’s list cells neutral like every other host while preserving its lighthouse identity marker; cover every card and cell border on desktop and mobile (PHAROS-302).

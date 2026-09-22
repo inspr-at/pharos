@@ -1336,7 +1336,12 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     await expect(failedDaily).toBeVisible();
     await expect(failedDaily).toHaveAttribute("href", `/backups?host=${failedHost}`);
     await expect(failedDaily.locator("[data-daily-backup-label]")).toHaveText("Failed");
-    await expect(failedCard.locator("[data-health-disclosure]")).toContainText("Backup Failed");
+    await expect(failedCard.locator("[data-health-summary]")).toHaveText("Backup Failed");
+    await expect(failedCard.locator("[data-health-disclosure]")).toHaveCount(0);
+    await expect(failedCard.locator("[data-health-reasons]")).toBeHidden();
+    await failedCard.locator("[data-host-drawer-trigger]").click();
+    await expect(page.locator("[data-host-drawer-reasons]")).toContainText("Backup Failed");
+    await page.locator("#host-quick-drawer [data-host-drawer-close]").click();
     await expect(failedCard.locator('[data-health-reason][data-health-tone="bad"]')).toContainText(
       "Backup Failed",
     );
@@ -1779,16 +1784,63 @@ test("nixpkgs age threshold persists in Settings and controls server and refresh
     }
     await page.goto("/");
     const card = name => page.locator(`.card[data-host="${name}"]`);
-    const warning = name => card(name).locator('[data-fresh-kind="nixpkgs-drift"]');
-    for (const name of hosts.slice(0, 2)) {
-      await expect(warning(name)).toBeHidden();
-      await expect(card(name)).toHaveAttribute("data-sev", "4");
+    const row = name => page.locator(`tr[data-host="${name}"][data-host-surface="runtime"]`);
+    const summaryOf = surface => surface.locator("[data-health-summary]");
+    const driftOf = surface => surface.locator('[data-fresh-kind="nixpkgs-drift"]');
+    const warningText = "nixpkgs differs from nixos-unstable";
+    async function expectQuiet(name) {
+      for (const surface of [card(name), row(name)]) {
+        await expect(driftOf(surface)).toBeHidden();
+        await expect(summaryOf(surface)).not.toContainText(warningText);
+        await expect(surface).toHaveAttribute("data-sev", "4");
+      }
     }
-    for (const name of hosts.slice(2)) {
-      await expect(warning(name)).toBeVisible();
-      await expect(warning(name)).toContainText("nixpkgs differs from nixos-unstable");
-      await expect(card(name)).toHaveAttribute("data-sev", "2");
+    async function expectWarned(name) {
+      for (const surface of [card(name), row(name)]) {
+        await expect(summaryOf(surface)).toContainText(warningText);
+        await expect(surface).toHaveAttribute("data-sev", "2");
+        await expect(driftOf(surface)).toBeHidden();
+      }
+      await expect(summaryOf(card(name))).toBeVisible();
+      const cardDrift = driftOf(card(name));
+      await expect(cardDrift).toHaveCount(1);
+      await expect(cardDrift).toHaveClass(/scan-duplicate/);
     }
+    async function expectListSummary(name, present) {
+      await page.locator("[data-view-button='list']").click();
+      await expect(page.locator("main")).toHaveAttribute("data-view", "list");
+      const summary = summaryOf(row(name));
+      await expect(summary).toBeVisible();
+      if (present) await expect(summary).toContainText(warningText);
+      else await expect(summary).not.toContainText(warningText);
+      await expect(row(name).locator(".beat-history")).toBeHidden();
+      await expect(row(name).locator(".beat-cadence")).toBeVisible();
+      await page.locator("[data-view-button='grid']").click();
+      await expect(page.locator("main")).toHaveAttribute("data-view", "grid");
+    }
+    async function expectPreview(name, present) {
+      await expect(card(name).locator(".beat-history")).toBeHidden();
+      await expect(card(name).locator(".beat-cadence")).toBeVisible();
+      await card(name).getByRole("button", { name: `Quick preview of ${name}` }).click();
+      const drawer = page.locator("[data-host-drawer]");
+      await expect(drawer).toBeVisible();
+      if (present) await expect(page.locator("[data-host-drawer-reasons]")).toContainText(warningText);
+      else await expect(page.locator("[data-host-drawer-reasons]")).not.toContainText(warningText);
+      const history = page.locator("[data-host-drawer-history]");
+      await expect(history.locator(".beat-stage")).toBeVisible();
+      await expect(history.locator(".beat-policy")).toContainText(/Expected every \d+s/);
+      await expect(history.locator(".beat-policy")).toContainText(/Late after \d+s/);
+      await expect(history.locator("[data-signal-window]")).toBeVisible();
+      await page.locator(".host-drawer-close").click();
+      await expect(drawer).toBeHidden();
+      await expect(card(name).locator(".beat-history")).toBeHidden();
+    }
+    for (const name of hosts.slice(0, 2)) await expectQuiet(name);
+    for (const name of hosts.slice(2)) await expectWarned(name);
+    await expectListSummary("age-below", false);
+    await expectListSummary("age-above", true);
+    await expectPreview("age-below", false);
+    await expectPreview("age-above", true);
     const initial = await (await page.request.get("/hosts.json")).json();
     // Browser clock and the legacy host-clock age mirror cannot affect policy.
     expect(await page.evaluate(body => {
@@ -1796,8 +1848,8 @@ test("nixpkgs age threshold persists in Settings and controls server and refresh
       Date.now = () => 0;
       try { return applyFleetSnapshot(body); } finally { Date.now = original; }
     }, initial)).toBe(true);
-    await expect(warning("age-below")).toBeHidden();
-    await expect(warning("age-above")).toBeVisible();
+    await expectQuiet("age-below");
+    await expectWarned("age-above");
     await settingsPage.goto("/settings/providers");
     const input = settingsPage.getByRole("spinbutton", { name: "nixpkgs warning threshold (days)", exact: true });
     await expect(input).toHaveValue("30");
@@ -1815,12 +1867,15 @@ test("nixpkgs age threshold persists in Settings and controls server and refresh
     expect(changed.hosts.find(host => host.name === "age-above").nixpkgs_warn_after_days).toBe(31);
     expect(changed.hosts.find(host => host.name === "age-override").nixpkgs_warn_after_days).toBe(7);
     expect(await page.evaluate(body => applyFleetSnapshot(body), changed)).toBe(true);
-    await expect(warning("age-above")).toBeHidden();
-    await expect(card("age-above")).toHaveAttribute("data-sev", "4");
-    await expect(warning("age-override")).toBeVisible();
+    await expectQuiet("age-above");
+    await expectWarned("age-override");
+    await expectListSummary("age-above", false);
+    await expectListSummary("age-override", true);
+    await expectPreview("age-above", false);
+    await expectPreview("age-override", true);
     await page.reload();
-    await expect(warning("age-above")).toBeHidden();
-    await expect(warning("age-override")).toBeVisible();
+    await expectQuiet("age-above");
+    await expectWarned("age-override");
 
     await settingsPage.goto("/hosts/age-override?section=settings");
     await settingsPage.getByText("Alert preferences", { exact: true }).click();

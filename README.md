@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-260922101200.0.0-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-260922141211.0.0-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -51,11 +51,11 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v260922101200.0.0
+## What ships in v260922141211.0.0
 
 | Area                    | Current capability                                                                                                                                                                                                       |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Fleet**               | Grid and list views, search, sorting, and host liveness on the existing shell. The seven navigation entries and lighthouse artwork stay. A host name opens the workspace; Quick preview is separate. Heartbeat history is a time axis whose percentage is delivery, not uptime |
+| **Fleet**               | Grid and list views, search, sorting, and host liveness on the existing shell. The seven navigation entries and lighthouse artwork stay. A host name opens the workspace; Quick preview is separate. One moving heartbeat age line per card and row; detailed history in Quick preview. The percentage is heartbeat delivery, not uptime |
 | **Map**                 | Optional host location and reachability signals without turning location into a control channel                                                                                                                          |
 | **Backups**             | Independent daily-backup and selective-restore facts. Overdue restore is strictly more than 30 days after the last successful test. Unknown evidence stays unknown. Disabled backup is not an exemption. The server uses the 36-hour daily stale default. No selective-restore producer ships here |
 | **Alerts and activity** | Actionable fleet attention, value-free workflow history and optional outbound silent-heartbeat notifications                                                                                                             |
@@ -86,9 +86,9 @@ seconds in the future is not treated as fresh. Repository checks, snapshot
 existence, and similar observations are not a successful selective restore.
 No producer of that restore ships with Pharos; NIX-562 tracks it. A history
 that keeps the last success distinct from the latest attempt is not shipped;
-PHAROS-304 tracks it. Whether several repositories on one host each need a
-test is still open. The rule in force is the host-level restore above, not a
-per-repository requirement, and the posture is not full-system recoverability.
+PHAROS-304 tracks it. One successfully restored file per host satisfies this check; it does not
+require one file from every repository. This posture does not establish
+full-system recoverability.
 
 A quiet lifecycle says **No pending changes**. That means no pending work, not
 that packages are fresh. A channel-tip difference alone is not a deployable
@@ -103,9 +103,18 @@ twice and five times the cadence. Publishing a populated host override is
 safe only after every reader of the shared preferences registry has been
 upgraded.
 
-Heartbeat history is a time axis over the retained window, separate from the
-current arrival indicator. The percentage is heartbeat delivery, not host or
-service uptime, and partial retention is qualified.
+Cards and list rows show one moving heartbeat age line. Its marker advances
+from the last observed report and resets on a new report; stale snapshots
+stop live motion. Reduced-motion preferences disable interpolation and
+arrival flashes while the displayed age remains current. Detailed heartbeat
+history and timing policy are in Quick preview. The percentage is heartbeat
+delivery, not host or service uptime, and partial retention is qualified.
+
+Host cards use consistent typography, spacing and centered health marks.
+Quick preview shows health, daily backup and selective restore immediately,
+then keeps those facts synchronized while switching hosts or refreshing.
+Document freeze and resume events suspend and recover the refresh clock;
+physical Chrome window-focus recovery still needs separate live verification.
 
 ## Architecture
 
@@ -1107,7 +1116,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v260922101200.0.0**. It is already used as a real
+Pharos is an active early release at **v260922141211.0.0**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 

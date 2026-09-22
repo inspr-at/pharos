@@ -184,6 +184,7 @@ test("inspection routes and clicks stay on the fixed allowlist", () => {
   assert.equal(allowlistedVersion("260921221314.0.0"), "260921221314.0.0");
   assert.equal(allowlistedVersion("v260921221314.0.0"), "");
   assert.equal(arrivalPercent("--arrival-x:12.20%"), "12.20");
+  assert.equal(arrivalPercent("--cadence-x:32.00%"), "32.00");
   assert.equal(boxUnchanged({ width: 10.2, height: 4 }, { x: 3, width: 10, height: 4.2 }), true);
   assert.equal(boxUnchanged({ width: 10, height: 4 }, { width: 12, height: 4 }), false);
   assert.equal(FOCUS_METHOD, "synthetic-visible-unfocused");
