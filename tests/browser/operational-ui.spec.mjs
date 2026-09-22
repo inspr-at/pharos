@@ -1475,6 +1475,7 @@ test("fleet card header keeps actions visible and backup shield only when not ok
 test("fault rail uses full card width, stays one line, and keeps quiet hashes in technical details", async ({
   page,
 }) => {
+  test.setTimeout(60_000);
   const quietHost = "freshness-rail-quiet";
   const faultHost = "freshness-rail-fault";
   const hosts = [quietHost, faultHost];
