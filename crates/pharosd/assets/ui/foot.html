@@ -2221,32 +2221,6 @@ function updateHealthProjection(surface,health){
   setFactText(surface,'[data-health-label]',health.label);
   ensureHealthScan(surface,health);
 }
-function updateBackup(surface,info){
-  const el=surface.querySelector('.backup-chip[data-backup-state]');
-  if(el&&el.classList.contains('backup-chip')){
-    const glyph={clear:'check',watch:'question',warning:'alert',critical:'x'}[info.level]||'question';
-    const host=surface.dataset.host||'';
-    el.classList.remove('clear','watch','warning','critical');
-    el.classList.add(info.level);
-    el.dataset.backupState=info.state;
-    el.dataset.backupLevel=info.level;
-    el.dataset.backupGlyph=glyph;
-    el.href=appUrl('/backups?host='+encodeURIComponent(host));
-    el.title='Backup: '+info.label+' - '+info.detail;
-    el.setAttribute('aria-label','Backup for '+host+': '+info.label+', '+info.detail);
-    const shouldHide=info.state==='healthy';
-    if(shouldHide&&document.activeElement===el)surface.querySelector('[data-host-actions-trigger]')?.focus();
-    el.hidden=shouldHide;
-  }
-  setFreshRow(surface,'backup-fault',{
-    value:info.label,
-    klass:info.level==='critical'?'down':info.level==='warning'?'warn':'na',
-    label:'Backup',
-    visible:false
-  });
-  syncFreshnessRail(surface);
-  updateBackupStatus(surface,info.protection);
-}
 function setReason(surface,reason){
   const el=surface.querySelector('[data-reason]');
   if(!el)return;
@@ -5510,7 +5484,7 @@ function applyFleetSnapshot(data){
       updateMuted(card,muted);
       updateKernelFault(card,h);
       updateFreshness(card,h.freshness,now,h.nixpkgs_warn_after_days);
-      updateBackup(card,backup);
+      updateBackupStatus(card,backup.protection);
       updateHealthProjection(card,assurance.health);
       setSeen(card,h.last_seen,now);
       setCardAsOf(card,now);
