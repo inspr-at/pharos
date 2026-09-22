@@ -6550,55 +6550,11 @@ mod tests {
     }
 
     #[test]
-    fn backup_chip_maps_posture_to_distinct_glyphs() {
-        let cases = [
-            (BackupPostureState::Healthy, "clear", "check"),
-            (BackupPostureState::Unknown, "watch", "question"),
-            (BackupPostureState::Stale, "warning", "alert"),
-            (BackupPostureState::Failed, "critical", "x"),
-        ];
-
-        for (state, level, glyph) in cases {
-            let summary = backup_ui_summary(&[backup_observation(state)], 1_700_000_120);
-            let html = backup_chip_markup(&summary, "athena", &PublicBasePath::ROOT);
-            assert!(html.contains(&format!(r#"class="header-chip backup-chip {level}""#)));
-            assert!(html.contains(&format!(r#"data-backup-glyph="{glyph}""#)));
-            assert!(html.contains(r#"href="/backups?host=athena""#));
-            assert!(html.contains(
-                r#"<span class="header-chip-label" aria-hidden="true">Backup</span></a>"#
-            ));
-        }
-        let healthy_html = backup_chip_markup(
-            &backup_ui_summary(
-                &[backup_observation(BackupPostureState::Healthy)],
-                1_700_000_120,
-            ),
-            "athena",
-            &PublicBasePath::ROOT,
-        );
-        assert!(healthy_html.contains(r#"data-backup-state="healthy""#));
-        assert!(healthy_html.contains(" hidden>"));
-        let failed_html = backup_chip_markup(
-            &backup_ui_summary(
-                &[backup_observation(BackupPostureState::Failed)],
-                1_700_000_120,
-            ),
-            "athena",
-            &PublicBasePath::ROOT,
-        );
-        assert!(!failed_html.contains(" hidden>"));
-    }
-
-    #[test]
     fn fleet_header_chips_expand_while_fault_rail_uses_full_width() {
         assert!(HEAD.contains(".header-chip{position:relative;appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:0;width:25px;height:25px"));
         assert!(HEAD.contains(".header-chip:hover,.header-chip:focus-visible{width:86px"));
         assert!(HEAD.contains(".header-chip-label{display:block;max-width:0;opacity:0"));
         assert!(HEAD.contains(".header-chip:hover .header-chip-label,.header-chip:focus-visible .header-chip-label{max-width:58px;opacity:1"));
-        assert!(HEAD.contains(".backup-chip[hidden]{display:none}"));
-        assert!(!HEAD.contains(
-            ".card .backup-chip:not(:hover):not(:focus-visible){border-color:transparent;background:transparent;box-shadow:none}"
-        ));
         assert!(HEAD.contains(
             ".host-actions-trigger{color:#4c6780;border-color:rgba(188,211,222,.92);background:rgba(255,255,255,.88)"
         ));
@@ -9554,11 +9510,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!rendered_card(&lifecycle_html, "lifecycle").contains("backup-chip"));
         assert!(lifecycle_html
             .contains(r#"<span data-host-lifecycle-chip-copy>Change requested</span></button>"#));
+        assert!(rendered_card(&lifecycle_html, "lifecycle").contains(r#"class="attention-line""#));
+        assert!(rendered_card(&lifecycle_html, "lifecycle").contains("data-host-lifecycle-chip"));
         assert!(!lifecycle_html.contains(r#"<span data-host-lifecycle-chip-copy>Continue:"#));
         assert!(!lifecycle_html.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
-        assert!(
-            HEAD.contains(".card-maintenance .host-lifecycle-chip{width:var(--lifecycle-width)")
-        );
         assert!(HEAD.contains(".card .fresh-row-compact{position:relative;display:flex"));
         assert!(HEAD.contains("width:max-content"));
 

@@ -1403,19 +1403,21 @@ mod module_tests {
             )),
         );
         let view = fleet_protection_view(std::slice::from_ref(&aged), now);
-        let scan = protection_scan_markup(&view, "qa-harbor", &PublicBasePath::ROOT);
-        assert!(scan.contains("Backup run"));
-        assert!(scan.contains("Selective restore"));
-        assert!(scan.contains(r#"class="scan-store" data-protection-evidence hidden"#));
-        assert!(!scan.contains("<summary>Exact times</summary>"));
-        assert!(!scan.contains("<summary>Repository check</summary>"));
-        assert!(scan.contains("data-daily-backup-date"));
+        let card = protection_card_markup(&view, "qa-harbor", &PublicBasePath::ROOT);
+        assert!(card.contains("Daily backup"));
+        assert!(card.contains("Monthly restore test"));
+        assert!(card.contains(r#"class="scan-store" data-protection-evidence hidden"#));
+        assert!(!card.contains("<summary>Exact times</summary>"));
+        assert!(!card.contains("<summary>Repository check</summary>"));
+        assert!(card.contains("data-daily-backup-date"));
+        assert!(card.contains("data-daily-backup-note"));
+        assert!(!card.contains(r#"class="fact-age""#));
         let health = health_for(&view, &proven_current("nixos-unstable"), now);
-        let scan_health = health_scan_markup(&health);
-        assert!(!scan_health.contains("data-health-disclosure"));
-        assert!(scan_health.contains("data-health-summary"));
-        assert!(scan_health.contains(r#"data-health-reasons hidden"#));
-        assert!(scan_health.contains("data-health-reason"));
+        let attention = card_attention_block(&health, "", "", "", "");
+        assert!(!attention.contains("data-health-disclosure"));
+        assert!(attention.contains("data-health-summary"));
+        assert!(attention.contains(r#"data-health-reasons hidden"#));
+        assert!(attention.contains("data-health-reason"));
         let beat = heartbeat_card(HeartbeatCard {
             last_seen: Some(now - 30),
             heartbeat_log: &[now - 90, now - 30],
@@ -1443,10 +1445,62 @@ mod module_tests {
         assert!(!beat.contains("arrival-track"));
         assert!(beat.contains(r#"data-history-axis="time""#));
         assert!(beat.contains("--now-x:100%"));
-        assert!(scan.contains(r#"class="fact-age" data-daily-backup-age>"#));
-        assert!(scan.contains(r#"data-daily-backup-note hidden"#));
-        assert!(scan.contains(r#"data-restore-note hidden"#));
-        assert!(scan.contains(r#"data-restore-age>"#));
+        assert!(card.contains(r#"data-restore-note"#));
+        assert!(!card.contains("backup-chip"));
+    }
+
+    #[test]
+    fn protection_pair_tone_follows_posture() {
+        let now = 1_700_000_120;
+        let cases = [
+            (
+                BackupPostureState::Healthy,
+                Some("daily"),
+                Some(now - 120),
+                "good",
+                "Daily OK",
+            ),
+            (
+                BackupPostureState::Unknown,
+                None,
+                None,
+                "neutral",
+                "Unknown",
+            ),
+            (
+                BackupPostureState::Stale,
+                Some("daily"),
+                Some(now - 3 * 86_400),
+                "amber",
+                "Stale",
+            ),
+            (
+                BackupPostureState::Failed,
+                Some("daily"),
+                Some(now - 120),
+                "bad",
+                "Failed",
+            ),
+        ];
+        let mut tones = Vec::new();
+        for (state, schedule, at, tone, label) in cases {
+            let observation = backup_observation(state, schedule, at, None);
+            let view = fleet_protection_view(std::slice::from_ref(&observation), now);
+            let card = protection_card_markup(&view, "athena", &PublicBasePath::ROOT);
+            assert!(
+                card.contains(&format!(r#"class="protection-fact {tone}""#)),
+                "{state:?} card missing tone {tone}"
+            );
+            assert!(
+                card.contains(&format!(r#"data-daily-backup-label>{label}</strong>"#)),
+                "{state:?} card missing label {label}"
+            );
+            assert!(!card.contains("backup-chip"));
+            tones.push(tone);
+        }
+        tones.sort_unstable();
+        tones.dedup();
+        assert_eq!(tones, ["amber", "bad", "good", "neutral"]);
     }
 
     #[test]
@@ -4495,18 +4549,6 @@ pub(super) fn protection_markup(
     protection_markup_surface(view, host, base, false, false)
 }
 
-/// Fleet scan surfaces keep the two backup facts visible and park exact times
-/// and the repository check in a hidden store. Quick preview and the host page
-/// are the places that open them.
-#[cfg(test)]
-pub(super) fn protection_scan_markup(
-    view: &FleetProtectionView,
-    host: &str,
-    base: &PublicBasePath,
-) -> String {
-    protection_markup_surface(view, host, base, true, false)
-}
-
 /// Grid cards show the two protection facts and their short notes. Exact times
 /// and the repository check stay in the hidden store the drawer already reads.
 pub(super) fn protection_card_markup(
@@ -4803,48 +4845,6 @@ pub(super) fn health_markup(health: &HostHealthView) -> String {
     )
 }
 
-#[cfg(test)]
-pub(super) fn health_scan_markup(health: &HostHealthView) -> String {
-    let reasons = health
-        .reasons
-        .iter()
-        .map(|reason| {
-            let at = reason.at.map(|at| at.to_string()).unwrap_or_default();
-            format!(
-                r#"<li data-health-reason data-health-tone="{tone}" data-health-at="{at}">{label}{time}</li>"#,
-                tone = html_escape(reason.tone),
-                at = html_escape(&at),
-                label = html_escape(&reason.label),
-                time = observed_time_markup(reason.at, "health"),
-            )
-        })
-        .collect::<String>();
-    let icon = if health.problem_count == 0 {
-        icons::SHIELD_CHECK
-    } else {
-        icons::BELL
-    };
-    let count_label = if health.problem_count == 1 {
-        "1 reason".to_string()
-    } else {
-        format!("{} reasons", health.problem_count)
-    };
-    let count_hidden = if health.problem_count == 0 {
-        " hidden"
-    } else {
-        ""
-    };
-    format!(
-        r#"<div class="harbor-health" data-health-block data-health-tone="{tone}"><span class="health-label" data-health-label data-health-tone="{tone}" hidden>{label}</span><div class="attention-line"><span class="attention-icon" aria-hidden="true">{icon}</span><span data-health-summary>{summary}</span><span class="health-count" data-health-count{count_hidden}>{count}</span></div><ul class="health-reasons" data-health-reasons hidden>{reasons}</ul></div>"#,
-        tone = html_escape(health.tone),
-        label = html_escape(health.label),
-        summary = html_escape(&health.summary),
-        count = html_escape(&count_label),
-        count_hidden = count_hidden,
-        reasons = reasons,
-    )
-}
-
 fn card_attention_summary(health: &HostHealthView, extra: &str) -> String {
     let mut parts: Vec<String> = health
         .reasons
@@ -5138,44 +5138,6 @@ pub(super) fn host_grace_presentation(
         source: policy.source.as_str().to_string(),
         late_after_secs: policy.late_after_secs,
     }
-}
-
-#[cfg(test)]
-pub(super) fn backup_glyph(level: &str) -> &'static str {
-    match level {
-        "clear" => "check",
-        "warning" => "alert",
-        "critical" => "x",
-        _ => "question",
-    }
-}
-
-#[cfg(test)]
-pub(super) fn backup_chip_markup(
-    summary: &BackupUiSummary,
-    host: &str,
-    base: &PublicBasePath,
-) -> String {
-    let title = format!("Backup: {} - {}", summary.label, summary.detail);
-    let aria_label = format!("Backup for {host}: {}, {}", summary.label, summary.detail);
-    let hidden = if summary.state == "healthy" {
-        " hidden"
-    } else {
-        ""
-    };
-    format!(
-        r#"<a class="header-chip backup-chip {level}" href="{href}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"{hidden}><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span class="header-chip-label" aria-hidden="true">Backup</span></a>"#,
-        href = app_href(base, &format!("/backups?host={}", url_query_escape(host))),
-        level = html_escape(summary.level),
-        state = html_escape(summary.state),
-        glyph = backup_glyph(summary.level),
-        title = html_escape(&title),
-        aria_label = html_escape(&aria_label),
-        check = icons::SHIELD_CHECK,
-        question = icons::SHIELD_QUESTION,
-        alert = icons::SHIELD_ALERT,
-        x = icons::SHIELD_X,
-    )
 }
 
 pub(super) fn host_actions_markup(
