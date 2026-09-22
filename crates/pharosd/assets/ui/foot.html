@@ -314,7 +314,7 @@ function projectRestoreStatus(observations,now){
     }
     if(state!=='passed')continue;
     const qualified=qualifyingSelectiveRestore(restore);
-    if(qualified&&qualified.at===at&&(!passed||at>passed.at))passed={at,files:qualified.files};
+    if(qualified&&qualified.at===at&&(!passed||at>passed.at))passed={at};
   }
   if(latestFailed&&(!passed||latestAt>passed.at)){
     return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(passed?passed.at:null,current,'last successful selective restore'),at:passed?passed.at:null,overdue:false,producer:'failed'};
@@ -324,7 +324,7 @@ function projectRestoreStatus(observations,now){
   }
   const age=Math.max(0,current-passed.at);
   if(age>SELECTIVE_RESTORE_OVERDUE_SECS)return {tone:'amber',state:'overdue',label:'Overdue',detail:agoNote(passed.at,current,'last successful selective restore'),at:passed.at,overdue:true,producer:'passed'};
-  if(latestAt===passed.at&&!latestAdverse)return {tone:'good',state:'passed',label:'Passed',detail:agoNote(passed.at,current,'selective restore'),at:passed.at,overdue:false,producer:'passed',files:passed.files};
+  if(latestAt===passed.at&&!latestAdverse)return {tone:'good',state:'passed',label:'Passed',detail:agoNote(passed.at,current,'selective restore'),at:passed.at,overdue:false,producer:'passed'};
   return {tone:'neutral',state:'unknown',label:'Unknown',detail:agoNote(passed.at,current,'last successful selective restore'),at:passed.at,overdue:false,producer:''};
 }
 function projectBackupCheck(observations,now){
@@ -2198,20 +2198,10 @@ function listDailyValue(daily){
   if(state==='disabled')return 'Disabled';
   return 'Not observed';
 }
-function reportedRestoreCount(restore){
-  const raw=restore?.files??restore?.file_count??restore?.restored_files??restore?.restored_file_count??restore?.files_restored;
-  if(typeof raw==='boolean'||raw==null||raw==='')return null;
-  const count=Number(raw);
-  return Number.isSafeInteger(count)&&count>=0?count:null;
-}
 function listRestoreValue(restore){
   const age=listAgeToken(restore&&restore.at);
   const state=String(restore&&restore.state||'');
-  if(state==='passed'){
-    const count=reportedRestoreCount(restore);
-    const word=count==null?'Passed':count===1?'1 file':count+' files';
-    return withListAge(word,age);
-  }
+  if(state==='passed')return withListAge('Passed',age);
   if(state==='overdue')return 'Overdue';
   if(state==='failed')return 'Failed';
   if(state==='not-required')return 'Not required';

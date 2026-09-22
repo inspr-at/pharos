@@ -1096,8 +1096,6 @@ globalThis.__facts = { updateBackupStatus, listRestoreValue, utcObservedStamp, r
   assert.equal(created.filter((node) => Object.prototype.hasOwnProperty.call(node.attributes, "data-daily-backup-date")).length, 0);
   const passedRestore = { state: "passed", at: Math.floor(Date.now() / 1000) - 6 * 86400 };
   assert.match(factContext.__facts.listRestoreValue(passedRestore), /^Passed · \d+d$/);
-  assert.match(factContext.__facts.listRestoreValue({ ...passedRestore, files: 1 }), /^1 file · \d+d$/);
-  assert.match(factContext.__facts.listRestoreValue({ ...passedRestore, files_restored: 4 }), /^4 files · \d+d$/);
   assert.equal(factContext.__facts.utcObservedStamp(1_700_000_000).iso, "2023-11-14T22:13:20Z");
   assert.equal(factContext.__facts.utcObservedStamp(1_700_000_000).visible, "2023-11-14 22:13:20 UTC");
   for (const missing of [null, undefined, "", 0, "0"]) {

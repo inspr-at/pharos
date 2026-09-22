@@ -1574,14 +1574,6 @@ mod module_tests {
         assert!(passed_list.contains(r#"data-daily-backup-label>OK · 2h</strong>"#));
         assert!(passed_list.contains(r#"data-restore-label>Passed · 6d</strong>"#));
         assert!(!passed_list.contains("1 file"));
-        let mut one_file = passed_view.clone();
-        one_file.restore_file_count = Some(1);
-        let one_list = list_protection_markup(&one_file, "atlas", &PublicBasePath::ROOT, now);
-        assert!(one_list.contains(r#"data-restore-label>1 file · 6d</strong>"#));
-        let mut several = passed_view.clone();
-        several.restore_file_count = Some(4);
-        let several_list = list_protection_markup(&several, "atlas", &PublicBasePath::ROOT, now);
-        assert!(several_list.contains(r#"data-restore-label>4 files · 6d</strong>"#));
         assert!(!passed_list.contains(r#"aria-label="Backup"#));
         let exact = r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="nixpkgs-drift"><strong class="warn" data-fresh-value>nixpkgs differs from nixos-unstable</strong></div>"#;
         assert!(
@@ -3747,9 +3739,6 @@ pub(super) struct FleetProtectionView {
     pub(super) daily_ok: bool,
     pub(super) missing_restore_producer: bool,
     pub(super) restore_overdue: bool,
-    /// Set only when the host reports a restored-file count. The observation
-    /// contract has no count field, so production leaves this empty.
-    pub(super) restore_file_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4183,7 +4172,6 @@ pub(super) fn fleet_protection_view(
         daily_ok,
         missing_restore_producer,
         restore_overdue,
-        restore_file_count: None,
     }
 }
 
@@ -4612,18 +4600,10 @@ fn list_daily_value(fact: &ProtectionFact, now: i64) -> String {
     }
 }
 
-fn restore_passed_word(file_count: Option<u64>) -> String {
-    match file_count {
-        None => "Passed".to_string(),
-        Some(1) => "1 file".to_string(),
-        Some(count) => format!("{count} files"),
-    }
-}
-
-fn list_restore_value(fact: &ProtectionFact, file_count: Option<u64>, now: i64) -> String {
+fn list_restore_value(fact: &ProtectionFact, now: i64) -> String {
     let age = list_age_token(fact.at, now);
     match fact.state {
-        "passed" => with_list_age(&restore_passed_word(file_count), &age),
+        "passed" => with_list_age("Passed", &age),
         "overdue" => "Overdue".to_string(),
         "failed" => "Failed".to_string(),
         "not-required" => "Not required".to_string(),
@@ -4660,7 +4640,7 @@ fn list_protection_markup(
     let restore_time = evidence_time_markup(view.restore.at, "restore");
     let note = list_protection_note(view);
     let daily = list_daily_value(&view.run, now);
-    let restore = list_restore_value(&view.restore, view.restore_file_count, now);
+    let restore = list_restore_value(&view.restore, now);
     let run_at = fact_instant_attr(view.run.at);
     let restore_at = fact_instant_attr(view.restore.at);
     let producer = if view.restore.state == "not-required" {
