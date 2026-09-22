@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Publish a guarded family UI runner for real OIDC sign-in and private desktop/mobile-size evidence across Aithema, Paimos, Pharos and Janus; record observed MFA and require each app's approved restricted scope (PHAROS-308).
+
 ## 260921221314.0.0 - 2026-09-21
 
 - Preserve the existing shell, seven navigation entries, and lighthouse artwork. Aggregate host health reasons on a compact list, open the native host workspace from the host name, and keep Quick preview separate (PHAROS-290, PHAROS-296, PHAROS-300).

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { FAMILY_ORIGIN, familyApp, familyAppLocation, familyAuthPath, classifyFamilyObservation } from "./live-ui-apps.mjs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { chromium } from "@playwright/test";
@@ -93,7 +94,7 @@ function remember(blocked, result, secrets) {
   blocked.push({ method, path: pathName, reason });
 }
 
-async function installGuard(context, policy, blocked, pageRef) {
+export async function installGuard(context, policy, blocked, pageRef) {
   const secrets = Array.isArray(policy.secrets) ? policy.secrets : [];
   const sessions = [];
   if (typeof context.routeWebSocket !== "function") throw new LiveUiError("browser-context");
@@ -133,7 +134,7 @@ async function installGuard(context, policy, blocked, pageRef) {
   return { sessions, armPage };
 }
 
-async function openDocument(page, href, policy) {
+export async function openDocument(page, href, policy) {
   if (policy?.gate?.compromised?.()) throw new LiveUiError("network-guard");
   const decision = decideRequest({ method: "GET", url: href }, policy);
   if (!decision.allow) throw new LiveUiError("navigation-denied");
@@ -144,16 +145,21 @@ async function openDocument(page, href, policy) {
   }
 }
 
-async function readProbe(page) {
+export async function readProbe(page, policy = {}) {
   try {
     const surface = await page.evaluate(collectProbeSurface);
-    return classifyProbeSurface(surface);
+    const probe = classifyProbeSurface(surface);
+    if (policy.familyApp) {
+      const app = familyApp(policy.familyApp);
+      probe.familyShell = !!app && (await page.locator(app.shell).count()) > 0;
+    }
+    return probe;
   } catch {
     return { ...EMPTY_PROBE };
   }
 }
 
-function observe(pageUrl, status, probe, managerConfirmed, secrets) {
+function observe(pageUrl, status, probe, managerConfirmed, secrets, policy = {}) {
   let location = { origin: "", pathname: "/" };
   try {
     location = publicLocation(pageUrl, secrets);
@@ -162,7 +168,9 @@ function observe(pageUrl, status, probe, managerConfirmed, secrets) {
   }
   return {
     location,
-    classification: classifyObservation({ location, status, probe, managerConfirmed }),
+    classification: policy.familyApp
+      ? classifyFamilyObservation({ app: policy.familyApp, location, status, probe, callbackConfirmed: policy.callbackConfirmed })
+      : classifyObservation({ location, status, probe, managerConfirmed }),
   };
 }
 
@@ -240,11 +248,12 @@ async function fillIssuerCredentialsOnce(page, username, password) {
   return "submitted";
 }
 
-async function waitForReturnedApp(page) {
+async function waitForReturnedApp(page, policy = {}) {
   try {
     await page.waitForURL((url) => {
       try {
         const location = publicLocation(url.toString());
+        if (policy.familyApp) return familyAppLocation(policy.familyApp, location) && !familyAuthPath(policy.familyApp, location.pathname);
         return (
           PERSONAL_APP_ORIGINS.includes(location.origin) &&
           isUnderBasePath(location.pathname) &&
@@ -256,6 +265,10 @@ async function waitForReturnedApp(page) {
     }, { timeout: 25_000 });
   } catch {
     return false;
+  }
+  if (policy.familyApp) {
+    const app = familyApp(policy.familyApp);
+    if (app) await page.locator(app.shell).first().waitFor({ state: "attached", timeout: 10_000 }).catch(() => {});
   }
   return true;
 }
@@ -329,10 +342,10 @@ async function maybeAttendTotp(page, viewed, policy) {
   try {
     const submitted = await submitUnattendedTotp(page, policy);
     if (submitted !== "submitted") return viewed;
-    await waitForReturnedApp(page);
+    await waitForReturnedApp(page, policy);
     await page.evaluate(clearTotpCodeField).catch(() => {});
-    const probe = await readProbe(page);
-    const next = observe(page.url(), 0, probe, false, policy.secrets);
+    const probe = await readProbe(page, policy);
+    const next = observe(page.url(), 0, probe, false, policy.secrets, policy);
     if (probe.accountSetup) next.classification = "account-setup-required";
     else if (probe.mfa) next.classification = "mfa-required";
     return next;
@@ -342,24 +355,24 @@ async function maybeAttendTotp(page, viewed, policy) {
   }
 }
 
-async function signIn(page, username, password, policy) {
-  const response = await openDocument(page, ENTRY_URL, policy);
-  let probe = await readProbe(page);
-  let viewed = observe(page.url(), response ? response.status() : 0, probe, false, policy.secrets);
+export async function signIn(page, username, password, policy) {
+  const response = await openDocument(page, policy.familyApp ? `${FAMILY_ORIGIN}${familyApp(policy.familyApp).login}` : ENTRY_URL, policy);
+  let probe = await readProbe(page, policy);
+  let viewed = observe(page.url(), response ? response.status() : 0, probe, false, policy.secrets, policy);
   if (viewed.location.origin === PERSONAL_ISSUER_ORIGIN) {
     const filled = await fillIssuerCredentials(page, username, password);
     if (filled !== "submitted") {
-      probe = await readProbe(page);
-      viewed = observe(page.url(), 0, probe, false, policy.secrets);
+      probe = await readProbe(page, policy);
+      viewed = observe(page.url(), 0, probe, false, policy.secrets, policy);
       if (filled === "account-setup-required" || probe.accountSetup) {
         viewed.classification = "account-setup-required";
       } else {
         viewed.classification = filled === "mfa-required" || probe.mfa ? "mfa-required" : "auth-required";
       }
     } else {
-      await waitForReturnedApp(page);
-      probe = await readProbe(page);
-      viewed = observe(page.url(), 0, probe, false, policy.secrets);
+      await waitForReturnedApp(page, policy);
+      probe = await readProbe(page, policy);
+      viewed = observe(page.url(), 0, probe, false, policy.secrets, policy);
     }
   }
   if (probe.accountSetup) viewed.classification = "account-setup-required";
@@ -449,12 +462,12 @@ async function discoverInventory(page, origin, secrets, includeJson) {
   return planObservedInventory({ hrefs, attributeNames, hostsPayload, origin, secrets });
 }
 
-async function visitRoute(page, origin, routePath, policy, managerConfirmed) {
+export async function visitRoute(page, origin, routePath, policy, managerConfirmed) {
   const href = new URL(routePath, origin).href;
   const response = await openDocument(page, href, policy);
   const status = response ? response.status() : 0;
-  const probe = await readProbe(page);
-  const viewed = observe(page.url(), status, probe, managerConfirmed, policy.secrets);
+  const probe = await readProbe(page, policy);
+  const viewed = observe(page.url(), status, probe, managerConfirmed, policy.secrets, policy);
   return {
     path: routePath,
     status,

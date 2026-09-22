@@ -1211,6 +1211,59 @@ scheme identifiers remain unchanged.
 
 ### Live UI harness
 
+The family runner, `node scripts/family-live-ui.mjs APP`, reuses the same
+request, redirect, Chromium target, screenshot, password and TOTP guards. `APP`
+is one of `aithema`, `paimos`, `pharos`, or `janus`; each run stays on that app's
+fixed `https://flow.inspr.at/APP/` mount and the real `auth.inspr.at` login.
+A successful OIDC callback and the app's signed-in shell are both required.
+Every application mutation is blocked, including server-side drafts. Pharos
+requires the approved Fleet manager grant; its runner permits inspection only.
+Janus requires JANUS-476's exclusive `flow_viewer` role and an exact sandbox
+binding, with no core viewer, auditor or operator role. It captures the dedicated
+Flow landing page, shell state and static assets. Its unique restricted-page
+marker is required before screenshots; an ordinary vault dashboard is refused.
+The server role denies catalog, posture, audit, setup and secret-use routes;
+the harness additionally blocks requests to those routes.
+
+From a clean checkout, run `npm ci --ignore-scripts` and install Chromium with
+`npx playwright install chromium`. The dedicated identity must already have its
+reviewed per-app access and enrolled authenticator. Keep its source file at
+`~/.inspr/secrets/agents/INSPR-UXQA.env`, owned by the current user with mode
+`0600`, containing `INSPR_UXQA_USERNAME`, `INSPR_UXQA_PASSWORD`, and
+`INSPR_UXQA_TOTP_SECRET`. Provision it privately; never paste its contents or
+values into command arguments. Run in a shell with tracing disabled:
+
+```sh
+bash -c '( set -a; source "$HOME/.inspr/secrets/agents/INSPR-UXQA.env"; node scripts/family-live-ui.mjs paimos; result=$?; set +a; exit "$result" )'
+```
+
+The runner captures those three values, removes them from the child-process
+environment before starting Chromium, and retains no browser session on disk.
+Protected-file input is also supported through `INSPR_UXQA_USERNAME_FILE`,
+`INSPR_UXQA_PASSWORD_FILE`, and `INSPR_UXQA_TOTP_SECRET_FILE`; do not mix modes.
+No client secret, bearer shortcut, dev login, or per-run human OTP is used.
+The unchanged Pharos-only runner below continues to accept its own file inputs.
+
+Evidence is created in a new private directory at
+`~/.inspr/runtime/inspr-uxqa/APP/UTC-STAMP/`: `evidence.json` uses
+`inspr.uxqa.live-ui-evidence.v1`, with named routes, classification, status,
+viewport and screenshot filenames. Observed password and TOTP submission are
+recorded independently; an OIDC callback never implies MFA was submitted.
+Both desktop `1440×1000` and mobile-size `390×844` landing captures are required
+for success. These are Chromium viewports, not mobile-device emulation. Pharos also captures its
+list view. Optional non-sensitive `INSPR_UXQA_PROJECT_REF` adds the already
+provisioned sandbox route (`project:ID` for Aithema, numeric ID for Paimos);
+it grants no server access. Set this per command for Aithema/Paimos only, never
+in the shared credential file; omit it for Janus and Pharos.
+A failed login, denied role, missing shell, or refused screenshot exits nonzero
+and is recorded as a blocker, never a health-check success. Screenshots and
+evidence are owner-only; symlinked paths and nonempty output directories are
+refused. Do not enable debugging, traces, HAR/video, proxying, or storage-state
+exports. Run `node --test tests/family-live-ui.test.mjs` for the policy tests and
+`node tests/family-live-ui-browser-proof.mjs` for the synthetic Chromium
+viewport/screenshot proof. The identity's allowed projects, rotation date, and manual canonical
+credential-store instructions belong in its INSPR Knowledge runbook.
+
 `node scripts/live-ui.mjs inventory` and `node scripts/live-ui.mjs draft` are
 the only commands. Arguments are those two words. The runner opens one
 headless Chromium context against the personal Pharos UI and signs in through
