@@ -91,6 +91,9 @@ test("source credentials are removed before child launch, including rejected inp
   const rejected = { ...credentials(), HTTPS_PROXY: "https://proxy.invalid" };
   assert.throws(() => captureFamilyCredentials(rejected, repo, file), /family-credentials/);
   assert.deepEqual(Object.keys(rejected), ["HTTPS_PROXY"]);
+  const extra = { ...credentials(), INSPR_UXQA_CLIENT_SECRET: "synthetic-unused-client-secret" };
+  assert.throws(() => captureFamilyCredentials(extra, repo, file), /family-credentials/);
+  assert.deepEqual(extra, {});
   fs.chmodSync(file, 0o644);
   const weak = credentials();
   assert.throws(() => captureFamilyCredentials(weak, repo, file), /family-credentials/);

@@ -21,9 +21,12 @@ function ownedPrivateFile(file) {
 export function captureFamilyCredentials(env, repoRoot, sourceFile = path.join(os.homedir(), ".inspr/secrets/agents/INSPR-UXQA.env")) {
   const values = CREDENTIAL_KEYS.map((key) => env[key]);
   const files = PATH_KEYS.map((key) => env[key]);
-  for (const key of [...CREDENTIAL_KEYS, ...PATH_KEYS]) delete env[key];
+  const unknown = Object.keys(env).filter((key) => key.startsWith("INSPR_UXQA_") &&
+    key !== "INSPR_UXQA_PROJECT_REF" && !CREDENTIAL_KEYS.includes(key) && !PATH_KEYS.includes(key));
+  for (const key of [...CREDENTIAL_KEYS, ...PATH_KEYS, ...unknown]) delete env[key];
   let totp;
   try {
+    if (unknown.length) throw new LiveUiError("family-credential-contract");
     assertRuntimeEnvironment(env);
     if (values.some((value) => value !== undefined)) {
       if (files.some((file) => file !== undefined)) throw new LiveUiError("family-credential-mode");
