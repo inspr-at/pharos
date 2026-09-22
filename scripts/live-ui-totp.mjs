@@ -31,7 +31,8 @@ function totpError(code) {
 function outsideRepo(candidate, repoRoot) {
   const root = fs.realpathSync(repoRoot);
   const relative = path.relative(root, candidate);
-  return relative.startsWith("..") || path.isAbsolute(relative);
+  // `..` must be its own segment. A child named `..private` stays inside the repo.
+  return relative.split(path.sep)[0] === ".." || path.isAbsolute(relative);
 }
 
 export function totpSecretFileFromEnv(env) {

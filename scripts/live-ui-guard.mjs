@@ -829,7 +829,9 @@ function assertOwnedRegularFile(filePath, repoRoot, maxBytes, prefix) {
 function assertOutsideRepo(candidate, repoRoot, code) {
   const root = fs.realpathSync(repoRoot);
   const relative = path.relative(root, candidate);
-  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+  // `..` must be its own segment. A child named `..private` stays inside the repo.
+  const segment = relative.split(path.sep)[0];
+  if (relative === "" || (segment !== ".." && !path.isAbsolute(relative))) {
     throw new LiveUiError(code);
   }
 }
