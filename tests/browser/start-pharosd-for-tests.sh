@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# Starts the pharosd under test from target/debug/pharosd. This script never
+# builds: run-playwright.mjs runs `cargo build -p pharosd --locked` before
+# launching it (PHAROS-312), because the UI assets are include_str! into the
+# binary and a stale build silently tests the wrong CSS and JS. Anyone
+# launching this script directly must build first; the startup line below
+# prints the binary's mtime and the source revision so a stale binary is
+# visible in every log.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../" && pwd)"
@@ -98,6 +105,17 @@ export RUST_LOG="${RUST_LOG:-warn}"
 
 node "$ROOT/tests/browser/validate-harness-env.mjs"
 
-"$ROOT/target/debug/pharosd" &
+PHAROSD_BIN="$ROOT/target/debug/pharosd"
+if [[ ! -x "$PHAROSD_BIN" ]]; then
+  echo "pharosd binary missing at $PHAROSD_BIN; run 'cargo build -p pharosd --locked' (run-playwright.mjs does this for you)" >&2
+  exit 1
+fi
+# Portable mtime: BSD date -r takes an epoch and stat flags differ; node is
+# already required by this script.
+binary_mtime=$(node -e 'process.stdout.write(require("node:fs").statSync(process.argv[1]).mtime.toISOString())' "$PHAROSD_BIN" 2>/dev/null || echo unknown)
+source_rev=$(git -C "$ROOT" describe --always --dirty 2>/dev/null || echo unknown)
+echo "pharosd under test: $PHAROSD_BIN mtime=$binary_mtime source=$source_rev"
+
+"$PHAROSD_BIN" &
 PHAROS_PID=$!
 wait "$PHAROS_PID"
