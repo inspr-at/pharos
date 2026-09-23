@@ -110,7 +110,9 @@ if [[ ! -x "$PHAROSD_BIN" ]]; then
   echo "pharosd binary missing at $PHAROSD_BIN; run 'cargo build -p pharosd --locked' (run-playwright.mjs does this for you)" >&2
   exit 1
 fi
-binary_mtime=$(date -u -r "$PHAROSD_BIN" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || stat -c %y "$PHAROSD_BIN")
+# Portable mtime: BSD date -r takes an epoch and stat flags differ; node is
+# already required by this script.
+binary_mtime=$(node -e 'process.stdout.write(require("node:fs").statSync(process.argv[1]).mtime.toISOString())' "$PHAROSD_BIN" 2>/dev/null || echo unknown)
 source_rev=$(git -C "$ROOT" describe --always --dirty 2>/dev/null || echo unknown)
 echo "pharosd under test: $PHAROSD_BIN mtime=$binary_mtime source=$source_rev"
 

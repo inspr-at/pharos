@@ -48,24 +48,32 @@ try {
           stdio: "inherit",
         });
       } catch (error) {
-        // A shell that cannot find cargo exits 127; a real build failure has
-        // already printed the compiler output above.
-        const hint = error?.status === 127 || error?.code === "ENOENT"
-          ? "cargo is not on PATH; run inside the devenv shell or set PHAROS_BROWSER_SKIP_BUILD=1 after building yourself"
-          : "cargo build -p pharosd --locked failed";
-        throw new Error(`browser suite refused to start: ${hint}`);
+        if (error?.signal === "SIGINT" || error?.signal === "SIGTERM") {
+          // The build was interrupted by the operator; report the signal exit
+          // code below instead of a build failure.
+          receivedSignal = error.signal;
+        } else {
+          // A shell that cannot find cargo exits 127; a real build failure has
+          // already printed the compiler output above.
+          const hint = error?.status === 127 || error?.code === "ENOENT"
+            ? "cargo is not on PATH; run inside the devenv shell or set PHAROS_BROWSER_SKIP_BUILD=1 after building yourself"
+            : "cargo build -p pharosd --locked failed";
+          throw new Error(`browser suite refused to start: ${hint}`);
+        }
       }
     }
-    // The start script prints the same line into the web server log, which
-    // Playwright only shows on failure; print it here so every run records
-    // which binary was under test.
-    const binary = path.join(repoRoot, "target", "debug", "pharosd");
-    const mtime = fs.statSync(binary).mtime.toISOString();
-    let source = "unknown";
-    try {
-      source = execSync("git describe --always --dirty", { cwd: repoRoot, encoding: "utf8" }).trim();
-    } catch {}
-    console.log(`pharosd under test: ${binary} mtime=${mtime} source=${source}`);
+    if (!receivedSignal) {
+      // The start script prints the same line into the web server log, which
+      // Playwright only shows on failure; print it here so every run records
+      // which binary was under test.
+      const binary = path.join(repoRoot, "target", "debug", "pharosd");
+      const mtime = fs.statSync(binary).mtime.toISOString();
+      let source = "unknown";
+      try {
+        source = execSync("git describe --always --dirty", { cwd: repoRoot, encoding: "utf8" }).trim();
+      } catch {}
+      console.log(`pharosd under test: ${binary} mtime=${mtime} source=${source}`);
+    }
 
     // These values are generated once by this launcher and inherited by every
     // Playwright config/worker process. Never reuse caller-supplied internal
