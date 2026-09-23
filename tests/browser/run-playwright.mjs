@@ -56,6 +56,16 @@ try {
         throw new Error(`browser suite refused to start: ${hint}`);
       }
     }
+    // The start script prints the same line into the web server log, which
+    // Playwright only shows on failure; print it here so every run records
+    // which binary was under test.
+    const binary = path.join(repoRoot, "target", "debug", "pharosd");
+    const mtime = fs.statSync(binary).mtime.toISOString();
+    let source = "unknown";
+    try {
+      source = execSync("git describe --always --dirty", { cwd: repoRoot, encoding: "utf8" }).trim();
+    } catch {}
+    console.log(`pharosd under test: ${binary} mtime=${mtime} source=${source}`);
 
     // These values are generated once by this launcher and inherited by every
     // Playwright config/worker process. Never reuse caller-supplied internal
