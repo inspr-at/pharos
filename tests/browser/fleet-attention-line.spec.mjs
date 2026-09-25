@@ -18,8 +18,8 @@ test("attention lines stay equal to the server text after load", async ({ page }
   const report = async (name, preferences, backup) => {
     const response = await page.request.post("/report", {
       data: {
-        schema: "inspr.pharos.host-report.v5",
-        version: 5,
+        schema: "inspr.pharos.host-report.v7",
+        version: 7,
         name,
         role: "production",
         is_nix: false,
@@ -46,6 +46,7 @@ test("attention lines stay equal to the server text after load", async ({ page }
       level: "restore-sample",
       state: "passed",
       checked_at: now - 86400,
+      restored_files: 1,
     },
   }]);
   await report(onboarding, { kind: "server" }, []);
@@ -111,6 +112,7 @@ test("attention lines stay equal to the server text after load", async ({ page }
           level: "restore-sample",
           state: "passed",
           checked_at: now - 86400,
+          restored_files: 1,
         },
       }]);
       const settled = await page.request.get(`/setup/provisioning-jobs/${encodeURIComponent(jobId)}`);

@@ -333,14 +333,14 @@ test("grace, restore, and history projections follow the shared contracts", () =
   assert.equal(api.resolveHeartbeatGrace({ preferences: { alerts: { heartbeat_grace_secs: 0 } } }, 40).secs, 0);
 
   const current = api.projectRestoreStatus([{
-    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 2_592_000 },
+    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 2_592_000, restored_files: 1 },
   }], now);
   assert.equal(current.state, "passed");
   assert.equal(current.tone, "good");
   assert.equal(current.overdue, false);
 
   const overdue = api.projectRestoreStatus([{
-    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 2_592_001 },
+    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 2_592_001, restored_files: 1 },
   }], now);
   assert.equal(overdue.state, "overdue");
   assert.equal(overdue.tone, "amber");
@@ -353,18 +353,43 @@ test("grace, restore, and history projections follow the shared contracts", () =
   assert.notEqual(checkOnly.tone, "good");
 
   const countedOut = api.projectRestoreStatus([{
-    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, files_restored: 0 },
+    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, restored_files: 0 },
   }], now);
   assert.equal(countedOut.state, "unknown");
   assert.notEqual(countedOut.tone, "good");
 
   const failed = api.projectRestoreStatus([
-    { restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 100 } },
+    { restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 100, restored_files: 1 } },
     { restore_validation: { level: "restore-sample", state: "failed", checked_at: now - 10 } },
   ], now);
   assert.equal(failed.state, "failed");
   assert.equal(failed.tone, "bad");
   assert.match(failed.detail, /last successful selective restore/);
+
+  const legacyWithoutEvidence = api.projectRestoreStatus([{
+    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 },
+  }], now);
+  assert.equal(legacyWithoutEvidence.state, "unknown");
+  assert.equal(legacyWithoutEvidence.label, "Not observed");
+  assert.match(legacyWithoutEvidence.detail, /No restored-file evidence/);
+
+  const retainedAfterFailure = api.projectRestoreStatus([{
+    restore_validation: { level: "restore-sample", state: "failed", checked_at: now - 10, last_success_at: now - 5 * 86_400, restored_files: 2 },
+  }], now);
+  assert.equal(retainedAfterFailure.state, "failed");
+  assert.equal(retainedAfterFailure.at, now - 5 * 86_400);
+  assert.match(retainedAfterFailure.detail, /last successful selective restore 5d ago/);
+
+  const retainedBoundary = api.projectRestoreStatus([{
+    restore_validation: { level: "restore-sample", state: "stale", checked_at: now - 10, last_success_at: now - 2_592_000, restored_files: 1 },
+  }], now);
+  assert.equal(retainedBoundary.overdue, false);
+  assert.equal(retainedBoundary.at, now - 2_592_000);
+  const retainedOverdue = api.projectRestoreStatus([{
+    restore_validation: { level: "restore-sample", state: "stale", checked_at: now - 10, last_success_at: now - 2_592_001, restored_files: 1 },
+  }], now);
+  assert.equal(retainedOverdue.state, "overdue");
+  assert.equal(retainedOverdue.overdue, true);
 
   const daily = api.projectDailyBackup([{
     state: "healthy", schedule: "daily", last_success_at: now - 50,
@@ -415,14 +440,14 @@ test("grace, restore, and history projections follow the shared contracts", () =
   assert.equal(staleDaily.label, "Stale");
   assert.notEqual(staleDaily.label, "Daily OK");
   const recentRestore = api.projectRestoreStatus([{
-    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 * 24 * 60 * 60 },
+    restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 * 24 * 60 * 60, restored_files: 1 },
   }], now);
   assert.equal(recentRestore.tone, "good");
   assert.equal(recentRestore.state, "passed");
   assert.equal(recentRestore.overdue, false);
   const sameHostJobs = [
     { repository_id: "repo-a", state: "failed", schedule: "daily", last_success_at: now - 3 * 24 * 60 * 60 },
-    { repository_id: "repo-b", state: "healthy", schedule: "daily", last_success_at: now - 10, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, files_restored: 1 } },
+    { repository_id: "repo-b", state: "healthy", schedule: "daily", last_success_at: now - 10, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, files_restored: 1, restored_files: 1 } },
   ];
   const sameHostRestore = api.projectRestoreStatus(sameHostJobs, now);
   assert.equal(sameHostRestore.state, "passed");
@@ -436,18 +461,18 @@ test("grace, restore, and history projections follow the shared contracts", () =
   assert.notEqual(noCrossHost.tone, "good");
   const zeroFromOtherJob = api.projectRestoreStatus([
     { repository_id: "repo-a", state: "failed", schedule: "daily", last_success_at: now - 100 },
-    { repository_id: "repo-b", state: "healthy", schedule: "daily", restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, files_restored: 0 } },
+    { repository_id: "repo-b", state: "healthy", schedule: "daily", restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, restored_files: 0 } },
   ], now);
   assert.equal(zeroFromOtherJob.state, "unknown");
   assert.notEqual(zeroFromOtherJob.tone, "good");
   const ownedRestore = api.projectRestoreStatus([
-    { repository_id: "repo-a", state: "healthy", schedule: "daily", last_success_at: now - 50, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 } },
+    { repository_id: "repo-a", state: "healthy", schedule: "daily", last_success_at: now - 50, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, restored_files: 1 } },
   ], now);
   assert.equal(ownedRestore.tone, "good");
   assert.equal(ownedRestore.state, "passed");
   const borrowedDaily = api.projectDailyBackup([
     { repository_id: "repo-a", state: "failed", schedule: "daily", last_success_at: now - 3 * 24 * 60 * 60 },
-    { repository_id: "repo-b", state: "healthy", schedule: "daily", last_success_at: now - 10, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10 } },
+    { repository_id: "repo-b", state: "healthy", schedule: "daily", last_success_at: now - 10, restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 10, restored_files: 1 } },
   ], now);
   assert.equal(borrowedDaily.label, "Failed");
   assert.equal(borrowedDaily.tone, "bad");
@@ -776,8 +801,9 @@ test("daily and restore projections follow the shared evidence contract", () => 
     { state: "not-required", summary: "No backup is required" },
   ], now).state, "not-required");
 
+  // Every matrix record carries restored-file evidence; the evidence gate has its own cases above.
   const restore = (records) => api.projectRestoreStatus(records.map((record) => ({
-    restore_validation: { level: "restore-sample", ...record },
+    restore_validation: { level: "restore-sample", restored_files: 1, ...record },
   })), now);
   const futureOnly = restore([{ state: "passed", checked_at: now + 86400 }]);
   assert.equal(futureOnly.state, "unknown");
@@ -2019,7 +2045,7 @@ globalThis.__drawer={
       state: "healthy",
       schedule: "daily",
       last_success_at: now - 3600,
-      restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 40 * 86400 },
+      restore_validation: { level: "restore-sample", state: "passed", checked_at: now - 40 * 86400, restored_files: 1 },
     }],
   };
   context.__drawer.populateHostDrawer(beacon);

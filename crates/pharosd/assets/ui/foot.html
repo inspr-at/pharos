@@ -203,18 +203,22 @@ function arrivalPresentation(last,interval,grace,now){
 }
 function backupLevelKey(value){return String(value||'').trim().toLowerCase().replace(/_/g,'-')}
 function selectiveRestoreFileCount(restore){
-  const raw=restore?.restored_files??restore?.restored_file_count??restore?.files_restored;
+  const raw=restore?.restored_files;
   if(raw==null||raw==='')return null;
   const count=Number(raw);
   return Number.isFinite(count)?count:null;
 }
-function qualifyingSelectiveRestore(restore){
-  if(!restore||backupLevelKey(restore.state)!=='passed'||backupLevelKey(restore.level)!=='restore-sample')return null;
+// Mirror of the server RestoreRecord (host-report v7, PHAROS-304): the latest
+// attempt is state/checked_at; the last success is last_success_at when the
+// producer retains it, else a legacy passed attempt's own time. Only a success
+// with at least one restored file is evidence for the monthly requirement.
+function restoreRecord(restore,now){
+  const latestAt=eligibleRestoreAt(restore?.checked_at,now);
+  const state=backupLevelKey(restore?.state);
+  const retained=eligibleRestoreAt(restore?.last_success_at,now);
+  const successAt=retained!=null?retained:(state==='passed'?latestAt:null);
   const files=selectiveRestoreFileCount(restore);
-  if(files!=null&&files<1)return null;
-  const at=Number(restore.checked_at);
-  if(!Number.isFinite(at)||at<=0)return null;
-  return {at};
+  return {latestAt,state,successAt,evidence:files!=null&&files>=1};
 }
 function dailyLabel(schedule){
   const text=String(schedule||'').trim();
@@ -290,42 +294,41 @@ function projectRestoreStatus(observations,now){
   const jobs=(Array.isArray(observations)?observations:[]).filter(job=>job&&typeof job==='object');
   if(projectDailyBackup(jobs,now).state==='not-required')return {tone:'neutral',state:'not-required',label:'Not required',detail:'No selective restore is required',at:null,overdue:false,producer:''};
   const current=Number(now);
-  let passed=null;
-  let latestAt=null;
-  let latestFailed=false;
-  let latestAdverse=false;
+  let successAt=null;
+  let unproven=false;
   let sawRestore=false;
+  const records=[];
   for(const job of jobs){
     const restore=job?.restore_validation;
     if(backupLevelKey(restore?.level)!=='restore-sample')continue;
     sawRestore=true;
-    const at=eligibleRestoreAt(restore.checked_at,current);
-    if(at==null)continue;
-    const state=backupLevelKey(restore.state);
-    const failed=state==='failed';
-    const adverse=state!=='passed';
-    if(latestAt==null||at>latestAt){
-      latestAt=at;
-      latestFailed=failed;
-      latestAdverse=adverse;
-    }else if(at===latestAt){
-      if(failed)latestFailed=true;
-      if(adverse)latestAdverse=true;
+    const record=restoreRecord(restore,current);
+    records.push(record);
+    if(record.successAt!=null){
+      if(record.evidence){if(successAt==null||record.successAt>successAt)successAt=record.successAt;}
+      else unproven=true;
     }
-    if(state!=='passed')continue;
-    const qualified=qualifyingSelectiveRestore(restore);
-    if(qualified&&qualified.at===at&&(!passed||at>passed.at))passed={at};
   }
-  if(latestFailed&&(!passed||latestAt>passed.at)){
-    return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(passed?passed.at:null,current,'last successful selective restore'),at:passed?passed.at:null,overdue:false,producer:'failed'};
+  // Latest attempt: newest eligible time; ties take the most adverse state across
+  // every record at that time (same rule as the server), so order cannot matter.
+  const adversityOf=state=>state==='failed'?3:state==='stale'?2:state==='passed'?0:1;
+  let latestAt=null;
+  for(const record of records)if(record.latestAt!=null&&(latestAt==null||record.latestAt>latestAt))latestAt=record.latestAt;
+  let latestAdversity=null;
+  for(const record of records)if(record.latestAt!=null&&record.latestAt===latestAt){const a=adversityOf(record.state);if(latestAdversity==null||a>latestAdversity)latestAdversity=a;}
+  const latestFailed=latestAdversity===3&&(successAt==null||latestAt>successAt);
+  if(latestFailed){
+    return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(successAt,current,'last successful selective restore'),at:successAt,overdue:false,producer:'failed'};
   }
-  if(!passed){
-    return {tone:'neutral',state:'unknown',label:'Not observed',detail:sawRestore?'No successful selective restore is recorded':'No selective restore evidence from the backup source',at:null,overdue:false,producer:''};
+  if(successAt==null){
+    const detail=unproven?'No restored-file evidence for the selective restore':sawRestore?'No successful selective restore is recorded':'No selective restore evidence from the backup source';
+    return {tone:'neutral',state:'unknown',label:'Not observed',detail,at:null,overdue:false,producer:''};
   }
-  const age=Math.max(0,current-passed.at);
-  if(age>SELECTIVE_RESTORE_OVERDUE_SECS)return {tone:'amber',state:'overdue',label:'Overdue',detail:agoNote(passed.at,current,'last successful selective restore'),at:passed.at,overdue:true,producer:'passed'};
-  if(latestAt===passed.at&&!latestAdverse)return {tone:'good',state:'passed',label:'Passed',detail:agoNote(passed.at,current,'selective restore'),at:passed.at,overdue:false,producer:'passed'};
-  return {tone:'neutral',state:'unknown',label:'Unknown',detail:agoNote(passed.at,current,'last successful selective restore'),at:passed.at,overdue:false,producer:''};
+  const age=Math.max(0,current-successAt);
+  if(age>SELECTIVE_RESTORE_OVERDUE_SECS)return {tone:'amber',state:'overdue',label:'Overdue',detail:agoNote(successAt,current,'last successful selective restore'),at:successAt,overdue:true,producer:'passed'};
+  const latestIsSuccess=latestAdversity===0&&records.some(record=>record.latestAt===latestAt&&record.evidence&&record.successAt===successAt);
+  if(latestIsSuccess)return {tone:'good',state:'passed',label:'Passed',detail:agoNote(successAt,current,'selective restore'),at:successAt,overdue:false,producer:'passed'};
+  return {tone:'neutral',state:'unknown',label:'Unknown',detail:agoNote(successAt,current,'last successful selective restore'),at:successAt,overdue:false,producer:''};
 }
 function projectBackupCheck(observations,now){
   const jobs=Array.isArray(observations)?observations:[];

@@ -1010,6 +1010,8 @@ mod module_tests {
             checked_at,
             evidence_label: Some("one file".to_string()),
             summary: None,
+            last_success_at: None,
+            restored_files: Some(1),
         }
     }
 
@@ -1069,6 +1071,115 @@ mod module_tests {
         assert!(markup.contains(r#"data-daily-backup-tone="good""#));
         assert!(markup.contains(r#"data-restore-overdue="true""#));
         assert!(markup.contains(r#"data-restore-state="overdue""#));
+    }
+
+    #[test]
+    fn later_failed_attempt_keeps_the_retained_last_success_visible() {
+        let now = 2_000_000_000;
+        let five_days = 5 * 24 * 60 * 60;
+        let mut validation =
+            restore_sample(pharos_core::BackupValidationState::Failed, Some(now - 10));
+        validation.last_success_at = Some(now - five_days);
+        let host = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now),
+            Some(validation),
+        );
+        let view = fleet_protection_view(std::slice::from_ref(&host), now);
+        assert_eq!(
+            view.run.tone, "good",
+            "a failed restore drill does not touch the daily fact"
+        );
+        assert_eq!(view.restore.state, "failed");
+        assert_eq!(view.restore.tone, "bad");
+        assert_eq!(view.restore.at, Some(now - five_days));
+        assert_eq!(
+            view.restore.note,
+            "last successful selective restore 5d ago"
+        );
+        assert!(!view.restore_overdue);
+        let markup = protection_markup(&view, "poseidon", &PublicBasePath::ROOT);
+        assert!(markup.contains(r#"data-restore-state="failed""#));
+        assert!(markup.contains("last successful selective restore 5d ago"));
+    }
+
+    #[test]
+    fn retained_last_success_drives_the_thirty_day_clock() {
+        let now = 2_000_000_000;
+        let mut stale = restore_sample(pharos_core::BackupValidationState::Stale, Some(now - 10));
+        stale.last_success_at = Some(now - SELECTIVE_RESTORE_OVERDUE_AFTER_SECS);
+        let host = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now),
+            Some(stale.clone()),
+        );
+        let current = fleet_protection_view(std::slice::from_ref(&host), now);
+        assert_eq!(
+            current.restore.at,
+            Some(now - SELECTIVE_RESTORE_OVERDUE_AFTER_SECS)
+        );
+        assert!(
+            !current.restore_overdue,
+            "exactly thirty days is still current"
+        );
+        assert_ne!(
+            current.restore.state, "passed",
+            "a stale latest attempt is not a pass"
+        );
+
+        stale.last_success_at = Some(now - SELECTIVE_RESTORE_OVERDUE_AFTER_SECS - 1);
+        let host = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now),
+            Some(stale),
+        );
+        let overdue = fleet_protection_view(std::slice::from_ref(&host), now);
+        assert_eq!(overdue.restore.state, "overdue");
+        assert!(overdue.restore_overdue);
+
+        let mut passed = restore_sample(pharos_core::BackupValidationState::Passed, Some(now - 60));
+        passed.last_success_at = Some(now - 60);
+        let host = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now),
+            Some(passed),
+        );
+        let fresh = fleet_protection_view(std::slice::from_ref(&host), now);
+        assert_eq!(fresh.restore.state, "passed");
+        assert_eq!(fresh.restore.tone, "good");
+    }
+
+    #[test]
+    fn selective_restore_without_restored_file_evidence_is_not_observed() {
+        let now = 2_000_000_000;
+        for files in [None, Some(0)] {
+            let mut validation =
+                restore_sample(pharos_core::BackupValidationState::Passed, Some(now - 60));
+            validation.restored_files = files;
+            let host = backup_observation(
+                BackupPostureState::Healthy,
+                Some("daily"),
+                Some(now),
+                Some(validation),
+            );
+            let view = fleet_protection_view(std::slice::from_ref(&host), now);
+            assert_eq!(view.restore.state, "unknown", "restored_files={files:?}");
+            assert_eq!(view.restore.label, "Not observed");
+            assert_eq!(
+                view.restore.note,
+                "No restored-file evidence for the selective restore"
+            );
+            assert!(
+                !view.missing_restore_producer,
+                "the producer reported; its evidence is what is missing"
+            );
+            let health = health_for(&view, &proven_current("nixos-unstable"), now);
+            assert_ne!(health.tone, "good");
+        }
     }
 
     #[test]
@@ -1567,6 +1678,8 @@ mod module_tests {
                 checked_at: Some(now - 6 * 86_400),
                 evidence_label: Some("one file".to_string()),
                 summary: None,
+                last_success_at: None,
+                restored_files: Some(1),
             }),
         );
         let passed_view = fleet_protection_view(std::slice::from_ref(&passed), now);
@@ -2010,6 +2123,8 @@ mod module_tests {
                 checked_at: Some(repo_at),
                 evidence_label: Some("repo check".to_string()),
                 summary: None,
+                last_success_at: None,
+                restored_files: None,
             }),
         );
         let repo_view = fleet_protection_view(&[repo.clone(), valid.clone()], now);
@@ -2089,6 +2204,8 @@ mod module_tests {
                 checked_at: Some(now),
                 evidence_label: Some("repo check".to_string()),
                 summary: None,
+                last_success_at: None,
+                restored_files: None,
             }),
         );
         let checked = fleet_protection_view(std::slice::from_ref(&check_only), now);
@@ -2111,6 +2228,8 @@ mod module_tests {
                     checked_at: Some(now),
                     evidence_label: None,
                     summary: None,
+                    last_success_at: None,
+                    restored_files: None,
                 }),
             );
             let view = fleet_protection_view(std::slice::from_ref(&observation), now);
@@ -3996,6 +4115,38 @@ fn check_state_fact(
     }
 }
 
+/// One selective-restore record split into the two facts the v7 contract keeps
+/// apart: the latest attempt (`state` / `checked_at`) and the last success.
+/// `success_at` is `last_success_at` when the producer retains it; a legacy
+/// record without it can only claim its own passed attempt as the success.
+/// `evidence` is true only when at least one restored file is recorded, so a
+/// success without that evidence never satisfies the monthly requirement.
+struct RestoreRecord {
+    latest_at: Option<i64>,
+    latest_state: pharos_core::BackupValidationState,
+    success_at: Option<i64>,
+    evidence: bool,
+}
+
+fn restore_record(
+    validation: &pharos_core::BackupValidationObservation,
+    now: i64,
+) -> RestoreRecord {
+    let latest_at = eligible_restore_instant(validation.checked_at, now);
+    let retained = eligible_restore_instant(validation.last_success_at, now);
+    let success_at = match retained {
+        Some(at) => Some(at),
+        None if validation.state == pharos_core::BackupValidationState::Passed => latest_at,
+        None => None,
+    };
+    RestoreRecord {
+        latest_at,
+        latest_state: validation.state,
+        success_at,
+        evidence: validation.restored_files.is_some_and(|files| files >= 1),
+    }
+}
+
 fn restore_fact(
     observations: &[BackupObservation],
     run_not_required: bool,
@@ -4032,33 +4183,35 @@ fn restore_fact(
             false,
         );
     }
-    let last_success = validations
+    let records: Vec<RestoreRecord> = validations
         .iter()
-        .copied()
-        .filter(|validation| {
-            validation.state == pharos_core::BackupValidationState::Passed
-                && eligible_restore_instant(validation.checked_at, now).is_some()
-        })
-        .max_by_key(|validation| validation.checked_at.unwrap_or(i64::MIN));
-    let latest = validations
+        .map(|validation| restore_record(validation, now))
+        .collect();
+    let last_success = records
         .iter()
-        .copied()
-        .filter(|validation| eligible_restore_instant(validation.checked_at, now).is_some())
-        .max_by(|left, right| {
-            left.checked_at.cmp(&right.checked_at).then_with(|| {
-                restore_state_adversity(left.state).cmp(&restore_state_adversity(right.state))
-            })
-        });
-    let newer_failed = match (latest, last_success) {
-        (Some(latest), Some(success)) => {
-            latest.state == pharos_core::BackupValidationState::Failed
-                && latest.checked_at > success.checked_at
-        }
-        (Some(latest), None) => latest.state == pharos_core::BackupValidationState::Failed,
-        _ => false,
-    };
+        .filter(|record| record.evidence)
+        .filter_map(|record| record.success_at)
+        .max();
+    let unproven_success = last_success.is_none()
+        && records
+            .iter()
+            .any(|record| record.success_at.is_some() && !record.evidence);
+    // The latest attempt is the newest eligible time; ties take the most
+    // adverse state across every record at that time, so input order and
+    // per-record success details cannot change the verdict.
+    let latest_at = records.iter().filter_map(|record| record.latest_at).max();
+    let latest_adversity = records
+        .iter()
+        .filter(|record| record.latest_at.is_some() && record.latest_at == latest_at)
+        .map(|record| restore_state_adversity(record.latest_state))
+        .max();
+    let newer_failed = latest_adversity
+        == Some(restore_state_adversity(
+            pharos_core::BackupValidationState::Failed,
+        ))
+        && last_success.is_none_or(|success_at| latest_at > Some(success_at));
     if newer_failed {
-        let at = positive_instant(last_success.and_then(|validation| validation.checked_at));
+        let at = last_success;
         return (
             ProtectionFact {
                 state: "failed",
@@ -4071,21 +4224,26 @@ fn restore_fact(
             false,
         );
     }
-    let Some(success) = last_success else {
+    let Some(success_at) = last_success else {
+        let note = if unproven_success {
+            "No restored-file evidence for the selective restore"
+        } else {
+            "No successful selective restore is recorded"
+        };
         return (
             ProtectionFact {
                 state: "unknown",
                 tone: "neutral",
                 label: "Not observed".to_string(),
-                note: "No successful selective restore is recorded".to_string(),
+                note: note.to_string(),
                 at: None,
             },
             false,
             false,
         );
     };
-    let at = positive_instant(success.checked_at);
-    let age = now.saturating_sub(at.unwrap_or(now));
+    let at = Some(success_at);
+    let age = now.saturating_sub(success_at);
     if age > SELECTIVE_RESTORE_OVERDUE_AFTER_SECS {
         return (
             ProtectionFact {
@@ -4099,10 +4257,10 @@ fn restore_fact(
             true,
         );
     }
-    let latest_is_success = latest.is_some_and(|validation| {
-        validation.state == pharos_core::BackupValidationState::Passed
-            && validation.checked_at == at
-    });
+    let latest_is_success = latest_adversity == Some(0)
+        && records.iter().any(|record| {
+            record.latest_at == latest_at && record.evidence && record.success_at == at
+        });
     if latest_is_success {
         return (
             ProtectionFact {
@@ -8648,19 +8806,33 @@ pub(super) fn backup_validation_alert(
         )
     };
 
-    let (level, issue, action) = match state {
-        pharos_core::BackupValidationState::Failed => (
+    // v7 (PHAROS-304): a selective restore with retained restored-file
+    // evidence is overdue by the age of that success, not by the state the
+    // producer put on its latest attempt. A failed latest attempt still alerts.
+    let retained_success_age = restore
+        .filter(|restore| is_selective_restore(restore.level))
+        .filter(|restore| restore.restored_files.is_some_and(|files| files >= 1))
+        .and_then(|restore| eligible_restore_instant(restore.last_success_at, now))
+        .map(|success_at| now.saturating_sub(success_at));
+    let overdue = (
+        "warning",
+        "Restore validation overdue",
+        "Run a restore validation or repository check and let Pharos observe it.",
+    );
+    let (level, issue, action) = match (state, retained_success_age) {
+        (pharos_core::BackupValidationState::Failed, _) => (
             "critical",
             "Restore validation failed",
             "Inspect validation evidence and run a clean restore or repository check.",
         ),
-        pharos_core::BackupValidationState::Stale => (
-            "warning",
-            "Restore validation overdue",
-            "Run a restore validation or repository check and let Pharos observe it.",
-        ),
-        pharos_core::BackupValidationState::Passed
-        | pharos_core::BackupValidationState::Unknown => return None,
+        (_, Some(age)) if age > SELECTIVE_RESTORE_OVERDUE_AFTER_SECS => overdue,
+        (_, Some(_)) => return None,
+        (pharos_core::BackupValidationState::Stale, None) => overdue,
+        (
+            pharos_core::BackupValidationState::Passed
+            | pharos_core::BackupValidationState::Unknown,
+            None,
+        ) => return None,
     };
 
     let sort_time = checked_at.unwrap_or_else(|| backup_sort_time(host, observation, now));

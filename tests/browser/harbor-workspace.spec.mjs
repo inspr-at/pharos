@@ -26,6 +26,7 @@ function backup(level, checkedAt, lastSuccessAt) {
       state: "passed",
       ...(checkedAt == null ? {} : { checked_at: checkedAt }),
       summary: "one file restored",
+      restored_files: 1,
     },
   };
 }
@@ -33,8 +34,8 @@ function backup(level, checkedAt, lastSuccessAt) {
 async function reportHost(page, name, backupObservation) {
   const response = await page.request.post("/report", {
     data: {
-      schema: "inspr.pharos.host-report.v4",
-      version: 4,
+      schema: "inspr.pharos.host-report.v7",
+      version: 7,
       name,
       role: "server",
       is_nix: false,

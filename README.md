@@ -84,9 +84,13 @@ projection uses the existing 36-hour stale default: a recorded success
 strictly older than 36 hours is stale, and a success time more than two
 seconds in the future is not treated as fresh. Repository checks, snapshot
 existence, and similar observations are not a successful selective restore.
-No producer of that restore ships with Pharos; NIX-562 tracks it. A history
-that keeps the last success distinct from the latest attempt is not shipped;
-PHAROS-304 tracks it. One successfully restored file per host satisfies this check; it does not
+No producer of that restore ships with Pharos; NIX-562 tracks it. Since
+host-report v7 the validation record keeps the last successful restore
+(`last_success_at`) apart from the latest attempt, so a later failed attempt
+renders as failed while the success that drives the 30-day clock stays
+recorded, and a later stale or unknown attempt keeps the restore out of green, and `restored_files` is the evidence: a restore without at least one
+restored file is not observed as a success. One successfully restored file per
+host satisfies this check; it does not
 require one file from every repository. This posture does not establish
 full-system recoverability.
 
@@ -148,8 +152,8 @@ physical Chrome window-focus recovery still needs separate live verification.
 
 The shared Rust contracts matter: server and beacon cannot silently drift onto
 different report schemas. The current report contract is
-`inspr.pharos.host-report.v6`; the control plane still accepts predecessor
-`v5` and `v4` reports. The local onboarding envelope is
+`inspr.pharos.host-report.v7`; the control plane still accepts predecessor
+`v6`, `v5` and `v4` reports, and refuses v7 selective-restore history on them. The local onboarding envelope is
 `inspr.pharos.host-registration.v1`. Both require explicit schema/version
 fields and reject extensions. Reports are limited to 64 KiB, heartbeat cadence
 is 10–3600 seconds, and all identities, freshness values, and observation text
@@ -947,7 +951,7 @@ promised third-party API. The important boundaries are:
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
 | `GET /healthz`, `GET /version`                                     | Public health and build metadata                                                                                          |
 | `POST /register`                                                   | Strict versioned registration contract plus deployment bootstrap token; issues one per-host token                         |
-| `POST /report`                                                     | Strict 64 KiB beacon v6/v5/v4 contract and per-host bearer token                                                          |
+| `POST /report`                                                     | Strict 64 KiB beacon v7/v6/v5/v4 contract and per-host bearer token                                                          |
 | `GET /hosts.json`, `GET /declared-hosts.json`, `GET /proof/{host}` | OIDC/access-policy or scoped machine-operator guarded fleet views                                                         |
 | `POST /host-need-intents`                                          | Stores a typed need and creates only the existing immutable Hetzner plan review; authorization and create remain separate |
 | `POST /setup/existing-host/preflight`                              | Guarded read-only onboarding facts                                                                                        |
@@ -1138,8 +1142,6 @@ Not provided today:
 - a replacement for a secret manager, backup engine or infrastructure source
   of truth;
 - a selective file-restore producer (NIX-562 tracks that work);
-- separate last-success and latest-attempt history for a selective restore
-  (PHAROS-304; not shipped);
 - a per-repository restore requirement, or full-system recoverability from
   backup posture.
 
