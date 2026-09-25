@@ -1,12 +1,14 @@
 # Pharos Changelog
 
+## 260925163010.0.0 - 2026-09-25
+
+- Move the host report contract to `inspr.pharos.host-report.v7`, keeping v6, v5 and v4 as accepted predecessors. The backup validation record now retains the last successful selective restore (`last_success_at`) separately from the latest attempt and carries the restored-file count (`restored_files`); a later failed attempt no longer erases the success that drives the 30-day clock, a restore without at least one restored file is not observed as a success, the overdue alert follows that retained success, and older report versions refuse the new fields (PHAROS-304).
+
 ## 260922214617.0.0 - 2026-09-22
 
 - Fleet cards, list and quick preview rebuilt on the approved Harbor design: fluid grid that fills the viewport (1 to 5 columns), fixed card regions with one attention line, a two-column protection panel, the moving heartbeat stage and a configuration footer; six-column list; 420px quick preview sheet with exact times and heartbeat history; phone and tablet layouts without horizontal scroll (PHAROS-310).
 
 ## Unreleased
-
-- Move the host report contract to `inspr.pharos.host-report.v7`, keeping v6, v5 and v4 as accepted predecessors. The backup validation record now retains the last successful selective restore (`last_success_at`) separately from the latest attempt and carries the restored-file count (`restored_files`); a later failed or stale attempt no longer erases the success that drives the 30-day clock, a restore without at least one restored file is not observed as a success, and older report versions refuse the new fields (PHAROS-304).
 
 ## 260922141211.0.0 - 2026-09-22
 
