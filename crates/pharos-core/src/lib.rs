@@ -3827,26 +3827,46 @@ pub fn heartbeat_timeline_x(
 
 // PHAROS-206 moved the contract to v6 by adding optional measured deployed
 // artifact identity, distinct from Nix generation / flake.lock evidence.
+// PHAROS-304 moved it to v7 by adding optional selective-restore history on
+// `BackupValidationObservation` (`last_success_at`, `restored_files`), so a
+// later failed attempt no longer erases the last successful restore.
 // `deny_unknown_fields` makes any addition breaking for an older consumer, so
 // the version moves with it and the rollout order in README applies: control
 // plane first, then beacons. Known browser clients still emit v4, so the
-// control plane keeps accepting v4 and v5 as supported predecessors.
-pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v6";
-pub const HOST_REPORT_VERSION: u16 = 6;
+// control plane keeps accepting v4, v5 and v6 as supported predecessors.
+pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v7";
+pub const HOST_REPORT_VERSION: u16 = 7;
 pub const HOST_REPORT_V4_SCHEMA: &str = "inspr.pharos.host-report.v4";
 pub const HOST_REPORT_V4_VERSION: u16 = 4;
 pub const HOST_REPORT_V5_SCHEMA: &str = "inspr.pharos.host-report.v5";
 pub const HOST_REPORT_V5_VERSION: u16 = 5;
-pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = HOST_REPORT_V5_SCHEMA;
-pub const PREVIOUS_HOST_REPORT_VERSION: u16 = HOST_REPORT_V5_VERSION;
-pub const SUPPORTED_HOST_REPORT_CONTRACTS: [(&str, u16); 3] = [
+pub const HOST_REPORT_V6_SCHEMA: &str = "inspr.pharos.host-report.v6";
+pub const HOST_REPORT_V6_VERSION: u16 = 6;
+pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = HOST_REPORT_V6_SCHEMA;
+pub const PREVIOUS_HOST_REPORT_VERSION: u16 = HOST_REPORT_V6_VERSION;
+pub const SUPPORTED_HOST_REPORT_CONTRACTS: [(&str, u16); 4] = [
     (HOST_REPORT_V4_SCHEMA, HOST_REPORT_V4_VERSION),
     (HOST_REPORT_V5_SCHEMA, HOST_REPORT_V5_VERSION),
+    (HOST_REPORT_V6_SCHEMA, HOST_REPORT_V6_VERSION),
     (HOST_REPORT_SCHEMA, HOST_REPORT_VERSION),
 ];
 
 fn default_host_report_version() -> u16 {
     HOST_REPORT_VERSION
+}
+
+/// v7 evidence: a retained last successful selective restore or a restored
+/// file count on the validation observation. Older report versions cannot
+/// carry it, so the control plane refuses it there instead of guessing.
+fn backup_observations_carry_restore_history(observations: &[BackupObservation]) -> bool {
+    observations.iter().any(|observation| {
+        observation
+            .restore_validation
+            .as_ref()
+            .is_some_and(|validation| {
+                validation.last_success_at.is_some() || validation.restored_files.is_some()
+            })
+    })
 }
 
 /// What a `pharos-beacon` sends to `pharosd` (PHAROS-9 ingestion). The server
@@ -3902,6 +3922,14 @@ impl HostReport {
         }
         if self.version == HOST_REPORT_V5_VERSION && self.deployed_artifact.is_some() {
             return Err("report v5 must not carry v6 deployed artifact evidence".to_string());
+        }
+        if self.version < HOST_REPORT_VERSION
+            && backup_observations_carry_restore_history(&self.backup_observations)
+        {
+            return Err(format!(
+                "report v{} must not carry v7 selective restore history",
+                self.version
+            ));
         }
         validate_report_identity(&self.name, &self.role)?;
         validate_heartbeat_interval(self.heartbeat_interval_secs)?;
@@ -4241,6 +4269,14 @@ pub enum BackupRunState {
     Unknown,
 }
 
+/// One validation record per backup observation. `level`, `state` and
+/// `checked_at` describe the latest attempt. Since host-report v7 (PHAROS-304)
+/// the record also retains the last successful selective restore on its own:
+/// `last_success_at` survives a later failed or stale attempt, and
+/// `restored_files` is the count of files that restore actually brought back.
+/// A selective restore satisfies the monthly requirement only with at least
+/// one restored file; a record without that evidence stays "not observed".
+/// Legacy documents without the two fields still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BackupValidationObservation {
@@ -4252,10 +4288,23 @@ pub struct BackupValidationObservation {
     pub evidence_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Time of the last successful selective restore, independent of the
+    /// latest attempt recorded in `state` / `checked_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<UnixSeconds>,
+    /// Files actually restored by that last success. Zero means the attempt
+    /// restored nothing and is not evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_files: Option<u32>,
 }
 
 impl BackupValidationObservation {
     pub fn validate_contract(&self) -> Result<(), String> {
+        if self.last_success_at.is_some_and(|at| at <= 0) {
+            return Err(
+                "backup validation last_success_at must be a positive unix time".to_string(),
+            );
+        }
         for value in self
             .evidence_label
             .as_deref()
@@ -5072,9 +5121,11 @@ mod tests {
 
     #[test]
     fn previous_host_report_must_not_carry_deployed_artifact_evidence() {
+        // v5 is the last contract without deployed-artifact evidence; v6 (the
+        // current predecessor since PHAROS-304) carries it.
         let mut report = HostReport {
-            schema: PREVIOUS_HOST_REPORT_SCHEMA.to_string(),
-            version: PREVIOUS_HOST_REPORT_VERSION,
+            schema: HOST_REPORT_V5_SCHEMA.to_string(),
+            version: HOST_REPORT_V5_VERSION,
             name: "hsb8".to_string(),
             role: "server".to_string(),
             is_nix: true,
@@ -5795,6 +5846,8 @@ mod tests {
                 checked_at: None,
                 evidence_label: Some("e".repeat(MAX_OBSERVATION_SUMMARY_BYTES)),
                 summary: Some("v".repeat(MAX_OBSERVATION_SUMMARY_BYTES)),
+                last_success_at: None,
+                restored_files: Some(1),
             }),
         };
         let oversized = HostReport {
@@ -6005,6 +6058,102 @@ mod tests {
     }
 
     #[test]
+    fn selective_restore_history_is_v7_only_and_legacy_records_still_load() {
+        let legacy: BackupValidationObservation = serde_json::from_value(serde_json::json!({
+            "level": "restore-sample",
+            "state": "passed",
+            "checked_at": 1_699_980_000
+        }))
+        .expect("legacy validation record deserializes");
+        assert_eq!(legacy.last_success_at, None);
+        assert_eq!(legacy.restored_files, None);
+        legacy.validate_contract().expect("legacy record validates");
+
+        let retained = BackupValidationObservation {
+            level: BackupValidationLevel::RestoreSample,
+            state: BackupValidationState::Failed,
+            checked_at: Some(1_700_000_000),
+            evidence_label: None,
+            summary: None,
+            last_success_at: Some(1_699_000_000),
+            restored_files: Some(3),
+        };
+        retained
+            .validate_contract()
+            .expect("retained history validates");
+        let encoded = serde_json::to_value(&retained).expect("serializes");
+        assert_eq!(encoded["last_success_at"], 1_699_000_000);
+        assert_eq!(encoded["restored_files"], 3);
+        assert!(BackupValidationObservation {
+            last_success_at: Some(0),
+            ..retained.clone()
+        }
+        .validate_contract()
+        .is_err());
+
+        let mut observation = BackupObservation {
+            id: "restic-main".to_string(),
+            label: "Restic main".to_string(),
+            engine: BackupEngine::Restic,
+            state: BackupPostureState::Healthy,
+            configured: BackupConfiguredState::Enabled,
+            summary: "last backup succeeded".to_string(),
+            target_label: None,
+            repository_id: None,
+            schedule: Some("daily".to_string()),
+            next_run_at: None,
+            last_attempt_at: Some(1_700_000_000),
+            last_attempt_state: Some(BackupRunState::Succeeded),
+            last_success_at: Some(1_700_000_000),
+            snapshot_count: None,
+            total_bytes: None,
+            latest_snapshot_bytes: None,
+            last_check_at: None,
+            last_check_state: None,
+            restore_validation: Some(retained.clone()),
+        };
+        let mut report = HostReport {
+            schema: HOST_REPORT_SCHEMA.to_string(),
+            version: HOST_REPORT_VERSION,
+            name: "hsb8".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            heartbeat_interval_secs: 60,
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+            kernel: None,
+            service_observations: Vec::new(),
+            backup_observations: vec![observation.clone()],
+            inbound_rtt_ms: None,
+            location: None,
+            preferences: HostPreferences::default(),
+            deployed_artifact: None,
+        };
+        report
+            .validate_contract()
+            .expect("v7 carries restore history");
+        for (schema, version) in [
+            (HOST_REPORT_V4_SCHEMA, HOST_REPORT_V4_VERSION),
+            (HOST_REPORT_V5_SCHEMA, HOST_REPORT_V5_VERSION),
+            (HOST_REPORT_V6_SCHEMA, HOST_REPORT_V6_VERSION),
+        ] {
+            report.schema = schema.to_string();
+            report.version = version;
+            assert!(
+                report.validate_contract().is_err(),
+                "{schema} must refuse v7 restore history"
+            );
+        }
+        observation.restore_validation = Some(legacy);
+        report.backup_observations = vec![observation];
+        report
+            .validate_contract()
+            .expect("v6 without restore history stays valid");
+    }
+
+    #[test]
     fn backup_observation_contract_is_typed_and_sanitized() {
         let supported_states = serde_json::to_value([
             BackupPostureState::Healthy,
@@ -6054,6 +6203,8 @@ mod tests {
                 checked_at: Some(1_699_980_000),
                 evidence_label: Some("sample restore drill".to_string()),
                 summary: Some("operator-validated sample restore".to_string()),
+                last_success_at: Some(1_699_980_000),
+                restored_files: Some(1),
             }),
         };
         observation

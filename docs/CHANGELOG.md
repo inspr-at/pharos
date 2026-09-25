@@ -6,6 +6,8 @@
 
 ## Unreleased
 
+- Move the host report contract to `inspr.pharos.host-report.v7`, keeping v6, v5 and v4 as accepted predecessors. The backup validation record now retains the last successful selective restore (`last_success_at`) separately from the latest attempt and carries the restored-file count (`restored_files`); a later failed or stale attempt no longer erases the success that drives the 30-day clock, a restore without at least one restored file is not observed as a success, and older report versions refuse the new fields (PHAROS-304).
+
 ## 260922141211.0.0 - 2026-09-22
 
 - Restore compact host cards and list rows with consistent typography, spacing and centered health marks, retaining the sidebar, header and lighthouse artwork (PHAROS-302).

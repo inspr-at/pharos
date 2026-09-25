@@ -5668,6 +5668,8 @@ mod tests {
                 checked_at: Some(1_700_000_100),
                 evidence_label: Some("repo check".to_string()),
                 summary: None,
+                last_success_at: None,
+                restored_files: None,
             }),
         }
     }
@@ -7208,6 +7210,8 @@ mod tests {
             checked_at: Some(1_700_000_050),
             evidence_label: Some("restore sample".to_string()),
             summary: Some("restore drill overdue".to_string()),
+            last_success_at: None,
+            restored_files: Some(1),
         });
         let host = host_with_backups("athena", 1_700_000_100, vec![observation]);
 
@@ -7243,6 +7247,8 @@ mod tests {
             checked_at: Some(1_700_000_050),
             evidence_label: Some("restore sample".to_string()),
             summary: Some("restore sample failed".to_string()),
+            last_success_at: None,
+            restored_files: Some(1),
         });
         let host = host_with_backups("csb1", 1_700_000_100, vec![]);
 
@@ -7582,6 +7588,8 @@ mod tests {
             checked_at: Some(900),
             evidence_label: Some("restore sample".to_string()),
             summary: Some("restore drill is overdue".to_string()),
+            last_success_at: None,
+            restored_files: Some(1),
         });
 
         let hosts = vec![
@@ -7778,6 +7786,8 @@ mod tests {
             checked_at: Some(950),
             evidence_label: Some("repo check".to_string()),
             summary: Some("repository check passed".to_string()),
+            last_success_at: None,
+            restored_files: None,
         });
 
         let hosts = vec![
