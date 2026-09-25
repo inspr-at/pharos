@@ -25,3 +25,4 @@ Authoritative for what is wired here; `doctrine-check.sh` diffs this against
 | `/nix` | Nix, flakes, Home Manager |
 | `/inspr` | Doctrine map |
 | `/push` | Single-repo commit + push |
+| `/inspr-versioning` | INSPR Calendar Versioning adoption |
