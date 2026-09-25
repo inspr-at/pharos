@@ -86,9 +86,9 @@ seconds in the future is not treated as fresh. Repository checks, snapshot
 existence, and similar observations are not a successful selective restore.
 No producer of that restore ships with Pharos; NIX-562 tracks it. Since
 host-report v7 the validation record keeps the last successful restore
-(`last_success_at`) apart from the latest attempt, so a later failed or stale
-attempt stays visible without erasing the success that drives the 30-day
-clock, and `restored_files` is the evidence: a restore without at least one
+(`last_success_at`) apart from the latest attempt, so a later failed attempt
+renders as failed while the success that drives the 30-day clock stays
+recorded, and a later stale or unknown attempt keeps the restore out of green, and `restored_files` is the evidence: a restore without at least one
 restored file is not observed as a success. One successfully restored file per
 host satisfies this check; it does not
 require one file from every repository. This posture does not establish

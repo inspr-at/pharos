@@ -296,22 +296,27 @@ function projectRestoreStatus(observations,now){
   const current=Number(now);
   let successAt=null;
   let unproven=false;
-  let latest=null;
   let sawRestore=false;
+  const records=[];
   for(const job of jobs){
     const restore=job?.restore_validation;
     if(backupLevelKey(restore?.level)!=='restore-sample')continue;
     sawRestore=true;
     const record=restoreRecord(restore,current);
+    records.push(record);
     if(record.successAt!=null){
       if(record.evidence){if(successAt==null||record.successAt>successAt)successAt=record.successAt;}
       else unproven=true;
     }
-    if(record.latestAt==null)continue;
-    const adversity=record.state==='failed'?3:record.state==='stale'?2:record.state==='passed'?0:1;
-    if(!latest||record.latestAt>latest.latestAt||(record.latestAt===latest.latestAt&&adversity>latest.adversity))latest={...record,adversity};
   }
-  const latestFailed=!!latest&&latest.state==='failed'&&(successAt==null||latest.latestAt>successAt);
+  // Latest attempt: newest eligible time; ties take the most adverse state across
+  // every record at that time (same rule as the server), so order cannot matter.
+  const adversityOf=state=>state==='failed'?3:state==='stale'?2:state==='passed'?0:1;
+  let latestAt=null;
+  for(const record of records)if(record.latestAt!=null&&(latestAt==null||record.latestAt>latestAt))latestAt=record.latestAt;
+  let latestAdversity=null;
+  for(const record of records)if(record.latestAt!=null&&record.latestAt===latestAt){const a=adversityOf(record.state);if(latestAdversity==null||a>latestAdversity)latestAdversity=a;}
+  const latestFailed=latestAdversity===3&&(successAt==null||latestAt>successAt);
   if(latestFailed){
     return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(successAt,current,'last successful selective restore'),at:successAt,overdue:false,producer:'failed'};
   }
@@ -321,7 +326,8 @@ function projectRestoreStatus(observations,now){
   }
   const age=Math.max(0,current-successAt);
   if(age>SELECTIVE_RESTORE_OVERDUE_SECS)return {tone:'amber',state:'overdue',label:'Overdue',detail:agoNote(successAt,current,'last successful selective restore'),at:successAt,overdue:true,producer:'passed'};
-  if(latest&&latest.state==='passed'&&latest.evidence&&latest.successAt===successAt)return {tone:'good',state:'passed',label:'Passed',detail:agoNote(successAt,current,'selective restore'),at:successAt,overdue:false,producer:'passed'};
+  const latestIsSuccess=latestAdversity===0&&records.some(record=>record.latestAt===latestAt&&record.evidence&&record.successAt===successAt);
+  if(latestIsSuccess)return {tone:'good',state:'passed',label:'Passed',detail:agoNote(successAt,current,'selective restore'),at:successAt,overdue:false,producer:'passed'};
   return {tone:'neutral',state:'unknown',label:'Unknown',detail:agoNote(successAt,current,'last successful selective restore'),at:successAt,overdue:false,producer:''};
 }
 function projectBackupCheck(observations,now){

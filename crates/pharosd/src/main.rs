@@ -7264,6 +7264,49 @@ mod tests {
     }
 
     #[test]
+    fn retained_last_success_governs_the_restore_overdue_alert() {
+        let now = 1_700_000_120;
+        let thirty_days = 30 * 24 * 60 * 60;
+        let host = host_with_backups("csb1", now - 20, vec![]);
+        let mut observation = backup_observation(BackupPostureState::Healthy);
+        observation.restore_validation = Some(pharos_core::BackupValidationObservation {
+            level: pharos_core::BackupValidationLevel::RestoreSample,
+            state: pharos_core::BackupValidationState::Stale,
+            checked_at: Some(now - 70),
+            evidence_label: Some("restore sample".to_string()),
+            summary: Some("producer marked the drill stale".to_string()),
+            last_success_at: Some(now - thirty_days),
+            restored_files: Some(1),
+        });
+        assert!(
+            backup_validation_alert(&host, &observation, now).is_none(),
+            "a retained success exactly thirty days old is current, whatever the latest attempt says"
+        );
+
+        let restore = observation.restore_validation.as_mut().unwrap();
+        restore.state = pharos_core::BackupValidationState::Passed;
+        restore.last_success_at = Some(now - thirty_days - 1);
+        let alert =
+            backup_validation_alert(&host, &observation, now).expect("overdue by success age");
+        assert_eq!(alert.level, "warning");
+        assert_eq!(alert.issue, "Restic main: Restore validation overdue");
+
+        let restore = observation.restore_validation.as_mut().unwrap();
+        restore.state = pharos_core::BackupValidationState::Failed;
+        restore.last_success_at = Some(now - 60);
+        let alert =
+            backup_validation_alert(&host, &observation, now).expect("failed attempt alerts");
+        assert_eq!(alert.level, "critical");
+
+        let restore = observation.restore_validation.as_mut().unwrap();
+        restore.state = pharos_core::BackupValidationState::Stale;
+        restore.restored_files = Some(0);
+        let alert = backup_validation_alert(&host, &observation, now)
+            .expect("no evidence keeps the producer's stale verdict");
+        assert_eq!(alert.level, "warning");
+    }
+
+    #[test]
     fn repository_check_state_can_raise_validation_overdue_alert() {
         let mut observation = backup_observation(BackupPostureState::Healthy);
         observation.restore_validation = None;

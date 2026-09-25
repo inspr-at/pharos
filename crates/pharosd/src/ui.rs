@@ -4196,23 +4196,20 @@ fn restore_fact(
         && records
             .iter()
             .any(|record| record.success_at.is_some() && !record.evidence);
-    let latest = records
+    // The latest attempt is the newest eligible time; ties take the most
+    // adverse state across every record at that time, so input order and
+    // per-record success details cannot change the verdict.
+    let latest_at = records.iter().filter_map(|record| record.latest_at).max();
+    let latest_adversity = records
         .iter()
-        .filter(|record| record.latest_at.is_some())
-        .max_by(|left, right| {
-            left.latest_at.cmp(&right.latest_at).then_with(|| {
-                restore_state_adversity(left.latest_state)
-                    .cmp(&restore_state_adversity(right.latest_state))
-            })
-        });
-    let newer_failed = match (latest, last_success) {
-        (Some(latest), Some(success_at)) => {
-            latest.latest_state == pharos_core::BackupValidationState::Failed
-                && latest.latest_at > Some(success_at)
-        }
-        (Some(latest), None) => latest.latest_state == pharos_core::BackupValidationState::Failed,
-        _ => false,
-    };
+        .filter(|record| record.latest_at.is_some() && record.latest_at == latest_at)
+        .map(|record| restore_state_adversity(record.latest_state))
+        .max();
+    let newer_failed = latest_adversity
+        == Some(restore_state_adversity(
+            pharos_core::BackupValidationState::Failed,
+        ))
+        && last_success.is_none_or(|success_at| latest_at > Some(success_at));
     if newer_failed {
         let at = last_success;
         return (
@@ -4260,11 +4257,10 @@ fn restore_fact(
             true,
         );
     }
-    let latest_is_success = latest.is_some_and(|record| {
-        record.latest_state == pharos_core::BackupValidationState::Passed
-            && record.evidence
-            && record.success_at == at
-    });
+    let latest_is_success = latest_adversity == Some(0)
+        && records.iter().any(|record| {
+            record.latest_at == latest_at && record.evidence && record.success_at == at
+        });
     if latest_is_success {
         return (
             ProtectionFact {
@@ -8810,19 +8806,33 @@ pub(super) fn backup_validation_alert(
         )
     };
 
-    let (level, issue, action) = match state {
-        pharos_core::BackupValidationState::Failed => (
+    // v7 (PHAROS-304): a selective restore with retained restored-file
+    // evidence is overdue by the age of that success, not by the state the
+    // producer put on its latest attempt. A failed latest attempt still alerts.
+    let retained_success_age = restore
+        .filter(|restore| is_selective_restore(restore.level))
+        .filter(|restore| restore.restored_files.is_some_and(|files| files >= 1))
+        .and_then(|restore| eligible_restore_instant(restore.last_success_at, now))
+        .map(|success_at| now.saturating_sub(success_at));
+    let overdue = (
+        "warning",
+        "Restore validation overdue",
+        "Run a restore validation or repository check and let Pharos observe it.",
+    );
+    let (level, issue, action) = match (state, retained_success_age) {
+        (pharos_core::BackupValidationState::Failed, _) => (
             "critical",
             "Restore validation failed",
             "Inspect validation evidence and run a clean restore or repository check.",
         ),
-        pharos_core::BackupValidationState::Stale => (
-            "warning",
-            "Restore validation overdue",
-            "Run a restore validation or repository check and let Pharos observe it.",
-        ),
-        pharos_core::BackupValidationState::Passed
-        | pharos_core::BackupValidationState::Unknown => return None,
+        (_, Some(age)) if age > SELECTIVE_RESTORE_OVERDUE_AFTER_SECS => overdue,
+        (_, Some(_)) => return None,
+        (pharos_core::BackupValidationState::Stale, None) => overdue,
+        (
+            pharos_core::BackupValidationState::Passed
+            | pharos_core::BackupValidationState::Unknown,
+            None,
+        ) => return None,
     };
 
     let sort_time = checked_at.unwrap_or_else(|| backup_sort_time(host, observation, now));
