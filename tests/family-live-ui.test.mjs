@@ -95,10 +95,18 @@ test("source credentials are removed before child launch, including rejected inp
   const extra = { ...credentials(), INSPR_UXQA_CLIENT_SECRET: "synthetic-unused-client-secret" };
   assert.throws(() => captureFamilyCredentials(extra, repo, file), /family-credential-contract/);
   assert.deepEqual(extra, {});
-  fs.chmodSync(file, 0o644);
-  const weak = credentials();
-  assert.throws(() => captureFamilyCredentials(weak, repo, file), /family-credential-file/);
-  assert.deepEqual(weak, {});
+  // agent-secrets materializes the file read-only (0400): accepted like 0600.
+  fs.chmodSync(file, 0o400);
+  const materialized = captureFamilyCredentials(credentials(), repo, file);
+  assert.equal(materialized.mode, "protected-env");
+  materialized.totp.bytes.fill(0);
+  for (const weakMode of [0o644, 0o640, 0o460, 0o666]) {
+    fs.chmodSync(file, weakMode);
+    const weak = credentials();
+    assert.throws(() => captureFamilyCredentials(weak, repo, file), /family-credential-file/);
+    assert.deepEqual(weak, {});
+  }
+  fs.chmodSync(file, 0o600);
 });
 
 test("runtime evidence is outside the checkout, owned private, new, and never follows a symlink", () => {
