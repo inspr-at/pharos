@@ -13,7 +13,10 @@ const PATH_KEYS = Object.freeze(["INSPR_UXQA_USERNAME_FILE", "INSPR_UXQA_PASSWOR
 
 function ownedPrivateFile(file) {
   const stat = fs.lstatSync(file);
-  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o600 || stat.uid !== process.getuid() || fs.realpathSync(file) !== path.resolve(file)) throw new LiveUiError("family-credential-file");
+  // Owner-only modes: 0600 for a hand-written file, 0400 for one materialized
+  // read-only by nixcfg agent-secrets (NIX-579). Any group or other bit refuses.
+  const mode = stat.mode & 0o777;
+  if (!stat.isFile() || stat.isSymbolicLink() || (mode !== 0o600 && mode !== 0o400) || stat.uid !== process.getuid() || fs.realpathSync(file) !== path.resolve(file)) throw new LiveUiError("family-credential-file");
 }
 
 // Capture only this explicit contract, then scrub the inherited environment
