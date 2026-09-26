@@ -57,6 +57,7 @@ const MAX_INTENTS: usize = 128;
 const MAX_JOURNAL_RECORDS: usize = MAX_INTENTS * 8;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const OBSERVED_AT_SKEW_SECS: i64 = 5 * 60;
+const READINESS_REFRESH_SECS: i64 = 600;
 
 #[derive(Debug)]
 enum AdapterError {
@@ -1197,12 +1198,21 @@ impl JournalStore {
         handoff_id: &str,
         kind: EvidenceKind,
     ) -> Option<EvidenceJournalRecord> {
+        self.newest_evidence(handoff_id, kind)
+    }
+
+    fn newest_evidence(
+        &self,
+        handoff_id: &str,
+        kind: EvidenceKind,
+    ) -> Option<EvidenceJournalRecord> {
         self.document
             .lock()
             .expect("Aeon delivery journal lock")
             .records
             .values()
-            .find(|record| record.handoff_id == handoff_id && record.kind == kind)
+            .filter(|record| record.handoff_id == handoff_id && record.kind == kind)
+            .max_by_key(|record| record.sequence)
             .cloned()
     }
 
@@ -2275,7 +2285,7 @@ impl AeonDeliveryAdapter {
         self.send_readiness(intent, handoff, &operation.job_id, &reviewed)
             .await?;
         let launch = self
-            .ensure_admission(intent, &operation.job_id, &reviewed)
+            .ensure_admission(intent, handoff, &operation.job_id, &reviewed)
             .await?;
         let admission = launch.admission.clone().ok_or(AdapterError::Journal)?;
         self.validate_admission(&admission, intent, handoff, &reviewed, now_unix())?;
@@ -2324,6 +2334,22 @@ impl AeonDeliveryAdapter {
             if posted != bare_plan_digest(reviewed)? {
                 return Err(AdapterError::LocalBinding);
             }
+            let observed = evidence_string_field(&current.body_json, "observed_at")?;
+            if now_unix().saturating_sub(unix_of(&observed)?) <= READINESS_REFRESH_SECS {
+                return Ok(());
+            }
+            let observed_at = format_timestamp(now_unix())?;
+            let sequence = self.journal.next_sequence(&intent.handoff_id)?;
+            let body = refreshed_readiness_body(&current.body_json, sequence, &observed_at)?;
+            let record = self.journal.ensure_evidence(EvidenceJournalRecord::new(
+                intent,
+                &self.config.aeon_origin,
+                sequence,
+                EvidenceKind::LaunchReadiness,
+                &body,
+            )?)?;
+            let receipt = self.aeon.post_evidence(&record).await?;
+            self.journal.acknowledge_evidence(&record, receipt)?;
             return Ok(());
         }
         let job = self
@@ -2366,6 +2392,7 @@ impl AeonDeliveryAdapter {
     async fn ensure_admission(
         &self,
         intent: &DeliveryIntent,
+        handoff: &HandoffDocument,
         job_id: &str,
         reviewed: &str,
     ) -> Result<LaunchJournalRecord, AdapterError> {
@@ -2379,7 +2406,9 @@ impl AeonDeliveryAdapter {
             if existing.admission.is_some() {
                 return Ok(existing);
             }
-            return self.replay_admit(intent, &existing).await;
+            return self
+                .replay_admit(intent, handoff, &existing, reviewed)
+                .await;
         }
         let readiness = self
             .journal
@@ -2411,19 +2440,24 @@ impl AeonDeliveryAdapter {
             receipt: None,
         };
         let record = self.journal.ensure_launch(record)?;
-        self.replay_admit(intent, &record).await
+        self.replay_admit(intent, handoff, &record, reviewed).await
     }
 
     async fn replay_admit(
         &self,
         intent: &DeliveryIntent,
+        handoff: &HandoffDocument,
         record: &LaunchJournalRecord,
+        reviewed: &str,
     ) -> Result<LaunchJournalRecord, AdapterError> {
         if record.consume_started {
             return Err(AdapterError::LaunchUnresolved);
         }
         match self.aeon.post_admit(record).await {
-            Ok(admission) => self.journal.store_admission(&intent.handoff_id, admission),
+            Ok(admission) => {
+                self.validate_admission(&admission, intent, handoff, reviewed, now_unix())?;
+                self.journal.store_admission(&intent.handoff_id, admission)
+            }
             Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
                 self.journal
                     .mark_admit_unresolved(&intent.handoff_id, status)?;
@@ -2881,6 +2915,21 @@ fn consume_receipt(response: &ConsumeResponse, now: i64) -> Result<ConsumeReceip
     })
 }
 
+fn refreshed_readiness_body(
+    body: &str,
+    sequence: i64,
+    observed_at: &str,
+) -> Result<Vec<u8>, AdapterError> {
+    let mut value: serde_json::Value = decode_strict(body.as_bytes())?;
+    let object = value.as_object_mut().ok_or(AdapterError::Contract)?;
+    object.insert("sequence".to_string(), serde_json::Value::from(sequence));
+    object.insert(
+        "observed_at".to_string(),
+        serde_json::Value::String(observed_at.to_string()),
+    );
+    serde_json::to_vec(&value).map_err(|_| AdapterError::Contract)
+}
+
 fn beacon_window_closed(anchor: i64, now: i64, freshness_secs: i64) -> bool {
     now.saturating_sub(anchor) > freshness_secs
 }
@@ -3290,7 +3339,16 @@ fn unix_of(value: &str) -> Result<i64, AdapterError> {
     Ok(parse_timestamp(value)?.unix_timestamp())
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_NOW: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
 fn now_unix() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
     OffsetDateTime::now_utc().unix_timestamp()
 }
 
@@ -4000,6 +4058,34 @@ mod tests {
         value["reviewed_plan_digest"].as_str().map(str::to_string)
     }
 
+    fn readiness_observed_at_is_stale(body: &[u8], now: i64) -> bool {
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            return false;
+        };
+        if value["kind"] != "launch_readiness" || value["outcome"] != "satisfied" {
+            return false;
+        }
+        if value["all_host_eval_passed"] != true
+            || value["target_build_passed"] != true
+            || value["backup_ready"] != true
+        {
+            return false;
+        }
+        if !value["backup_observed_at"]
+            .as_str()
+            .is_some_and(|stamp| observation_fresh(stamp, now))
+        {
+            return false;
+        }
+        let Some(stamp) = value["observed_at"].as_str() else {
+            return false;
+        };
+        let Ok(parsed) = parse_timestamp(stamp) else {
+            return false;
+        };
+        now.saturating_sub(parsed.unix_timestamp()) > 900
+    }
+
     fn handle_evidence(handoff: &mut FakeHandoff, body: &[u8], now: i64) -> Response<Body> {
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
@@ -4047,15 +4133,24 @@ mod tests {
         }
         let mut reviewed = None;
         let mut best_sequence = 0;
+        let mut saw_stale = false;
         for (sequence, evidence) in &handoff.evidence {
             if let Some(plan) = satisfying_readiness(&evidence.body, flags.now) {
                 if *sequence >= best_sequence {
                     best_sequence = *sequence;
                     reviewed = Some(plan);
                 }
+            } else if readiness_observed_at_is_stale(&evidence.body, flags.now) {
+                saw_stale = true;
             }
         }
         let Some(reviewed) = reviewed else {
+            if saw_stale {
+                return json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": "launch readiness is stale"}),
+                );
+            }
             return json_response(StatusCode::CONFLICT, &json!({}));
         };
         let contradicted = handoff.evidence.iter().any(|(sequence, evidence)| {
@@ -5030,6 +5125,166 @@ mod tests {
         assert!(saved_launch.receipt.is_some());
         assert_eq!(saved_launch.consume_body_json, launch.consume_body_json);
         fixture.server.abort();
+    }
+
+    struct FrozenNow;
+
+    impl FrozenNow {
+        fn at(now: i64) -> Self {
+            TEST_NOW.with(|cell| cell.set(Some(now)));
+            Self
+        }
+
+        fn set(now: i64) {
+            TEST_NOW.with(|cell| cell.set(Some(now)));
+        }
+    }
+
+    impl Drop for FrozenNow {
+        fn drop(&mut self) {
+            TEST_NOW.with(|cell| cell.set(None));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_readiness_is_reposted_and_a_bad_admission_is_not_journaled() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        fixture
+            .fake
+            .update(|inner| inner.drop_accepted_admit = true);
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .admission
+            .is_none());
+        FrozenNow::set(now + 700);
+        fixture.fake.update(|inner| inner.now = now + 700);
+        for _ in 0..4 {
+            fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap();
+            if fixture.actions.get(&job_id).unwrap().state == HostActionState::QueuedApply {
+                break;
+            }
+        }
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        let readiness: Vec<Value> = posts(&fixture.fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/evidence"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .filter(|body: &Value| body["kind"] == "launch_readiness")
+            .collect();
+        assert_eq!(readiness.len(), 2);
+        assert_eq!(readiness[0]["sequence"], 1);
+        assert_eq!(readiness[1]["sequence"], 2);
+        assert_ne!(readiness[0]["observed_at"], readiness[1]["observed_at"]);
+        assert_eq!(
+            readiness[0]["reviewed_plan_digest"],
+            readiness[1]["reviewed_plan_digest"]
+        );
+        assert_eq!(
+            readiness[0]["backup_observed_at"],
+            readiness[1]["backup_observed_at"]
+        );
+        fixture.server.abort();
+
+        let stale_now = now + 700;
+        let stale = FakeAeon::new(stale_now);
+        let (origin, server) = serve(stale).await;
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let evidence_status = client
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+                    .unwrap(),
+            )
+            .header(AUTHORIZATION, &bearer)
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(
+                serde_json::to_vec(&json!({
+                    "sequence": 1,
+                    "kind": "launch_readiness",
+                    "outcome": "satisfied",
+                    "observed_at": format_timestamp(stale_now - 1000).unwrap(),
+                    "authority_epoch": 3,
+                    "reviewed_plan_digest": "ab".repeat(32),
+                    "host": "hsb8",
+                    "all_host_eval_passed": true,
+                    "target_build_passed": true,
+                    "backup_ready": true,
+                    "backup_observed_at": format_timestamp(stale_now).unwrap(),
+                    "restart_required": true,
+                    "running_kernel": "unknown",
+                    "expected_kernel": "unknown"
+                }))
+                .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(evidence_status, StatusCode::CREATED);
+        let refused = client
+            .post(
+                origin
+                    .join(&format!(
+                        "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"
+                    ))
+                    .unwrap(),
+            )
+            .header(AUTHORIZATION, &bearer)
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(
+                serde_json::to_vec(&json!({
+                    "version_scheme": "legacy",
+                    "version": "1.2.3",
+                    "release_channel": "stable",
+                    "release_sequence": 123,
+                    "digest_sha256": "1".repeat(64),
+                    "commit_digest": "a".repeat(40),
+                    "manifest_coordinate": "ghcr:inspr-at/pharos/releases/1.2.3",
+                    "manifest_digest_sha256": "9".repeat(64)
+                }))
+                .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let refused: Value = refused.json().await.unwrap();
+        assert_eq!(refused["error"], "launch readiness is stale");
+        server.abort();
+
+        let bad = harness(true).await;
+        prepare_ready_launch(&bad).await;
+        bad.fake.update(|inner| inner.corrupt_binding = true);
+        let error = bad.adapter.process_intent(&bad.intent).await.unwrap_err();
+        assert!(matches!(error, AdapterError::LocalBinding));
+        assert!(bad
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .admission
+            .is_none());
+        assert_eq!(post_count(&bad.fake, "/launch/consume"), 0);
+        bad.server.abort();
     }
 
     #[tokio::test]
