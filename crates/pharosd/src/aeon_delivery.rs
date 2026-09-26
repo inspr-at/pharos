@@ -2232,7 +2232,7 @@ impl AeonDeliveryAdapter {
             Ok(false) => {}
             Err(error) => return self.finish_blocked_confirmation(intent, error).await,
         }
-        if let Err(error) = self.confirm_if_consumed(intent) {
+        if let Err(error) = self.confirm_if_consumed(intent).await {
             return self.finish_blocked_confirmation(intent, error).await;
         }
         if let Some(pending) = self.journal.pending_evidence(&intent.handoff_id) {
@@ -2384,7 +2384,7 @@ impl AeonDeliveryAdapter {
                 let launch = self
                     .journal
                     .acknowledge_consume(&intent.handoff_id, receipt)?;
-                self.finish_confirmation(intent, &launch)?;
+                self.finish_confirmation(intent, &launch, &observed.expires_at)?;
                 Ok(true)
             }
             Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
@@ -2394,7 +2394,7 @@ impl AeonDeliveryAdapter {
         }
     }
 
-    fn confirm_if_consumed(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
+    async fn confirm_if_consumed(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
         let Some(launch) = self.journal.launch(&intent.handoff_id) else {
             return Ok(());
         };
@@ -2402,7 +2402,16 @@ impl AeonDeliveryAdapter {
             return Ok(());
         }
         self.reject_terminal_block(&intent.handoff_id)?;
-        self.finish_confirmation(intent, &launch)
+        let job = self
+            .host_actions
+            .get(&launch.job_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        let handoff_expires = if job.state == HostActionState::AwaitingConfirmation {
+            self.aeon.get_handoff(&intent.handoff_id).await?.expires_at
+        } else {
+            String::new()
+        };
+        self.finish_confirmation(intent, &launch, &handoff_expires)
     }
 
     async fn report_confirmation_not_delegated(
@@ -2486,7 +2495,8 @@ impl AeonDeliveryAdapter {
             .journal
             .launch(&intent.handoff_id)
             .ok_or(AdapterError::Journal)?;
-        self.finish_confirmation(intent, &launch)?;
+        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        self.finish_confirmation(intent, &launch, &handoff.expires_at)?;
         Ok(true)
     }
 
@@ -2751,7 +2761,7 @@ impl AeonDeliveryAdapter {
             return Err(AdapterError::LocalBinding);
         }
         self.validate_admission(&admission, intent, &fresh, &reviewed, now_unix())?;
-        self.consume_and_confirm(intent).await
+        self.consume_and_confirm(intent, &fresh).await
     }
 
     fn refuse_undelegated_launch(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
@@ -3067,20 +3077,25 @@ impl AeonDeliveryAdapter {
         Ok(())
     }
 
-    async fn consume_and_confirm(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
+    async fn consume_and_confirm(
+        &self,
+        intent: &DeliveryIntent,
+        handoff: &HandoffDocument,
+    ) -> Result<(), AdapterError> {
         let launch = self.journal.mark_consume_started(&intent.handoff_id)?;
         let response = self.aeon.post_consume(&launch).await?;
         let receipt = consume_receipt(&response)?;
         let launch = self
             .journal
             .acknowledge_consume(&intent.handoff_id, receipt)?;
-        self.finish_confirmation(intent, &launch)
+        self.finish_confirmation(intent, &launch, &handoff.expires_at)
     }
 
     fn finish_confirmation(
         &self,
         intent: &DeliveryIntent,
         launch: &LaunchJournalRecord,
+        handoff_expires_at: &str,
     ) -> Result<(), AdapterError> {
         if launch.receipt.is_none() {
             return Err(AdapterError::Journal);
@@ -3097,9 +3112,13 @@ impl AeonDeliveryAdapter {
             return Err(AdapterError::LocalBinding);
         }
         if job.state == HostActionState::AwaitingConfirmation {
+            let now = now_unix();
+            if unix_of(&admission.expires_at)? <= now || unix_of(handoff_expires_at)? <= now {
+                return Err(AdapterError::LocalBinding);
+            }
             // Aeon's consumed_at stays in the journal. The host job clock is
             // local, and never earlier than the review that produced this job.
-            let confirmed_at = now_unix().max(job.updated_at);
+            let confirmed_at = now.max(job.updated_at);
             self.host_actions
                 .confirm_update_delegated(&launch.job_id, &intent.host, &admission.id, confirmed_at)
                 .map_err(map_host_action_error)?;
@@ -7817,6 +7836,37 @@ mod tests {
                 .count(),
             1
         );
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_admission_is_not_confirmed_on_replay() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        fixture
+            .fake
+            .update(|inner| inner.drop_accepted_consume = true);
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        FrozenNow::set(now + 4000);
+        fixture.fake.update(|inner| inner.now = now + 4000);
+        let replay = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(replay, Err(AdapterError::LocalBinding)));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_some());
         fixture.server.abort();
     }
 
