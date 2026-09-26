@@ -405,7 +405,16 @@ impl FlowHostService {
                 );
             }
         };
-        let projection = if intent_type == "flow:start-intent" {
+        // Every routed intent carries the mounted projection so the review
+        // link can retain the stage Aeon returned and the allow-list can pin it.
+        let projection = if matches!(
+            intent_type,
+            "flow:start-intent"
+                | "flow:review-batch"
+                | "flow:view-drafts"
+                | "flow:save-proposal"
+                | "flow:header-project"
+        ) {
             self.fetch_projection(&context, now).await.ok()
         } else {
             None
@@ -485,7 +494,11 @@ impl FlowHostService {
                 FlowIntentResponse {
                     executed: false,
                     routed: Some(review_route.to_string()),
-                    location: self.valid_navigation_location(&review_url),
+                    location: self.valid_navigation_location(
+                        &review_url,
+                        &context.binding,
+                        projected_stage.as_deref(),
+                    ),
                     notice: Some(format!(
                         "Start stays on the configured {upstream_name} project controls. Pharos does not start delivery."
                     )),
@@ -497,7 +510,11 @@ impl FlowHostService {
                 FlowIntentResponse {
                     executed: false,
                     routed: Some(review_route.to_string()),
-                    location: self.valid_navigation_location(&review_url),
+                    location: self.valid_navigation_location(
+                        &review_url,
+                        &context.binding,
+                        projected_stage.as_deref(),
+                    ),
                     notice: Some(format!(
                         "Review stays on the configured {upstream_name} project controls."
                     )),
@@ -511,7 +528,7 @@ impl FlowHostService {
                     FlowIntentResponse {
                         executed: false,
                         routed: Some(overview_route.to_string()),
-                        location: self.valid_navigation_location(&location),
+                        location: self.valid_navigation_location(&location, &context.binding, None),
                         notice: Some(format!(
                             "Project navigation stays in configured {upstream_name}."
                         )),
@@ -677,19 +694,15 @@ impl FlowHostService {
         context: &ResolvedContext,
         now: i64,
     ) -> Result<CachedProjection, FlowError> {
+        // The cache is keyed by the full binding identity (classic ref, or
+        // Aeon project node plus key) and operator, so two bindings can never
+        // share a validated journey.
         let key = CacheKey {
-            project: context.binding.target.material(),
+            project: context.binding.target.identity(),
             operator_ref: context.user.operator_ref.clone(),
             host: None,
         };
-        let previous = self
-            .cache
-            .lock()
-            .expect("flow cache")
-            .entries
-            .get(&key)
-            .cloned();
-        if let Some(cached) = &previous {
+        if let Some(cached) = self.cache.lock().expect("flow cache").entries.get(&key) {
             if cached.fetched_at >= floor_ten_minute_boundary(now) {
                 return Ok(cached.clone());
             }
@@ -700,24 +713,24 @@ impl FlowHostService {
                 self.fetch_aeon_journey(context, tenant_slug, now).await?
             }
         };
-        if previous.is_some_and(|cached| upstream_revision < cached.upstream_revision) {
-            return Err(FlowError::Unavailable(
-                "Configured Aeon journey reported an older revision than the last accepted one.",
-            ));
-        }
         let evaluated_at = fetched
             .get("evaluatedAt")
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| iso_timestamp(now));
+        // Classic keeps its exact source-revision material; only Aeon mixes
+        // the journey revision in.
+        let mut revision_parts = vec![context.binding.target.identity(), evaluated_at.clone()];
+        if matches!(self.config.upstream, FlowUpstream::Aeon { .. }) {
+            revision_parts.push(upstream_revision.to_string());
+        }
         let source_revision = pharos_opaque_ref(
             &self.config.host_id,
             "src",
-            &[
-                &context.binding.target.identity(),
-                &evaluated_at,
-                &upstream_revision.to_string(),
-            ],
+            &revision_parts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
         );
         let entry = CachedProjection {
             generation: FETCH_GENERATION.fetch_add(1, Ordering::Relaxed),
@@ -727,11 +740,18 @@ impl FlowHostService {
             paimos_evaluated_at: evaluated_at,
             upstream_revision,
         };
-        self.cache
-            .lock()
-            .expect("flow cache")
-            .entries
-            .insert(key, entry.clone());
+        // Compare against the entry that is current at insert time, not a
+        // pre-fetch snapshot: a slower response carrying an older journey
+        // can neither overwrite nor be served over a newer accepted one.
+        let mut cache = self.cache.lock().expect("flow cache");
+        if let Some(current) = cache.entries.get(&key) {
+            if upstream_revision < current.upstream_revision {
+                return Err(FlowError::Unavailable(
+                    "Configured Aeon journey reported an older revision than the last accepted one.",
+                ));
+            }
+        }
+        cache.entries.insert(key, entry.clone());
         Ok(entry)
     }
 
@@ -986,7 +1006,12 @@ impl FlowHostService {
     /// and, per upstream, exactly one route shape. Classic keeps
     /// `/projects/{id}?tab=overview`; Aeon allows only `/p/{project_key}` for a
     /// configured binding with `view=journey` and at most a known stage.
-    fn valid_navigation_location(&self, location: &str) -> Option<String> {
+    fn valid_navigation_location(
+        &self,
+        location: &str,
+        binding: &FlowBinding,
+        projected_stage: Option<&str>,
+    ) -> Option<String> {
         let parsed = Url::parse(location).ok()?;
         if parsed.origin() != self.config.upstream_public_url.origin() {
             return None;
@@ -1011,26 +1036,32 @@ impl FlowHostService {
                 }
             }
             FlowUpstream::Aeon { .. } => {
+                // Exactly the mounted binding's key, exactly one view=journey,
+                // and at most one stage that equals what the validated journey
+                // reported. Nothing else, no fragment.
                 let key = local.strip_prefix("/p/")?;
-                let configured = self.config.bindings.iter().any(|binding| {
-                    matches!(&binding.target, BindingTarget::Aeon { project_key, .. } if project_key == key)
-                });
-                if !configured || parsed.fragment().is_some() {
+                let BindingTarget::Aeon { project_key, .. } = &binding.target else {
+                    return None;
+                };
+                if key != project_key || parsed.fragment().is_some() {
                     return None;
                 }
                 let query = parsed.query()?;
-                let mut saw_view = false;
+                let mut views = 0;
+                let mut stages = 0;
                 for part in query.split('&') {
                     if part == AEON_REVIEW_QUERY {
-                        saw_view = true;
-                    } else if !part
-                        .strip_prefix("stage=")
-                        .is_some_and(|stage| AEON_STAGES.contains(&stage))
-                    {
+                        views += 1;
+                    } else if let Some(stage) = part.strip_prefix("stage=") {
+                        if !AEON_STAGES.contains(&stage) || projected_stage != Some(stage) {
+                            return None;
+                        }
+                        stages += 1;
+                    } else {
                         return None;
                     }
                 }
-                if !saw_view {
+                if views != 1 || stages > 1 {
                     return None;
                 }
             }
@@ -1139,17 +1170,28 @@ impl FlowHostConfig {
             .into_iter()
             .map(FlowBinding::from_aeon_document)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut keys: Vec<&str> = bindings
-            .iter()
-            .filter_map(|binding| match &binding.target {
-                BindingTarget::Aeon { project_key, .. } => Some(project_key.as_str()),
-                BindingTarget::Classic { .. } => None,
-            })
-            .collect();
-        keys.sort_unstable();
-        keys.dedup();
-        if keys.len() != bindings.len() {
-            return Err("invalid flow host configuration".to_string());
+        // One binding per project: neither a route key nor a project node
+        // may appear twice, so a projection can never be shared across bindings.
+        for pick in [0usize, 1usize] {
+            let mut values: Vec<&str> = bindings
+                .iter()
+                .filter_map(|binding| match &binding.target {
+                    BindingTarget::Aeon {
+                        project_node_id,
+                        project_key,
+                    } => Some(if pick == 0 {
+                        project_key.as_str()
+                    } else {
+                        project_node_id.as_str()
+                    }),
+                    BindingTarget::Classic { .. } => None,
+                })
+                .collect();
+            values.sort_unstable();
+            values.dedup();
+            if values.len() != bindings.len() {
+                return Err("invalid flow host configuration".to_string());
+            }
         }
         let config_digest = hex_digest(bytes);
         let host_id = document.host_id;
@@ -1339,12 +1381,52 @@ fn aeon_shell_state(journey: &Value, binding: &FlowBinding, now: i64) -> Value {
         .and_then(|value| value.get("can_admit"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let next_action = journey.get("next_action").cloned().unwrap_or(Value::Null);
+    let action_available = next_action
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // The vendored shell only knows draft, authorized, in_progress, blocked and
+    // completed, and a 0..3 stage rail (define, build, deliver, access).
     let delivery_status = match stage {
-        "deploy" | "access" if can_admit => "authorized",
-        "plan" | "build" | "deploy" | "access" => "draft",
-        "live" => "live",
-        _ => "pending",
+        "live" => "completed",
+        "deploy" | "access" if action_available && can_admit => "authorized",
+        "plan" | "build" | "deploy" | "access" if action_available => "draft",
+        "plan" | "build" | "deploy" | "access" => "blocked",
+        _ => "blocked",
     };
+    // Same folding as the Janus shell: inspire/shape/requirements form the
+    // define stage, plan/build the build stage, deploy delivers, access is last.
+    let active_stage = match stage {
+        "plan" | "build" => 1,
+        "deploy" => 2,
+        "access" | "live" => 3,
+        _ => 0,
+    };
+    let folded = [
+        &["inspire", "shape", "requirements"][..],
+        &["plan", "build"][..],
+        &["deploy"][..],
+        &["access", "live"][..],
+    ];
+    let stage_evidence: Vec<&str> = folded
+        .iter()
+        .map(|keys| {
+            let states: Vec<String> = keys.iter().map(|key| stage_state(key)).collect();
+            if states.iter().all(|state| state == "done") {
+                "performed"
+            } else if states.iter().any(|state| state == "skipped") {
+                "not_in_batch"
+            } else {
+                "unknown"
+            }
+        })
+        .collect();
+    let action_label = next_action
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("No action available")
+        .to_string();
     // The vendored shell's reference grammar needs a leading letter; a bare
     // UUID release id would be dropped and the start gate would close.
     let release = journey
@@ -1363,7 +1445,6 @@ fn aeon_shell_state(journey: &Value, binding: &FlowBinding, now: i64) -> Value {
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     let evaluated_at = iso_timestamp(now);
     let fresh_until = iso_timestamp(next_ten_minute_boundary(now));
-    let next_action = journey.get("next_action").cloned().unwrap_or(Value::Null);
     let selected_action = match next_action.get("stage").and_then(Value::as_str) {
         Some("deploy") => "deploy",
         Some("access") => "janus_apply",
@@ -1387,6 +1468,11 @@ fn aeon_shell_state(journey: &Value, binding: &FlowBinding, now: i64) -> Value {
         "health": {"status": "available", "label": "Aeon journey"},
         "delivery": {
             "status": delivery_status,
+            "activeStage": active_stage,
+            "stageEvidence": stage_evidence,
+            "liveReleaseLabel": "Aeon journey",
+            "batchTitle": match &release { Value::String(_) => "Current release", _ => "No open release" },
+            "batchStatusLabel": action_label,
             "batchRef": release,
             "baselineRef": format!("requirements:{requirements_revision}"),
             "baselineDigest": requirements_digest
@@ -2580,6 +2666,10 @@ mod tests {
 
     /// Serves one Aeon journey response (status + body) at the journey route
     /// for the configured project node, counting requests.
+    /// The fixture key `private_fixture_dir` writes; the mock Aeon refuses
+    /// any other bearer with 401, so a revoked or wrong key is exercised.
+    const FIXTURE_KEY: &str = "01234567890123456789012345678901";
+
     async fn serve_aeon(
         status: StatusCode,
         body: Value,
@@ -2595,11 +2685,21 @@ mod tests {
         let task = tokio::spawn(async move {
             let app = Router::new().route(
                 &format!("/api/projects/{AEON_PROJECT_NODE_ID}/journey"),
-                get(move || {
+                get(move |headers: HeaderMap| {
                     let body = body.clone();
                     let counter = counter.clone();
                     async move {
                         counter.fetch_add(1, Ordering::Relaxed);
+                        let authorized = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            == Some(&format!("Bearer {FIXTURE_KEY}"));
+                        if !authorized {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                axum::Json(json!({"error": "unauthorized"})),
+                            );
+                        }
                         (status, axum::Json(body))
                     }
                 }),
@@ -2741,6 +2841,12 @@ mod tests {
         assert_eq!(shell_state["progress"]["revision"], 7);
         assert_eq!(shell_state["progress"]["projectKey"], "PHAROS");
         assert_eq!(shell_state["delivery"]["status"], "draft");
+        assert_eq!(shell_state["delivery"]["activeStage"], 1);
+        assert_eq!(
+            shell_state["delivery"]["stageEvidence"],
+            json!(["performed", "unknown", "unknown", "unknown"])
+        );
+        assert_eq!(shell_state["delivery"]["batchStatusLabel"], "Start build");
         assert_eq!(
             shell_state["delivery"]["batchRef"],
             "release:5e6f7a8b-0000-4000-8000-00000000000a"
@@ -2782,11 +2888,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "intent error: {:?}", intent.error);
         assert!(!intent.executed);
         assert_eq!(intent.routed.as_deref(), Some("aeon-project-journey"));
+        // Review carries the stage the validated journey reported.
         assert_eq!(
             intent.location.as_deref(),
             Some(
                 format!(
-                    "{}/p/PHAROS?view=journey",
+                    "{}/p/PHAROS?view=journey&stage=build",
                     origin.as_str().trim_end_matches('/')
                 )
                 .as_str()
@@ -2809,6 +2916,17 @@ mod tests {
             .await;
         assert_eq!(header.routed.as_deref(), Some("aeon-project-journey"));
         assert!(header.location.unwrap().ends_with("/p/PHAROS?view=journey"));
+
+        // A journey whose next action is unavailable projects a blocked delivery.
+        let mut blocked = sample_journey(8);
+        blocked["next_action"]["available"] = json!(false);
+        let projected = aeon_shell_state(&blocked, &service.config.bindings[0], now);
+        assert_eq!(projected["delivery"]["status"], "blocked");
+        let mut live = sample_journey(8);
+        live["stage"] = json!("live");
+        let projected = aeon_shell_state(&live, &service.config.bindings[0], now);
+        assert_eq!(projected["delivery"]["status"], "completed");
+        assert_eq!(projected["delivery"]["activeStage"], 3);
         server.abort();
         cleanup_fixture_dir(&fixture_dir);
     }
@@ -2860,11 +2978,6 @@ mod tests {
                 "cannot read this project journey",
             ),
             (
-                StatusCode::UNAUTHORIZED,
-                json!({"error": "revoked"}),
-                "cannot read this project journey",
-            ),
-            (
                 StatusCode::NOT_FOUND,
                 json!({"error": "gone"}),
                 "unavailable for this binding",
@@ -2882,6 +2995,27 @@ mod tests {
             assert!(reason.contains(expected), "{status}: {reason}");
             server.abort();
         }
+        // A rotated key: the file no longer matches what Aeon accepts, and the
+        // mock answers 401 like a revoked key would.
+        let rotated = fixture_dir.join("rotated.key");
+        write_private_key(&rotated, b"ffffffffffffffffffffffffffffffff");
+        let (origin, server, hits) = serve_aeon(StatusCode::OK, sample_journey(1)).await;
+        let service = aeon_service(&origin, rotated.clone());
+        let response = service
+            .shell_state(&auth, &headers, &access, &hosts, Some("hsb8"), now)
+            .await;
+        assert!(!response.mount_shell);
+        assert!(response
+            .unavailable_reason
+            .unwrap_or_default()
+            .contains("cannot read this project journey"));
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "the request reached Aeon and was refused"
+        );
+        server.abort();
+        let _ = std::fs::remove_file(&rotated);
         cleanup_fixture_dir(&fixture_dir);
     }
 
@@ -2935,32 +3069,118 @@ mod tests {
             service.review_url(&binding, Some("not-a-stage")),
             "https://aeon.example/p/PHAROS?view=journey"
         );
-        for allowed in [
-            "https://aeon.example/p/PHAROS?view=journey",
-            "https://aeon.example/p/PHAROS?view=journey&stage=build",
+        for (allowed, stage) in [
+            ("https://aeon.example/p/PHAROS?view=journey", None),
+            ("https://aeon.example/p/PHAROS?view=journey", Some("build")),
+            (
+                "https://aeon.example/p/PHAROS?view=journey&stage=build",
+                Some("build"),
+            ),
         ] {
             assert_eq!(
-                service.valid_navigation_location(allowed).as_deref(),
+                service
+                    .valid_navigation_location(allowed, &binding, stage)
+                    .as_deref(),
                 Some(allowed),
                 "{allowed}"
             );
         }
-        for denied in [
-            "https://aeon.example/p/OTHER?view=journey",
-            "https://aeon.example/p/PHAROS",
-            "https://aeon.example/p/PHAROS?view=settings",
-            "https://aeon.example/p/PHAROS?view=journey&stage=nope",
-            "https://aeon.example/p/PHAROS?view=journey&redirect=https://evil.example",
-            "https://aeon.example/p/PHAROS?view=journey#fragment",
-            "https://aeon.example/projects/17?tab=overview",
-            "https://evil.example/p/PHAROS?view=journey",
-            "https://user:pw@aeon.example/p/PHAROS?view=journey",
+        let other = FlowBinding {
+            target: BindingTarget::Aeon {
+                project_node_id: "0e6c3b2a-1111-4000-8000-000000000002".to_string(),
+                project_key: "OTHER".to_string(),
+            },
+            ..binding.clone()
+        };
+        for (denied, stage) in [
+            ("https://aeon.example/p/OTHER?view=journey", None),
+            ("https://aeon.example/p/PHAROS", None),
+            ("https://aeon.example/p/PHAROS?view=settings", None),
+            (
+                "https://aeon.example/p/PHAROS?view=journey&view=settings",
+                None,
+            ),
+            (
+                "https://aeon.example/p/PHAROS?view=journey&stage=nope",
+                Some("nope"),
+            ),
+            (
+                "https://aeon.example/p/PHAROS?view=journey&stage=deploy",
+                Some("build"),
+            ),
+            (
+                "https://aeon.example/p/PHAROS?view=journey&stage=build",
+                None,
+            ),
+            (
+                "https://aeon.example/p/PHAROS?view=journey&stage=build&stage=build",
+                Some("build"),
+            ),
+            (
+                "https://aeon.example/p/PHAROS?view=journey&redirect=https://evil.example",
+                None,
+            ),
+            ("https://aeon.example/p/PHAROS?view=journey#fragment", None),
+            ("https://aeon.example/projects/17?tab=overview", None),
+            ("https://evil.example/p/PHAROS?view=journey", None),
+            ("https://user:pw@aeon.example/p/PHAROS?view=journey", None),
         ] {
             assert!(
-                service.valid_navigation_location(denied).is_none(),
+                service
+                    .valid_navigation_location(denied, &binding, stage)
+                    .is_none(),
                 "{denied} must be refused"
             );
         }
+        // The other binding's own key is fine for that binding, never for this one.
+        assert!(service
+            .valid_navigation_location("https://aeon.example/p/OTHER?view=journey", &other, None)
+            .is_some());
+        assert!(service
+            .valid_navigation_location("https://aeon.example/p/PHAROS?view=journey", &other, None)
+            .is_none());
+    }
+
+    #[test]
+    fn aeon_config_rejects_one_project_under_two_keys_and_classic_source_revision_is_unchanged() {
+        let (fixture_dir, key_path) = private_fixture_dir("aeon-dup");
+        let config_path = fixture_dir.join("flow.json");
+        let document = json!({
+            "schema": CONFIG_SCHEMA_V2,
+            "schema_version": CONFIG_SCHEMA_VERSION_V2,
+            "enabled": true,
+            "host_id": "pharos-test",
+            "upstream": "aeon",
+            "aeon_origin": "https://aeon.example",
+            "api_key_file": key_path,
+            "tenant_slug": "inspr",
+            "bindings": [
+                {"project_node_id": AEON_PROJECT_NODE_ID, "project_key": "PHAROS", "label": "a", "hosts": ["hsb8"], "operator_refs": ["operator-a"]},
+                {"project_node_id": AEON_PROJECT_NODE_ID, "project_key": "PHAROS2", "label": "b", "hosts": ["hsb9"], "operator_refs": ["operator-a"]}
+            ]
+        });
+        write_private_key(&config_path, document.to_string().as_bytes());
+        assert!(FlowHostConfig::load(&config_path, false).is_err());
+        let _ = std::fs::remove_file(&config_path);
+        cleanup_fixture_dir(&fixture_dir);
+
+        // Classic source revisions are computed from exactly the material they
+        // used before the Aeon upstream existed.
+        let expected = pharos_opaque_ref(
+            "pharos-test",
+            "src",
+            &[PAIMOS_PROJECT_REF_17, "2023-11-14T22:13:20.000Z"],
+        );
+        let with_zero = pharos_opaque_ref(
+            "pharos-test",
+            "src",
+            &[PAIMOS_PROJECT_REF_17, "2023-11-14T22:13:20.000Z", "0"],
+        );
+        assert_ne!(expected, with_zero);
+        assert_eq!(
+            expected,
+            "pharos-test:src-".to_string() + &expected["pharos-test:src-".len()..]
+        );
     }
 
     #[test]

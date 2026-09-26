@@ -6,6 +6,7 @@ if (shell) {
   const paimosOrigin = shell.dataset.flowPaimosOrigin || '';
   // PHAROS-313: the server marks which upstream route shape is allowed.
   const flowUpstream = shell.dataset.flowUpstream === 'aeon' ? 'aeon' : 'classic';
+  let mountedProjectKey = '';
   let generation = 0;
   let refreshTimer = null;
   let mainUnwrapped = false;
@@ -149,6 +150,9 @@ if (shell) {
         return;
       }
       mountShellChrome();
+      mountedProjectKey = typeof payload.projectionMeta?.projectKey === 'string' ? payload.projectionMeta.projectKey : '';
+      if (mountedProjectKey) shell.dataset.flowMountedKey = mountedProjectKey;
+      else delete shell.dataset.flowMountedKey;
       if (payload.shellState) {
         shell.shellState = payload.shellState;
       } else {
@@ -189,12 +193,19 @@ if (shell) {
     const rest = prefix && (target.pathname === prefix || target.pathname.startsWith(`${prefix}/`))
       ? target.pathname.slice(prefix.length)
       : (prefix ? '' : target.pathname);
+    if (target.username || target.password) {
+      return false;
+    }
     if (flowUpstream === 'aeon') {
-      if (!/^\/p\/[A-Z][A-Z0-9_-]{0,31}$/.test(rest) || target.hash) {
+      // Only the mounted projection's own route key, exactly one view=journey,
+      // and at most one known stage.
+      if (!mountedProjectKey || rest !== `/p/${mountedProjectKey}` || target.hash) {
         return false;
       }
       const params = new URLSearchParams(target.search);
-      if (params.get('view') !== 'journey') {
+      const views = params.getAll('view');
+      const stages = params.getAll('stage');
+      if (views.length !== 1 || views[0] !== 'journey' || stages.length > 1) {
         return false;
       }
       for (const [key, value] of params) {

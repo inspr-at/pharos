@@ -13,7 +13,7 @@ async function harnessMeta(page) {
   if (upstream === "aeon") {
     return {
       upstream,
-      reviewPath: "/p/PHAROS?view=journey",
+      reviewPath: "/p/PHAROS?view=journey&stage=build",
       startPath: "/p/PHAROS?view=journey&stage=build",
       reviewRoute: "aeon-project-journey",
     };
@@ -66,8 +66,14 @@ async function dispatchFlowIntent(page, intentKind) {
       body: JSON.stringify(body),
     });
   });
-  if (paimosOrigin) {
-    await page.route(`${paimosOrigin}/**`, (route) => route.abort());
+  const attempted = [];
+  const originPrefix = paimosOrigin.replace(/\/$/, "");
+  if (originPrefix) {
+    // Predicate, not glob: the target carries a query string.
+    await page.route((url) => url.href.startsWith(`${originPrefix}/`), (route) => {
+      attempted.push(route.request().url());
+      route.abort();
+    });
   }
   await page.evaluate(async (kind) => {
     const { createReviewBatchIntent, createStartIntent } = await import(
@@ -112,9 +118,22 @@ async function dispatchFlowIntent(page, intentKind) {
     );
   }, intentKind);
   await expect.poll(() => captured, { timeout: 10_000 }).not.toBeNull();
+  // The bootstrap navigates only to an allowed location; the aborted request
+  // to the upstream origin proves it attempted exactly that target.
+  if (paimosOrigin && captured?.body?.location) {
+    const target = captured.body.location.replace(/#.*$/, "");
+    await expect
+      .poll(() => attempted.includes(target), { timeout: 10_000 })
+      .toBe(true)
+      .catch(() => {
+        throw new Error(
+          `bootstrap did not attempt ${target}; origin=${JSON.stringify(paimosOrigin)} attempted=${JSON.stringify(attempted)}`,
+        );
+      });
+  }
   await page.unroute("**/flow/intents**");
-  if (paimosOrigin) {
-    await page.unroute(`${paimosOrigin}/**`);
+  if (originPrefix) {
+    await page.unroute((url) => url.href.startsWith(`${originPrefix}/`));
   }
   return captured;
 }

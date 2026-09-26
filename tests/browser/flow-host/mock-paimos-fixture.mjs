@@ -110,6 +110,11 @@ export function createMockAeonFixture() {
     const server = http.createServer((request, response) => {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       if (url.pathname === `/api/projects/${AEON_PROJECT_NODE_ID}/journey`) {
+        if (request.headers.authorization !== "Bearer 01234567890123456789012345678901") {
+          response.writeHead(401, { "Content-Type": "application/json" });
+          response.end('{"error":"unauthorized"}');
+          return;
+        }
         const payload = JSON.stringify(journey());
         response.writeHead(200, {
           "Content-Type": "application/json",
