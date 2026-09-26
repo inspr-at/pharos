@@ -61,6 +61,8 @@ const READINESS_REFRESH_SECS: i64 = 600;
 const BACKUP_FUTURE_SKEW_SECS: i64 = 5 * 60;
 const LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING: &str = "backup_success_missing";
 const LAUNCH_BLOCK_BACKUP_NOT_READY: &str = "backup_not_ready";
+const LAUNCH_BLOCK_READINESS_PLAN_CHANGED: &str = "readiness_plan_changed";
+const LAUNCH_BLOCK_READINESS_FLAG_FALSE: &str = "readiness_flag_false";
 
 #[derive(Debug)]
 enum AdapterError {
@@ -1147,6 +1149,8 @@ struct LaunchBlock {
     handoff_id: String,
     intent_digest: String,
     reason: String,
+    #[serde(default)]
+    terminal: bool,
 }
 
 impl LaunchBlock {
@@ -1161,6 +1165,8 @@ fn launch_block_reason(token: &str) -> Option<&'static str> {
     match token {
         LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING => Some(LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING),
         LAUNCH_BLOCK_BACKUP_NOT_READY => Some(LAUNCH_BLOCK_BACKUP_NOT_READY),
+        LAUNCH_BLOCK_READINESS_PLAN_CHANGED => Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED),
+        LAUNCH_BLOCK_READINESS_FLAG_FALSE => Some(LAUNCH_BLOCK_READINESS_FLAG_FALSE),
         _ => None,
     }
 }
@@ -1278,6 +1284,21 @@ impl JournalStore {
             .values()
             .filter(|record| record.handoff_id == handoff_id && record.kind == kind)
             .max_by_key(|record| record.sequence)
+            .cloned()
+    }
+
+    fn oldest_evidence(
+        &self,
+        handoff_id: &str,
+        kind: EvidenceKind,
+    ) -> Option<EvidenceJournalRecord> {
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .records
+            .values()
+            .filter(|record| record.handoff_id == handoff_id && record.kind == kind)
+            .min_by_key(|record| record.sequence)
             .cloned()
     }
 
@@ -1423,7 +1444,6 @@ impl JournalStore {
             .cloned()
     }
 
-    #[cfg(test)]
     fn launch_block(&self, handoff_id: &str) -> Option<LaunchBlock> {
         self.document
             .lock()
@@ -1438,8 +1458,10 @@ impl JournalStore {
             return Err(AdapterError::Journal);
         }
         let mut document = self.document.lock().expect("Aeon delivery journal lock");
-        if document.launch_blocks.get(&block.handoff_id) == Some(&block) {
-            return Ok(());
+        if let Some(existing) = document.launch_blocks.get(&block.handoff_id) {
+            if existing.terminal || existing == &block {
+                return Ok(());
+            }
         }
         if document.launch_blocks.len() >= MAX_INTENTS
             && !document.launch_blocks.contains_key(&block.handoff_id)
@@ -1455,7 +1477,11 @@ impl JournalStore {
 
     fn clear_launch_block(&self, handoff_id: &str) -> Result<(), AdapterError> {
         let mut document = self.document.lock().expect("Aeon delivery journal lock");
-        if !document.launch_blocks.contains_key(handoff_id) {
+        if document
+            .launch_blocks
+            .get(handoff_id)
+            .is_none_or(|block| block.terminal)
+        {
             return Ok(());
         }
         let mut updated = document.clone();
@@ -2402,6 +2428,12 @@ impl AeonDeliveryAdapter {
                 return Err(AdapterError::LaunchUnresolved);
             }
         }
+        if let Some(block) = self.journal.launch_block(&intent.handoff_id) {
+            if block.terminal {
+                let reason = launch_block_reason(&block.reason).ok_or(AdapterError::Journal)?;
+                return Err(AdapterError::LaunchBlocked(reason));
+            }
+        }
         let Some(operation) = self.journal.operation(&intent.handoff_id) else {
             return Ok(());
         };
@@ -2411,12 +2443,15 @@ impl AeonDeliveryAdapter {
         let Some(job) = self.host_actions.get(&operation.job_id) else {
             return Err(AdapterError::LocalBinding);
         };
+        if let Some(reason) = self.readiness_contradiction(intent, &job)? {
+            return self.block_launch(intent, reason, true);
+        }
         if job.host == intent.host
             && job.workflow_kind() == HostWorkflowKind::UpdateRestart
             && job.state == HostActionState::AwaitingConfirmation
             && job.plan.as_ref().is_some_and(|plan| !plan.backup_ready)
         {
-            return self.block_launch(intent, LAUNCH_BLOCK_BACKUP_NOT_READY);
+            return self.block_launch(intent, LAUNCH_BLOCK_BACKUP_NOT_READY, false);
         }
         if !awaiting_ready_review(&job, &intent.host) {
             return Ok(());
@@ -2456,13 +2491,49 @@ impl AeonDeliveryAdapter {
         &self,
         intent: &DeliveryIntent,
         reason: &'static str,
+        terminal: bool,
     ) -> Result<(), AdapterError> {
         self.journal.record_launch_block(LaunchBlock {
             handoff_id: intent.handoff_id.clone(),
             intent_digest: intent.binding_digest(&self.config.aeon_origin)?,
             reason: reason.to_string(),
+            terminal,
         })?;
         Err(AdapterError::LaunchBlocked(reason))
+    }
+
+    fn readiness_contradiction(
+        &self,
+        intent: &DeliveryIntent,
+        job: &HostActionJob,
+    ) -> Result<Option<&'static str>, AdapterError> {
+        let Some(anchor) = self
+            .journal
+            .oldest_evidence(&intent.handoff_id, EvidenceKind::LaunchReadiness)
+        else {
+            return Ok(None);
+        };
+        if anchor.receipt.is_none() {
+            return Ok(None);
+        }
+        let body: serde_json::Value = decode_strict(anchor.body_json.as_bytes())?;
+        let anchor_digest = body
+            .get("reviewed_plan_digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(AdapterError::Contract)?;
+        let flags_true = job.plan.as_ref().is_some_and(|plan| {
+            plan.all_host_eval_passed && plan.target_build_passed && plan.backup_ready
+        }) && evidence_flag_true(&body, "all_host_eval_passed")
+            && evidence_flag_true(&body, "target_build_passed")
+            && evidence_flag_true(&body, "backup_ready");
+        if !flags_true {
+            return Ok(Some(LAUNCH_BLOCK_READINESS_FLAG_FALSE));
+        }
+        let current = bare_plan_digest(&reviewed_plan_digest(job).map_err(map_shared)?)?;
+        if current != anchor_digest {
+            return Ok(Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED));
+        }
+        Ok(None)
     }
 
     fn withhold_unusable_readiness(
@@ -2477,7 +2548,7 @@ impl AeonDeliveryAdapter {
         let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
         let backup_at = backup_observed_at(&self.hosts, &intent.host);
         if let Some(reason) = readiness_wait_reason(plan, backup_at.as_deref(), now_unix()) {
-            return self.block_launch(intent, reason);
+            return self.block_launch(intent, reason, false);
         }
         self.journal.clear_launch_block(&intent.handoff_id)
     }
@@ -2502,7 +2573,7 @@ impl AeonDeliveryAdapter {
                 .ok_or(AdapterError::Journal)?;
             let posted = evidence_string_field(&current.body_json, "reviewed_plan_digest")?;
             if posted != bare_plan_digest(reviewed)? {
-                return Err(AdapterError::LocalBinding);
+                return self.block_launch(intent, LAUNCH_BLOCK_READINESS_PLAN_CHANGED, true);
             }
             let observed = evidence_string_field(&current.body_json, "observed_at")?;
             self.withhold_unusable_readiness(intent, job_id)?;
@@ -2512,6 +2583,9 @@ impl AeonDeliveryAdapter {
             let observed_at = format_timestamp(now_unix())?;
             let sequence = self.journal.next_sequence(&intent.handoff_id)?;
             let body = refreshed_readiness_body(&current.body_json, sequence, &observed_at)?;
+            if let Some(reason) = refresh_refusal(&current.body_json, &body)? {
+                return self.block_launch(intent, reason, true);
+            }
             let record = self.journal.ensure_evidence(EvidenceJournalRecord::new(
                 intent,
                 &self.config.aeon_origin,
@@ -3139,6 +3213,28 @@ fn handoff_result_matches(result: &HandoffResult, body: &str, handoff_id: &str) 
 
 fn beacon_window_closed(anchor: i64, now: i64, freshness_secs: i64) -> bool {
     now.saturating_sub(anchor) > freshness_secs
+}
+
+fn evidence_flag_true(body: &serde_json::Value, key: &str) -> bool {
+    body.get(key).and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+fn refresh_refusal(previous: &str, refreshed: &[u8]) -> Result<Option<&'static str>, AdapterError> {
+    let previous: serde_json::Value = decode_strict(previous.as_bytes())?;
+    let refreshed: serde_json::Value = decode_strict(refreshed)?;
+    if refreshed.get("reviewed_plan_digest") != previous.get("reviewed_plan_digest") {
+        return Ok(Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED));
+    }
+    for flag in [
+        "all_host_eval_passed",
+        "target_build_passed",
+        "backup_ready",
+    ] {
+        if !evidence_flag_true(&refreshed, flag) || refreshed.get(flag) != previous.get(flag) {
+            return Ok(Some(LAUNCH_BLOCK_READINESS_FLAG_FALSE));
+        }
+    }
+    Ok(None)
 }
 
 fn readiness_wait_reason(
@@ -7348,6 +7444,104 @@ mod tests {
         );
         assert_eq!(post_count(&present.fake, "/launch/consume"), 1);
         present.server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_refresh_refuses_a_changed_plan_and_a_false_flag() {
+        contradict_settled_readiness(
+            "readiness-plan",
+            LAUNCH_BLOCK_READINESS_PLAN_CHANGED,
+            |plan| {
+                plan["changed_file_count"] = json!(3);
+            },
+        )
+        .await;
+        contradict_settled_readiness(
+            "readiness-flag",
+            LAUNCH_BLOCK_READINESS_FLAG_FALSE,
+            |plan| {
+                plan["backup_ready"] = json!(false);
+            },
+        )
+        .await;
+    }
+
+    async fn contradict_settled_readiness(
+        label: &str,
+        reason: &str,
+        edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+    ) {
+        let directory = TestDir::new(label);
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let actions_path = directory.path().join("host-actions.json");
+        let journal = directory
+            .path()
+            .join("hosts.json.aeon-delivery-journal.json");
+        let fake = FakeAeon::new(now_unix());
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let intent = deploy_intent(true);
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![intent.clone()]),
+            journal.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        );
+        adapter.process_intent(&intent).await.unwrap();
+        let job_id = actions.list()[0].id.clone();
+        review_job(&actions, &job_id, actions.get(&job_id).unwrap().created_at);
+        record_backup(&hosts, fake_now(&fake));
+        fake.update(|inner| inner.drop_accepted_admit = true);
+        assert!(adapter.process_intent(&intent).await.is_err());
+        assert_eq!(readiness_post_count(&fake), 1);
+        assert_eq!(post_count(&fake, "/launch/admit"), 1);
+        assert_eq!(post_count(&fake, "/launch/consume"), 0);
+        let mut saved: Value =
+            serde_json::from_slice(&std::fs::read(&actions_path).expect("saved actions")).unwrap();
+        let plan = saved
+            .as_array_mut()
+            .expect("action list")
+            .iter_mut()
+            .find(|job| job["kind"] == "update_restart")
+            .expect("update job")
+            .get_mut("plan")
+            .expect("reviewed plan")
+            .as_object_mut()
+            .expect("plan object");
+        edit(plan);
+        std::fs::write(&actions_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let reloaded_actions = Arc::new(HostActionStore::new(Some(actions_path)));
+        let reloaded = test_adapter(
+            runtime_config(
+                adapter.config.aeon_origin.clone(),
+                adapter.config.api_key_file.clone(),
+                vec![intent.clone()],
+            ),
+            journal,
+            hosts,
+            Arc::clone(&reloaded_actions),
+        );
+        let readiness = readiness_post_count(&fake);
+        let admits = post_count(&fake, "/launch/admit");
+        let blocked = reloaded.process_intent(&intent).await.unwrap_err();
+        assert_eq!(blocked.code(), reason);
+        let block = reloaded.journal.launch_block(DEPLOY_HANDOFF).unwrap();
+        assert_eq!(block.reason, reason);
+        assert!(block.terminal);
+        assert_eq!(readiness_post_count(&fake), readiness);
+        assert_eq!(post_count(&fake, "/launch/admit"), admits);
+        assert_eq!(post_count(&fake, "/launch/consume"), 0);
+        assert_eq!(
+            reloaded_actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        let again = reloaded.process_intent(&intent).await.unwrap_err();
+        assert_eq!(again.code(), reason);
+        assert_eq!(readiness_post_count(&fake), readiness);
+        assert_eq!(post_count(&fake, "/launch/admit"), admits);
+        server.abort();
     }
 
     #[tokio::test]
