@@ -2,9 +2,9 @@
 //!
 //! Selected only by `PHAROS_AEON_DELIVERY_CONFIG_FILE`. Classic Paimos delivery
 //! stays on its own config and journal. This adapter reads an Aeon handoff,
-//! binds one guarded `UpdateRestart` for a deploy intent, and — when the
-//! intent opts into `delegated_launch` — posts launch readiness, checks a
-//! one-use admission, consumes it, and only then confirms that same job.
+//! binds one guarded `UpdateRestart` for a deploy intent. Every deploy intent
+//! carries `delegated_launch`: readiness is posted, a one-use admission is
+//! checked and consumed, and only then is that same job confirmed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -211,7 +211,7 @@ impl DeliveryIntent {
                         && self
                             .delegated_launch
                             .as_ref()
-                            .is_none_or(DelegatedLaunchSelection::valid)
+                            .is_some_and(DelegatedLaunchSelection::valid)
                 }
                 Operation::Verify => {
                     self.workflow == GuardedWorkflow::VerifyProduction
@@ -3530,6 +3530,9 @@ mod tests {
             "environment": "production-eu1",
             "host": "hsb8",
             "artifact": artifact(),
+            "delegated_launch": {
+                "target_ref": format!("sha256:{}", "a".repeat(64)),
+            },
         })
     }
 
@@ -3561,6 +3564,21 @@ mod tests {
         write_private(&config_path, &serde_json::to_vec(&document).unwrap());
         assert!(AdapterConfig::load(&config_path).is_ok());
 
+        document["intents"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("delegated_launch");
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            AdapterConfig::load(&config_path),
+            Err(AdapterError::Configuration)
+        ));
+
+        document = config_document(
+            &api,
+            "https://aeon.example.test",
+            json!([deploy_intent_json(), verify_intent_json()]),
+        );
         document["schema"] = json!("inspr.pharos.aeon-delivery-adapter.v2");
         write_private(&config_path, &serde_json::to_vec(&document).unwrap());
         assert!(matches!(
