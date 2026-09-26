@@ -1,5 +1,31 @@
 import { test, expect } from "@playwright/test";
 
+// PHAROS-313: the server marks the mounted upstream on the shell element;
+// the expected navigation targets follow from it.
+async function harnessMeta(page) {
+  const upstream = await page.evaluate(async () => {
+    const shell = document.querySelector("inspr-flow-shell");
+    if (shell?.dataset.flowUpstream) return shell.dataset.flowUpstream;
+    const response = await fetch("/flow/shell-state.json", { credentials: "same-origin", cache: "no-store" });
+    const payload = response.ok ? await response.json() : {};
+    return payload.projectionMeta?.projectKey ? "aeon" : "classic";
+  });
+  if (upstream === "aeon") {
+    return {
+      upstream,
+      reviewPath: "/p/PHAROS?view=journey",
+      startPath: "/p/PHAROS?view=journey&stage=build",
+      reviewRoute: "aeon-project-journey",
+    };
+  }
+  return {
+    upstream: "classic",
+    reviewPath: "/projects/17?tab=overview#baseline-batch",
+    startPath: "/projects/17?tab=overview#baseline-batch",
+    reviewRoute: "paimos-project-overview-baseline",
+  };
+}
+
 async function loginAsVerifiedHuman(page) {
   await page.goto("/auth/login?return_to=/");
   await page.waitForURL(/\/($|\?)/, { timeout: 20_000 });
@@ -258,12 +284,21 @@ test("review intent routes through bootstrap flow-intent handling", async ({ pag
   await page.goto("/");
   await waitForFlowProjection(page);
 
+  // Read the upstream before the intent: an allowed location makes the
+  // bootstrap navigate, so the shell is gone afterwards.
+  const meta = await harnessMeta(page);
+  const shellUpstream = await page.evaluate(
+    () => document.querySelector("inspr-flow-shell")?.dataset.flowUpstream ?? null,
+  );
+  // The bootstrap's navigation guard keys off this attribute; it must match the server.
+  expect(shellUpstream).toBe(meta.upstream);
+
   const result = await dispatchFlowIntent(page, "review");
 
   expect(result.status).toBe(200);
-  expect(result.body.location).toContain("/projects/17?tab=overview#baseline-batch");
+  expect(result.body.location).toContain(meta.reviewPath);
   expect(result.body.executed).toBe(false);
-  expect(result.body.routed).toBe("paimos-project-overview-baseline");
+  expect(result.body.routed).toBe(meta.reviewRoute);
 });
 
 test("start intent routes through bootstrap with exact navigation target", async ({
@@ -277,14 +312,13 @@ test("start intent routes through bootstrap with exact navigation target", async
     () => document.querySelector("inspr-flow-shell")?.dataset.flowPaimosOrigin ?? "",
   );
 
+  const meta = await harnessMeta(page);
   const result = await dispatchFlowIntent(page, "start");
 
   expect(result.status).toBe(200);
   expect(result.body.error).toBeUndefined();
-  expect(result.body.routed).toBe("paimos-project-overview-baseline");
-  expect(result.body.location).toBe(
-    `${paimosOrigin.replace(/\/$/, "")}/projects/17?tab=overview#baseline-batch`,
-  );
+  expect(result.body.routed).toBe(meta.reviewRoute);
+  expect(result.body.location).toBe(`${paimosOrigin.replace(/\/$/, "")}${meta.startPath}`);
 });
 
 test("revoked start identity is rejected through bootstrap flow-intent handling", async ({

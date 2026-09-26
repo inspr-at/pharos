@@ -4,6 +4,8 @@ const shell = document.querySelector('inspr-flow-shell[data-flow-host]');
 if (shell) {
   const hostScope = shell.dataset.flowHostScope || '';
   const paimosOrigin = shell.dataset.flowPaimosOrigin || '';
+  // PHAROS-313: the server marks which upstream route shape is allowed.
+  const flowUpstream = shell.dataset.flowUpstream === 'aeon' ? 'aeon' : 'classic';
   let generation = 0;
   let refreshTimer = null;
   let mainUnwrapped = false;
@@ -187,6 +189,22 @@ if (shell) {
     const rest = prefix && (target.pathname === prefix || target.pathname.startsWith(`${prefix}/`))
       ? target.pathname.slice(prefix.length)
       : (prefix ? '' : target.pathname);
+    if (flowUpstream === 'aeon') {
+      if (!/^\/p\/[A-Z][A-Z0-9_-]{0,31}$/.test(rest) || target.hash) {
+        return false;
+      }
+      const params = new URLSearchParams(target.search);
+      if (params.get('view') !== 'journey') {
+        return false;
+      }
+      for (const [key, value] of params) {
+        if (key === 'view') continue;
+        if (key !== 'stage' || !/^(inspire|shape|requirements|plan|build|deploy|access|live)$/.test(value)) {
+          return false;
+        }
+      }
+      return true;
+    }
     return /^\/projects\/\d+$/.test(rest);
   }
 

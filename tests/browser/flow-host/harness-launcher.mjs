@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createMockOidcIssuer } from "./mock-oidc-issuer.mjs";
-import { createMockPaimosFixture } from "./mock-paimos-fixture.mjs";
+import { AEON_PROJECT_NODE_ID, createMockAeonFixture, createMockPaimosFixture } from "./mock-paimos-fixture.mjs";
 import { operatorRef } from "./operator-ref.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -80,36 +80,54 @@ try {
   );
 
   oidc = await createMockOidcIssuer(runDir);
-  paimos = await createMockPaimosFixture();
+  // PHAROS-313: PHAROS_FLOW_HARNESS_UPSTREAM=aeon runs the same suite against a
+  // loopback Aeon with the v2 config; the default stays classic.
+  const upstream = process.env.PHAROS_FLOW_HARNESS_UPSTREAM === "aeon" ? "aeon" : "classic";
+  paimos = upstream === "aeon" ? await createMockAeonFixture() : await createMockPaimosFixture();
   const operator = operatorRef(oidc.issuer, oidc.subject);
 
   const flowConfigPath = path.join(secretsDir, "flow-host.json");
-  fs.writeFileSync(
-    flowConfigPath,
-    `${JSON.stringify(
-      {
-        schema: "inspr.pharos.flow-host-config.v1",
-        schema_version: 1,
-        enabled: true,
-        host_id: "pharos-flow-harness",
-        paimos_origin: paimos.origin,
-        api_key_file: apiKeyPath,
-        instance_label: "Flow harness",
-        bindings: [
-          {
-            project_id: 17,
-            project_ref: "paimos:proj-9b2899fb59591130607952d66fcb5607",
-            label: "Harness project",
-            hosts: [hostName],
-            operator_refs: [operator],
-          },
-        ],
-      },
-      null,
-      2,
-    )}\n`,
-    { mode: 0o600 },
-  );
+  const flowConfig =
+    upstream === "aeon"
+      ? {
+          schema: "inspr.pharos.flow-host-config.v2",
+          schema_version: 2,
+          enabled: true,
+          host_id: "pharos-flow-harness",
+          upstream: "aeon",
+          aeon_origin: paimos.origin,
+          api_key_file: apiKeyPath,
+          instance_label: "Flow harness",
+          tenant_slug: "inspr",
+          bindings: [
+            {
+              project_node_id: AEON_PROJECT_NODE_ID,
+              project_key: "PHAROS",
+              label: "Harness project",
+              hosts: [hostName],
+              operator_refs: [operator],
+            },
+          ],
+        }
+      : {
+          schema: "inspr.pharos.flow-host-config.v1",
+          schema_version: 1,
+          enabled: true,
+          host_id: "pharos-flow-harness",
+          paimos_origin: paimos.origin,
+          api_key_file: apiKeyPath,
+          instance_label: "Flow harness",
+          bindings: [
+            {
+              project_id: 17,
+              project_ref: "paimos:proj-9b2899fb59591130607952d66fcb5607",
+              label: "Harness project",
+              hosts: [hostName],
+              operator_refs: [operator],
+            },
+          ],
+        };
+  fs.writeFileSync(flowConfigPath, `${JSON.stringify(flowConfig, null, 2)}\n`, { mode: 0o600 });
 
   fs.writeFileSync(
     path.join(runDir, "flow-harness.json"),
@@ -119,6 +137,10 @@ try {
         oidcIssuer: oidc.issuer,
         paimosOrigin: paimos.origin,
         operatorRef: operator,
+        upstream,
+        reviewPath: upstream === "aeon" ? "/p/PHAROS?view=journey" : "/projects/17?tab=overview#baseline-batch",
+        reviewRoute: upstream === "aeon" ? "aeon-project-journey" : "paimos-project-overview-baseline",
+        startPath: upstream === "aeon" ? "/p/PHAROS?view=journey&stage=build" : "/projects/17?tab=overview#baseline-batch",
       },
       null,
       2,

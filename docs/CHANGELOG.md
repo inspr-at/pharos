@@ -10,6 +10,8 @@
 
 ## Unreleased
 
+- Add a config-selectable Aeon upstream for the Flow host (`inspr.pharos.flow-host-config.v2`): journey read with strict project node, project key and tenant verification, backwards-revision refusal, `/p/{project_key}?view=journey` navigation with an exact allow-list, and the classic Paimos path left untouched. No production change until the operator switches the config (PHAROS-313).
+
 ## 260922141211.0.0 - 2026-09-22
 
 - Restore compact host cards and list rows with consistent typography, spacing and centered health marks, retaining the sidebar, header and lighthouse artwork (PHAROS-302).

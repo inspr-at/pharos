@@ -972,6 +972,21 @@ API key file stays off the browser. Optional `paimos_public_url` is the
 browser navigation address when that public URL differs from the server-side
 origin (for example a same-origin `/paimos` mount).
 
+Schema `inspr.pharos.flow-host-config.v2` (PHAROS-313) selects the Aeon
+successor instead: `upstream` is `aeon`, `aeon_origin` (and optional
+`aeon_public_url`) replace the Paimos URLs, `tenant_slug` names the Aeon tenant,
+and each binding carries the project's `project_node_id` (UUID) and route
+`project_key` instead of a numeric id and opaque ref. The server reads
+`GET /api/projects/{project_node_id}/journey` with the scoped key
+(`journey.read`), refuses any response whose `project_node_id`, `project_key`
+or `tenant_slug` differ from the configuration, refuses a journey whose
+revision moved backwards, and projects stage, next action and launch readiness
+onto the shell. Browser navigation goes to `/p/{project_key}?view=journey`
+(plus `stage=` only when Aeon returned one) and nothing else. A v1 and a v2
+document never mix; the classic path is unchanged. The key file is materialized
+by the operator (see nixcfg agent secrets); a hand-placed file does not survive
+a Home Manager switch.
+
 Optional `PHAROS_PUBLIC_BASE_PATH` (empty default) serves the same binary under
 a configured prefix such as `/pharos` without changing cookie names, `__Host-`
 flags (`Secure`, `Path=/`, no `Domain`), or per-app operator/project
