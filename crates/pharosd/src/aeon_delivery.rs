@@ -802,6 +802,18 @@ impl ResultReceipt {
         })
     }
 
+    fn from_handoff(result: &HandoffResult) -> Result<Self, AdapterError> {
+        Self::from_response(&ResultResponse {
+            outcome: result.outcome,
+            terminal_sequence: result.terminal_sequence,
+            authority_epoch: result.authority_epoch,
+            prerequisite_seal_sha256: result.prerequisite_seal_sha256.clone(),
+            blocker_code: result.blocker_code,
+            handoff_id: result.handoff_id.clone(),
+            completed_at: result.completed_at.clone(),
+        })
+    }
+
     fn matches_request(&self, body: &str, handoff_id: &str) -> bool {
         let Ok(request) = decode_strict::<ResultRequest>(body.as_bytes()) else {
             return false;
@@ -2021,15 +2033,23 @@ impl AeonDeliveryAdapter {
         {
             let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
             handoff.validate(intent)?;
-            if handoff.state.is_closed() {
-                self.log_closed(&handoff);
-                return Ok(());
-            }
-            handoff.open_for_write(now_unix())?;
             let pending = self
                 .journal
                 .result(&intent.handoff_id)
                 .ok_or(AdapterError::Journal)?;
+            if let Some(result) = handoff.result.as_ref() {
+                if !handoff_result_matches(result, &pending.body_json, &intent.handoff_id) {
+                    return Err(AdapterError::LocalBinding);
+                }
+                let receipt = ResultReceipt::from_handoff(result)?;
+                self.journal.acknowledge_result(&pending, receipt)?;
+                return Ok(());
+            }
+            if handoff.state.is_closed() {
+                self.log_closed(&handoff);
+            } else {
+                handoff.open_for_write(now_unix())?;
+            }
             let request: ResultRequest = decode_strict(pending.body_json.as_bytes())?;
             return self
                 .finish_result(
@@ -2928,6 +2948,18 @@ fn refreshed_readiness_body(
         serde_json::Value::String(observed_at.to_string()),
     );
     serde_json::to_vec(&value).map_err(|_| AdapterError::Contract)
+}
+
+fn handoff_result_matches(result: &HandoffResult, body: &str, handoff_id: &str) -> bool {
+    let Ok(request) = decode_strict::<ResultRequest>(body.as_bytes()) else {
+        return false;
+    };
+    result.handoff_id == handoff_id
+        && result.outcome == request.outcome
+        && result.terminal_sequence == request.terminal_sequence
+        && result.authority_epoch == request.authority_epoch
+        && result.prerequisite_seal_sha256 == request.prerequisite_seal_sha256
+        && result.blocker_code == request.blocker_code
 }
 
 fn beacon_window_closed(anchor: i64, now: i64, freshness_secs: i64) -> bool {
@@ -4297,7 +4329,7 @@ mod tests {
         {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
-        let response = json!({
+        let mut response = json!({
             "outcome": value["outcome"],
             "terminal_sequence": value["terminal_sequence"],
             "authority_epoch": value["authority_epoch"],
@@ -4305,6 +4337,14 @@ mod tests {
             "handoff_id": handoff.id,
             "completed_at": format_timestamp(now).unwrap(),
         });
+        if let Some(blocker) = value["blocker_code"].as_str() {
+            response["blocker_code"] = json!(blocker);
+        }
+        handoff.state = if value["outcome"] == "succeeded" {
+            "succeeded".to_string()
+        } else {
+            "failed".to_string()
+        };
         handoff.result_body = Some(body.to_vec());
         handoff.result = Some(response.clone());
         if drop_result {
@@ -6276,13 +6316,67 @@ mod tests {
             .into_iter()
             .filter(|capture| capture.path.ends_with("/result"))
             .collect();
-        assert_eq!(result_posts.len(), 2);
-        assert_eq!(result_posts[0].body, result_posts[1].body);
+        assert_eq!(result_posts.len(), 1);
         let saved = adapter.journal.result(DEPLOY_HANDOFF).unwrap();
         assert_eq!(saved.body_json, journaled);
         assert_eq!(
             saved.receipt.unwrap().prerequisite_seal_sha256,
             hex_chars('d')
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn closed_handoff_replays_a_lost_result_and_verification_continues() {
+        let now = now_unix();
+        let directory = TestDir::new("closed-result");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now);
+        fake.update(|inner| inner.drop_accepted_result = true);
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let job_id = completed_update(&actions, now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        record_beacon(&hosts, now - 10, &artifact());
+        let mut intent = deploy_intent(false);
+        intent.update_restart_job_id = Some(job_id);
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![intent.clone(), verify_intent()]),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            Arc::clone(&hosts),
+            actions,
+        );
+        assert!(adapter.process_intent(&intent).await.is_err());
+        assert!(adapter
+            .journal
+            .result(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_none());
+        adapter.process_intent(&intent).await.unwrap();
+        let receipt = adapter
+            .journal
+            .result(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .unwrap();
+        assert_eq!(receipt.outcome, ResultOutcome::Succeeded);
+        let seal = dependency_digest(DEPLOY_HANDOFF, "deployment", receipt.terminal_sequence);
+        arm_verify_seal(&fake, &seal, 11);
+        record_beacon(&hosts, now_unix() + 1, &artifact());
+        adapter.process_intent(&verify_intent()).await.unwrap();
+        assert_eq!(
+            adapter
+                .journal
+                .result(VERIFY_HANDOFF)
+                .unwrap()
+                .receipt
+                .unwrap()
+                .outcome,
+            ResultOutcome::Succeeded
         );
         server.abort();
     }
