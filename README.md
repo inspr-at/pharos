@@ -565,8 +565,8 @@ journey `node_key`, refuses `project_key` `PHAROS` and any tenant other than
 `inspr`, refuses a journey with a live stage gate (`stages[].gate_live`),
 and refuses a handoff whose `release_node_id` is not
 `PHAROS_AEON_LIVE_RELEASE_NODE_ID`. It prints the project key, node key, and
-release number first. A response that reflects the bearer token is withheld
-from the trace and the report. It does not run in CI.
+release number first. A response that reflects the bearer token, in the body or in any header,
+is withheld from the trace and the report. It does not run in CI.
 
 ### 5. Requested is never presented as applied
 

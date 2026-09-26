@@ -2276,6 +2276,9 @@ impl AeonClient {
         }
         let response = builder.send().await.map_err(|_| AdapterError::Transport)?;
         let status = response.status();
+        // Every header is checked before any header value is copied. A reflected
+        // key in x-request-id must not reach a trace, a panic, or the report.
+        reject_reflected_headers(response.headers(), credentials)?;
         #[cfg(test)]
         let request_id = response
             .headers()
@@ -2287,7 +2290,6 @@ impl AeonClient {
             self.note_exchange(&method_name, path, status, request_id, &[], credentials);
             return Err(AdapterError::Contract);
         }
-        reject_reflected_headers(response.headers(), credentials)?;
         let media_ok = response_media_json(response.headers());
         let bytes = match bounded_body(response).await {
             Ok(bytes) => bytes,
@@ -10615,16 +10617,28 @@ mod tests {
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or("")
                         .to_string();
-                    let body = if path.ends_with("/long-error") {
+                    let header_key = path.ends_with("/header-key");
+                    let body = if header_key {
+                        "{}".to_string()
+                    } else if path.ends_with("/long-error") {
                         "n".repeat(500)
                     } else {
                         format!("{{\"error\":\"reflected {authorization}\"}}")
                     };
-                    Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .header(CONTENT_TYPE.as_str(), JSON_MEDIA)
-                        .body(Body::from(body))
-                        .unwrap()
+                    let mut response = Response::builder()
+                        .status(if header_key {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        })
+                        .header(CONTENT_TYPE.as_str(), JSON_MEDIA);
+                    if header_key {
+                        response = response
+                            .header(CONTENT_ENCODING.as_str(), "gzip")
+                            .header("x-request-id", authorization.clone())
+                            .header("x-echo", authorization);
+                    }
+                    response.body(Body::from(body)).unwrap()
                 }),
             )
             .await
@@ -10676,6 +10690,23 @@ mod tests {
         let report_bytes = std::fs::read(&report).unwrap();
         assert_no_key(&report_bytes);
         assert_live_bytes_exclude_key(&report_bytes, &api);
+        let credentials = adapter.aeon.credentials().expect("test key");
+        let header_key = adapter
+            .aeon
+            .exchange(Method::GET, "/header-key", None, None, &credentials)
+            .await;
+        drop(credentials);
+        assert!(matches!(header_key, Err(AdapterError::Contract)));
+        let recorded = traces.lock().expect("traces").clone();
+        assert!(recorded.iter().all(|trace| trace.path != "/header-key"));
+        for trace in &recorded {
+            assert_no_key(format!("{trace:?}").as_bytes());
+        }
+        let message = live_failure(&traces);
+        assert_no_key(message.as_bytes());
+        save_live_failure(&report, &traces, &api, &message);
+        let report_bytes = std::fs::read(&report).unwrap();
+        assert_no_key(&report_bytes);
         server.abort();
     }
 

@@ -22,6 +22,7 @@
 - Post the mapped Aeon blocker when crash recovery records a terminal launch block, including a consume abandoned after the operator cancels the job (PHAROS-313).
 - Refuse an Aeon deploy intent that names an `update_restart_job_id` the delivery adapter does not own, at startup and before the job is bound (PHAROS-313).
 - Require the live Aeon roundtrip to name the journey node key and to see every stage gate dark before it writes (PHAROS-313).
+- Check every Aeon response header for a reflected bearer token before copying a header into a trace, a panic, or the live report (PHAROS-313).
 - Withhold a reflected API key from Aeon delivery traces, panic text, and the live roundtrip report (PHAROS-313).
 - Refuse the live Aeon roundtrip unless the journey project key, tenant, and handoff release match the disposable target named in the environment (PHAROS-313).
 - Refuse to confirm a recovered Aeon launch when the handoff is no longer open or its authority no longer matches the journaled admission (PHAROS-313).
