@@ -4160,6 +4160,10 @@ mod tests {
                 json_response(StatusCode::CONFLICT, &json!({}))
             };
         }
+        let max_sequence = handoff.evidence.keys().max().copied().unwrap_or(0);
+        if sequence != max_sequence + 1 {
+            return json_response(StatusCode::CONFLICT, &json!({}));
+        }
         if value["authority_epoch"].as_i64() != Some(handoff.authority_epoch) {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
@@ -6075,6 +6079,86 @@ mod tests {
         assert_eq!(bodies.len(), 2);
         assert_eq!(bodies[0], bodies[1]);
         assert_eq!(bodies[0], journaled.body_json.as_bytes());
+        replayed.server.abort();
+    }
+
+    #[tokio::test]
+    async fn evidence_sequence_must_be_contiguous_and_replay_reuses_it() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake).await;
+        let client = reqwest::Client::new();
+        let url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+            .unwrap();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let send = |sequence: i64| {
+            let client = client.clone();
+            let url = url.clone();
+            let bearer = bearer.clone();
+            async move {
+                client
+                    .post(url)
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA)
+                    .body(
+                        serde_json::to_vec(&json!({
+                            "sequence": sequence,
+                            "kind": "deployment",
+                            "outcome": "succeeded",
+                            "observed_at": format_timestamp(now).unwrap(),
+                            "authority_epoch": 3
+                        }))
+                        .unwrap(),
+                    )
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(send(2).await, StatusCode::CONFLICT);
+        assert_eq!(send(1).await, StatusCode::CREATED);
+        assert_eq!(send(1).await, StatusCode::CREATED);
+        assert_eq!(send(3).await, StatusCode::CONFLICT);
+        server.abort();
+
+        let replayed = harness(false).await;
+        replayed
+            .adapter
+            .process_intent(&replayed.intent)
+            .await
+            .unwrap();
+        let job_id = replayed.actions.list()[0].id.clone();
+        fail_review(&replayed.actions, &job_id, now_unix());
+        replayed.fake.update(|inner| inner.fail_next_post = true);
+        assert!(replayed
+            .adapter
+            .process_intent(&replayed.intent)
+            .await
+            .is_err());
+        replayed
+            .adapter
+            .process_intent(&replayed.intent)
+            .await
+            .unwrap();
+        let sequences: Vec<i64> = posts(&replayed.fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/evidence"))
+            .map(|capture| {
+                serde_json::from_slice::<Value>(&capture.body).unwrap()["sequence"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(sequences, vec![1, 1]);
+        assert!(replayed
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::Deployment)
+            .unwrap()
+            .receipt
+            .is_some());
         replayed.server.abort();
     }
 
