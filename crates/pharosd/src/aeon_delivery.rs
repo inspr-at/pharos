@@ -645,8 +645,8 @@ impl HandoffDocument {
         Ok(())
     }
 
-    fn open_for_write(&self, now: i64) -> Result<(), AdapterError> {
-        if !self.state.is_open() || unix_of(&self.expires_at)? <= now {
+    fn open_for_write(&self) -> Result<(), AdapterError> {
+        if !self.state.is_open() || stamp_passed(&self.expires_at)? {
             return Err(AdapterError::Contract);
         }
         Ok(())
@@ -1241,10 +1241,8 @@ fn aeon_blocker_for_reason(reason: &str) -> Option<BlockerCode> {
         LAUNCH_BLOCK_READINESS_PLAN_CHANGED
         | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
         | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
-        | LAUNCH_BLOCK_LAUNCH_NOT_OWNED => BlockerCode::PolicyRefused,
-        // A consumed admission cannot be replaced. While it is still unconsumed
-        // and the handoff is current, the reporter sends external_waiting.
-        LAUNCH_BLOCK_ADMISSION_EXPIRED => BlockerCode::PolicyRefused,
+        | LAUNCH_BLOCK_LAUNCH_NOT_OWNED
+        | LAUNCH_BLOCK_ADMISSION_EXPIRED => BlockerCode::PolicyRefused,
         LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
         | LAUNCH_BLOCK_CONSUME_ABANDONED
         | LAUNCH_BLOCK_AUTHORITY_CLOSED => BlockerCode::DependencyFailed,
@@ -2341,7 +2339,7 @@ impl AeonDeliveryAdapter {
             if handoff.state.is_closed() {
                 self.log_closed(&handoff);
             } else {
-                handoff.open_for_write(now_unix())?;
+                handoff.open_for_write()?;
             }
             let request: ResultRequest = decode_strict(pending.body_json.as_bytes())?;
             return self
@@ -2361,7 +2359,7 @@ impl AeonDeliveryAdapter {
             self.log_closed(&handoff);
             return Ok(());
         }
-        handoff.open_for_write(now_unix())?;
+        handoff.open_for_write()?;
         if intent.operation == Operation::Deploy {
             self.bind_deployment(intent, &handoff)?;
         }
@@ -2457,20 +2455,17 @@ impl AeonDeliveryAdapter {
         } else {
             // The consume has not committed. Re-check the handoff, the journaled
             // admission, and the job before sending it again.
-            observed.open_for_write(now_unix())?;
+            observed.open_for_write()?;
             let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
-            if unix_of(&admission.expires_at)? <= now_unix() {
+            // Consume accepts the admission only while expires_at is strictly
+            // after now (launch.go). Truncating to the second closes a fraction
+            // that is still valid.
+            if stamp_reached(&admission.expires_at)? {
                 return self
                     .block_launch(intent, LAUNCH_BLOCK_ADMISSION_EXPIRED, true)
                     .map(|_| true);
             }
-            self.validate_admission(
-                admission,
-                intent,
-                &observed,
-                &launch.reviewed_plan_digest,
-                now_unix(),
-            )?;
+            self.validate_admission(admission, intent, &observed, &launch.reviewed_plan_digest)?;
             if !confirmable {
                 return self
                     .block_launch(intent, LAUNCH_BLOCK_CONSUME_ABANDONED, true)
@@ -2525,7 +2520,7 @@ impl AeonDeliveryAdapter {
         let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
         if handoff.state.is_open() {
-            handoff.open_for_write(now_unix())?;
+            handoff.open_for_write()?;
         }
         let blocker = aeon_blocker_for_reason(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED)
             .ok_or(AdapterError::Journal)?;
@@ -2550,29 +2545,19 @@ impl AeonDeliveryAdapter {
         }
         let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
-        let now = now_unix();
-        // Aeon current() stays true until now is strictly after expires_at.
-        // A result posted later is 409 and must not be journaled for replay.
-        let current = handoff.state.is_open() && unix_of(&handoff.expires_at)? >= now;
-        if !current {
+        // Aeon current() is false only once now is strictly after expires_at
+        // (store.go). A later result is 409 and must not be journaled. The
+        // admission expiry equals the handoff and a second admit is refused
+        // (launch.go), so the code is always policy_refused.
+        if !handoff.state.is_open() || stamp_passed(&handoff.expires_at)? {
             return Ok(());
         }
-        let consumed = self
-            .journal
-            .launch(&intent.handoff_id)
-            .is_some_and(|launch| launch.receipt.is_some());
-        // A fresh admit is still possible only before this admission is consumed.
-        let blocker = if consumed {
-            BlockerCode::PolicyRefused
-        } else {
-            BlockerCode::ExternalWaiting
-        };
         self.write_observation(
             intent,
             &handoff,
             EvidenceOutcome::Failed,
-            now,
-            Some(blocker),
+            now_unix(),
+            Some(BlockerCode::PolicyRefused),
             Some(LAUNCH_BLOCK_ADMISSION_EXPIRED),
         )
         .await
@@ -2621,8 +2606,7 @@ impl AeonDeliveryAdapter {
         }
         let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
-        let now = now_unix();
-        if unix_of(&handoff.expires_at)? < now || handoff.result.is_some() {
+        if stamp_passed(&handoff.expires_at)? || handoff.result.is_some() {
             return Ok(());
         }
         let blocker =
@@ -2631,7 +2615,7 @@ impl AeonDeliveryAdapter {
             intent,
             &handoff,
             EvidenceOutcome::Failed,
-            now,
+            now_unix(),
             Some(blocker),
             Some(LAUNCH_BLOCK_AUTHORITY_CLOSED),
         )
@@ -2944,13 +2928,13 @@ impl AeonDeliveryAdapter {
             .ensure_admission(intent, handoff, &operation.job_id, &reviewed)
             .await?;
         let admission = launch.admission.clone().ok_or(AdapterError::Journal)?;
-        if unix_of(&admission.expires_at)? <= now_unix() {
+        if stamp_reached(&admission.expires_at)? {
             return self.block_launch(intent, LAUNCH_BLOCK_ADMISSION_EXPIRED, true);
         }
-        self.validate_admission(&admission, intent, handoff, &reviewed, now_unix())?;
+        self.validate_admission(&admission, intent, handoff, &reviewed)?;
         let fresh = self.aeon.get_handoff(&intent.handoff_id).await?;
         fresh.validate(intent)?;
-        fresh.open_for_write(now_unix())?;
+        fresh.open_for_write()?;
         if fresh.plan_digest != handoff.plan_digest
             || fresh.predecessor_digest != handoff.predecessor_digest
             || fresh.context_digest != handoff.context_digest
@@ -2967,7 +2951,7 @@ impl AeonDeliveryAdapter {
         {
             return Err(AdapterError::LocalBinding);
         }
-        self.validate_admission(&admission, intent, &fresh, &reviewed, now_unix())?;
+        self.validate_admission(&admission, intent, &fresh, &reviewed)?;
         self.consume_and_confirm(intent).await
     }
 
@@ -3285,7 +3269,7 @@ impl AeonDeliveryAdapter {
         }
         match self.aeon.post_admit(record).await {
             Ok(admission) => {
-                self.validate_admission(&admission, intent, handoff, reviewed, now_unix())?;
+                self.validate_admission(&admission, intent, handoff, reviewed)?;
                 self.journal.store_admission(&intent.handoff_id, admission)
             }
             Err(error) => Err(error),
@@ -3298,7 +3282,6 @@ impl AeonDeliveryAdapter {
         intent: &DeliveryIntent,
         handoff: &HandoffDocument,
         reviewed: &str,
-        now: i64,
     ) -> Result<(), AdapterError> {
         let artifact_digest = strip_sha256(&intent.artifact.digest)?;
         let expected = launch_binding_digest(
@@ -3308,15 +3291,15 @@ impl AeonDeliveryAdapter {
             &intent.release_node_id,
             reviewed,
         )?;
-        let expires_at = unix_of(&admission.expires_at)?;
-        let handoff_expires = unix_of(&handoff.expires_at)?;
+        let expires_at = timestamp_nanos(&admission.expires_at)?;
+        let handoff_expires = timestamp_nanos(&handoff.expires_at)?;
         if !valid_uuid(&admission.id)
             || admission.handoff_id != intent.handoff_id
             || admission.artifact_digest_sha256 != artifact_digest
             || admission.authority_epoch != handoff.authority_epoch
             || admission.binding_digest_sha256 != expected
             || admission.consumed_at.is_some()
-            || expires_at <= now
+            || now_nanos() >= expires_at
             || expires_at > handoff_expires
         {
             return Err(AdapterError::LocalBinding);
@@ -3358,10 +3341,10 @@ impl AeonDeliveryAdapter {
             return Err(AdapterError::LocalBinding);
         }
         if job.state == HostActionState::AwaitingConfirmation {
-            let now = now_unix();
-            if unix_of(&admission.expires_at)? <= now || unix_of(handoff_expires_at)? <= now {
+            if stamp_reached(&admission.expires_at)? || stamp_reached(handoff_expires_at)? {
                 return self.block_launch(intent, LAUNCH_BLOCK_ADMISSION_EXPIRED, true);
             }
+            let now = now_unix();
             // Aeon's consumed_at stays in the journal. The host job clock is
             // local, and never earlier than the review that produced this job.
             let confirmed_at = now.max(job.updated_at);
@@ -3741,9 +3724,12 @@ impl AeonDeliveryAdapter {
     ) -> Result<(), AdapterError> {
         let fresh = self.aeon.get_handoff(&intent.handoff_id).await?;
         fresh.validate(intent)?;
-        fresh.open_for_write(now_unix())?;
+        fresh.open_for_write()?;
         self.result_retry_binding(intent, &fresh)?;
         let failed_request: ResultRequest = decode_strict(failed.body_json.as_bytes())?;
+        // Real Aeon writes the seal once and never updates it. This replacement
+        // runs only when GET returns a different seal. FakeAeon simulates that
+        // with bump_seal_on_result; a live handoff does not.
         if fresh.authority_epoch != failed_request.authority_epoch
             || fresh.prerequisite_seal_sha256 == failed_request.prerequisite_seal_sha256
         {
@@ -4429,9 +4415,24 @@ fn unix_of(value: &str) -> Result<i64, AdapterError> {
     Ok(parse_timestamp(value)?.unix_timestamp())
 }
 
+fn timestamp_nanos(value: &str) -> Result<i128, AdapterError> {
+    Ok(parse_timestamp(value)?.unix_timestamp_nanos())
+}
+
+/// Aeon consume accepts an expiry only while it is strictly after now.
+fn stamp_reached(stamp: &str) -> Result<bool, AdapterError> {
+    Ok(now_nanos() >= timestamp_nanos(stamp)?)
+}
+
+/// Aeon `current()` is false only once now is strictly after `expires_at`.
+fn stamp_passed(stamp: &str) -> Result<bool, AdapterError> {
+    Ok(now_nanos() > timestamp_nanos(stamp)?)
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_NOW: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    static TEST_NOW_EXTRA_NANOS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn now_unix() -> i64 {
@@ -4440,6 +4441,17 @@ fn now_unix() -> i64 {
         return now;
     }
     OffsetDateTime::now_utc().unix_timestamp()
+}
+
+fn now_nanos() -> i128 {
+    #[cfg(test)]
+    if let Some(seconds) = TEST_NOW.with(std::cell::Cell::get) {
+        let extra = TEST_NOW_EXTRA_NANOS.with(std::cell::Cell::get) as i128;
+        return (seconds as i128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(extra);
+    }
+    OffsetDateTime::now_utc().unix_timestamp_nanos()
 }
 
 fn strip_sha256(value: &str) -> Result<String, AdapterError> {
@@ -5102,10 +5114,17 @@ mod tests {
         now: i64,
         handoffs: BTreeMap<String, FakeHandoff>,
         fail_next_post: bool,
+        /// FakeAeon only. Real Aeon writes `prerequisite_seal_sha256` once and
+        /// `current()` only compares it. Set to make the next result 409 and
+        /// replace the seal, which is the only way `retry_result_seal` replaces
+        /// a journaled body.
         bump_seal_on_result: bool,
         reject_result: bool,
         corrupt_binding: bool,
         expire_admission: bool,
+        /// FakeAeon only. Real Aeon sets admission `expires_at` equal to the
+        /// handoff and refuses a second admit. A shorter lifetime is how a test
+        /// expires the admission while the handoff is still current.
         admission_lifetime_secs: Option<i64>,
         get_status: Option<StatusCode>,
         drop_accepted_consume: bool,
@@ -5505,6 +5524,8 @@ mod tests {
             )
             .unwrap_or_else(|_| "0".repeat(64))
         };
+        // `expire` and `admission_lifetime_secs` are FakeAeon-only. Real Aeon
+        // copies the handoff expiry and does not issue a shorter admission.
         let expires_at = if flags.expire {
             format_timestamp(flags.now - 120).unwrap()
         } else if let Some(lifetime) = flags.admission_lifetime_secs {
@@ -5575,6 +5596,8 @@ mod tests {
         if handoff.consumed {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
+        // Whole seconds. Real Aeon compares `expires_at > now()` at full
+        // time.Time precision. A fraction inside this second can still be valid.
         let admission_expires = admission["expires_at"]
             .as_str()
             .and_then(|stamp| parse_timestamp(stamp).ok())
@@ -5615,6 +5638,7 @@ mod tests {
         if inner.reject_result {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
+        // FakeAeon only. Real Aeon does not change the stored seal on 409.
         if inner.bump_seal_on_result {
             inner.bump_seal_on_result = false;
             if inner.arm_lineage_drift {
@@ -5650,6 +5674,8 @@ mod tests {
         {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
         }
+        // Whole seconds. Real Aeon uses time.Now().After(expires_at), so a
+        // fraction inside this second is already stale.
         let expires_at = parse_timestamp(&handoff.expires_at)
             .map(|time| time.unix_timestamp())
             .unwrap_or(0);
@@ -6819,17 +6845,24 @@ mod tests {
     impl FrozenNow {
         fn at(now: i64) -> Self {
             TEST_NOW.with(|cell| cell.set(Some(now)));
+            TEST_NOW_EXTRA_NANOS.with(|cell| cell.set(0));
             Self
         }
 
         fn set(now: i64) {
             TEST_NOW.with(|cell| cell.set(Some(now)));
+            TEST_NOW_EXTRA_NANOS.with(|cell| cell.set(0));
+        }
+
+        fn set_extra_nanos(extra: u32) {
+            TEST_NOW_EXTRA_NANOS.with(|cell| cell.set(extra));
         }
     }
 
     impl Drop for FrozenNow {
         fn drop(&mut self) {
             TEST_NOW.with(|cell| cell.set(None));
+            TEST_NOW_EXTRA_NANOS.with(|cell| cell.set(0));
         }
     }
 
@@ -8798,8 +8831,114 @@ mod tests {
         fixture.server.abort();
     }
 
+    fn stamp_with_millis(unix_seconds: i64, millis: u32) -> String {
+        assert!(millis < 1000);
+        let whole = format_timestamp(unix_seconds).unwrap();
+        let split = whole.rfind(['Z', '+']).expect("rfc3339 offset");
+        let (bare, suffix) = whole.split_at(split);
+        format!("{bare}.{millis:03}{suffix}")
+    }
+
+    #[test]
+    fn timestamp_nanos_keeps_a_fractional_second() {
+        let whole = format_timestamp(1_800_000_000).unwrap();
+        let fractional = stamp_with_millis(1_800_000_000, 800);
+        assert_eq!(
+            timestamp_nanos(&fractional).unwrap() - timestamp_nanos(&whole).unwrap(),
+            800_000_000
+        );
+    }
+
+    fn set_deploy_expiry(fake: &FakeAeon, expires_at: String) {
+        fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .expect("deploy handoff")
+                .expires_at = expires_at;
+        });
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn unconsumed_expired_admission_reports_external_waiting() {
+    async fn fractional_expiry_still_confirms_inside_the_same_second() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        set_deploy_expiry(&fixture.fake, stamp_with_millis(now + 3600, 800));
+        let job_id = dropped_consume(&fixture).await;
+        let admission = fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .admission
+            .unwrap();
+        assert!(
+            admission.expires_at.contains(".800"),
+            "{}",
+            admission.expires_at
+        );
+        FrozenNow::set(now + 3600);
+        FrozenNow::set_extra_nanos(100_000_000);
+        fixture.fake.update(|inner| inner.now = now + 3600);
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        assert!(fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fractional_expiry_after_the_instant_posts_nothing() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        set_deploy_expiry(&fixture.fake, stamp_with_millis(now + 3600, 200));
+        let job_id = dropped_consume(&fixture).await;
+        FrozenNow::set(now + 3600);
+        FrozenNow::set_extra_nanos(500_000_000);
+        fixture.fake.update(|inner| inner.now = now + 3600);
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_ADMISSION_EXPIRED
+        );
+        assert!(fixture.adapter.journal.result(DEPLOY_HANDOFF).is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unconsumed_expired_admission_reports_policy_refused() {
+        // admission_lifetime_secs is FakeAeon-only. Real Aeon copies the handoff
+        // expiry, so this shorter admission cannot be issued there.
         let now = now_unix();
         let _clock = FrozenNow::at(now);
         let fixture = harness(true).await;
@@ -8839,7 +8978,7 @@ mod tests {
         let results = result_posts(&fixture.fake);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["outcome"], "failed");
-        assert_eq!(results[0]["blocker_code"], "external_waiting");
+        assert_eq!(results[0]["blocker_code"], "policy_refused");
         assert!(results[0].get("detail").is_none());
         assert_eq!(
             fixture

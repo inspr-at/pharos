@@ -15,7 +15,8 @@
 - Add an ignored live roundtrip for that adapter. It runs only when `PHAROS_AEON_LIVE_ACK=disposable`, reads the bearer token through the production reader, and writes a value-free request report (PHAROS-313).
 - Require an Aeon deploy intent's `delegated_launch.target_ref` to be that intent's artifact digest (PHAROS-313).
 - Send only an Aeon-accepted blocker code on a stage result, and keep the Pharos reason token in the delivery journal (PHAROS-313).
-- Close an Aeon handoff when its launch admission expires by journaling `admission_expired` and posting a failed result Aeon accepts while the handoff is still current (PHAROS-313).
+- Close an Aeon handoff when its launch admission expires by journaling `admission_expired` and posting `policy_refused` while `now` is not strictly after `expires_at`. Aeon sets that expiry equal to the handoff and refuses a second admit, so there is no fresh attempt on the same handoff (PHAROS-313).
+- Compare admission expiry at sub-second precision. A still-valid fraction of the expiry second stays open, and once that instant has passed the block stays local instead of replaying a result Aeon rejects as stale (PHAROS-313).
 - Withhold a reflected API key from Aeon delivery traces, panic text, and the live roundtrip report (PHAROS-313).
 - Refuse the live Aeon roundtrip unless the journey project key, tenant, and handoff release match the disposable target named in the environment (PHAROS-313).
 - Refuse to confirm a recovered Aeon launch when the handoff is no longer open or its authority no longer matches the journaled admission (PHAROS-313).
