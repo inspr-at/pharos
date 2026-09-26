@@ -530,9 +530,12 @@ admission — including a binding digest recomputed locally — consumes that
 admission, and only then confirms the same job. Deployment evidence follows a
 fresh config-class beacon, or a failed or cancelled job. Verification evidence
 follows the deploy handoff's plan digest and authority epoch. Every mutation
-is journaled as exact request bytes before it is sent and replayed after a
-crash. The bearer token stays in its referenced file and is not written to the
-journal. The adapter does nothing until the config variable is set.
+is journaled as exact request bytes before it is sent. After a crash, admit
+and consume are replayed with the journaled Idempotency-Key. An exact replay
+returns the stored admission or receipt, and a conflicting replay stays
+unresolved without changing the host. The bearer token stays in its referenced
+file and is not written to the journal. The adapter does nothing until the
+config variable is set.
 
 ### 5. Requested is never presented as applied
 
