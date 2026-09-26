@@ -560,8 +560,10 @@ is set and `PHAROS_AEON_LIVE_ACK=disposable`, reads the bearer token from
 `PHAROS_AEON_LIVE_KEY_FILE` with the production reader, and writes a value-free
 JSON report to `PHAROS_AEON_LIVE_REPORT`. Before any write it reads the journey
 and the handoff, requires `PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY` to equal the
-journey `project_key`, refuses `project_key` `PHAROS` and any tenant other than
-`inspr`, and refuses a handoff whose `release_node_id` is not
+journey `project_key` and `PHAROS_AEON_LIVE_EXPECT_NODE_KEY` to equal the
+journey `node_key`, refuses `project_key` `PHAROS` and any tenant other than
+`inspr`, refuses a journey with a live stage gate (`stages[].gate_live`),
+and refuses a handoff whose `release_node_id` is not
 `PHAROS_AEON_LIVE_RELEASE_NODE_ID`. It prints the project key, node key, and
 release number first. A response that reflects the bearer token is withheld
 from the trace and the report. It does not run in CI.

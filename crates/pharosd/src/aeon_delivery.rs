@@ -5215,6 +5215,8 @@ mod tests {
         journey_project_key: String,
         journey_node_key: String,
         journey_tenant_slug: String,
+        /// When true, the journey fixture reports one live gate.
+        journey_gate_live: bool,
     }
 
     #[derive(Clone)]
@@ -5261,6 +5263,7 @@ mod tests {
                     journey_project_key: "lab".to_string(),
                     journey_node_key: "PRJ-17".to_string(),
                     journey_tenant_slug: "inspr".to_string(),
+                    journey_gate_live: false,
                 })),
                 captures: Arc::new(Mutex::new(Vec::new())),
                 reread_hook: Arc::new(Mutex::new(None)),
@@ -5848,6 +5851,11 @@ mod tests {
                     "project_key": inner.journey_project_key,
                     "node_key": inner.journey_node_key,
                     "tenant_slug": inner.journey_tenant_slug,
+                    "stages": [{
+                        "key": "deploy",
+                        "state": "current",
+                        "gate_live": inner.journey_gate_live,
+                    }],
                 }),
             );
         }
@@ -10677,6 +10685,7 @@ mod tests {
         let identity = confirm_live_target(
             &allowed.adapter,
             "lab",
+            "PRJ-17",
             &allowed.intent.project_node_id,
             RELEASE_NODE,
             allowed.intent.artifact.release_sequence,
@@ -10697,6 +10706,7 @@ mod tests {
         let refused = confirm_live_target(
             &production.adapter,
             "PHAROS",
+            "PRJ-17",
             &production.intent.project_node_id,
             RELEASE_NODE,
             production.intent.artifact.release_sequence,
@@ -10714,6 +10724,7 @@ mod tests {
         let refused = confirm_live_target(
             &other_tenant.adapter,
             "lab",
+            "PRJ-17",
             &other_tenant.intent.project_node_id,
             RELEASE_NODE,
             other_tenant.intent.artifact.release_sequence,
@@ -10728,6 +10739,7 @@ mod tests {
         let refused = confirm_live_target(
             &mismatch.adapter,
             "lumen",
+            "PRJ-17",
             &mismatch.intent.project_node_id,
             RELEASE_NODE,
             mismatch.intent.artifact.release_sequence,
@@ -10751,6 +10763,7 @@ mod tests {
         let refused = confirm_live_target(
             &other_release.adapter,
             "lab",
+            "PRJ-17",
             &other_release.intent.project_node_id,
             RELEASE_NODE,
             other_release.intent.artifact.release_sequence,
@@ -10762,6 +10775,41 @@ mod tests {
             .contains("PHAROS_AEON_LIVE_RELEASE_NODE_ID"));
         assert!(posts(&other_release.fake).is_empty());
         other_release.server.abort();
+
+        let live_gate = harness(true).await;
+        live_gate
+            .fake
+            .update(|inner| inner.journey_gate_live = true);
+        let refused = confirm_live_target(
+            &live_gate.adapter,
+            "lab",
+            "PRJ-17",
+            &live_gate.intent.project_node_id,
+            RELEASE_NODE,
+            live_gate.intent.artifact.release_sequence,
+            &[live_gate.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused.unwrap_err().contains("gate_live is true"));
+        assert!(posts(&live_gate.fake).is_empty());
+        live_gate.server.abort();
+
+        let other_node = harness(true).await;
+        let refused = confirm_live_target(
+            &other_node.adapter,
+            "lab",
+            "LAB-1",
+            &other_node.intent.project_node_id,
+            RELEASE_NODE,
+            other_node.intent.artifact.release_sequence,
+            &[other_node.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused
+            .unwrap_err()
+            .contains("PHAROS_AEON_LIVE_EXPECT_NODE_KEY"));
+        assert!(posts(&other_node.fake).is_empty());
+        other_node.server.abort();
     }
 
     #[tokio::test]
@@ -10796,6 +10844,7 @@ mod tests {
         if let Err(reason) = confirm_live_target(
             &adapter,
             &live.expect_project_key,
+            &live.expect_node_key,
             &live.deploy.project_node_id,
             &live.deploy.release_node_id,
             live.artifact.release_sequence,
@@ -10944,6 +10993,7 @@ mod tests {
         origin: Url,
         key_file: PathBuf,
         expect_project_key: String,
+        expect_node_key: String,
         host: String,
         environment: String,
         artifact: ArtifactEvidence,
@@ -10976,6 +11026,14 @@ mod tests {
         assert!(
             expect_project_key != "PHAROS",
             "live Aeon roundtrip refused: PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY is PHAROS"
+        );
+        let expect_node_key = std::env::var("PHAROS_AEON_LIVE_EXPECT_NODE_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert!(
+            !expect_node_key.is_empty(),
+            "live Aeon roundtrip missing PHAROS_AEON_LIVE_EXPECT_NODE_KEY"
         );
         let key_file = required_live_path("PHAROS_AEON_LIVE_KEY_FILE");
         let project = required_live_uuid("PHAROS_AEON_LIVE_PROJECT_NODE_ID");
@@ -11041,6 +11099,7 @@ mod tests {
             origin,
             key_file,
             expect_project_key,
+            expect_node_key,
             host,
             environment,
             artifact,
@@ -11113,6 +11172,7 @@ mod tests {
     async fn confirm_live_target(
         adapter: &AeonDeliveryAdapter,
         expected_project_key: &str,
+        expected_node_key: &str,
         project_node_id: &str,
         expected_release_node: &str,
         release_number: i64,
@@ -11163,8 +11223,38 @@ mod tests {
         if tenant != "inspr" {
             return Err("live Aeon roundtrip refused: tenant is not inspr".to_string());
         }
-        if node_key.is_empty() {
-            return Err("journey node_key is missing".to_string());
+        if expected_node_key.is_empty() {
+            return Err("live Aeon roundtrip missing PHAROS_AEON_LIVE_EXPECT_NODE_KEY".to_string());
+        }
+        if node_key != expected_node_key {
+            return Err(
+                "journey node_key differs from PHAROS_AEON_LIVE_EXPECT_NODE_KEY".to_string(),
+            );
+        }
+        // Aeon has no disposable-project field. gate_live is the current
+        // approval/grant check on each stage (journey doc.go). Every stage
+        // must be dark before this harness writes.
+        let stages = journey
+            .get("stages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "journey stages are missing".to_string())?;
+        if stages.is_empty() {
+            return Err("journey has no stages".to_string());
+        }
+        for stage in stages {
+            match stage.get("gate_live").and_then(Value::as_bool) {
+                Some(false) => {}
+                Some(true) => {
+                    let key = stage
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    return Err(format!(
+                        "live Aeon roundtrip refused: journey stage {key} gate_live is true"
+                    ));
+                }
+                None => return Err("journey stage is missing gate_live".to_string()),
+            }
         }
         if handoff_ids.is_empty() {
             return Err("live Aeon roundtrip has no handoff".to_string());
@@ -11189,7 +11279,7 @@ mod tests {
             }
         }
         println!(
-            "live Aeon roundtrip target: project_key={project_key} node_key={node_key} release_number={release_number}"
+            "live Aeon roundtrip target: project_key={project_key} node_key={node_key} release_number={release_number} gate_live=false"
         );
         Ok(LiveIdentity {
             project_key: project_key.to_string(),
