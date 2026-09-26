@@ -2020,6 +2020,18 @@ impl AeonClient {
         decode_strict(&bytes)
     }
 
+    #[cfg(test)]
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, AdapterError> {
+        let credentials = self.credentials()?;
+        let (status, bytes) = self
+            .exchange(Method::GET, path, None, None, &credentials)
+            .await?;
+        if status != StatusCode::OK {
+            return Err(status_error(status));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| AdapterError::Contract)
+    }
+
     async fn get_principal(&self) -> Result<String, AdapterError> {
         let credentials = self.credentials()?;
         let (status, bytes) = self
@@ -5001,6 +5013,9 @@ mod tests {
         drop_accepted_result: bool,
         drift_plan_on_next_get: bool,
         arm_lineage_drift: bool,
+        journey_project_key: String,
+        journey_node_key: String,
+        journey_tenant_slug: String,
     }
 
     #[derive(Clone)]
@@ -5044,6 +5059,9 @@ mod tests {
                     drop_accepted_result: false,
                     drift_plan_on_next_get: false,
                     arm_lineage_drift: false,
+                    journey_project_key: "lab".to_string(),
+                    journey_node_key: "PRJ-17".to_string(),
+                    journey_tenant_slug: "inspr".to_string(),
                 })),
                 captures: Arc::new(Mutex::new(Vec::new())),
                 reread_hook: Arc::new(Mutex::new(None)),
@@ -5599,6 +5617,22 @@ mod tests {
             );
         }
         let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        if method == "GET"
+            && parts.len() == 4
+            && parts[0] == "api"
+            && parts[1] == "projects"
+            && parts[3] == "journey"
+        {
+            return json_response(
+                StatusCode::OK,
+                &json!({
+                    "project_node_id": parts[2],
+                    "project_key": inner.journey_project_key,
+                    "node_key": inner.journey_node_key,
+                    "tenant_slug": inner.journey_tenant_slug,
+                }),
+            );
+        }
         if parts.len() < 3 || parts[0] != "api" || parts[1] != "stage-handoffs" {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         }
@@ -9768,6 +9802,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_guard_identifies_the_disposable_target_before_any_write() {
+        let allowed = harness(true).await;
+        let identity = confirm_live_target(
+            &allowed.adapter,
+            "lab",
+            &allowed.intent.project_node_id,
+            RELEASE_NODE,
+            allowed.intent.artifact.release_sequence,
+            &[allowed.intent.handoff_id.as_str()],
+        )
+        .await
+        .expect("disposable lab target");
+        assert_eq!(identity.project_key, "lab");
+        assert_eq!(identity.node_key, "PRJ-17");
+        assert_eq!(identity.release_number, 123);
+        assert!(posts(&allowed.fake).is_empty());
+        allowed.server.abort();
+
+        let production = harness(true).await;
+        production
+            .fake
+            .update(|inner| inner.journey_project_key = "PHAROS".to_string());
+        let refused = confirm_live_target(
+            &production.adapter,
+            "PHAROS",
+            &production.intent.project_node_id,
+            RELEASE_NODE,
+            production.intent.artifact.release_sequence,
+            &[production.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused.unwrap_err().contains("project_key is PHAROS"));
+        assert!(posts(&production.fake).is_empty());
+        production.server.abort();
+
+        let other_tenant = harness(true).await;
+        other_tenant
+            .fake
+            .update(|inner| inner.journey_tenant_slug = "other".to_string());
+        let refused = confirm_live_target(
+            &other_tenant.adapter,
+            "lab",
+            &other_tenant.intent.project_node_id,
+            RELEASE_NODE,
+            other_tenant.intent.artifact.release_sequence,
+            &[other_tenant.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused.unwrap_err().contains("tenant is not inspr"));
+        assert!(posts(&other_tenant.fake).is_empty());
+        other_tenant.server.abort();
+
+        let mismatch = harness(true).await;
+        let refused = confirm_live_target(
+            &mismatch.adapter,
+            "lumen",
+            &mismatch.intent.project_node_id,
+            RELEASE_NODE,
+            mismatch.intent.artifact.release_sequence,
+            &[mismatch.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused
+            .unwrap_err()
+            .contains("PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY"));
+        assert!(posts(&mismatch.fake).is_empty());
+        mismatch.server.abort();
+
+        let other_release = harness(true).await;
+        other_release.fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .release_node_id = OTHER_RELEASE.to_string();
+        });
+        let refused = confirm_live_target(
+            &other_release.adapter,
+            "lab",
+            &other_release.intent.project_node_id,
+            RELEASE_NODE,
+            other_release.intent.artifact.release_sequence,
+            &[other_release.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused
+            .unwrap_err()
+            .contains("PHAROS_AEON_LIVE_RELEASE_NODE_ID"));
+        assert!(posts(&other_release.fake).is_empty());
+        other_release.server.abort();
+    }
+
+    #[tokio::test]
     #[ignore = "live Aeon roundtrip; set PHAROS_AEON_LIVE_ACK=disposable"]
     async fn live_roundtrip_against_aeon() {
         let Some(live) = live_roundtrip_env() else {
@@ -9792,6 +9919,22 @@ mod tests {
             Arc::clone(&actions),
         );
         adapter.aeon.enable_trace(Arc::clone(&traces));
+        let mut handoff_ids = vec![live.deploy.handoff_id.as_str()];
+        if let Some(verify) = &live.verify {
+            handoff_ids.push(verify.handoff_id.as_str());
+        }
+        if let Err(reason) = confirm_live_target(
+            &adapter,
+            &live.expect_project_key,
+            &live.deploy.project_node_id,
+            &live.deploy.release_node_id,
+            live.artifact.release_sequence,
+            &handoff_ids,
+        )
+        .await
+        {
+            panic!("live Aeon roundtrip refused: {reason}");
+        }
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(90);
         let now = now_unix();
@@ -9930,6 +10073,7 @@ mod tests {
     struct LiveRoundtrip {
         origin: Url,
         key_file: PathBuf,
+        expect_project_key: String,
         host: String,
         environment: String,
         artifact: ArtifactEvidence,
@@ -9951,6 +10095,18 @@ mod tests {
         }
         let origin =
             parse_origin(origin_text.trim()).expect("PHAROS_AEON_LIVE_ORIGIN https origin");
+        let expect_project_key = std::env::var("PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert!(
+            !expect_project_key.is_empty(),
+            "live Aeon roundtrip missing PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY"
+        );
+        assert!(
+            expect_project_key != "PHAROS",
+            "live Aeon roundtrip refused: PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY is PHAROS"
+        );
         let key_file = required_live_path("PHAROS_AEON_LIVE_KEY_FILE");
         let project = required_live_uuid("PHAROS_AEON_LIVE_PROJECT_NODE_ID");
         let release = required_live_uuid("PHAROS_AEON_LIVE_RELEASE_NODE_ID");
@@ -10014,6 +10170,7 @@ mod tests {
         Some(LiveRoundtrip {
             origin,
             key_file,
+            expect_project_key,
             host,
             environment,
             artifact,
@@ -10074,6 +10231,101 @@ mod tests {
                 }
             }),
         }
+    }
+
+    #[derive(Debug)]
+    struct LiveIdentity {
+        project_key: String,
+        node_key: String,
+        release_number: i64,
+    }
+
+    async fn confirm_live_target(
+        adapter: &AeonDeliveryAdapter,
+        expected_project_key: &str,
+        project_node_id: &str,
+        expected_release_node: &str,
+        release_number: i64,
+        handoff_ids: &[&str],
+    ) -> Result<LiveIdentity, String> {
+        if expected_project_key.is_empty() {
+            return Err(
+                "live Aeon roundtrip missing PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY".to_string(),
+            );
+        }
+        if release_number < 1 {
+            return Err("live Aeon roundtrip release number is missing".to_string());
+        }
+        let journey = adapter
+            .aeon
+            .get_json(&format!("/api/projects/{project_node_id}/journey"))
+            .await
+            .map_err(|error| format!("live Aeon journey read failed ({})", error.code()))?;
+        let project_key = journey
+            .get("project_key")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let node_key = journey
+            .get("node_key")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tenant = journey
+            .get("tenant_slug")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let project_node = journey
+            .get("project_node_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if project_node != project_node_id {
+            return Err(
+                "journey project_node_id differs from PHAROS_AEON_LIVE_PROJECT_NODE_ID".to_string(),
+            );
+        }
+        if project_key != expected_project_key {
+            return Err(
+                "journey project_key differs from PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY".to_string(),
+            );
+        }
+        if project_key == "PHAROS" {
+            return Err("live Aeon roundtrip refused: project_key is PHAROS".to_string());
+        }
+        if tenant != "inspr" {
+            return Err("live Aeon roundtrip refused: tenant is not inspr".to_string());
+        }
+        if node_key.is_empty() {
+            return Err("journey node_key is missing".to_string());
+        }
+        if handoff_ids.is_empty() {
+            return Err("live Aeon roundtrip has no handoff".to_string());
+        }
+        for handoff_id in handoff_ids {
+            let handoff = adapter
+                .aeon
+                .get_handoff(handoff_id)
+                .await
+                .map_err(|error| format!("live Aeon handoff read failed ({})", error.code()))?;
+            if handoff.release_node_id != expected_release_node {
+                return Err(
+                    "handoff release_node_id differs from PHAROS_AEON_LIVE_RELEASE_NODE_ID"
+                        .to_string(),
+                );
+            }
+            if handoff.project_node_id != project_node_id {
+                return Err(
+                    "handoff project_node_id differs from PHAROS_AEON_LIVE_PROJECT_NODE_ID"
+                        .to_string(),
+                );
+            }
+        }
+        println!(
+            "live Aeon roundtrip target: project_key={project_key} node_key={node_key} release_number={release_number}"
+        );
+        Ok(LiveIdentity {
+            project_key: project_key.to_string(),
+            node_key: node_key.to_string(),
+            release_number,
+        })
     }
 
     async fn live_step(

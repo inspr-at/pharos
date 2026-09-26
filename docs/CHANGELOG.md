@@ -17,6 +17,7 @@
 - Send only an Aeon-accepted blocker code on a stage result, and keep the Pharos reason token in the delivery journal (PHAROS-313).
 - Close an Aeon handoff when its launch admission expires by journaling `admission_expired` and posting a failed result Aeon accepts while the handoff is still current (PHAROS-313).
 - Withhold a reflected API key from Aeon delivery traces, panic text, and the live roundtrip report (PHAROS-313).
+- Refuse the live Aeon roundtrip unless the journey project key, tenant, and handoff release match the disposable target named in the environment (PHAROS-313).
 
 ## 260922141211.0.0 - 2026-09-22
 
