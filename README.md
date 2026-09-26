@@ -591,8 +591,10 @@ journey `node_key`, refuses `project_key` `PHAROS` and any tenant other than
 `inspr`, and refuses a handoff whose `release_node_id` is not
 `PHAROS_AEON_LIVE_RELEASE_NODE_ID`. Admission answers 403 `stage gate is not
 approved` unless the candidate and deploy gates are live, so the harness
-requires the build stage's `gate_live` and the deploy stage's `gate_live`
-before it writes and says so when the fixture is not ready. Aeon has no
+finds the stage whose `gate_scope` is `journey.candidate` and the stage whose
+`gate_scope` is `journey.deploy`, and requires `gate_live` on exactly those
+two. A refusal names the scope that is not live. It does not assume stage
+keys. Aeon has no
 operator-only disposable marker yet (AEON-188). Until that exists, the
 operator-supplied project key, node key, and release id are the guard.
 It prints the project key, node key, and
