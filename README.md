@@ -576,8 +576,12 @@ and to match the journaled admission. When that handoff carries
 `expires_at`. It is journaled as `handoff_authority_not_open` and maps to
 `policy_refused`. A handoff already past `expires_at` is journaled as
 `admission_expired` instead, which also maps to `policy_refused`, and no
-result is posted. Those fields are optional. An older Aeon that omits them
-keeps the inferred check, and a true `authority_open` does not waive it. A newer attempt of the same operation is
+result is posted. Those fields are optional. An older Aeon that never sends
+`authority_open` keeps the inferred check. Once any handoff read from this
+Aeon origin includes `authority_open`, that fact stays in the delivery
+journal. A later handoff read that omits it is journaled as
+`authority_signal_missing`, which maps to `policy_refused`, and the host job
+is not confirmed. A true `authority_open` does not waive the inferred check. A newer attempt of the same operation is
 not visible as a change to this handoff's attempt or epoch. Aeon's handoff
 create response now matches GET (AEON-177). This adapter does not create
 handoffs, and GET remains the source of truth for the handoff it confirms.
