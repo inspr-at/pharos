@@ -2411,6 +2411,12 @@ async fn confirm_update_restart(
             "Type the exact host name and confirm that the host is attended",
         );
     }
+    if existing.requested_by == aeon_delivery::ACTOR {
+        return action_error(
+            StatusCode::CONFLICT,
+            "This workflow is owned by the Aeon delivery adapter; confirmation comes through its launch admission",
+        );
+    }
     let actor = action_actor(&state.auth, &headers);
     match state
         .host_actions
@@ -16470,6 +16476,85 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(payload["job"]["state"], "queued_apply");
+    }
+
+    #[tokio::test]
+    async fn operator_confirm_refuses_an_aeon_owned_update_and_keeps_paimos() {
+        async fn confirm_ready(actor: &str) -> (StatusCode, serde_json::Value, AppState, String) {
+            let (state, _fixture) = state_with_janus_manifest("hsb8", "action-token");
+            let id = format!("{actor}-job");
+            state
+                .host_actions
+                .ensure_update_review_with_id(
+                    &id,
+                    "hsb8",
+                    actor,
+                    UpdateRestartIntent::Update,
+                    now_unix(),
+                )
+                .expect("owned review");
+            let claim = claim_host_action(
+                State(state.clone()),
+                bearer_headers("action-token"),
+                Json(AgentActionClaimRequest {
+                    host: "hsb8".to_string(),
+                }),
+            )
+            .await;
+            assert_eq!(claim.status(), StatusCode::OK);
+            let result = record_host_action_result(
+                State(state.clone()),
+                bearer_headers("action-token"),
+                AxumPath(id.clone()),
+                Json(AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: host_actions::AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(host_actions::HostActionPlan {
+                        changed_file_count: 2,
+                        changed_areas: vec!["flake.lock".to_string()],
+                        all_host_eval_passed: true,
+                        target_build_passed: true,
+                        backup_ready: true,
+                        running_kernel: Some("6.18.26".to_string()),
+                        expected_kernel: Some("7.0.14".to_string()),
+                        restart_required: true,
+                    }),
+                    result: None,
+                }),
+            )
+            .await;
+            assert_eq!(result.status(), StatusCode::OK);
+            let (status, Json(payload)) = confirm_update_restart(
+                State(state.clone()),
+                action_headers(),
+                AxumPath(id.clone()),
+                Json(ConfirmHostActionRequest {
+                    confirmation: "hsb8".to_string(),
+                    attended: true,
+                }),
+            )
+            .await;
+            (status, payload, state, id)
+        }
+
+        let (status, payload, state, id) = confirm_ready(aeon_delivery::ACTOR).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            payload["error"],
+            "This workflow is owned by the Aeon delivery adapter; confirmation comes through its launch admission"
+        );
+        let owned = state.host_actions.get(&id).unwrap();
+        assert_eq!(owned.state, HostActionState::AwaitingConfirmation);
+        assert!(owned.confirmed_at.is_none());
+
+        let (status, payload, state, id) = confirm_ready("paimos-delivery").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "queued_apply");
+        assert_eq!(
+            state.host_actions.get(&id).unwrap().requested_by,
+            "paimos-delivery"
+        );
     }
 
     #[tokio::test]

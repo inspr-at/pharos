@@ -525,19 +525,74 @@ same host, environment, and artifact. No Aeon field becomes a command, path,
 or host selector.
 
 A deploy intent binds one guarded `UpdateRestart` review and requires
-`delegated_launch`. A ready review posts `launch_readiness`, checks a one-use
+`delegated_launch`, whose `target_ref` is that intent's artifact digest.
+A configured `update_restart_job_id` must already be requested by
+`aeon-delivery`; an operator-owned job is refused at startup and is not bound.
+A ready review posts `launch_readiness`, checks a one-use
 admission — including a binding digest recomputed locally — consumes that
 admission, and only then confirms the same job. Deployment evidence follows a
-fresh config-class beacon, or a failed or cancelled job. Verification evidence
+fresh config-class beacon, a failed or cancelled job, or a terminal launch
+block while the job is still awaiting confirmation. A failed result uses
+one of Aeon's blocker codes (`dependency_pending`, `dependency_failed`,
+`reporter_stale`, `external_waiting`, `policy_refused`). A dark candidate or deploy gate is
+`stage_gate_not_approved`, which maps to `policy_refused`. That
+classification matches the error text exactly. Any other 403,
+including a missing live agent grant, stays a credential failure.
+Aeon will not
+store the result while that gate is dark, so the block stays in the
+journal and the host job is not confirmed. The precise Pharos
+reason stays in the journal and is not sent as the code: Aeon rejects any
+other result field. An expired admission journals `admission_expired` and
+posts `policy_refused` while `now` is not strictly after `expires_at`. Aeon
+sets that expiry equal to the handoff and refuses a second admit, so the same
+handoff has no fresh attempt. The comparison keeps sub-second precision:
+truncating to the whole second would close an admission that is still valid,
+or post a result Aeon rejects as stale. Once `now` is strictly after
+`expires_at`, the block stays in the journal and no result is posted.
+Verification evidence
 requires `plan_digest` to equal the deploy binding plan digest and
 `predecessor_digest` to equal the dependency seal recomputed from the journaled
 deploy result. Epochs are per release, stage, and operation. Every mutation
-is journaled as exact request bytes before it is sent. After a crash, admit
+is journaled as exact request bytes before it is sent. An unacknowledged
+evidence row is read from Aeon before it is posted again. The replay stops
+when that handoff is expired, no longer requested or active, or already has
+a result, and when Aeon answers 409 `handoff is stale` or `handoff is terminal`.
+Those bytes stay in the journal and are not posted again. A 409
+`evidence predates handoff` stops only that observation. The handoff
+document has no `created_at`, so the refusal is how Pharos learns the
+bound; a later beacon reuses the unstored sequence, and a closed
+verification window reports `reporter_stale` instead of replaying the
+old bytes. A failed
+deployment after a terminal launch block replays any unacknowledged
+evidence first, and allocates the next sequence only after those rows
+are stored. After a crash, admit
 and consume are replayed with the journaled Idempotency-Key. An exact replay
 returns the stored admission or receipt, and a conflicting replay stays
-unresolved without changing the host. The bearer token stays in its referenced
+unresolved without changing the host. Confirmation after that replay still
+requires the fetched handoff to be `requested` or `active`, to have no result,
+and to match the journaled admission. A newer attempt of the same operation
+is not visible on that handoff. The bearer token stays in its referenced
 file and is not written to the journal. The adapter does nothing until the
 config variable is set.
+
+`live_roundtrip_against_aeon` is an ignored test that drives this adapter
+against a live HTTPS Aeon origin. It runs only when `PHAROS_AEON_LIVE_ORIGIN`
+is set and `PHAROS_AEON_LIVE_ACK=disposable`, reads the bearer token from
+`PHAROS_AEON_LIVE_KEY_FILE` with the production reader, and writes a value-free
+JSON report to `PHAROS_AEON_LIVE_REPORT`. Before any write it reads the journey
+and the handoff, requires `PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY` to equal the
+journey `project_key` and `PHAROS_AEON_LIVE_EXPECT_NODE_KEY` to equal the
+journey `node_key`, refuses `project_key` `PHAROS` and any tenant other than
+`inspr`, and refuses a handoff whose `release_node_id` is not
+`PHAROS_AEON_LIVE_RELEASE_NODE_ID`. Admission answers 403 `stage gate is not
+approved` unless the candidate and deploy gates are live, so the harness
+requires the build stage's `gate_live` and the deploy stage's `gate_live`
+before it writes and says so when the fixture is not ready. Aeon has no
+operator-only disposable marker yet (AEON-188). Until that exists, the
+operator-supplied project key, node key, and release id are the guard.
+It prints the project key, node key, and
+release number first. A response that reflects the bearer token, in the body or in any header,
+is withheld from the trace and the report. It does not run in CI.
 
 ### 5. Requested is never presented as applied
 

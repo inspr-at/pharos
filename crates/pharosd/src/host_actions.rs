@@ -4636,6 +4636,14 @@ impl HostActionStore {
             .cloned()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_requested_by_for_test(&self, id: &str, actor: &str) {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        if let Some(job) = jobs.get_mut(id) {
+            job.requested_by = actor.to_string();
+        }
+    }
+
     fn note_durable_repair_pending(&self, id: &str) {
         if self.path.is_some() {
             self.pending_durable_repair

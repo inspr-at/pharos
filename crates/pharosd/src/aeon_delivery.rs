@@ -25,8 +25,8 @@ use url::Url;
 
 use crate::durable_file::atomic_write_json;
 use crate::host_actions::{
-    HostActionJob, HostActionPlan, HostActionState, HostActionStore, HostActionStoreError,
-    HostWorkflowKind, UpdateRestartIntent,
+    HostActionEventKind, HostActionEventSource, HostActionJob, HostActionKind, HostActionPlan,
+    HostActionState, HostActionStore, HostActionStoreError, HostWorkflowKind, UpdateRestartIntent,
 };
 use crate::paimos_delivery::{
     load_ca_certificates, observed_fresh_config_beacon, read_private_file, reviewed_plan_digest,
@@ -47,7 +47,7 @@ const JSON_MEDIA: &str = "application/json";
 const IDENTITY_ENCODING: &str = "identity";
 const PLUGIN_ID: &str = "pharos";
 const STAGE_DEPLOY: &str = "deploy";
-const ACTOR: &str = "aeon-delivery";
+pub(crate) const ACTOR: &str = "aeon-delivery";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_API_KEY_BYTES: u64 = 512;
@@ -58,12 +58,40 @@ const MAX_JOURNAL_RECORDS: usize = MAX_INTENTS * 8;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const OBSERVED_AT_SKEW_SECS: i64 = 5 * 60;
 const READINESS_REFRESH_SECS: i64 = 600;
+#[cfg(test)]
+const TRACE_EXCERPT_MAX_BYTES: usize = 300;
+#[cfg(test)]
+const REFLECTED_CREDENTIAL_MARKER: &str = "<body withheld: reflected credential>";
 const BACKUP_FUTURE_SKEW_SECS: i64 = 5 * 60;
 const LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING: &str = "backup_success_missing";
 const LAUNCH_BLOCK_BACKUP_NOT_READY: &str = "backup_not_ready";
 const LAUNCH_BLOCK_READINESS_PLAN_CHANGED: &str = "readiness_plan_changed";
 const LAUNCH_BLOCK_READINESS_FLAG_FALSE: &str = "readiness_flag_false";
 const LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED: &str = "delegated_launch_required";
+const LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB: &str = "consumed_without_confirmable_job";
+const LAUNCH_BLOCK_CONSUME_ABANDONED: &str = "consume_abandoned";
+const LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED: &str = "confirmation_not_delegated";
+const LAUNCH_BLOCK_ADMISSION_EXPIRED: &str = "admission_expired";
+const LAUNCH_BLOCK_AUTHORITY_CLOSED: &str = "handoff_authority_closed";
+const LAUNCH_BLOCK_LAUNCH_NOT_OWNED: &str = "launch_not_owned";
+const LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED: &str = "configured_job_not_owned";
+const LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED: &str = "stage_gate_not_approved";
+
+const LAUNCH_BLOCK_REASONS: &[&str] = &[
+    LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING,
+    LAUNCH_BLOCK_BACKUP_NOT_READY,
+    LAUNCH_BLOCK_READINESS_PLAN_CHANGED,
+    LAUNCH_BLOCK_READINESS_FLAG_FALSE,
+    LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED,
+    LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB,
+    LAUNCH_BLOCK_CONSUME_ABANDONED,
+    LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED,
+    LAUNCH_BLOCK_ADMISSION_EXPIRED,
+    LAUNCH_BLOCK_AUTHORITY_CLOSED,
+    LAUNCH_BLOCK_LAUNCH_NOT_OWNED,
+    LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED,
+    LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED,
+];
 
 #[derive(Debug)]
 enum AdapterError {
@@ -142,12 +170,11 @@ impl Operation {
         }
     }
 
-    fn ceilings_allow(self, delegated_launch: bool, ceiling: &[EvidenceCeiling]) -> bool {
+    fn ceilings_allow(self, ceiling: &[EvidenceCeiling]) -> bool {
         match self {
-            Self::Deploy => {
-                ceiling.contains(&EvidenceCeiling::Deployment)
-                    && (!delegated_launch || ceiling.contains(&EvidenceCeiling::LaunchReadiness))
-            }
+            // Aeon accepts launch_readiness on a pharos deploy even when the
+            // stored ceiling was written before that kind existed.
+            Self::Deploy => ceiling.contains(&EvidenceCeiling::Deployment),
             Self::Verify => ceiling.contains(&EvidenceCeiling::Verification),
         }
     }
@@ -217,10 +244,9 @@ impl DeliveryIntent {
                             .as_deref()
                             .is_none_or(valid_action_id)
                         && self.deployment_handoff_id.is_none()
-                        && self
-                            .delegated_launch
-                            .as_ref()
-                            .is_some_and(DelegatedLaunchSelection::valid)
+                        && self.delegated_launch.as_ref().is_some_and(|selection| {
+                            selection.valid() && selection.target_ref == self.artifact.digest
+                        })
                 }
                 Operation::Verify => {
                     self.workflow == GuardedWorkflow::VerifyProduction
@@ -465,6 +491,34 @@ enum BlockerCode {
     PolicyRefused,
 }
 
+/// Codes Aeon accepts on a stage result. Anything else is HTTP 400, and a
+/// journaled body with that code would replay forever.
+const AEON_BLOCKER_CODES: &[&str] = &[
+    "dependency_pending",
+    "dependency_failed",
+    "reporter_stale",
+    "external_waiting",
+    "policy_refused",
+];
+
+fn blocker_code_wire(code: BlockerCode) -> &'static str {
+    match code {
+        BlockerCode::DependencyPending => "dependency_pending",
+        BlockerCode::DependencyFailed => "dependency_failed",
+        BlockerCode::ReporterStale => "reporter_stale",
+        BlockerCode::ExternalWaiting => "external_waiting",
+        BlockerCode::PolicyRefused => "policy_refused",
+    }
+}
+
+fn require_accepted_blocker(code: BlockerCode) -> Result<(), AdapterError> {
+    if AEON_BLOCKER_CODES.contains(&blocker_code_wire(code)) {
+        Ok(())
+    } else {
+        Err(AdapterError::Contract)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct WireArtifact {
@@ -573,9 +627,7 @@ impl HandoffDocument {
             || unique.len() != self.evidence_ceiling.len()
             || self.evidence_ceiling.is_empty()
             || self.evidence_ceiling.len() > 4
-            || !intent
-                .operation
-                .ceilings_allow(intent.delegated_launch.is_some(), &self.evidence_ceiling)
+            || !intent.operation.ceilings_allow(&self.evidence_ceiling)
             || !valid_hex64(&self.plan_digest)
             || !valid_hex64(&self.predecessor_digest)
             || !valid_hex64(&self.context_digest)
@@ -597,8 +649,8 @@ impl HandoffDocument {
         Ok(())
     }
 
-    fn open_for_write(&self, now: i64) -> Result<(), AdapterError> {
-        if !self.state.is_open() || unix_of(&self.expires_at)? <= now {
+    fn open_for_write(&self) -> Result<(), AdapterError> {
+        if !self.state.is_open() || stamp_passed(&self.expires_at)? {
             return Err(AdapterError::Contract);
         }
         Ok(())
@@ -768,6 +820,10 @@ struct ConsumeReceipt {
     admission_id: String,
     consumed: bool,
     consumed_at: String,
+    /// Set when the receipt was synthesised from GET because the consume replay
+    /// was refused. The API key and principal id are not stored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reconciled_from_get: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -849,6 +905,15 @@ impl ResultReceipt {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EvidenceReplayStop {
+    /// The handoff will not store another row.
+    Handoff,
+    /// These bytes are older than the handoff. The sequence was not stored.
+    Predates,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct EvidenceJournalRecord {
@@ -861,6 +926,14 @@ struct EvidenceJournalRecord {
     body_json: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt: Option<EvidenceReceipt>,
+    /// Set when Aeon will not accept these bytes again. The row stays
+    /// unacknowledged and is not replayed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    replay_stopped: bool,
+    /// Why `replay_stopped` was set. Absent on a handoff-level stop written
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay_stop: Option<EvidenceReplayStop>,
 }
 
 impl EvidenceJournalRecord {
@@ -884,7 +957,19 @@ impl EvidenceJournalRecord {
             request_digest,
             body_json: String::from_utf8(body.to_vec()).map_err(|_| AdapterError::Contract)?,
             receipt: None,
+            replay_stopped: false,
+            replay_stop: None,
         })
+    }
+
+    fn predates_stopped(&self) -> bool {
+        self.replay_stopped
+            && self.receipt.is_none()
+            && self.replay_stop == Some(EvidenceReplayStop::Predates)
+    }
+
+    fn blocks_new_evidence(&self) -> bool {
+        self.replay_stopped && self.receipt.is_none() && !self.predates_stopped()
     }
 
     fn key(&self) -> String {
@@ -912,6 +997,10 @@ impl EvidenceJournalRecord {
                 .binding_digest(origin)
                 .is_ok_and(|digest| digest == self.intent_digest)
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn json_kind_matches(body: &str, kind: EvidenceKind, sequence: i64) -> bool {
@@ -1090,6 +1179,10 @@ struct ResultJournalRecord {
     request_digest: String,
     idempotency_key: String,
     body_json: String,
+    /// Pharos reason token. Aeon rejects unknown result fields, so this stays
+    /// off the posted bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt: Option<ResultReceipt>,
 }
@@ -1113,6 +1206,7 @@ impl ResultJournalRecord {
             ),
             request_digest,
             body_json: String::from_utf8(body.to_vec()).map_err(|_| AdapterError::Contract)?,
+            detail: None,
             receipt: None,
         })
     }
@@ -1130,6 +1224,10 @@ impl ResultJournalRecord {
                 )
             && decode_strict::<ResultRequest>(self.body_json.as_bytes())
                 .is_ok_and(|request| request.terminal_sequence == self.terminal_sequence)
+            && self
+                .detail
+                .as_deref()
+                .is_none_or(|detail| launch_block_reason(detail).is_some())
             && self
                 .receipt
                 .as_ref()
@@ -1162,15 +1260,109 @@ impl LaunchBlock {
     }
 }
 
-fn launch_block_reason(token: &str) -> Option<&'static str> {
-    match token {
-        LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING => Some(LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING),
-        LAUNCH_BLOCK_BACKUP_NOT_READY => Some(LAUNCH_BLOCK_BACKUP_NOT_READY),
-        LAUNCH_BLOCK_READINESS_PLAN_CHANGED => Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED),
-        LAUNCH_BLOCK_READINESS_FLAG_FALSE => Some(LAUNCH_BLOCK_READINESS_FLAG_FALSE),
-        LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED => Some(LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED),
-        _ => None,
+/// Same predicate as `HostActionJob::review_retryable`, which is private to
+/// the host-action store. Failed, unconfirmed, and still without a plan or result.
+fn review_retryable_job(job: &HostActionJob) -> bool {
+    job.kind == HostActionKind::UpdateRestart
+        && job.state == HostActionState::Failed
+        && job.confirmed_at.is_none()
+        && job.plan.is_none()
+        && job.result.is_none()
+}
+
+/// `latest_update_for` is private. Rank updates the same way: created_at, then
+/// updated_at, then id. `except_job_id` drops a job inserted before this check.
+fn latest_update_id(
+    actions: &HostActionStore,
+    host: &str,
+    except_job_id: Option<&str>,
+) -> Option<String> {
+    actions
+        .list()
+        .into_iter()
+        .filter(|job| {
+            job.kind == HostActionKind::UpdateRestart
+                && job.host == host
+                && except_job_id != Some(job.id.as_str())
+        })
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .map(|job| job.id)
+}
+
+/// A configured `update_restart_job_id` must already belong to this adapter.
+/// Checked at startup, before the first poll, and again when the intent binds.
+fn refuse_unowned_configured_jobs(
+    config: &AdapterConfig,
+    actions: &HostActionStore,
+) -> Result<(), String> {
+    for intent in &config.intents {
+        let Some(job_id) = intent.update_restart_job_id.as_deref() else {
+            continue;
+        };
+        let Some(job) = actions.get(job_id) else {
+            return Err(format!(
+                "Aeon delivery intent {} names update_restart_job_id {job_id}, which is not in the host action store",
+                intent.handoff_id
+            ));
+        };
+        if job.requested_by != ACTOR {
+            return Err(format!(
+                "Aeon delivery intent {} names update_restart_job_id {job_id} requested by {}, not {ACTOR}",
+                intent.handoff_id, job.requested_by
+            ));
+        }
+        if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
+            return Err(format!(
+                "Aeon delivery intent {} names update_restart_job_id {job_id} for a different host or workflow",
+                intent.handoff_id
+            ));
+        }
     }
+    Ok(())
+}
+
+fn job_links_as_review_retry(
+    actions: &HostActionStore,
+    predecessor: &HostActionJob,
+    except_job_id: Option<&str>,
+) -> bool {
+    review_retryable_job(predecessor)
+        && latest_update_id(actions, &predecessor.host, except_job_id)
+            .is_some_and(|id| id == predecessor.id)
+}
+
+fn launch_block_reason(token: &str) -> Option<&'static str> {
+    LAUNCH_BLOCK_REASONS
+        .iter()
+        .copied()
+        .find(|reason| *reason == token)
+}
+
+fn aeon_blocker_for_reason(reason: &str) -> Option<BlockerCode> {
+    Some(match reason {
+        LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING | LAUNCH_BLOCK_BACKUP_NOT_READY => {
+            BlockerCode::ExternalWaiting
+        }
+        // A false flag after a posted readiness row is a local precondition,
+        // not a refused plan. The same wait applies before the first row.
+        LAUNCH_BLOCK_READINESS_FLAG_FALSE => BlockerCode::ExternalWaiting,
+        LAUNCH_BLOCK_READINESS_PLAN_CHANGED
+        | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
+        | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
+        | LAUNCH_BLOCK_LAUNCH_NOT_OWNED
+        | LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED
+        | LAUNCH_BLOCK_ADMISSION_EXPIRED
+        | LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED => BlockerCode::PolicyRefused,
+        LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
+        | LAUNCH_BLOCK_CONSUME_ABANDONED
+        | LAUNCH_BLOCK_AUTHORITY_CLOSED => BlockerCode::DependencyFailed,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1261,7 +1453,11 @@ impl JournalStore {
             .expect("Aeon delivery journal lock")
             .records
             .values()
-            .filter(|record| record.handoff_id == handoff_id && record.receipt.is_none())
+            .filter(|record| {
+                record.handoff_id == handoff_id
+                    && record.receipt.is_none()
+                    && !record.replay_stopped
+            })
             .min_by_key(|record| record.sequence)
             .cloned()
     }
@@ -1377,6 +1573,97 @@ impl JournalStore {
         persist_journal(&self.path, &mut document, updated)
     }
 
+    fn stop_evidence_replay(
+        &self,
+        record: &EvidenceJournalRecord,
+        stop: EvidenceReplayStop,
+    ) -> Result<(), AdapterError> {
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        let existing = document
+            .records
+            .get(&record.key())
+            .ok_or(AdapterError::Journal)?;
+        if existing.body_json != record.body_json {
+            return Err(AdapterError::Journal);
+        }
+        if existing.replay_stopped || existing.receipt.is_some() {
+            return Ok(());
+        }
+        let mut updated = document.clone();
+        let saved = updated
+            .records
+            .get_mut(&record.key())
+            .expect("evidence record remains present");
+        saved.replay_stopped = true;
+        saved.replay_stop = Some(stop);
+        let saved = updated.records.get(&record.key()).expect("saved").clone();
+        if !saved.valid() {
+            return Err(AdapterError::Journal);
+        }
+        persist_journal(&self.path, &mut document, updated)
+    }
+
+    fn replace_predates_evidence(
+        &self,
+        previous: &EvidenceJournalRecord,
+        replacement: EvidenceJournalRecord,
+    ) -> Result<EvidenceJournalRecord, AdapterError> {
+        if !previous.predates_stopped()
+            || !replacement.valid()
+            || replacement.handoff_id != previous.handoff_id
+            || replacement.sequence != previous.sequence
+            || replacement.kind != previous.kind
+        {
+            return Err(AdapterError::Journal);
+        }
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        let existing = document
+            .records
+            .get(&previous.key())
+            .ok_or(AdapterError::Journal)?;
+        if existing.body_json != previous.body_json || !existing.predates_stopped() {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        updated
+            .records
+            .insert(replacement.key(), replacement.clone());
+        persist_journal(&self.path, &mut document, updated)?;
+        Ok(replacement)
+    }
+
+    fn evidence_sequence(&self, handoff_id: &str, sequence: i64) -> Option<EvidenceJournalRecord> {
+        let key = format!("{handoff_id}:{sequence}");
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .records
+            .get(&key)
+            .cloned()
+    }
+
+    fn has_stopped_evidence(&self, handoff_id: &str) -> bool {
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .records
+            .values()
+            .any(|record| record.handoff_id == handoff_id && record.blocks_new_evidence())
+    }
+
+    fn has_blocking_unacknowledged(&self, handoff_id: &str) -> bool {
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .records
+            .values()
+            .any(|record| {
+                record.handoff_id == handoff_id
+                    && record.receipt.is_none()
+                    && !record.predates_stopped()
+            })
+    }
+
     fn operation(&self, handoff_id: &str) -> Option<OperationBinding> {
         self.document
             .lock()
@@ -1395,17 +1682,26 @@ impl JournalStore {
             return Ok(None);
         }
         let document = self.document.lock().expect("Aeon delivery journal lock");
-        let mut matches = document.operations.values().filter(|binding| {
-            binding.handoff_id != intent.handoff_id
-                && binding.host == intent.host
-                && binding.workflow == intent.workflow.key()
-                && binding.environment == intent.environment
-                && binding.artifact == intent.artifact
-                && binding.release_node_id == intent.release_node_id
-                && binding.plan_digest == handoff.predecessor_digest
-        });
-        let predecessor = matches.next().cloned();
-        if predecessor.is_some() && matches.next().is_some() {
+        let candidates: Vec<_> = document
+            .operations
+            .values()
+            .filter(|binding| {
+                binding.handoff_id != intent.handoff_id
+                    && binding.release_node_id == intent.release_node_id
+                    && binding.workflow == intent.workflow.key()
+                    && binding.host == intent.host
+                    && binding.attempt < handoff.attempt
+            })
+            .cloned()
+            .collect();
+        let Some(best_attempt) = candidates.iter().map(|binding| binding.attempt).max() else {
+            return Ok(None);
+        };
+        let mut chosen = candidates
+            .into_iter()
+            .filter(|binding| binding.attempt == best_attempt);
+        let predecessor = chosen.next();
+        if predecessor.is_some() && chosen.next().is_some() {
             return Err(AdapterError::LocalBinding);
         }
         Ok(predecessor)
@@ -1628,43 +1924,6 @@ impl JournalStore {
         Ok(saved)
     }
 
-    fn mark_admit_unresolved(
-        &self,
-        handoff_id: &str,
-        status: StatusCode,
-    ) -> Result<LaunchJournalRecord, AdapterError> {
-        if status != StatusCode::CONFLICT {
-            return Err(AdapterError::Journal);
-        }
-        let mut document = self.document.lock().expect("Aeon delivery journal lock");
-        let existing = document
-            .launches
-            .get(handoff_id)
-            .ok_or(AdapterError::Journal)?
-            .clone();
-        if existing.admission.is_some() || existing.consume_started || existing.receipt.is_some() {
-            return Err(AdapterError::Journal);
-        }
-        if existing.admit_unresolved == Some(status.as_u16()) {
-            return Ok(existing);
-        }
-        if existing.admit_unresolved.is_some() {
-            return Err(AdapterError::Journal);
-        }
-        let mut updated = document.clone();
-        let launch = updated
-            .launches
-            .get_mut(handoff_id)
-            .expect("launch record remains present");
-        launch.admit_unresolved = Some(status.as_u16());
-        let saved = launch.clone();
-        if !saved.valid() {
-            return Err(AdapterError::Journal);
-        }
-        persist_journal(&self.path, &mut document, updated)?;
-        Ok(saved)
-    }
-
     fn acknowledge_consume(
         &self,
         handoff_id: &str,
@@ -1859,10 +2118,27 @@ impl Drop for Credentials {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct RequestTrace {
+    method: String,
+    path: String,
+    status: u16,
+    request_id: Option<String>,
+    error_excerpt: Option<String>,
+}
+
+enum PostedEvidence {
+    Accepted(EvidenceReceipt),
+    Rejected { status: StatusCode, body: Vec<u8> },
+}
+
 struct AeonClient {
     origin: Url,
     api_key_file: PathBuf,
     client: reqwest::Client,
+    #[cfg(test)]
+    traces: Option<Arc<Mutex<Vec<RequestTrace>>>>,
 }
 
 impl AeonClient {
@@ -1894,7 +2170,45 @@ impl AeonClient {
             origin,
             api_key_file,
             client,
+            #[cfg(test)]
+            traces: None,
         })
+    }
+
+    #[cfg(test)]
+    fn enable_trace(&mut self, traces: Arc<Mutex<Vec<RequestTrace>>>) {
+        self.traces = Some(traces);
+    }
+
+    #[cfg(test)]
+    fn note_exchange(
+        &self,
+        method: &Method,
+        path: &str,
+        status: StatusCode,
+        request_id: Option<String>,
+        body: &[u8],
+        credentials: &Credentials,
+    ) {
+        let Some(traces) = &self.traces else {
+            return;
+        };
+        let path = path.split('?').next().unwrap_or(path);
+        let error_excerpt = if status.is_success() {
+            None
+        } else {
+            Some(trace_body_excerpt(body, credentials))
+        };
+        traces
+            .lock()
+            .expect("Aeon request trace lock")
+            .push(RequestTrace {
+                method: method.as_str().to_string(),
+                path: path.to_string(),
+                status: status.as_u16(),
+                request_id,
+                error_excerpt,
+            });
     }
 
     fn credentials(&self) -> Result<Credentials, AdapterError> {
@@ -1924,10 +2238,53 @@ impl AeonClient {
         decode_strict(&bytes)
     }
 
+    #[cfg(test)]
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, AdapterError> {
+        let credentials = self.credentials()?;
+        let (status, bytes) = self
+            .exchange(Method::GET, path, None, None, &credentials)
+            .await?;
+        if status != StatusCode::OK {
+            return Err(status_error(status));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| AdapterError::Contract)
+    }
+
+    async fn get_principal(&self) -> Result<String, AdapterError> {
+        let credentials = self.credentials()?;
+        let (status, bytes) = self
+            .exchange(Method::GET, "/api/me", None, None, &credentials)
+            .await?;
+        if status != StatusCode::OK {
+            return Err(status_error(status));
+        }
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| AdapterError::Contract)?;
+        let id = document
+            .get("principal")
+            .and_then(|principal| principal.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or(AdapterError::Contract)?;
+        if !valid_uuid(id) {
+            return Err(AdapterError::Contract);
+        }
+        Ok(id.to_string())
+    }
+
     async fn post_evidence(
         &self,
         record: &EvidenceJournalRecord,
     ) -> Result<EvidenceReceipt, AdapterError> {
+        match self.post_evidence_raw(record).await? {
+            PostedEvidence::Accepted(receipt) => Ok(receipt),
+            PostedEvidence::Rejected { status, .. } => Err(status_error(status)),
+        }
+    }
+
+    async fn post_evidence_raw(
+        &self,
+        record: &EvidenceJournalRecord,
+    ) -> Result<PostedEvidence, AdapterError> {
         let credentials = self.credentials()?;
         let (status, bytes) = self
             .exchange(
@@ -1939,7 +2296,10 @@ impl AeonClient {
             )
             .await?;
         if status != StatusCode::CREATED {
-            return Err(status_error(status));
+            return Ok(PostedEvidence::Rejected {
+                status,
+                body: bytes,
+            });
         }
         let response: EvidenceResponse = decode_strict(&bytes)?;
         let receipt = EvidenceReceipt::from_response(&response)?;
@@ -1948,7 +2308,7 @@ impl AeonClient {
         {
             return Err(AdapterError::Contract);
         }
-        Ok(receipt)
+        Ok(PostedEvidence::Accepted(receipt))
     }
 
     async fn post_admit(
@@ -1966,7 +2326,7 @@ impl AeonClient {
             )
             .await?;
         if status != StatusCode::OK {
-            return Err(status_error(status));
+            return Err(refusal_from_aeon(status, &bytes));
         }
         decode_strict(&bytes)
     }
@@ -1994,7 +2354,7 @@ impl AeonClient {
             )
             .await?;
         if status != StatusCode::OK {
-            return Err(status_error(status));
+            return Err(refusal_from_aeon(status, &bytes));
         }
         let response: ConsumeResponse = decode_strict(&bytes)?;
         if !response.consumed
@@ -2022,7 +2382,7 @@ impl AeonClient {
             )
             .await?;
         if status != StatusCode::OK {
-            return Err(status_error(status));
+            return Err(refusal_from_aeon(status, &bytes));
         }
         let response: ResultResponse = decode_strict(&bytes)?;
         let receipt = ResultReceipt::from_response(&response)?;
@@ -2040,6 +2400,8 @@ impl AeonClient {
         idempotency_key: Option<&str>,
         credentials: &Credentials,
     ) -> Result<(StatusCode, Vec<u8>), AdapterError> {
+        #[cfg(test)]
+        let method_name = method.clone();
         let url = self.origin.join(path).map_err(|_| AdapterError::Contract)?;
         let mut authorization = Vec::with_capacity(7 + credentials.api_key.len());
         authorization.extend_from_slice(b"Bearer ");
@@ -2062,13 +2424,32 @@ impl AeonClient {
             builder = builder.header(CONTENT_TYPE, JSON_MEDIA).body(body.to_vec());
         }
         let response = builder.send().await.map_err(|_| AdapterError::Transport)?;
+        let status = response.status();
+        // Every header is checked before any header value is copied. A reflected
+        // key in x-request-id must not reach a trace, a panic, or the report.
+        reject_reflected_headers(response.headers(), credentials)?;
+        #[cfg(test)]
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         if response.headers().contains_key(CONTENT_ENCODING) {
+            #[cfg(test)]
+            self.note_exchange(&method_name, path, status, request_id, &[], credentials);
             return Err(AdapterError::Contract);
         }
-        reject_reflected_headers(response.headers(), credentials)?;
         let media_ok = response_media_json(response.headers());
-        let status = response.status();
-        let bytes = bounded_body(response).await?;
+        let bytes = match bounded_body(response).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                #[cfg(test)]
+                self.note_exchange(&method_name, path, status, request_id, &[], credentials);
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        self.note_exchange(&method_name, path, status, request_id, &bytes, credentials);
         reject_reflected_bytes(&bytes, credentials)?;
         if status.is_success() && !media_ok {
             return Err(AdapterError::Contract);
@@ -2083,6 +2464,8 @@ pub(crate) struct AeonDeliveryAdapter {
     aeon: AeonClient,
     hosts: Arc<Store>,
     host_actions: Arc<HostActionStore>,
+    /// Principal id from GET /api/me. Memory only; the API key is never stored.
+    principal_id: Mutex<Option<String>>,
 }
 
 impl AeonDeliveryAdapter {
@@ -2104,6 +2487,8 @@ impl AeonDeliveryAdapter {
         })?;
         let config = AdapterConfig::load(Path::new(&config_path))
             .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
+        refuse_unowned_configured_jobs(&config, &host_actions)
+            .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
         let journal = JournalStore::new(derived_journal_path(host_store_path))
             .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
         let aeon = AeonClient::new(
@@ -2119,6 +2504,7 @@ impl AeonDeliveryAdapter {
             aeon,
             hosts,
             host_actions,
+            principal_id: Mutex::new(None),
         }))
     }
 
@@ -2127,6 +2513,12 @@ impl AeonDeliveryAdapter {
     }
 
     async fn run(self) {
+        if let Err(error) = self.remember_principal().await {
+            tracing::warn!(
+                reason = error.code(),
+                "Aeon principal was not loaded; consume reconciliation will retry"
+            );
+        }
         let mut interval = tokio::time::interval(self.config.poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -2146,10 +2538,14 @@ impl AeonDeliveryAdapter {
     async fn process_intent(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
         self.journal
             .assert_bound(intent, &self.config.aeon_origin)?;
-        if self.replay_started_consume(intent).await? {
-            return Ok(());
+        match self.replay_started_consume(intent).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => return self.finish_blocked_confirmation(intent, error).await,
         }
-        self.confirm_if_consumed(intent)?;
+        if let Err(error) = self.confirm_if_consumed(intent).await {
+            return self.finish_blocked_confirmation(intent, error).await;
+        }
         if let Some(pending) = self.journal.pending_evidence(&intent.handoff_id) {
             return self.replay_evidence(intent, &pending).await;
         }
@@ -2175,7 +2571,7 @@ impl AeonDeliveryAdapter {
             if handoff.state.is_closed() {
                 self.log_closed(&handoff);
             } else {
-                handoff.open_for_write(now_unix())?;
+                handoff.open_for_write()?;
             }
             let request: ResultRequest = decode_strict(pending.body_json.as_bytes())?;
             return self
@@ -2185,8 +2581,12 @@ impl AeonDeliveryAdapter {
                     request.terminal_sequence,
                     request.outcome,
                     request.blocker_code,
+                    pending.detail.as_deref(),
                 )
                 .await;
+        }
+        if self.journal.has_stopped_evidence(&intent.handoff_id) {
+            return Ok(());
         }
         let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
@@ -2194,12 +2594,41 @@ impl AeonDeliveryAdapter {
             self.log_closed(&handoff);
             return Ok(());
         }
-        handoff.open_for_write(now_unix())?;
+        handoff.open_for_write()?;
         if intent.operation == Operation::Deploy {
             self.bind_deployment(intent, &handoff)?;
         }
-        self.maybe_launch(intent, &handoff).await?;
+        if let Err(error) = self.maybe_launch(intent, &handoff).await {
+            if self
+                .journal
+                .launch_block(&intent.handoff_id)
+                .is_some_and(|block| block.terminal)
+            {
+                self.maybe_report(intent, &handoff).await?;
+            }
+            return self.finish_blocked_confirmation(intent, error).await;
+        }
         self.maybe_report(intent, &handoff).await
+    }
+
+    async fn finish_blocked_confirmation(
+        &self,
+        intent: &DeliveryIntent,
+        error: AdapterError,
+    ) -> Result<(), AdapterError> {
+        // Crash recovery returns here before maybe_report. A later poll stops
+        // at reject_terminal_block and lands here again, so this is the post.
+        if let AdapterError::LaunchBlocked(reason) = error {
+            if self
+                .journal
+                .launch_block(&intent.handoff_id)
+                .is_some_and(|block| block.terminal && block.reason == reason)
+            {
+                self.report_terminal_launch_block(intent, reason).await?;
+            }
+            return Err(AdapterError::LaunchBlocked(reason));
+        }
+        Err(error)
     }
 
     fn log_closed(&self, handoff: &HandoffDocument) {
@@ -2223,7 +2652,9 @@ impl AeonDeliveryAdapter {
         if intent.delegated_launch.is_none() || !launch.valid() {
             return Err(AdapterError::LocalBinding);
         }
+        self.reject_terminal_block(&intent.handoff_id)?;
         let observed = self.aeon.get_handoff(&intent.handoff_id).await?;
+        observed.validate(intent)?;
         let server_consumed_ours = observed.admission.as_ref().is_some_and(|admission| {
             admission.consumed_at.is_some()
                 && launch
@@ -2231,38 +2662,302 @@ impl AeonDeliveryAdapter {
                     .as_ref()
                     .is_some_and(|stored| stored.id == admission.admission_id)
         });
+        let job = self
+            .host_actions
+            .get(&launch.job_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        let confirmable = consume_job_confirmable(intent, &job, &launch.reviewed_plan_digest)?;
         if server_consumed_ours {
             tracing::debug!(
                 handoff_id = %intent.handoff_id,
                 "Aeon shows the journaled admission consumed; replaying that consume"
             );
+            if !confirmable {
+                return self
+                    .replay_consume_without_confirming(
+                        intent,
+                        &launch,
+                        LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB,
+                    )
+                    .await;
+            }
+        } else {
+            // The consume has not committed. Re-check the handoff, the journaled
+            // admission, and the job before sending it again.
+            observed.open_for_write()?;
+            let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
+            // Consume accepts the admission only while expires_at is strictly
+            // after now (launch.go). Truncating to the second closes a fraction
+            // that is still valid.
+            if stamp_reached(&admission.expires_at)? {
+                return self
+                    .block_launch(intent, LAUNCH_BLOCK_ADMISSION_EXPIRED, true)
+                    .map(|_| true);
+            }
+            self.validate_admission(admission, intent, &observed, &launch.reviewed_plan_digest)?;
+            if !confirmable {
+                return self
+                    .block_launch(intent, LAUNCH_BLOCK_CONSUME_ABANDONED, true)
+                    .map(|_| true);
+            }
+            // A same-plan refresh is not a contradiction. An exact replay of a
+            // consume that did commit still returns the stored receipt.
+            self.refresh_readiness_for_consume(intent).await?;
         }
+        let launch = self
+            .journal
+            .launch(&intent.handoff_id)
+            .ok_or(AdapterError::Journal)?;
         match self.aeon.post_consume(&launch).await {
             Ok(response) => {
                 let receipt = consume_receipt(&response)?;
                 let launch = self
                     .journal
                     .acknowledge_consume(&intent.handoff_id, receipt)?;
-                self.finish_confirmation(intent, &launch)?;
+                self.confirm_consumed(intent, &launch).await?;
                 Ok(true)
             }
             Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
-                self.journal
-                    .mark_consume_unresolved(&intent.handoff_id, status)?;
-                Err(AdapterError::LaunchUnresolved)
+                self.finish_consume_conflict(intent, &launch, true).await
+            }
+            Err(AdapterError::LaunchBlocked(reason))
+                if reason == LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED =>
+            {
+                self.block_launch(intent, reason, true).map(|_| true)
             }
             Err(error) => Err(error),
         }
     }
 
-    fn confirm_if_consumed(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
+    async fn confirm_if_consumed(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
         let Some(launch) = self.journal.launch(&intent.handoff_id) else {
             return Ok(());
         };
         if launch.receipt.is_none() {
             return Ok(());
         }
-        self.finish_confirmation(intent, &launch)
+        self.reject_terminal_block(&intent.handoff_id)?;
+        let job = self
+            .host_actions
+            .get(&launch.job_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        if job.state == HostActionState::AwaitingConfirmation {
+            return self.confirm_consumed(intent, &launch).await;
+        }
+        self.finish_confirmation(intent, &launch, "")
+    }
+
+    async fn report_terminal_launch_block(
+        &self,
+        intent: &DeliveryIntent,
+        reason: &'static str,
+    ) -> Result<(), AdapterError> {
+        if self
+            .journal
+            .result(&intent.handoff_id)
+            .is_some_and(|record| record.receipt.is_some())
+        {
+            return Ok(());
+        }
+        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        handoff.validate(intent)?;
+        if stamp_passed(&handoff.expires_at)? || handoff.result.is_some() {
+            return Ok(());
+        }
+        if reason == LAUNCH_BLOCK_ADMISSION_EXPIRED {
+            return self.report_admission_expired(intent).await;
+        }
+        // close() answers 403 while the candidate or deploy gate is dark, so
+        // a failed result cannot be stored until the gate is approved.
+        if reason == LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED {
+            return Ok(());
+        }
+        let blocker = aeon_blocker_for_reason(reason).ok_or(AdapterError::Journal)?;
+        self.write_observation(
+            intent,
+            &handoff,
+            EvidenceOutcome::Failed,
+            now_unix(),
+            Some(blocker),
+            Some(reason),
+        )
+        .await
+    }
+
+    async fn report_admission_expired(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
+        if self
+            .journal
+            .result(&intent.handoff_id)
+            .is_some_and(|record| record.receipt.is_some())
+        {
+            return Ok(());
+        }
+        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        handoff.validate(intent)?;
+        // Aeon current() is false only once now is strictly after expires_at
+        // (store.go). A later result is 409 and must not be journaled. The
+        // admission expiry equals the handoff and a second admit is refused
+        // (launch.go), so the code is always policy_refused.
+        if !handoff.state.is_open() || stamp_passed(&handoff.expires_at)? {
+            return Ok(());
+        }
+        self.write_observation(
+            intent,
+            &handoff,
+            EvidenceOutcome::Failed,
+            now_unix(),
+            Some(BlockerCode::PolicyRefused),
+            Some(LAUNCH_BLOCK_ADMISSION_EXPIRED),
+        )
+        .await
+    }
+
+    async fn confirm_consumed(
+        &self,
+        intent: &DeliveryIntent,
+        launch: &LaunchJournalRecord,
+    ) -> Result<(), AdapterError> {
+        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        handoff.validate(intent)?;
+        self.require_open_authority(intent, launch, &handoff)?;
+        self.finish_confirmation(intent, launch, &handoff.expires_at)
+    }
+
+    fn require_open_authority(
+        &self,
+        intent: &DeliveryIntent,
+        launch: &LaunchJournalRecord,
+        handoff: &HandoffDocument,
+    ) -> Result<(), AdapterError> {
+        let operation = self
+            .journal
+            .operation(&intent.handoff_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
+        // GET /api/stage-handoffs/{id} returns this row only. Its attempt and
+        // epoch do not change when a newer attempt is created, and there is no
+        // list route. launchReplay returns the stored consume receipt before
+        // current() (launch.go). Journey stages[].handoff_id is the newest
+        // handoff in the stage by created_at, not this operation's latest
+        // attempt, and it has no attempt or epoch. These fields are the whole
+        // of what that GET can show.
+        let admission_matches = handoff.admission.as_ref().is_some_and(|embedded| {
+            embedded.admission_id == admission.id && embedded.epoch == admission.authority_epoch
+        });
+        let current = handoff.state.is_open()
+            && handoff.result.is_none()
+            && admission_matches
+            && handoff.authority_epoch == admission.authority_epoch
+            && handoff.release_node_id == operation.release_node_id
+            && handoff.operation == intent.operation
+            && handoff.attempt == operation.attempt;
+        if current {
+            return Ok(());
+        }
+        self.block_launch(intent, LAUNCH_BLOCK_AUTHORITY_CLOSED, true)
+    }
+
+    fn reject_terminal_block(&self, handoff_id: &str) -> Result<(), AdapterError> {
+        let Some(block) = self.journal.launch_block(handoff_id) else {
+            return Ok(());
+        };
+        if !block.terminal {
+            return Ok(());
+        }
+        let reason = launch_block_reason(&block.reason).ok_or(AdapterError::Journal)?;
+        Err(AdapterError::LaunchBlocked(reason))
+    }
+
+    async fn replay_consume_without_confirming(
+        &self,
+        intent: &DeliveryIntent,
+        launch: &LaunchJournalRecord,
+        reason: &'static str,
+    ) -> Result<bool, AdapterError> {
+        match self.aeon.post_consume(launch).await {
+            Ok(response) => {
+                let receipt = consume_receipt(&response)?;
+                self.journal
+                    .acknowledge_consume(&intent.handoff_id, receipt)?;
+                self.block_launch(intent, reason, true).map(|_| true)
+            }
+            Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
+                self.finish_consume_conflict(intent, launch, false).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn remember_principal(&self) -> Result<(), AdapterError> {
+        if self.principal_id.lock().expect("aeon principal").is_some() {
+            return Ok(());
+        }
+        let id = self.aeon.get_principal().await?;
+        *self.principal_id.lock().expect("aeon principal") = Some(id);
+        Ok(())
+    }
+
+    async fn finish_consume_conflict(
+        &self,
+        intent: &DeliveryIntent,
+        launch: &LaunchJournalRecord,
+        confirm: bool,
+    ) -> Result<bool, AdapterError> {
+        let Some(receipt) = self.receipt_reconciled_from_handoff(intent, launch).await? else {
+            self.journal
+                .mark_consume_unresolved(&intent.handoff_id, StatusCode::CONFLICT)?;
+            return Err(AdapterError::LaunchUnresolved);
+        };
+        self.journal
+            .acknowledge_consume(&intent.handoff_id, receipt)?;
+        if !confirm {
+            return self
+                .block_launch(intent, LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB, true)
+                .map(|_| true);
+        }
+        let launch = self
+            .journal
+            .launch(&intent.handoff_id)
+            .ok_or(AdapterError::Journal)?;
+        self.confirm_consumed(intent, &launch).await?;
+        Ok(true)
+    }
+
+    async fn receipt_reconciled_from_handoff(
+        &self,
+        intent: &DeliveryIntent,
+        launch: &LaunchJournalRecord,
+    ) -> Result<Option<ConsumeReceipt>, AdapterError> {
+        let observed = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let Some(admission) = observed.admission.as_ref() else {
+            return Ok(None);
+        };
+        let Some(stored) = launch.admission.as_ref() else {
+            return Ok(None);
+        };
+        let Some(consumed_at) = admission.consumed_at.as_deref() else {
+            return Ok(None);
+        };
+        if admission.admission_id != stored.id || parse_timestamp(consumed_at).is_err() {
+            return Ok(None);
+        }
+        self.remember_principal().await?;
+        let principal = self
+            .principal_id
+            .lock()
+            .expect("aeon principal")
+            .clone()
+            .ok_or(AdapterError::Contract)?;
+        if admission.consumed_by_principal_id.as_deref() != Some(principal.as_str()) {
+            return Ok(None);
+        }
+        Ok(Some(ConsumeReceipt {
+            handoff_id: intent.handoff_id.clone(),
+            admission_id: stored.id.clone(),
+            consumed: true,
+            consumed_at: consumed_at.to_string(),
+            reconciled_from_get: true,
+        }))
     }
 
     async fn replay_evidence(
@@ -2270,11 +2965,63 @@ impl AeonDeliveryAdapter {
         intent: &DeliveryIntent,
         record: &EvidenceJournalRecord,
     ) -> Result<(), AdapterError> {
+        if record.replay_stopped {
+            return Ok(());
+        }
         if !record.bound_to(intent, &self.config.aeon_origin) || !record.valid() {
             return Err(AdapterError::Journal);
         }
-        let receipt = self.aeon.post_evidence(record).await?;
-        self.journal.acknowledge_evidence(record, receipt)
+        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        handoff.validate(intent)?;
+        // report.go answers 409 "handoff is terminal" when a result is set or
+        // the handoff is revoked, and 409 "handoff is stale" once current()
+        // is false. current() runs before the stored-evidence replay, so an
+        // exact replay is refused after expiry. Expiry, a closed state, and
+        // a recorded result are on the GET. Clock skew and a recomputed plan
+        // digest are not: those arrive as 409. A contiguous-sequence 409 is
+        // not one of these; that row can still be stored after its predecessor.
+        // "evidence predates handoff" stops only those bytes. report.go returns
+        // it before insert, so the sequence was not stored and a later
+        // observation may reuse it. GET does not carry created_at.
+        if !handoff.state.is_open()
+            || handoff.result.is_some()
+            || stamp_passed(&handoff.expires_at)?
+        {
+            self.journal
+                .stop_evidence_replay(record, EvidenceReplayStop::Handoff)?;
+            return Ok(());
+        }
+        match self.aeon.post_evidence_raw(record).await? {
+            PostedEvidence::Accepted(receipt) => self.journal.acknowledge_evidence(record, receipt),
+            PostedEvidence::Rejected { status, body } => {
+                match evidence_replay_stop(status, &body) {
+                    Some(stop) => {
+                        self.journal.stop_evidence_replay(record, stop)?;
+                        Ok(())
+                    }
+                    None => Err(status_error(status)),
+                }
+            }
+        }
+    }
+
+    /// Aeon stores evidence only at max(sequence)+1 (report.go). Replay every
+    /// unacknowledged row before allocating another, lowest sequence first.
+    async fn settle_unacknowledged_evidence(
+        &self,
+        intent: &DeliveryIntent,
+    ) -> Result<bool, AdapterError> {
+        while let Some(pending) = self.journal.pending_evidence(&intent.handoff_id) {
+            self.replay_evidence(intent, &pending).await?;
+            let replayed = self
+                .journal
+                .evidence_sequence(&intent.handoff_id, pending.sequence)
+                .ok_or(AdapterError::Journal)?;
+            if replayed.replay_stopped || replayed.receipt.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(!self.journal.has_blocking_unacknowledged(&intent.handoff_id))
     }
 
     fn bind_deployment(
@@ -2294,25 +3041,38 @@ impl AeonDeliveryAdapter {
             if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
                 return Err(AdapterError::LocalBinding);
             }
+            // An operator-owned job can be confirmed through the operator route.
+            // Binding it here would let that confirmation apply before any admission.
+            if job.requested_by != ACTOR {
+                return self.block_launch(intent, LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED, true);
+            }
             configured.to_string()
         } else {
             let job_id = deterministic_job_id(&intent.host, &operation_id)?;
             let predecessor = self.journal.retry_predecessor(intent, handoff)?;
-            let job = match predecessor.as_ref() {
-                Some(predecessor) => self.host_actions.retry_update_review_with_id(
-                    &predecessor.job_id,
+            // retry_update_review only accepts a review-retryable predecessor
+            // that is still this host's latest update. A cancelled or succeeded
+            // predecessor, or one an operator already retried, takes a fresh review.
+            let job = if let Some(binding) = predecessor.as_ref().filter(|binding| {
+                self.host_actions
+                    .get(&binding.job_id)
+                    .is_some_and(|job| job_links_as_review_retry(&self.host_actions, &job, None))
+            }) {
+                self.host_actions.retry_update_review_with_id(
+                    &binding.job_id,
                     &job_id,
                     &intent.host,
                     ACTOR,
                     now_unix(),
-                ),
-                None => self.host_actions.ensure_update_review_with_id(
+                )
+            } else {
+                self.host_actions.ensure_update_review_with_id(
                     &job_id,
                     &intent.host,
                     ACTOR,
                     UpdateRestartIntent::Update,
                     now_unix(),
-                ),
+                )
             }
             .map_err(map_host_action_error)?;
             self.validate_new_owned_job(intent, handoff, &job)?;
@@ -2365,6 +3125,9 @@ impl AeonDeliveryAdapter {
         if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
             return Err(AdapterError::LocalBinding);
         }
+        if intent.update_restart_job_id.is_some() && job.requested_by != ACTOR {
+            return self.block_launch(intent, LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED, true);
+        }
         if intent.update_restart_job_id.is_none() {
             self.validate_bound_owned_job(intent, existing, &job)?;
         }
@@ -2397,12 +3160,18 @@ impl AeonDeliveryAdapter {
         job: &HostActionJob,
     ) -> Result<(), AdapterError> {
         let predecessor = self.journal.retry_predecessor(intent, handoff)?;
+        // The new job is already inserted, so it is the latest update. Compare
+        // the predecessor with every other update on the host.
+        let linked_to = predecessor.as_ref().and_then(|binding| {
+            let previous = self.host_actions.get(&binding.job_id)?;
+            job_links_as_review_retry(&self.host_actions, &previous, Some(job.id.as_str()))
+                .then(|| binding.job_id.clone())
+        });
         if job.host != intent.host
             || job.workflow_kind() != HostWorkflowKind::UpdateRestart
             || job.update_restart_intent() != UpdateRestartIntent::Update
             || job.requested_by != ACTOR
-            || job.retry_of.as_deref()
-                != predecessor.as_ref().map(|binding| binding.job_id.as_str())
+            || job.retry_of != linked_to
         {
             return Err(AdapterError::LocalBinding);
         }
@@ -2468,10 +3237,13 @@ impl AeonDeliveryAdapter {
             .ensure_admission(intent, handoff, &operation.job_id, &reviewed)
             .await?;
         let admission = launch.admission.clone().ok_or(AdapterError::Journal)?;
-        self.validate_admission(&admission, intent, handoff, &reviewed, now_unix())?;
+        if stamp_reached(&admission.expires_at)? {
+            return self.block_launch(intent, LAUNCH_BLOCK_ADMISSION_EXPIRED, true);
+        }
+        self.validate_admission(&admission, intent, handoff, &reviewed)?;
         let fresh = self.aeon.get_handoff(&intent.handoff_id).await?;
         fresh.validate(intent)?;
-        fresh.open_for_write(now_unix())?;
+        fresh.open_for_write()?;
         if fresh.plan_digest != handoff.plan_digest
             || fresh.predecessor_digest != handoff.predecessor_digest
             || fresh.context_digest != handoff.context_digest
@@ -2488,7 +3260,7 @@ impl AeonDeliveryAdapter {
         {
             return Err(AdapterError::LocalBinding);
         }
-        self.validate_admission(&admission, intent, &fresh, &reviewed, now_unix())?;
+        self.validate_admission(&admission, intent, &fresh, &reviewed)?;
         self.consume_and_confirm(intent).await
     }
 
@@ -2574,6 +3346,87 @@ impl AeonDeliveryAdapter {
         self.journal.clear_launch_block(&intent.handoff_id)
     }
 
+    async fn refresh_readiness_for_consume(
+        &self,
+        intent: &DeliveryIntent,
+    ) -> Result<(), AdapterError> {
+        let Some(existing) = self
+            .journal
+            .evidence_with_kind(&intent.handoff_id, EvidenceKind::LaunchReadiness)
+        else {
+            return Err(AdapterError::Journal);
+        };
+        if existing.receipt.is_none() {
+            self.replay_evidence(intent, &existing).await?;
+            let replayed = self
+                .journal
+                .evidence_sequence(&intent.handoff_id, existing.sequence)
+                .ok_or(AdapterError::Journal)?;
+            if replayed.replay_stopped {
+                return Err(AdapterError::Contract);
+            }
+        }
+        let current = self
+            .journal
+            .evidence_with_kind(&intent.handoff_id, EvidenceKind::LaunchReadiness)
+            .ok_or(AdapterError::Journal)?;
+        if current.replay_stopped {
+            return Err(AdapterError::Contract);
+        }
+        let observed = evidence_string_field(&current.body_json, "observed_at")?;
+        let now = now_unix();
+        // Aeon still accepts the posted row for 900s (LaunchFreshness). The
+        // backup gate runs on every recovery, including inside the 600s window
+        // that skips reposting the row.
+        let launch = self
+            .journal
+            .launch(&intent.handoff_id)
+            .ok_or(AdapterError::Journal)?;
+        let job = self
+            .host_actions
+            .get(&launch.job_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
+        let host = self.hosts.get(&intent.host);
+        let backup_at = backup_stamp(host.as_ref());
+        let posted_backup = match validated_readiness_backup(plan, backup_at.as_deref(), now) {
+            Ok(stamp) => stamp.to_string(),
+            Err(reason) => return self.block_launch(intent, reason, false),
+        };
+        if now.saturating_sub(unix_of(&observed)?) <= READINESS_REFRESH_SECS {
+            self.journal.clear_launch_block(&intent.handoff_id)?;
+            return Ok(());
+        }
+        let observed_at = format_timestamp(now)?;
+        let sequence = self.journal.next_sequence(&intent.handoff_id)?;
+        let reviewed = bare_plan_digest(&reviewed_plan_digest(&job).map_err(map_shared)?)?;
+        let mut value: serde_json::Value = decode_strict(&readiness_refresh_candidate(
+            &current.body_json,
+            sequence,
+            &observed_at,
+            &reviewed,
+            plan,
+        )?)?;
+        value.as_object_mut().ok_or(AdapterError::Contract)?.insert(
+            "backup_observed_at".to_string(),
+            serde_json::Value::String(posted_backup),
+        );
+        let body = serde_json::to_vec(&value).map_err(|_| AdapterError::Contract)?;
+        self.journal.clear_launch_block(&intent.handoff_id)?;
+        if let Some(reason) = refresh_refusal(&current.body_json, &body)? {
+            return self.block_launch(intent, reason, true);
+        }
+        let record = self.journal.ensure_evidence(EvidenceJournalRecord::new(
+            intent,
+            &self.config.aeon_origin,
+            sequence,
+            EvidenceKind::LaunchReadiness,
+            &body,
+        )?)?;
+        let receipt = self.aeon.post_evidence(&record).await?;
+        self.journal.acknowledge_evidence(&record, receipt)
+    }
+
     async fn send_readiness(
         &self,
         intent: &DeliveryIntent,
@@ -2592,6 +3445,9 @@ impl AeonDeliveryAdapter {
                 .journal
                 .evidence_with_kind(&intent.handoff_id, EvidenceKind::LaunchReadiness)
                 .ok_or(AdapterError::Journal)?;
+            if current.replay_stopped {
+                return Err(AdapterError::Contract);
+            }
             let posted = evidence_string_field(&current.body_json, "reviewed_plan_digest")?;
             if posted != bare_plan_digest(reviewed)? {
                 return self.block_launch(intent, LAUNCH_BLOCK_READINESS_PLAN_CHANGED, true);
@@ -2603,7 +3459,18 @@ impl AeonDeliveryAdapter {
             }
             let observed_at = format_timestamp(now_unix())?;
             let sequence = self.journal.next_sequence(&intent.handoff_id)?;
-            let body = refreshed_readiness_body(&current.body_json, sequence, &observed_at)?;
+            let job = self
+                .host_actions
+                .get(job_id)
+                .ok_or(AdapterError::LocalBinding)?;
+            let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
+            let body = readiness_refresh_candidate(
+                &current.body_json,
+                sequence,
+                &observed_at,
+                &bare_plan_digest(reviewed)?,
+                plan,
+            )?;
             if let Some(reason) = refresh_refusal(&current.body_json, &body)? {
                 return self.block_launch(intent, reason, true);
             }
@@ -2623,12 +3490,18 @@ impl AeonDeliveryAdapter {
             .get(job_id)
             .ok_or(AdapterError::LocalBinding)?;
         let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
-        let observed_at = format_timestamp(now_unix())?;
+        let now = now_unix();
+        let observed_at = format_timestamp(now)?;
         let bare_reviewed = bare_plan_digest(reviewed)?;
-        // Aeon returns 400 for a zero or future backup_observed_at. Wait until
-        // the host store has a success inside that window, and keep backup_ready.
-        self.withhold_unusable_readiness(intent, job_id)?;
-        let backup_at = backup_observed_at(&self.hosts, &intent.host);
+        // One host snapshot feeds both the gate and the posted stamp. A second
+        // read could omit backup_observed_at after the gate had passed.
+        let host = self.hosts.get(&intent.host);
+        let backup_at = backup_stamp(host.as_ref());
+        let posted_backup = match validated_readiness_backup(plan, backup_at.as_deref(), now) {
+            Ok(stamp) => stamp.to_string(),
+            Err(reason) => return self.block_launch(intent, reason, false),
+        };
+        self.journal.clear_launch_block(&intent.handoff_id)?;
         let running_kernel = kernel_token(plan.running_kernel.as_deref());
         let expected_kernel = kernel_token(plan.expected_kernel.as_deref());
         let sequence = self.journal.next_sequence(&intent.handoff_id)?;
@@ -2646,7 +3519,7 @@ impl AeonDeliveryAdapter {
             all_host_eval_passed: Some(plan.all_host_eval_passed),
             target_build_passed: Some(plan.target_build_passed),
             backup_ready: Some(plan.backup_ready),
-            backup_observed_at: backup_at.as_deref(),
+            backup_observed_at: Some(posted_backup.as_str()),
             restart_required: Some(plan.restart_required),
             running_kernel: Some(running_kernel),
             expected_kernel: Some(expected_kernel),
@@ -2722,13 +3595,15 @@ impl AeonDeliveryAdapter {
         }
         match self.aeon.post_admit(record).await {
             Ok(admission) => {
-                self.validate_admission(&admission, intent, handoff, reviewed, now_unix())?;
+                self.validate_admission(&admission, intent, handoff, reviewed)?;
                 self.journal.store_admission(&intent.handoff_id, admission)
             }
-            Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
-                self.journal
-                    .mark_admit_unresolved(&intent.handoff_id, status)?;
-                Err(AdapterError::LaunchUnresolved)
+            Err(AdapterError::LaunchBlocked(reason))
+                if reason == LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED =>
+            {
+                Err(self
+                    .block_launch(intent, reason, true)
+                    .expect_err("stage gate refusal is journaled as an error"))
             }
             Err(error) => Err(error),
         }
@@ -2740,7 +3615,6 @@ impl AeonDeliveryAdapter {
         intent: &DeliveryIntent,
         handoff: &HandoffDocument,
         reviewed: &str,
-        now: i64,
     ) -> Result<(), AdapterError> {
         let artifact_digest = strip_sha256(&intent.artifact.digest)?;
         let expected = launch_binding_digest(
@@ -2750,15 +3624,15 @@ impl AeonDeliveryAdapter {
             &intent.release_node_id,
             reviewed,
         )?;
-        let expires_at = unix_of(&admission.expires_at)?;
-        let handoff_expires = unix_of(&handoff.expires_at)?;
+        let expires_at = timestamp_nanos(&admission.expires_at)?;
+        let handoff_expires = timestamp_nanos(&handoff.expires_at)?;
         if !valid_uuid(&admission.id)
             || admission.handoff_id != intent.handoff_id
             || admission.artifact_digest_sha256 != artifact_digest
             || admission.authority_epoch != handoff.authority_epoch
             || admission.binding_digest_sha256 != expected
             || admission.consumed_at.is_some()
-            || expires_at <= now
+            || now_nanos() >= expires_at
             || expires_at > handoff_expires
         {
             return Err(AdapterError::LocalBinding);
@@ -2768,20 +3642,31 @@ impl AeonDeliveryAdapter {
 
     async fn consume_and_confirm(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
         let launch = self.journal.mark_consume_started(&intent.handoff_id)?;
-        let response = self.aeon.post_consume(&launch).await?;
+        let response = match self.aeon.post_consume(&launch).await {
+            Ok(response) => response,
+            Err(AdapterError::LaunchBlocked(reason))
+                if reason == LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED =>
+            {
+                return self.block_launch(intent, reason, true);
+            }
+            Err(error) => return Err(error),
+        };
         let receipt = consume_receipt(&response)?;
         let launch = self
             .journal
             .acknowledge_consume(&intent.handoff_id, receipt)?;
-        self.finish_confirmation(intent, &launch)
+        self.confirm_consumed(intent, &launch).await
     }
 
     fn finish_confirmation(
         &self,
         intent: &DeliveryIntent,
         launch: &LaunchJournalRecord,
+        handoff_expires_at: &str,
     ) -> Result<(), AdapterError> {
-        let receipt = launch.receipt.as_ref().ok_or(AdapterError::Journal)?;
+        if launch.receipt.is_none() {
+            return Err(AdapterError::Journal);
+        }
         let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
         let job = self
             .host_actions
@@ -2790,17 +3675,22 @@ impl AeonDeliveryAdapter {
         if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
             return Err(AdapterError::LocalBinding);
         }
+        if job.requested_by != ACTOR {
+            return self.block_launch(intent, LAUNCH_BLOCK_LAUNCH_NOT_OWNED, true);
+        }
         if reviewed_plan_digest(&job).map_err(map_shared)? != launch.reviewed_plan_digest {
             return Err(AdapterError::LocalBinding);
         }
         if job.state == HostActionState::AwaitingConfirmation {
+            if stamp_reached(&admission.expires_at)? || stamp_reached(handoff_expires_at)? {
+                return self.block_launch(intent, LAUNCH_BLOCK_ADMISSION_EXPIRED, true);
+            }
+            let now = now_unix();
+            // Aeon's consumed_at stays in the journal. The host job clock is
+            // local, and never earlier than the review that produced this job.
+            let confirmed_at = now.max(job.updated_at);
             self.host_actions
-                .confirm_update_delegated(
-                    &launch.job_id,
-                    &intent.host,
-                    &admission.id,
-                    unix_of(&receipt.consumed_at)?,
-                )
+                .confirm_update_delegated(&launch.job_id, &intent.host, &admission.id, confirmed_at)
                 .map_err(map_host_action_error)?;
             return Ok(());
         }
@@ -2813,7 +3703,10 @@ impl AeonDeliveryAdapter {
                 | HostActionState::Failed
                 | HostActionState::Cancelled
         ) {
-            return Ok(());
+            if confirmation_is_delegated(&job, &admission.id) {
+                return Ok(());
+            }
+            return self.block_launch(intent, LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED, true);
         }
         Err(AdapterError::LocalBinding)
     }
@@ -2846,27 +3739,37 @@ impl AeonDeliveryAdapter {
         if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
             return Err(AdapterError::LocalBinding);
         }
+        if let Some(block) = self.journal.launch_block(&intent.handoff_id) {
+            if block.terminal {
+                let reason = launch_block_reason(&block.reason).ok_or(AdapterError::Journal)?;
+                return self.report_terminal_launch_block(intent, reason).await;
+            }
+        }
         match job.state {
             HostActionState::Failed | HostActionState::Cancelled => {
+                let detail = self
+                    .journal
+                    .launch_block(&intent.handoff_id)
+                    .map(|block| block.reason);
+                let blocker = detail
+                    .as_deref()
+                    .and_then(aeon_blocker_for_reason)
+                    .unwrap_or(BlockerCode::DependencyFailed);
+                // Aeon rejects evidence observed more than a minute before the
+                // handoff was created (report.go). The job clock can be older
+                // than that, and a 409 on those bytes would replay forever.
                 self.write_observation(
                     intent,
                     handoff,
                     EvidenceOutcome::Failed,
-                    job.updated_at,
-                    Some(BlockerCode::DependencyFailed),
+                    now_unix(),
+                    Some(blocker),
+                    detail.as_deref(),
                 )
                 .await
             }
             HostActionState::Succeeded => {
                 if job.confirmed_at.is_none() || job.result.is_none() {
-                    return Err(AdapterError::LocalBinding);
-                }
-                if intent.delegated_launch.is_some()
-                    && self
-                        .journal
-                        .launch(&intent.handoff_id)
-                        .is_none_or(|launch| launch.receipt.is_none())
-                {
                     return Err(AdapterError::LocalBinding);
                 }
                 let host = self.hosts.get(&intent.host);
@@ -2893,16 +3796,25 @@ impl AeonDeliveryAdapter {
                                 EvidenceOutcome::Failed,
                                 now,
                                 Some(BlockerCode::ReporterStale),
+                                None,
                             )
                             .await;
                     }
                     return Ok(());
                 };
+                if self
+                    .journal
+                    .launch(&intent.handoff_id)
+                    .is_none_or(|launch| launch.receipt.is_none())
+                {
+                    return Err(AdapterError::LocalBinding);
+                }
                 self.write_observation(
                     intent,
                     handoff,
                     EvidenceOutcome::Succeeded,
                     observed_at,
+                    None,
                     None,
                 )
                 .await
@@ -2945,7 +3857,7 @@ impl AeonDeliveryAdapter {
         let host = self.hosts.get(&intent.host);
         let anchor = unix_of(&receipt.completed_at)?;
         let now = now_unix();
-        match observed_fresh_config_beacon(
+        let fresh = match observed_fresh_config_beacon(
             host.as_ref(),
             &intent.environment,
             &intent.artifact,
@@ -2954,40 +3866,70 @@ impl AeonDeliveryAdapter {
             self.config.verification_freshness_secs,
         ) {
             Ok(Some(observed_at)) => {
+                if self.verification_stamp_is_spent(&intent.handoff_id, observed_at)? {
+                    None
+                } else {
+                    Some(observed_at)
+                }
+            }
+            Ok(None) => None,
+            Err(_) if config_measurement_mismatches(host.as_ref(), intent) => {
+                return self
+                    .write_observation(
+                        intent,
+                        handoff,
+                        EvidenceOutcome::Failed,
+                        now,
+                        Some(BlockerCode::DependencyFailed),
+                        None,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(map_shared(error)),
+        };
+        match fresh {
+            Some(observed_at) => {
                 self.write_observation(
                     intent,
                     handoff,
                     EvidenceOutcome::Succeeded,
                     observed_at,
                     None,
+                    None,
                 )
                 .await
             }
-            Ok(None)
-                if beacon_window_closed(anchor, now, self.config.verification_freshness_secs) =>
-            {
+            None if beacon_window_closed(anchor, now, self.config.verification_freshness_secs) => {
                 self.write_observation(
                     intent,
                     handoff,
                     EvidenceOutcome::Failed,
                     now,
                     Some(BlockerCode::ReporterStale),
+                    None,
                 )
                 .await
             }
-            Ok(None) => Ok(()),
-            Err(_) if config_measurement_mismatches(host.as_ref(), intent) => {
-                self.write_observation(
-                    intent,
-                    handoff,
-                    EvidenceOutcome::Failed,
-                    now,
-                    Some(BlockerCode::DependencyFailed),
-                )
-                .await
-            }
-            Err(error) => Err(map_shared(error)),
+            None => Ok(()),
         }
+    }
+
+    fn verification_stamp_is_spent(
+        &self,
+        handoff_id: &str,
+        observed_at: i64,
+    ) -> Result<bool, AdapterError> {
+        let Some(existing) = self
+            .journal
+            .evidence_with_kind(handoff_id, EvidenceKind::Verification)
+        else {
+            return Ok(false);
+        };
+        if !existing.predates_stopped() {
+            return Ok(false);
+        }
+        let previous = unix_of(&evidence_string_field(&existing.body_json, "observed_at")?)?;
+        Ok(observed_at <= previous)
     }
 
     async fn write_observation(
@@ -2997,19 +3939,46 @@ impl AeonDeliveryAdapter {
         outcome: EvidenceOutcome,
         observed_at: i64,
         blocker: Option<BlockerCode>,
+        detail: Option<&str>,
     ) -> Result<(), AdapterError> {
+        if !self.settle_unacknowledged_evidence(intent).await? {
+            return Ok(());
+        }
         let kind = intent.operation.evidence_kind();
+        if self
+            .journal
+            .evidence_with_kind(&intent.handoff_id, kind)
+            .is_some_and(|record| record.predates_stopped())
+        {
+            return self
+                .replace_predates_observation(
+                    intent,
+                    handoff,
+                    outcome,
+                    observed_at,
+                    blocker,
+                    detail,
+                )
+                .await;
+        }
         let record =
             if let Some(existing) = self.journal.evidence_with_kind(&intent.handoff_id, kind) {
                 if existing.receipt.is_none() {
                     self.replay_evidence(intent, &existing).await?;
                 }
-                self.journal
+                let current = self
+                    .journal
                     .evidence_with_kind(&intent.handoff_id, kind)
-                    .ok_or(AdapterError::Journal)?
+                    .ok_or(AdapterError::Journal)?;
+                if current.replay_stopped {
+                    return Ok(());
+                }
+                current
+            } else if self.journal.has_stopped_evidence(&intent.handoff_id) {
+                return Ok(());
             } else {
-                let observed_at = format_timestamp(observed_at)?;
-                if unix_of(&observed_at)? > now_unix().saturating_add(OBSERVED_AT_SKEW_SECS) {
+                let observed_stamp = format_timestamp(observed_at)?;
+                if unix_of(&observed_stamp)? > now_unix().saturating_add(OBSERVED_AT_SKEW_SECS) {
                     return Err(AdapterError::Contract);
                 }
                 let artifact = WireArtifact::from_evidence(&intent.artifact)?;
@@ -3018,7 +3987,7 @@ impl AeonDeliveryAdapter {
                     sequence,
                     kind,
                     outcome,
-                    observed_at: &observed_at,
+                    observed_at: &observed_stamp,
                     authority_epoch: handoff.authority_epoch,
                     workflow: Some(intent.workflow.key()),
                     environment: Some(&intent.environment),
@@ -3040,8 +4009,15 @@ impl AeonDeliveryAdapter {
             return Err(AdapterError::LocalBinding);
         }
         let result_outcome = ResultOutcome::from_evidence(outcome)?;
-        self.finish_result(intent, handoff, record.sequence, result_outcome, blocker)
-            .await
+        self.finish_result(
+            intent,
+            handoff,
+            record.sequence,
+            result_outcome,
+            blocker,
+            detail,
+        )
+        .await
     }
 
     async fn send_new_evidence(
@@ -3058,11 +4034,98 @@ impl AeonDeliveryAdapter {
             kind,
             &body,
         )?)?;
-        let receipt = self.aeon.post_evidence(&record).await?;
-        self.journal.acknowledge_evidence(&record, receipt)?;
-        self.journal
+        self.store_evidence_post(intent, &record).await
+    }
+
+    async fn replace_predates_observation(
+        &self,
+        intent: &DeliveryIntent,
+        handoff: &HandoffDocument,
+        outcome: EvidenceOutcome,
+        observed_at: i64,
+        blocker: Option<BlockerCode>,
+        detail: Option<&str>,
+    ) -> Result<(), AdapterError> {
+        let kind = intent.operation.evidence_kind();
+        let previous = self
+            .journal
             .evidence_with_kind(&intent.handoff_id, kind)
-            .ok_or(AdapterError::Journal)
+            .filter(|record| record.predates_stopped())
+            .ok_or(AdapterError::Journal)?;
+        let previous_at = unix_of(&evidence_string_field(&previous.body_json, "observed_at")?)?;
+        if observed_at <= previous_at {
+            return Ok(());
+        }
+        let observed_stamp = format_timestamp(observed_at)?;
+        if unix_of(&observed_stamp)? > now_unix().saturating_add(OBSERVED_AT_SKEW_SECS) {
+            return Err(AdapterError::Contract);
+        }
+        let artifact = WireArtifact::from_evidence(&intent.artifact)?;
+        let write = EvidenceWrite {
+            sequence: previous.sequence,
+            kind,
+            outcome,
+            observed_at: &observed_stamp,
+            authority_epoch: handoff.authority_epoch,
+            workflow: Some(intent.workflow.key()),
+            environment: Some(&intent.environment),
+            artifact: Some(&artifact),
+            reviewed_plan_digest: None,
+            host: None,
+            all_host_eval_passed: None,
+            target_build_passed: None,
+            backup_ready: None,
+            backup_observed_at: None,
+            restart_required: None,
+            running_kernel: None,
+            expected_kernel: None,
+        };
+        let body = serde_json::to_vec(&write).map_err(|_| AdapterError::Contract)?;
+        let replacement = EvidenceJournalRecord::new(
+            intent,
+            &self.config.aeon_origin,
+            previous.sequence,
+            kind,
+            &body,
+        )?;
+        let record = self
+            .journal
+            .replace_predates_evidence(&previous, replacement)?;
+        let record = self.store_evidence_post(intent, &record).await?;
+        let receipt = record.receipt.as_ref().ok_or(AdapterError::Journal)?;
+        if receipt.outcome != outcome {
+            return Err(AdapterError::LocalBinding);
+        }
+        self.finish_result(
+            intent,
+            handoff,
+            record.sequence,
+            ResultOutcome::from_evidence(outcome)?,
+            blocker,
+            detail,
+        )
+        .await
+    }
+
+    async fn store_evidence_post(
+        &self,
+        intent: &DeliveryIntent,
+        record: &EvidenceJournalRecord,
+    ) -> Result<EvidenceJournalRecord, AdapterError> {
+        match self.aeon.post_evidence_raw(record).await? {
+            PostedEvidence::Accepted(receipt) => {
+                self.journal.acknowledge_evidence(record, receipt)?;
+                self.journal
+                    .evidence_sequence(&intent.handoff_id, record.sequence)
+                    .ok_or(AdapterError::Journal)
+            }
+            PostedEvidence::Rejected { status, body } => {
+                if let Some(stop) = evidence_replay_stop(status, &body) {
+                    self.journal.stop_evidence_replay(record, stop)?;
+                }
+                Err(status_error(status))
+            }
+        }
     }
 
     async fn finish_result(
@@ -3072,6 +4135,7 @@ impl AeonDeliveryAdapter {
         terminal_sequence: i64,
         outcome: ResultOutcome,
         blocker: Option<BlockerCode>,
+        detail: Option<&str>,
     ) -> Result<(), AdapterError> {
         if self
             .journal
@@ -3080,7 +4144,8 @@ impl AeonDeliveryAdapter {
         {
             return Ok(());
         }
-        let record = self.stage_result(intent, handoff, terminal_sequence, outcome, blocker)?;
+        let record =
+            self.stage_result(intent, handoff, terminal_sequence, outcome, blocker, detail)?;
         match self.aeon.post_result(&record).await {
             Ok(receipt) => self.journal.acknowledge_result(&record, receipt),
             Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
@@ -3097,6 +4162,7 @@ impl AeonDeliveryAdapter {
         terminal_sequence: i64,
         outcome: ResultOutcome,
         blocker: Option<BlockerCode>,
+        detail: Option<&str>,
     ) -> Result<ResultJournalRecord, AdapterError> {
         if let Some(existing) = self.journal.result(&intent.handoff_id) {
             // Replay the journaled bytes. A different seal replaces this record
@@ -3106,6 +4172,12 @@ impl AeonDeliveryAdapter {
         if (outcome == ResultOutcome::Succeeded) != blocker.is_none() {
             return Err(AdapterError::Contract);
         }
+        if detail.is_some_and(|token| launch_block_reason(token).is_none()) {
+            return Err(AdapterError::Journal);
+        }
+        if let Some(code) = blocker {
+            require_accepted_blocker(code)?;
+        }
         let request = ResultRequest {
             outcome,
             terminal_sequence,
@@ -3114,8 +4186,9 @@ impl AeonDeliveryAdapter {
             blocker_code: blocker,
         };
         let body = serde_json::to_vec(&request).map_err(|_| AdapterError::Contract)?;
-        let record =
+        let mut record =
             ResultJournalRecord::new(intent, &self.config.aeon_origin, terminal_sequence, &body)?;
+        record.detail = detail.map(str::to_string);
         self.journal.ensure_result(record)
     }
 
@@ -3126,15 +4199,12 @@ impl AeonDeliveryAdapter {
     ) -> Result<(), AdapterError> {
         let fresh = self.aeon.get_handoff(&intent.handoff_id).await?;
         fresh.validate(intent)?;
-        fresh.open_for_write(now_unix())?;
-        let operation = self
-            .journal
-            .operation(&intent.handoff_id)
-            .ok_or(AdapterError::LocalBinding)?;
-        if !operation.matches_handoff(&fresh) {
-            return Err(AdapterError::LocalBinding);
-        }
+        fresh.open_for_write()?;
+        self.result_retry_binding(intent, &fresh)?;
         let failed_request: ResultRequest = decode_strict(failed.body_json.as_bytes())?;
+        // Real Aeon writes the seal once and never updates it. This replacement
+        // runs only when GET returns a different seal. FakeAeon simulates that
+        // with bump_seal_on_result; a live handoff does not.
         if fresh.authority_epoch != failed_request.authority_epoch
             || fresh.prerequisite_seal_sha256 == failed_request.prerequisite_seal_sha256
         {
@@ -3148,15 +4218,48 @@ impl AeonDeliveryAdapter {
             blocker_code: failed_request.blocker_code,
         };
         let body = serde_json::to_vec(&request).map_err(|_| AdapterError::Contract)?;
-        let record = ResultJournalRecord::new(
+        let mut record = ResultJournalRecord::new(
             intent,
             &self.config.aeon_origin,
             request.terminal_sequence,
             &body,
         )?;
+        record.detail = failed.detail.clone();
         let record = self.journal.replace_unacked_result(record)?;
         let receipt = self.aeon.post_result(&record).await?;
         self.journal.acknowledge_result(&record, receipt)
+    }
+
+    fn result_retry_binding(
+        &self,
+        intent: &DeliveryIntent,
+        fresh: &HandoffDocument,
+    ) -> Result<(), AdapterError> {
+        if intent.operation == Operation::Verify {
+            let deploy_id = intent
+                .deployment_handoff_id
+                .as_deref()
+                .ok_or(AdapterError::LocalBinding)?;
+            let operation = self
+                .journal
+                .operation(deploy_id)
+                .ok_or(AdapterError::LocalBinding)?;
+            if operation.host != intent.host
+                || operation.environment != intent.environment
+                || operation.artifact != intent.artifact
+            {
+                return Err(AdapterError::LocalBinding);
+            }
+            return Ok(());
+        }
+        let operation = self
+            .journal
+            .operation(&intent.handoff_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        if !operation.matches_handoff(fresh) {
+            return Err(AdapterError::LocalBinding);
+        }
+        Ok(())
     }
 }
 
@@ -3171,6 +4274,33 @@ fn consumable_for_launch(job: &HostActionJob, host: &str) -> bool {
     awaiting_ready_review(job, host) && job.requested_by == ACTOR && job.confirmed_at.is_none()
 }
 
+fn confirmation_is_delegated(job: &HostActionJob, admission_id: &str) -> bool {
+    job.events.iter().any(|event| {
+        event.kind == HostActionEventKind::Confirmed
+            && event.source == HostActionEventSource::Pharos
+            && event.actor.as_deref() == Some(admission_id)
+    })
+}
+
+fn consume_job_confirmable(
+    intent: &DeliveryIntent,
+    job: &HostActionJob,
+    reviewed: &str,
+) -> Result<bool, AdapterError> {
+    if job.host != intent.host
+        || job.workflow_kind() != HostWorkflowKind::UpdateRestart
+        || job.requested_by != ACTOR
+        || job.state != HostActionState::AwaitingConfirmation
+    {
+        return Ok(false);
+    }
+    match reviewed_plan_digest(job) {
+        Ok(digest) => Ok(digest == reviewed),
+        Err(SharedError::LocalBinding) => Ok(false),
+        Err(error) => Err(map_shared(error)),
+    }
+}
+
 fn consume_receipt(response: &ConsumeResponse) -> Result<ConsumeReceipt, AdapterError> {
     if !response.consumed || parse_timestamp(&response.consumed_at).is_err() {
         return Err(AdapterError::Contract);
@@ -3180,7 +4310,37 @@ fn consume_receipt(response: &ConsumeResponse) -> Result<ConsumeReceipt, Adapter
         admission_id: response.admission_id.clone(),
         consumed: true,
         consumed_at: response.consumed_at.clone(),
+        reconciled_from_get: false,
     })
+}
+
+fn readiness_refresh_candidate(
+    previous: &str,
+    sequence: i64,
+    observed_at: &str,
+    reviewed_plan_digest: &str,
+    plan: &HostActionPlan,
+) -> Result<Vec<u8>, AdapterError> {
+    let mut value: serde_json::Value =
+        decode_strict(&refreshed_readiness_body(previous, sequence, observed_at)?)?;
+    let object = value.as_object_mut().ok_or(AdapterError::Contract)?;
+    object.insert(
+        "reviewed_plan_digest".to_string(),
+        serde_json::Value::String(reviewed_plan_digest.to_string()),
+    );
+    object.insert(
+        "all_host_eval_passed".to_string(),
+        serde_json::Value::Bool(plan.all_host_eval_passed),
+    );
+    object.insert(
+        "target_build_passed".to_string(),
+        serde_json::Value::Bool(plan.target_build_passed),
+    );
+    object.insert(
+        "backup_ready".to_string(),
+        serde_json::Value::Bool(plan.backup_ready),
+    );
+    serde_json::to_vec(&value).map_err(|_| AdapterError::Contract)
 }
 
 fn refreshed_readiness_body(
@@ -3258,6 +4418,17 @@ fn refresh_refusal(previous: &str, refreshed: &[u8]) -> Result<Option<&'static s
     Ok(None)
 }
 
+fn validated_readiness_backup<'a>(
+    plan: &HostActionPlan,
+    backup_at: Option<&'a str>,
+    now: i64,
+) -> Result<&'a str, &'static str> {
+    if let Some(reason) = readiness_wait_reason(plan, backup_at, now) {
+        return Err(reason);
+    }
+    backup_at.ok_or(LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING)
+}
+
 fn readiness_wait_reason(
     plan: &HostActionPlan,
     backup_at: Option<&str>,
@@ -3287,7 +4458,11 @@ fn acceptable_backup_stamp(stamp: Option<&str>, now: i64) -> bool {
 }
 
 fn backup_observed_at(hosts: &Store, host_name: &str) -> Option<String> {
-    let host = hosts.get(host_name)?;
+    backup_stamp(hosts.get(host_name).as_ref())
+}
+
+fn backup_stamp(host: Option<&pharos_core::Host>) -> Option<String> {
+    let host = host?;
     let at = host
         .backup_observations
         .iter()
@@ -3581,6 +4756,49 @@ fn status_error(status: StatusCode) -> AdapterError {
     }
 }
 
+/// Exact Aeon gate texts. A longer sentence that merely contains one of
+/// these phrases stays a credential failure.
+fn stage_gate_block(status: StatusCode, body: &[u8]) -> Option<&'static str> {
+    if status != StatusCode::FORBIDDEN {
+        return None;
+    }
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return None;
+    };
+    match document.get("error").and_then(serde_json::Value::as_str) {
+        Some(
+            "stage gate is not approved"
+            | "stage gate is no longer approved"
+            | "candidate gate is no longer approved",
+        ) => Some(LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED),
+        _ => None,
+    }
+}
+
+fn refusal_from_aeon(status: StatusCode, body: &[u8]) -> AdapterError {
+    if let Some(reason) = stage_gate_block(status, body) {
+        return AdapterError::LaunchBlocked(reason);
+    }
+    status_error(status)
+}
+
+/// report.go uses the handoff texts once no further row will be stored.
+/// "evidence predates handoff" refuses that observed_at before insert, so
+/// the sequence stays free. A contiguous-sequence 409 stops nothing.
+fn evidence_replay_stop(status: StatusCode, body: &[u8]) -> Option<EvidenceReplayStop> {
+    if status != StatusCode::CONFLICT {
+        return None;
+    }
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return None;
+    };
+    match document.get("error").and_then(serde_json::Value::as_str) {
+        Some("handoff is stale" | "handoff is terminal") => Some(EvidenceReplayStop::Handoff),
+        Some("evidence predates handoff") => Some(EvidenceReplayStop::Predates),
+        _ => None,
+    }
+}
+
 async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, AdapterError> {
     if response
         .content_length()
@@ -3619,6 +4837,30 @@ fn reject_reflected_bytes(bytes: &[u8], credentials: &Credentials) -> Result<(),
         return Err(AdapterError::Contract);
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn trace_body_excerpt(body: &[u8], credentials: &Credentials) -> String {
+    if contains_slice(body, &credentials.api_key) {
+        return REFLECTED_CREDENTIAL_MARKER.to_string();
+    }
+    let end = body.len().min(TRACE_EXCERPT_MAX_BYTES);
+    truncate_to_bytes(
+        &String::from_utf8_lossy(&body[..end]),
+        TRACE_EXCERPT_MAX_BYTES,
+    )
+}
+
+#[cfg(test)]
+fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -3691,9 +4933,24 @@ fn unix_of(value: &str) -> Result<i64, AdapterError> {
     Ok(parse_timestamp(value)?.unix_timestamp())
 }
 
+fn timestamp_nanos(value: &str) -> Result<i128, AdapterError> {
+    Ok(parse_timestamp(value)?.unix_timestamp_nanos())
+}
+
+/// Aeon consume accepts an expiry only while it is strictly after now.
+fn stamp_reached(stamp: &str) -> Result<bool, AdapterError> {
+    Ok(now_nanos() >= timestamp_nanos(stamp)?)
+}
+
+/// Aeon `current()` is false only once now is strictly after `expires_at`.
+fn stamp_passed(stamp: &str) -> Result<bool, AdapterError> {
+    Ok(now_nanos() > timestamp_nanos(stamp)?)
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_NOW: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    static TEST_NOW_EXTRA_NANOS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn now_unix() -> i64 {
@@ -3702,6 +4959,17 @@ fn now_unix() -> i64 {
         return now;
     }
     OffsetDateTime::now_utc().unix_timestamp()
+}
+
+fn now_nanos() -> i128 {
+    #[cfg(test)]
+    if let Some(seconds) = TEST_NOW.with(std::cell::Cell::get) {
+        let extra = TEST_NOW_EXTRA_NANOS.with(std::cell::Cell::get) as i128;
+        return (seconds as i128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(extra);
+    }
+    OffsetDateTime::now_utc().unix_timestamp_nanos()
 }
 
 fn strip_sha256(value: &str) -> Result<String, AdapterError> {
@@ -3713,10 +4981,12 @@ fn strip_sha256(value: &str) -> Result<String, AdapterError> {
 }
 
 fn valid_symbol(value: &str) -> bool {
-    (1..=64).contains(&value.len())
-        && value.as_bytes()[0].is_ascii_lowercase()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+    // Aeon symbolicRE: ^[a-z][a-z0-9_-]{0,127}$
+    let bytes = value.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
         })
 }
 
@@ -3856,6 +5126,24 @@ mod tests {
         }
     }
 
+    fn held_launch_artifact() -> Value {
+        serde_json::to_value(WireArtifact::from_evidence(&artifact()).expect("held artifact"))
+            .expect("held artifact json")
+    }
+
+    fn full_deployment(sequence: i64, outcome: &str, now: i64) -> Value {
+        json!({
+            "sequence": sequence,
+            "kind": "deployment",
+            "outcome": outcome,
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "workflow": "deploy-production",
+            "environment": "production-eu1",
+            "artifact": held_launch_artifact(),
+        })
+    }
+
     fn artifact() -> ArtifactEvidence {
         ArtifactEvidence {
             version_scheme: pharos_core::ArtifactVersionScheme::Legacy,
@@ -3882,7 +5170,7 @@ mod tests {
             update_restart_job_id: None,
             deployment_handoff_id: None,
             delegated_launch: delegated.then(|| DelegatedLaunchSelection {
-                target_ref: format!("sha256:{}", "a".repeat(64)),
+                target_ref: artifact().digest,
             }),
         }
     }
@@ -3942,7 +5230,7 @@ mod tests {
             "host": "hsb8",
             "artifact": artifact(),
             "delegated_launch": {
-                "target_ref": format!("sha256:{}", "a".repeat(64)),
+                "target_ref": artifact().digest,
             },
         })
     }
@@ -4015,6 +5303,34 @@ mod tests {
             json!([deploy_intent_json()]),
         );
         document["intents"][0]["handoff_id"] = json!("not-a-uuid");
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            AdapterConfig::load(&config_path),
+            Err(AdapterError::Configuration)
+        ));
+
+        document = config_document(
+            &api,
+            "https://aeon.example.test",
+            json!([deploy_intent_json()]),
+        );
+        document["intents"][0]["environment"] = json!("production.eu1");
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            AdapterConfig::load(&config_path),
+            Err(AdapterError::Configuration)
+        ));
+        assert!(valid_symbol("production-eu1"));
+        assert!(!valid_symbol("1production"));
+        assert!(!valid_symbol(&"a".repeat(129)));
+
+        document = config_document(
+            &api,
+            "https://aeon.example.test",
+            json!([deploy_intent_json()]),
+        );
+        document["intents"][0]["delegated_launch"]["target_ref"] =
+            json!(format!("sha256:{}", "b".repeat(64)));
         write_private(&config_path, &serde_json::to_vec(&document).unwrap());
         assert!(matches!(
             AdapterConfig::load(&config_path),
@@ -4126,6 +5442,51 @@ mod tests {
     }
 
     #[test]
+    fn readiness_row_posts_the_backup_stamp_it_validated() {
+        let plan = ready_plan();
+        let now = 1_700_000_100;
+        let stamp = format_timestamp(now - 30).unwrap();
+        assert_eq!(
+            validated_readiness_backup(&plan, Some(&stamp), now).unwrap(),
+            stamp
+        );
+        assert_eq!(
+            validated_readiness_backup(&plan, None, now).unwrap_err(),
+            LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING
+        );
+        let mut unready = plan;
+        unready.backup_ready = false;
+        assert_eq!(
+            validated_readiness_backup(&unready, Some(&stamp), now).unwrap_err(),
+            LAUNCH_BLOCK_BACKUP_NOT_READY
+        );
+    }
+
+    #[test]
+    fn refresh_refusal_compares_the_current_plan_with_the_journaled_row() {
+        let previous = r#"{"sequence":1,"reviewed_plan_digest":"aa","all_host_eval_passed":true,"target_build_passed":true,"backup_ready":true,"observed_at":"2026-01-01T00:00:00Z"}"#;
+        let plan = ready_plan();
+        let same =
+            readiness_refresh_candidate(previous, 2, "2026-01-01T00:10:00Z", "aa", &plan).unwrap();
+        assert!(refresh_refusal(previous, &same).unwrap().is_none());
+        let mut changed = plan.clone();
+        changed.backup_ready = false;
+        let flagged =
+            readiness_refresh_candidate(previous, 2, "2026-01-01T00:10:00Z", "aa", &changed)
+                .unwrap();
+        assert_eq!(
+            refresh_refusal(previous, &flagged).unwrap(),
+            Some(LAUNCH_BLOCK_READINESS_FLAG_FALSE)
+        );
+        let drifted =
+            readiness_refresh_candidate(previous, 2, "2026-01-01T00:10:00Z", "bb", &plan).unwrap();
+        assert_eq!(
+            refresh_refusal(previous, &drifted).unwrap(),
+            Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED)
+        );
+    }
+
+    #[test]
     fn classic_journal_is_not_resumed() {
         let directory = TestDir::new("classic-journal");
         let path = directory
@@ -4167,6 +5528,13 @@ mod tests {
         predecessor_digest: String,
         context_digest: String,
         prerequisite_seal_sha256: String,
+        /// When the handoff was opened. Not part of the GET document. Aeon
+        /// stores this as `created_at` and rejects evidence observed more than
+        /// a minute earlier.
+        created_at: i64,
+        /// FakeAeon only. Real `current()` is false when the recomputed plan
+        /// digest or authority epoch differs, and GET does not show that.
+        force_stale: bool,
         evidence: BTreeMap<i64, StoredEvidence>,
         admission: Option<Value>,
         admit_idempotency_key: Option<String>,
@@ -4174,6 +5542,7 @@ mod tests {
         consumed: bool,
         consumed_at: Option<String>,
         consumed_by_principal_id: Option<String>,
+        held_artifact: Value,
         result_body: Option<Vec<u8>>,
         result: Option<Value>,
     }
@@ -4183,6 +5552,7 @@ mod tests {
             let mut handoff = Self::open(DEPLOY_HANDOFF, "deploy", "deployment", now);
             handoff.evidence_ceiling =
                 vec!["deployment".to_string(), "launch_readiness".to_string()];
+            handoff.held_artifact = held_launch_artifact();
             handoff
         }
 
@@ -4211,6 +5581,8 @@ mod tests {
                 predecessor_digest: hex_chars('b'),
                 context_digest: hex_chars('c'),
                 prerequisite_seal_sha256: hex_chars('d'),
+                created_at: now,
+                force_stale: false,
                 evidence: BTreeMap::new(),
                 admission: None,
                 admit_idempotency_key: None,
@@ -4218,6 +5590,7 @@ mod tests {
                 consumed: false,
                 consumed_at: None,
                 consumed_by_principal_id: None,
+                held_artifact: Value::Null,
                 result_body: None,
                 result: None,
             }
@@ -4268,17 +5641,31 @@ mod tests {
         now: i64,
         handoffs: BTreeMap<String, FakeHandoff>,
         fail_next_post: bool,
+        /// FakeAeon only. Real Aeon writes `prerequisite_seal_sha256` once and
+        /// `current()` only compares it. Set to make the next result 409 and
+        /// replace the seal, which is the only way `retry_result_seal` replaces
+        /// a journaled body.
         bump_seal_on_result: bool,
         reject_result: bool,
         corrupt_binding: bool,
         expire_admission: bool,
+        /// FakeAeon only. Real Aeon sets admission `expires_at` equal to the
+        /// handoff and refuses a second admit. A shorter lifetime is how a test
+        /// expires the admission while the handoff is still current.
+        admission_lifetime_secs: Option<i64>,
         get_status: Option<StatusCode>,
-        approved_digest: String,
         drop_accepted_consume: bool,
         drop_accepted_admit: bool,
         drop_accepted_result: bool,
         drift_plan_on_next_get: bool,
         arm_lineage_drift: bool,
+        journey_project_key: String,
+        journey_node_key: String,
+        journey_tenant_slug: String,
+        /// Build stage carries the candidate gate once that gate exists
+        /// (journey derive.go gateIDFor). Admit requires both live.
+        journey_candidate_gate_live: bool,
+        journey_deploy_gate_live: bool,
     }
 
     #[derive(Clone)]
@@ -4297,6 +5684,7 @@ mod tests {
         inner: Arc<Mutex<FakeInner>>,
         captures: Arc<Mutex<Vec<Captured>>>,
         reread_hook: RereadHook,
+        consume_hook: RereadHook,
     }
 
     impl FakeAeon {
@@ -4314,16 +5702,22 @@ mod tests {
                     reject_result: false,
                     corrupt_binding: false,
                     expire_admission: false,
+                    admission_lifetime_secs: None,
                     get_status: None,
-                    approved_digest: "1".repeat(64),
                     drop_accepted_consume: false,
                     drop_accepted_admit: false,
                     drop_accepted_result: false,
                     drift_plan_on_next_get: false,
                     arm_lineage_drift: false,
+                    journey_project_key: "lab".to_string(),
+                    journey_node_key: "PRJ-17".to_string(),
+                    journey_tenant_slug: "inspr".to_string(),
+                    journey_candidate_gate_live: true,
+                    journey_deploy_gate_live: true,
                 })),
                 captures: Arc::new(Mutex::new(Vec::new())),
                 reread_hook: Arc::new(Mutex::new(None)),
+                consume_hook: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -4337,6 +5731,7 @@ mod tests {
         Response::builder()
             .status(status)
             .header(CONTENT_TYPE.as_str(), JSON_MEDIA)
+            .header("x-request-id", "fake-aeon-request")
             .body(Body::from(serde_json::to_vec(value).unwrap()))
             .unwrap()
     }
@@ -4452,6 +5847,67 @@ mod tests {
         now.saturating_sub(parsed.unix_timestamp()) > 900
     }
 
+    fn same_held_artifact(body: &Value, held: &Value) -> bool {
+        [
+            "version_scheme",
+            "version",
+            "release_channel",
+            "release_sequence",
+            "digest_sha256",
+            "commit_digest",
+            "manifest_coordinate",
+            "manifest_digest_sha256",
+        ]
+        .iter()
+        .all(|key| body.get(*key).is_some() && body.get(*key) == held.get(*key))
+    }
+
+    fn pharos_evidence_complete(value: &Value) -> bool {
+        value["workflow"].as_str().is_some_and(valid_symbol)
+            && value["environment"].as_str().is_some_and(valid_symbol)
+            && value.get("artifact").is_some_and(|artifact| {
+                artifact["version"]
+                    .as_str()
+                    .is_some_and(|item| !item.is_empty())
+                    && artifact["release_channel"]
+                        .as_str()
+                        .is_some_and(|item| !item.is_empty())
+                    && artifact["release_sequence"]
+                        .as_i64()
+                        .is_some_and(|item| item >= 1)
+                    && artifact["digest_sha256"].as_str().is_some_and(valid_hex64)
+                    && artifact["commit_digest"]
+                        .as_str()
+                        .is_some_and(|item| !item.is_empty())
+                    && artifact["manifest_coordinate"]
+                        .as_str()
+                        .is_some_and(|item| !item.is_empty())
+                    && artifact["manifest_digest_sha256"]
+                        .as_str()
+                        .is_some_and(valid_hex64)
+                    && artifact["version_scheme"]
+                        .as_str()
+                        .is_some_and(|item| !item.is_empty())
+            })
+    }
+
+    fn readiness_contradicts(handoff: &FakeHandoff, value: &Value) -> bool {
+        let Some((_, first)) = handoff.evidence.iter().find(|(_, evidence)| {
+            serde_json::from_slice::<Value>(&evidence.body)
+                .ok()
+                .is_some_and(|stored| stored["kind"] == "launch_readiness")
+        }) else {
+            return false;
+        };
+        let Ok(first) = serde_json::from_slice::<Value>(&first.body) else {
+            return false;
+        };
+        first["reviewed_plan_digest"] != value["reviewed_plan_digest"]
+            || value["all_host_eval_passed"] != true
+            || value["target_build_passed"] != true
+            || value["backup_ready"] != true
+    }
+
     fn handle_evidence(handoff: &mut FakeHandoff, body: &[u8], now: i64) -> Response<Body> {
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
@@ -4459,6 +5915,56 @@ mod tests {
         let Some(sequence) = value["sequence"].as_i64().filter(|sequence| *sequence >= 1) else {
             return json_response(StatusCode::CONFLICT, &json!({}));
         };
+        if value["authority_epoch"].as_i64() != Some(handoff.authority_epoch) {
+            return json_response(StatusCode::CONFLICT, &json!({}));
+        }
+        // report.go: observed_at before created_at minus one minute is 409,
+        // for every kind including verification. Before is strict, so the
+        // exact one-minute boundary is still accepted. created_at is not on GET.
+        if value["observed_at"].as_str().is_some_and(|stamp| {
+            parse_timestamp(stamp)
+                .map(|time| time.unix_timestamp().saturating_add(60) < handoff.created_at)
+                .unwrap_or(false)
+        }) {
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "evidence predates handoff"}),
+            );
+        }
+        let stored_exact = handoff
+            .evidence
+            .get(&sequence)
+            .is_some_and(|stored| stored.body == body);
+        // report.go: a recorded result or state revoked replays an exact stored
+        // row and otherwise answers 409 "handoff is terminal", before current().
+        // failed, blocked, and succeeded without a result are not that refusal.
+        if handoff.result.is_some() || handoff.state == "revoked" {
+            if stored_exact {
+                let received_at = handoff
+                    .evidence
+                    .get(&sequence)
+                    .map(|stored| stored.received_at.clone())
+                    .unwrap_or_default();
+                return json_response(
+                    StatusCode::CREATED,
+                    &evidence_echo(body, &handoff.id, &received_at),
+                );
+            }
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "handoff is terminal"}),
+            );
+        }
+        // current() is false after expiry and when the plan digest or epoch
+        // drifts. report.go returns 409 "handoff is stale" before the stored
+        // replay, so an exact replay is refused as well. force_stale is the
+        // stand-in for the recomputed digest, which GET does not carry.
+        let expires_at = parse_timestamp(&handoff.expires_at)
+            .map(|time| time.unix_timestamp())
+            .unwrap_or(0);
+        if handoff.force_stale || expires_at < now {
+            return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
+        }
         if let Some(stored) = handoff.evidence.get(&sequence) {
             return if stored.body == body {
                 json_response(
@@ -4473,9 +5979,6 @@ mod tests {
         if sequence != max_sequence + 1 {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
-        if value["authority_epoch"].as_i64() != Some(handoff.authority_epoch) {
-            return json_response(StatusCode::CONFLICT, &json!({}));
-        }
         if value["kind"] == "launch_readiness"
             && (!launch_readiness_tokens(&value)
                 || !acceptable_backup_stamp(value["backup_observed_at"].as_str(), now))
@@ -4483,6 +5986,29 @@ mod tests {
             return json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": "invalid launch readiness"}),
+            );
+        }
+        if value["kind"] == "launch_readiness" && readiness_contradicts(handoff, &value) {
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "launch readiness was contradicted"}),
+            );
+        }
+        if matches!(value["kind"].as_str(), Some("deployment" | "verification"))
+            && !pharos_evidence_complete(&value)
+        {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "invalid Pharos evidence"}),
+            );
+        }
+        if value["kind"] == "deployment"
+            && matches!(value["outcome"].as_str(), Some("succeeded" | "satisfied"))
+            && !handoff.consumed
+        {
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "deployment lacks consumed launch admission"}),
             );
         }
         let received_at = format_timestamp(now).unwrap();
@@ -4518,7 +6044,7 @@ mod tests {
         let Some(digest) = value["digest_sha256"].as_str() else {
             return json_response(StatusCode::CONFLICT, &json!({}));
         };
-        if digest != flags.approved {
+        if !same_held_artifact(&value, &handoff.held_artifact) {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
         if let Some(response) = replay_response(launch_replay(
@@ -4529,6 +6055,15 @@ mod tests {
             body,
             flags.now,
         )) {
+            return response;
+        }
+        // launch.go checks both gates after an exact replay has already
+        // returned. A new admit uses "stage gate is not approved".
+        if let Some(response) = launch_gate_refusal(
+            flags.candidate_gate_live,
+            flags.deploy_gate_live,
+            "stage gate is not approved",
+        ) {
             return response;
         }
         let mut reviewed = None;
@@ -4563,19 +6098,8 @@ mod tests {
         if contradicted {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
-        if let Some(existing) = &handoff.admission {
-            let expires_at = existing["expires_at"]
-                .as_str()
-                .and_then(|value| parse_timestamp(value).ok())
-                .map(|time| time.unix_timestamp())
-                .unwrap_or(0);
-            let open = !handoff.consumed && expires_at > flags.now;
-            if open && handoff.admit_idempotency_key.as_deref() == Some(flags.idempotency) {
-                return json_response(StatusCode::OK, existing);
-            }
-            if open {
-                return json_response(StatusCode::CONFLICT, &json!({}));
-            }
+        if handoff.admission.is_some() {
+            return json_response(StatusCode::CONFLICT, &json!({}));
         }
         let binding = if flags.corrupt {
             "0".repeat(64)
@@ -4589,8 +6113,15 @@ mod tests {
             )
             .unwrap_or_else(|_| "0".repeat(64))
         };
+        // `expire` and `admission_lifetime_secs` are FakeAeon-only. Real Aeon
+        // copies the handoff expiry and does not issue a shorter admission.
         let expires_at = if flags.expire {
             format_timestamp(flags.now - 120).unwrap()
+        } else if let Some(lifetime) = flags.admission_lifetime_secs {
+            let handoff_expires = parse_timestamp(&handoff.expires_at)
+                .map(|time| time.unix_timestamp())
+                .unwrap_or(flags.now);
+            format_timestamp(flags.now.saturating_add(lifetime).min(handoff_expires)).unwrap()
         } else {
             handoff.expires_at.clone()
         };
@@ -4618,6 +6149,47 @@ mod tests {
         json_response(StatusCode::OK, &admission)
     }
 
+    struct ReleaseGates {
+        candidate_live: bool,
+        deploy_live: bool,
+    }
+
+    fn launch_gate_refusal(
+        candidate_live: bool,
+        deploy_live: bool,
+        message: &'static str,
+    ) -> Option<Response<Body>> {
+        if candidate_live && deploy_live {
+            None
+        } else {
+            Some(json_response(
+                StatusCode::FORBIDDEN,
+                &json!({"error": message}),
+            ))
+        }
+    }
+
+    fn result_gate_refusal(
+        operation: &str,
+        candidate_live: bool,
+        deploy_live: bool,
+    ) -> Option<Response<Body>> {
+        if operation == "deploy" && !candidate_live {
+            return Some(json_response(
+                StatusCode::FORBIDDEN,
+                &json!({"error": "candidate gate is no longer approved"}),
+            ));
+        }
+        // route() uses the deploy gate for both deploy and verify.
+        if matches!(operation, "deploy" | "verify") && !deploy_live {
+            return Some(json_response(
+                StatusCode::FORBIDDEN,
+                &json!({"error": "stage gate is no longer approved"}),
+            ));
+        }
+        None
+    }
+
     fn handle_consume(
         handoff: &mut FakeHandoff,
         body: &[u8],
@@ -4625,6 +6197,7 @@ mod tests {
         idempotency: &str,
         now: i64,
         drop_response: bool,
+        gates: ReleaseGates,
     ) -> Response<Body> {
         if let Some(response) = rejected_launch_key(idempotency) {
             return response;
@@ -4651,7 +6224,37 @@ mod tests {
         if admission["id"] != admission_id {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         }
+        // launch.go checks the gates after the admission is loaded and after
+        // an exact consume replay has returned. The text is "no longer".
+        if let Some(response) = launch_gate_refusal(
+            gates.candidate_live,
+            gates.deploy_live,
+            "stage gate is no longer approved",
+        ) {
+            return response;
+        }
         if handoff.consumed {
+            return json_response(StatusCode::CONFLICT, &json!({}));
+        }
+        // Whole seconds. Real Aeon compares `expires_at > now()` at full
+        // time.Time precision. A fraction inside this second can still be valid.
+        let admission_expires = admission["expires_at"]
+            .as_str()
+            .and_then(|stamp| parse_timestamp(stamp).ok())
+            .map(|time| time.unix_timestamp())
+            .unwrap_or(0);
+        let handoff_expires = parse_timestamp(&handoff.expires_at)
+            .map(|time| time.unix_timestamp())
+            .unwrap_or(0);
+        let fresh = handoff
+            .evidence
+            .values()
+            .any(|evidence| satisfying_readiness(&evidence.body, now).is_some());
+        if admission_expires <= now
+            || handoff_expires <= now
+            || !matches!(handoff.state.as_str(), "requested" | "active")
+            || !fresh
+        {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
         let consumed_at = format_timestamp(now).unwrap();
@@ -4675,6 +6278,7 @@ mod tests {
         if inner.reject_result {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
+        // FakeAeon only. Real Aeon does not change the stored seal on 409.
         if inner.bump_seal_on_result {
             inner.bump_seal_on_result = false;
             if inner.arm_lineage_drift {
@@ -4688,6 +6292,8 @@ mod tests {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
         let now = inner.now;
+        let candidate_gate_live = inner.journey_candidate_gate_live;
+        let deploy_gate_live = inner.journey_deploy_gate_live;
         let drop_result = inner.drop_accepted_result;
         inner.drop_accepted_result = false;
         let Some(handoff) = inner.handoffs.get_mut(id) else {
@@ -4704,20 +6310,19 @@ mod tests {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
         };
         let blocker = value["blocker_code"].as_str();
-        let failed_blocker = matches!(
-            blocker,
-            Some(
-                "dependency_pending"
-                    | "dependency_failed"
-                    | "reporter_stale"
-                    | "external_waiting"
-                    | "policy_refused"
-            )
-        );
+        let failed_blocker = blocker.is_some_and(|code| AEON_BLOCKER_CODES.contains(&code));
         if (value["outcome"] == "failed" && !failed_blocker)
             || (value["outcome"] == "succeeded" && blocker.is_some())
         {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
+        }
+        // Whole seconds. Real Aeon uses time.Now().After(expires_at), so a
+        // fraction inside this second is already stale.
+        let expires_at = parse_timestamp(&handoff.expires_at)
+            .map(|time| time.unix_timestamp())
+            .unwrap_or(0);
+        if expires_at < now {
+            return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
         }
         let last = handoff.evidence.keys().max().copied();
         if value["prerequisite_seal_sha256"].as_str()
@@ -4726,6 +6331,13 @@ mod tests {
             || value["terminal_sequence"].as_i64() != last
         {
             return json_response(StatusCode::CONFLICT, &json!({}));
+        }
+        // report.go checks the candidate gate for a deploy result, then the
+        // stage gate from route(). Exact result replay has already returned.
+        if let Some(response) =
+            result_gate_refusal(&handoff.operation, candidate_gate_live, deploy_gate_live)
+        {
+            return response;
         }
         let mut response = json!({
             "outcome": value["outcome"],
@@ -4759,7 +6371,52 @@ mod tests {
         principal: &str,
         idempotency: &str,
     ) -> Response<Body> {
+        if method == "GET" && path == "/api/me" {
+            return json_response(
+                StatusCode::OK,
+                &json!({
+                    "principal": {
+                        "id": LAUNCH_PRINCIPAL,
+                        "tenant_id": "55555555-5555-4555-8555-555555555555",
+                        "kind": "agent",
+                        "name": "pharos-delivery",
+                        "roles": []
+                    },
+                    "tenant": {
+                        "id": "55555555-5555-4555-8555-555555555555",
+                        "slug": "lab",
+                        "name": "lab"
+                    },
+                    "identity": null
+                }),
+            );
+        }
         let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        if method == "GET"
+            && parts.len() == 4
+            && parts[0] == "api"
+            && parts[1] == "projects"
+            && parts[3] == "journey"
+        {
+            return json_response(
+                StatusCode::OK,
+                &json!({
+                    "project_node_id": parts[2],
+                    "project_key": inner.journey_project_key,
+                    "node_key": inner.journey_node_key,
+                    "tenant_slug": inner.journey_tenant_slug,
+                    "stages": [{
+                        "key": "build",
+                        "state": "done",
+                        "gate_live": inner.journey_candidate_gate_live,
+                    }, {
+                        "key": "deploy",
+                        "state": "current",
+                        "gate_live": inner.journey_deploy_gate_live,
+                    }],
+                }),
+            );
+        }
         if parts.len() < 3 || parts[0] != "api" || parts[1] != "stage-handoffs" {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         }
@@ -4782,11 +6439,13 @@ mod tests {
         let now = inner.now;
         let corrupt = inner.corrupt_binding;
         let expire = inner.expire_admission;
-        let approved = inner.approved_digest.clone();
+        let admission_lifetime_secs = inner.admission_lifetime_secs;
         let drop_admit =
             matches!(route, ("POST", Some("launch"), Some("admit"))) && inner.drop_accepted_admit;
         let drop_consume = matches!(route, ("POST", Some("launch"), Some("consume")))
             && inner.drop_accepted_consume;
+        let candidate_gate_live = inner.journey_candidate_gate_live;
+        let deploy_gate_live = inner.journey_deploy_gate_live;
         if drop_admit {
             inner.drop_accepted_admit = false;
         }
@@ -4804,16 +6463,27 @@ mod tests {
                     now,
                     corrupt,
                     expire,
-                    approved,
+                    admission_lifetime_secs,
                     principal,
                     idempotency,
                     drop_response: drop_admit,
+                    candidate_gate_live,
+                    deploy_gate_live,
                 };
                 handle_admit(&flags, handoff, body)
             }
-            ("POST", Some("launch"), Some("consume")) => {
-                handle_consume(handoff, body, principal, idempotency, now, drop_consume)
-            }
+            ("POST", Some("launch"), Some("consume")) => handle_consume(
+                handoff,
+                body,
+                principal,
+                idempotency,
+                now,
+                drop_consume,
+                ReleaseGates {
+                    candidate_live: candidate_gate_live,
+                    deploy_live: deploy_gate_live,
+                },
+            ),
             _ => json_response(StatusCode::NOT_FOUND, &json!({})),
         }
     }
@@ -4829,10 +6499,12 @@ mod tests {
         now: i64,
         corrupt: bool,
         expire: bool,
-        approved: String,
+        admission_lifetime_secs: Option<i64>,
         principal: &'a str,
         idempotency: &'a str,
         drop_response: bool,
+        candidate_gate_live: bool,
+        deploy_gate_live: bool,
     }
 
     fn canonical_body_digest(body: &[u8]) -> Result<String, ()> {
@@ -4990,6 +6662,11 @@ mod tests {
                 hook();
             }
         }
+        if method == "POST" && path.ends_with("/launch/consume") {
+            if let Some(hook) = fake.consume_hook.lock().expect("consume hook").take() {
+                hook();
+            }
+        }
         let mut inner = fake.inner.lock().expect("fake lock");
         let idempotency = header_text(&headers, "idempotency-key");
         dispatch(
@@ -5052,6 +6729,7 @@ mod tests {
             aeon,
             hosts,
             host_actions: actions,
+            principal_id: Mutex::new(None),
         }
     }
 
@@ -5069,16 +6747,20 @@ mod tests {
     }
 
     fn review_job(store: &HostActionStore, job_id: &str, at: i64) {
+        review_job_for(store, "hsb8", job_id, at);
+    }
+
+    fn review_job_for(store: &HostActionStore, host: &str, job_id: &str, at: i64) {
         let review = store
-            .claim("hsb8", at)
+            .claim(host, at)
             .expect("claim review")
             .expect("review lease");
         store
             .record_agent_result(
                 job_id,
-                "hsb8",
+                host,
                 AgentActionResultRequest {
-                    host: "hsb8".to_string(),
+                    host: host.to_string(),
                     phase: review.phase,
                     outcome: AgentActionOutcome::Succeeded,
                     plan: Some(ready_plan()),
@@ -5112,17 +6794,21 @@ mod tests {
     }
 
     fn finish_apply(store: &HostActionStore, job_id: &str, at: i64) {
+        finish_apply_for(store, "hsb8", job_id, at);
+    }
+
+    fn finish_apply_for(store: &HostActionStore, host: &str, job_id: &str, at: i64) {
         let apply = store
-            .claim("hsb8", at)
+            .claim(host, at)
             .expect("claim apply")
             .expect("apply lease");
         assert_eq!(apply.phase, AgentActionPhase::Apply);
         store
             .record_agent_result(
                 job_id,
-                "hsb8",
+                host,
                 AgentActionResultRequest {
-                    host: "hsb8".to_string(),
+                    host: host.to_string(),
                     phase: apply.phase,
                     outcome: AgentActionOutcome::Succeeded,
                     plan: None,
@@ -5142,10 +6828,18 @@ mod tests {
     }
 
     fn measured(artifact: &ArtifactEvidence, observed_at: i64) -> DeployedArtifactEvidence {
+        measured_for("production-eu1", artifact, observed_at)
+    }
+
+    fn measured_for(
+        environment: &str,
+        artifact: &ArtifactEvidence,
+        observed_at: i64,
+    ) -> DeployedArtifactEvidence {
         DeployedArtifactEvidence {
             schema: DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
             version: DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
-            environment: "production-eu1".to_string(),
+            environment: environment.to_string(),
             version_scheme: artifact.version_scheme,
             artifact_version: artifact.version.clone(),
             release_channel: artifact.release_channel.clone(),
@@ -5164,6 +6858,24 @@ mod tests {
 
     fn record_beacon(store: &Store, observed_at: i64, artifact: &ArtifactEvidence) {
         record_host(store, observed_at, artifact, None);
+    }
+
+    fn record_beacon_for(
+        store: &Store,
+        host: &str,
+        environment: &str,
+        observed_at: i64,
+        artifact: &ArtifactEvidence,
+        backup_success_at: Option<i64>,
+    ) {
+        record_named_host(
+            store,
+            host,
+            environment,
+            observed_at,
+            artifact,
+            backup_success_at,
+        );
     }
 
     fn record_backup(store: &Store, success_at: i64) {
@@ -5200,12 +6912,30 @@ mod tests {
         artifact: &ArtifactEvidence,
         backup_success_at: Option<i64>,
     ) {
+        record_named_host(
+            store,
+            "hsb8",
+            "production-eu1",
+            observed_at,
+            artifact,
+            backup_success_at,
+        );
+    }
+
+    fn record_named_host(
+        store: &Store,
+        host: &str,
+        environment: &str,
+        observed_at: i64,
+        artifact: &ArtifactEvidence,
+        backup_success_at: Option<i64>,
+    ) {
         store
             .record(
                 HostReport {
                     schema: HOST_REPORT_SCHEMA.to_string(),
                     version: HOST_REPORT_VERSION,
-                    name: "hsb8".to_string(),
+                    name: host.to_string(),
                     role: "server".to_string(),
                     is_nix: true,
                     heartbeat_interval_secs: 60,
@@ -5231,7 +6961,7 @@ mod tests {
                     inbound_rtt_ms: None,
                     location: None,
                     preferences: Default::default(),
-                    deployed_artifact: Some(measured(artifact, observed_at)),
+                    deployed_artifact: Some(measured_for(environment, artifact, observed_at)),
                 },
                 observed_at,
             )
@@ -5278,6 +7008,32 @@ mod tests {
 
     fn fake_now(fake: &FakeAeon) -> i64 {
         fake.update(|inner| inner.now)
+    }
+
+    async fn advance_delegated_job_to_succeeded(
+        adapter: &AeonDeliveryAdapter,
+        actions: &HostActionStore,
+        hosts: &Store,
+        intent: &DeliveryIntent,
+    ) -> String {
+        adapter.process_intent(intent).await.unwrap();
+        let job_id = actions.list()[0].id.clone();
+        review_job(actions, &job_id, actions.get(&job_id).unwrap().created_at);
+        record_backup(hosts, now_unix());
+        for _ in 0..8 {
+            adapter.process_intent(intent).await.unwrap();
+            if actions.get(&job_id).unwrap().state == HostActionState::QueuedApply {
+                break;
+            }
+        }
+        assert_eq!(
+            actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        let at = now_unix().max(actions.get(&job_id).unwrap().updated_at);
+        finish_apply(actions, &job_id, at);
+        record_beacon(hosts, at + 1, &intent.artifact);
+        job_id
     }
 
     fn completed_update(store: &HostActionStore, now: i64) -> String {
@@ -5349,23 +7105,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegated_deploy_requires_launch_readiness_on_the_ceiling() {
-        let fixture = harness(true).await;
-        fixture.fake.update(|inner| {
+    async fn delegated_deploy_allows_launch_readiness_without_that_ceiling() {
+        let allowed = harness(true).await;
+        allowed.fake.update(|inner| {
             inner
                 .handoffs
                 .get_mut(DEPLOY_HANDOFF)
                 .unwrap()
                 .evidence_ceiling = vec!["deployment".to_string()];
         });
-        let error = fixture
+        allowed
             .adapter
-            .process_intent(&fixture.intent)
+            .process_intent(&allowed.intent)
+            .await
+            .unwrap();
+        assert_eq!(allowed.actions.list().len(), 1);
+        allowed.server.abort();
+
+        let refused = harness(true).await;
+        refused.fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .evidence_ceiling = vec!["launch_readiness".to_string()];
+        });
+        let error = refused
+            .adapter
+            .process_intent(&refused.intent)
             .await
             .unwrap_err();
         assert!(matches!(error, AdapterError::Contract));
-        assert!(fixture.actions.list().is_empty());
-        fixture.server.abort();
+        assert!(refused.actions.list().is_empty());
+        refused.server.abort();
     }
 
     #[tokio::test]
@@ -5746,17 +7518,24 @@ mod tests {
     impl FrozenNow {
         fn at(now: i64) -> Self {
             TEST_NOW.with(|cell| cell.set(Some(now)));
+            TEST_NOW_EXTRA_NANOS.with(|cell| cell.set(0));
             Self
         }
 
         fn set(now: i64) {
             TEST_NOW.with(|cell| cell.set(Some(now)));
+            TEST_NOW_EXTRA_NANOS.with(|cell| cell.set(0));
+        }
+
+        fn set_extra_nanos(extra: u32) {
+            TEST_NOW_EXTRA_NANOS.with(|cell| cell.set(extra));
         }
     }
 
     impl Drop for FrozenNow {
         fn drop(&mut self) {
             TEST_NOW.with(|cell| cell.set(None));
+            TEST_NOW_EXTRA_NANOS.with(|cell| cell.set(0));
         }
     }
 
@@ -5819,6 +7598,15 @@ mod tests {
 
         let stale_now = now + 700;
         let stale = FakeAeon::new(stale_now);
+        // 1000s is past the 900s freshness window. The handoff has to exist
+        // by the observation, or Aeon rejects it as predating the handoff.
+        stale.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .expect("deploy handoff")
+                .created_at = stale_now - 1000;
+        });
         let (origin, server) = serve(stale).await;
         let client = reqwest::Client::new();
         let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
@@ -6029,6 +7817,7 @@ mod tests {
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
         let job_id = completed_update(&actions, now);
+        actions.set_requested_by_for_test(&job_id, ACTOR);
         let hosts = Arc::new(Store::new(None).unwrap());
         let mut intent = deploy_intent(false);
         intent.update_restart_job_id = Some(job_id);
@@ -6049,6 +7838,185 @@ mod tests {
             .map(|capture| serde_json::from_slice(&capture.body).unwrap())
             .unwrap();
         assert_eq!(stale["blocker_code"], "reporter_stale");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn evidence_predating_the_handoff_is_refused() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake).await;
+        let early =
+            post_deployment_evidence(&origin, &full_deployment(1, "failed", now - 61)).await;
+        assert_eq!(early.0, StatusCode::CONFLICT);
+        assert_eq!(early.1["error"], "evidence predates handoff");
+        let boundary =
+            post_deployment_evidence(&origin, &full_deployment(1, "failed", now - 60)).await;
+        assert_eq!(boundary.0, StatusCode::CREATED);
+        server.abort();
+    }
+
+    async fn post_deployment_evidence(origin: &Url, body: &Value) -> (StatusCode, Value) {
+        let response = reqwest::Client::new()
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+                    .unwrap(),
+            )
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
+            )
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(serde_json::to_vec(body).unwrap())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let payload = response.json::<Value>().await.unwrap_or(Value::Null);
+        (status, payload)
+    }
+
+    fn test_adapter_config(intents: Vec<DeliveryIntent>) -> AdapterConfig {
+        AdapterConfig {
+            aeon_origin: Url::parse("https://aeon.example.test").unwrap(),
+            api_key_file: PathBuf::from("api-key"),
+            aeon_ca_certificates: Vec::new(),
+            poll_interval: Duration::from_secs(5),
+            verification_freshness_secs: 300,
+            intents,
+        }
+    }
+
+    #[test]
+    fn startup_refuses_a_configured_job_the_adapter_does_not_own() {
+        let actions = HostActionStore::new(None);
+        let operator = actions
+            .create_update_review("hsb8", "operator", 1_700_000_000)
+            .unwrap();
+        let mut intent = deploy_intent(true);
+        intent.update_restart_job_id = Some(operator.id.clone());
+        let error = refuse_unowned_configured_jobs(&test_adapter_config(vec![intent]), &actions)
+            .unwrap_err();
+        assert!(error.contains(operator.id.as_str()));
+        assert!(error.contains("not aeon-delivery"));
+        assert!(error.contains("operator"));
+
+        let mut missing = deploy_intent(true);
+        missing.update_restart_job_id = Some("missingjob".to_string());
+        let error = refuse_unowned_configured_jobs(&test_adapter_config(vec![missing]), &actions)
+            .unwrap_err();
+        assert!(error.contains("not in the host action store"));
+
+        let owned_store = HostActionStore::new(None);
+        let owned = owned_store
+            .create_update_review("hsb8", ACTOR, 1_700_000_000)
+            .unwrap();
+        let mut owned_intent = deploy_intent(true);
+        owned_intent.update_restart_job_id = Some(owned.id);
+        assert!(refuse_unowned_configured_jobs(
+            &test_adapter_config(vec![owned_intent]),
+            &owned_store
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn operator_owned_configured_job_never_binds() {
+        let fixture = harness(true).await;
+        let job = fixture
+            .actions
+            .create_update_review("hsb8", "operator", now_unix())
+            .unwrap();
+        let mut intent = fixture.intent.clone();
+        intent.update_restart_job_id = Some(job.id.clone());
+        let blocked = fixture.adapter.process_intent(&intent).await.unwrap_err();
+        assert!(matches!(
+            blocked,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED)
+        ));
+        assert!(fixture.adapter.journal.operation(DEPLOY_HANDOFF).is_none());
+        assert_eq!(readiness_post_count(&fixture.fake), 0);
+        assert_eq!(post_count(&fixture.fake, "/launch/admit"), 0);
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), 0);
+        let block = fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .unwrap();
+        assert_eq!(block.reason, LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED);
+        assert!(block.terminal);
+        let stored = fixture.actions.get(&job.id).unwrap();
+        assert_eq!(stored.requested_by, "operator");
+        assert!(stored.confirmed_at.is_none());
+        assert_eq!(stored.state, HostActionState::QueuedReview);
+        let again = fixture.adapter.process_intent(&intent).await.unwrap_err();
+        assert!(matches!(
+            again,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED)
+        ));
+        assert!(fixture.adapter.journal.operation(DEPLOY_HANDOFF).is_none());
+        assert_eq!(readiness_post_count(&fixture.fake), 0);
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_job_that_predates_the_handoff_posts_evidence_at_now() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let directory = TestDir::new("predate-evidence");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let job = actions
+            .create_update_review("hsb8", ACTOR, now - 10_000)
+            .expect("old review");
+        fail_review(&actions, &job.id, now - 9_999);
+        let failed = actions.get(&job.id).unwrap();
+        assert_eq!(failed.state, HostActionState::Failed);
+        assert!(failed.updated_at + 60 < now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let mut intent = deploy_intent(false);
+        intent.update_restart_job_id = Some(job.id);
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![intent.clone()]),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            hosts,
+            actions,
+        );
+        adapter.process_intent(&intent).await.unwrap();
+        let evidence: Value = posts(&fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/evidence"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(evidence["kind"], "deployment");
+        assert_eq!(evidence["outcome"], "failed");
+        assert_eq!(evidence["observed_at"], format_timestamp(now).unwrap());
+        let recorded = adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::Deployment)
+            .unwrap();
+        let journaled: Value = serde_json::from_str(&recorded.body_json).unwrap();
+        assert_eq!(journaled["observed_at"], evidence["observed_at"]);
+        assert!(recorded.receipt.is_some());
+        let result: Value = posts(&fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/result"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(result["outcome"], "failed");
+        assert_eq!(result["blocker_code"], "dependency_failed");
+        assert!(adapter
+            .journal
+            .result(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_some());
         server.abort();
     }
 
@@ -6088,22 +8056,20 @@ mod tests {
         let api = directory.path().join("api-key");
         write_private(&api, API_KEY);
         let fake = FakeAeon::new(now);
-        fake.update(|inner| inner.reject_result = true);
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
-        let job_id = completed_update(&actions, now);
         let hosts = Arc::new(Store::new(None).unwrap());
-        record_beacon(&hosts, now - 10, &artifact());
-        let mut intent = deploy_intent(false);
-        intent.update_restart_job_id = Some(job_id.clone());
+        let intent = deploy_intent(true);
         let adapter = test_adapter(
             runtime_config(origin, api, vec![intent.clone()]),
             directory
                 .path()
                 .join("hosts.json.aeon-delivery-journal.json"),
-            hosts,
+            Arc::clone(&hosts),
             Arc::clone(&actions),
         );
+        let job_id = advance_delegated_job_to_succeeded(&adapter, &actions, &hosts, &intent).await;
+        fake.update(|inner| inner.reject_result = true);
         let error = adapter.process_intent(&intent).await.unwrap_err();
         assert!(matches!(error, AdapterError::Refused(status) if status == StatusCode::CONFLICT));
         assert_eq!(
@@ -6130,25 +8096,23 @@ mod tests {
         let api = directory.path().join("api-key");
         write_private(&api, API_KEY);
         let fake = FakeAeon::new(now);
-        fake.update(|inner| {
-            inner.bump_seal_on_result = true;
-            inner.arm_lineage_drift = true;
-        });
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
-        let job_id = completed_update(&actions, now);
         let hosts = Arc::new(Store::new(None).unwrap());
-        record_beacon(&hosts, now - 10, &artifact());
-        let mut intent = deploy_intent(false);
-        intent.update_restart_job_id = Some(job_id);
+        let intent = deploy_intent(true);
         let adapter = test_adapter(
             runtime_config(origin, api, vec![intent.clone()]),
             directory
                 .path()
                 .join("hosts.json.aeon-delivery-journal.json"),
-            hosts,
-            actions,
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
         );
+        advance_delegated_job_to_succeeded(&adapter, &actions, &hosts, &intent).await;
+        fake.update(|inner| {
+            inner.bump_seal_on_result = true;
+            inner.arm_lineage_drift = true;
+        });
         let error = adapter.process_intent(&intent).await.unwrap_err();
         assert!(matches!(error, AdapterError::LocalBinding));
         assert_eq!(
@@ -6183,19 +8147,17 @@ mod tests {
         let fake = FakeAeon::new(now);
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
-        let job_id = completed_update(&actions, now);
         let hosts = Arc::new(Store::new(None).unwrap());
-        record_beacon(&hosts, now - 10, &artifact());
-        let mut intent = deploy_intent(false);
-        intent.update_restart_job_id = Some(job_id);
+        let intent = deploy_intent(true);
         let adapter = test_adapter(
             runtime_config(origin, api, vec![intent.clone(), verify_intent()]),
             directory
                 .path()
                 .join("hosts.json.aeon-delivery-journal.json"),
             Arc::clone(&hosts),
-            actions,
+            Arc::clone(&actions),
         );
+        advance_delegated_job_to_succeeded(&adapter, &actions, &hosts, &intent).await;
         adapter.process_intent(&intent).await.unwrap();
         SealedDeploy {
             fake,
@@ -6264,6 +8226,211 @@ mod tests {
                 .fake
                 .update(|inner| inner.handoffs[VERIFY_HANDOFF].predecessor_digest.clone()),
             dependency_digest(DEPLOY_HANDOFF, "deployment", receipt.terminal_sequence)
+        );
+        sealed.server.abort();
+    }
+
+    fn adapter_verify_evidence(fake: &FakeAeon) -> Vec<Value> {
+        posts(fake)
+            .into_iter()
+            .filter(|capture| {
+                capture.path.contains(VERIFY_HANDOFF)
+                    && capture.path.ends_with("/evidence")
+                    && !capture.idempotency.is_empty()
+            })
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect()
+    }
+
+    async fn post_verify_evidence(origin: &Url, body: &[u8]) -> (StatusCode, Value) {
+        let response = reqwest::Client::new()
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{VERIFY_HANDOFF}/evidence"))
+                    .unwrap(),
+            )
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
+            )
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.bytes().await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+        (status, value)
+    }
+
+    fn arm_predating_verify(sealed: &SealedDeploy, created_at: i64) {
+        arm_recorded_deploy(sealed);
+        sealed.fake.update(|inner| {
+            inner.handoffs.get_mut(VERIFY_HANDOFF).unwrap().created_at = created_at;
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_that_predates_the_handoff_waits_for_a_later_beacon() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let sealed = sealed_deploy().await;
+        arm_predating_verify(&sealed, now + 180);
+        let early = now + 30;
+        FrozenNow::set(early);
+        record_beacon(&sealed.hosts, early, &artifact());
+        let refused = sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            AdapterError::Refused(status) if status == StatusCode::CONFLICT
+        ));
+        let stopped = sealed
+            .adapter
+            .journal
+            .evidence_with_kind(VERIFY_HANDOFF, EvidenceKind::Verification)
+            .unwrap();
+        assert!(stopped.predates_stopped());
+        assert!(stopped.receipt.is_none());
+        assert_eq!(stopped.sequence, 1);
+        assert_eq!(adapter_verify_evidence(&sealed.fake).len(), 1);
+        let (status, value) = post_verify_evidence(
+            &sealed.adapter.config.aeon_origin,
+            stopped.body_json.as_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "evidence predates handoff");
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        assert_eq!(adapter_verify_evidence(&sealed.fake).len(), 1);
+
+        let later = now + 200;
+        FrozenNow::set(later);
+        record_beacon(&sealed.hosts, later, &artifact());
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        let evidence = adapter_verify_evidence(&sealed.fake);
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0]["sequence"], 1);
+        assert_eq!(evidence[1]["sequence"], 1);
+        assert_eq!(evidence[1]["outcome"], "succeeded");
+        assert_ne!(evidence[0]["observed_at"], evidence[1]["observed_at"]);
+        assert_eq!(
+            sealed
+                .adapter
+                .journal
+                .result(VERIFY_HANDOFF)
+                .unwrap()
+                .receipt
+                .unwrap()
+                .outcome,
+            ResultOutcome::Succeeded
+        );
+        sealed.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_that_predates_the_handoff_reports_stale_when_the_window_closes() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let sealed = sealed_deploy().await;
+        arm_predating_verify(&sealed, now + 180);
+        let early = now + 30;
+        FrozenNow::set(early);
+        record_beacon(&sealed.hosts, early, &artifact());
+        assert!(sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .is_err());
+        FrozenNow::set(now + 1_000);
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        let evidence = adapter_verify_evidence(&sealed.fake);
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[1]["sequence"], 1);
+        assert_eq!(evidence[1]["outcome"], "failed");
+        assert_ne!(evidence[0]["observed_at"], evidence[1]["observed_at"]);
+        let result = sealed
+            .adapter
+            .journal
+            .result(VERIFY_HANDOFF)
+            .unwrap()
+            .receipt
+            .unwrap();
+        assert_eq!(result.outcome, ResultOutcome::Failed);
+        let posted: Vec<Value> = posts(&sealed.fake)
+            .into_iter()
+            .filter(|capture| {
+                capture.path.contains(VERIFY_HANDOFF) && capture.path.ends_with("/result")
+            })
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0]["outcome"], "failed");
+        assert_eq!(posted[0]["blocker_code"], "reporter_stale");
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        assert_eq!(adapter_verify_evidence(&sealed.fake).len(), 2);
+        sealed.server.abort();
+    }
+
+    #[tokio::test]
+    async fn verify_result_rotated_seal_retry_succeeds() {
+        let sealed = sealed_deploy().await;
+        let receipt = sealed
+            .adapter
+            .journal
+            .result(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .unwrap();
+        let seal = dependency_digest(DEPLOY_HANDOFF, "deployment", receipt.terminal_sequence);
+        arm_verify_seal(&sealed.fake, &seal, 11);
+        record_beacon(&sealed.hosts, now_unix() + 1, &artifact());
+        sealed.fake.update(|inner| inner.bump_seal_on_result = true);
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        let results: Vec<Value> = posts(&sealed.fake)
+            .into_iter()
+            .filter(|capture| {
+                capture.path.contains(VERIFY_HANDOFF) && capture.path.ends_with("/result")
+            })
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["prerequisite_seal_sha256"], seal);
+        assert_eq!(results[1]["prerequisite_seal_sha256"], hex_chars('f'));
+        assert_eq!(
+            sealed
+                .adapter
+                .journal
+                .result(VERIFY_HANDOFF)
+                .unwrap()
+                .receipt
+                .unwrap()
+                .outcome,
+            ResultOutcome::Succeeded
         );
         sealed.server.abort();
     }
@@ -6382,7 +8549,9 @@ mod tests {
             next.id = NEW_HANDOFF.to_string();
             next.attempt = 2;
             next.plan_digest = hex_chars('e');
-            next.predecessor_digest = hex_chars('a');
+            // Aeon sets predecessor_digest to the dependency seal, not the
+            // previous attempt's plan digest.
+            next.predecessor_digest = hex_chars('f');
             inner.handoffs.insert(NEW_HANDOFF.to_string(), next);
         });
         let (origin, server) = serve(fake).await;
@@ -6433,6 +8602,18 @@ mod tests {
             actions.get(&retried).unwrap().retry_of.as_deref(),
             Some(lineage_job.as_str())
         );
+        assert_ne!(
+            adapter
+                .journal
+                .operation(DEPLOY_HANDOFF)
+                .unwrap()
+                .plan_digest,
+            adapter
+                .journal
+                .operation(NEW_HANDOFF)
+                .unwrap()
+                .predecessor_digest
+        );
         assert_eq!(
             adapter
                 .journal
@@ -6443,6 +8624,93 @@ mod tests {
         );
         assert_ne!(other_job, lineage_job);
         server.abort();
+    }
+
+    async fn attempt_two_after(
+        label: &str,
+        settle: impl FnOnce(&HostActionStore, &str),
+    ) -> (Arc<HostActionStore>, String, String) {
+        let now = now_unix();
+        let directory = TestDir::new(label);
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now);
+        fake.update(|inner| {
+            let mut next = FakeHandoff::deploy(now);
+            next.id = NEW_HANDOFF.to_string();
+            next.attempt = 2;
+            next.plan_digest = hex_chars('e');
+            next.predecessor_digest = hex_chars('f');
+            inner.handoffs.insert(NEW_HANDOFF.to_string(), next);
+        });
+        let (origin, server) = serve(fake).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let first = deploy_intent(false);
+        let mut next = deploy_intent(false);
+        next.handoff_id = NEW_HANDOFF.to_string();
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![first.clone(), next.clone()]),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            hosts,
+            Arc::clone(&actions),
+        );
+        adapter.process_intent(&first).await.unwrap();
+        let predecessor = adapter.journal.operation(DEPLOY_HANDOFF).unwrap().job_id;
+        settle(&actions, &predecessor);
+        adapter.process_intent(&next).await.unwrap();
+        let retried = adapter.journal.operation(NEW_HANDOFF).unwrap().job_id;
+        adapter.process_intent(&next).await.unwrap();
+        server.abort();
+        (actions, predecessor, retried)
+    }
+
+    #[tokio::test]
+    async fn cancelled_predecessor_starts_a_fresh_review() {
+        let (actions, predecessor, retried) =
+            attempt_two_after("retry-cancelled", |actions, id| {
+                let at = now_unix().max(actions.get(id).unwrap().updated_at);
+                actions
+                    .cancel_update_review(id, "hsb8", "operator", at)
+                    .expect("cancel predecessor");
+            })
+            .await;
+        assert_eq!(
+            actions.get(&predecessor).unwrap().state,
+            HostActionState::Cancelled
+        );
+        let job = actions.get(&retried).unwrap();
+        assert_eq!(job.state, HostActionState::QueuedReview);
+        assert!(job.retry_of.is_none());
+        assert_ne!(retried, predecessor);
+        assert_eq!(job.requested_by, ACTOR);
+    }
+
+    #[tokio::test]
+    async fn succeeded_predecessor_starts_a_fresh_review() {
+        let (actions, predecessor, retried) =
+            attempt_two_after("retry-succeeded", |actions, id| {
+                let created = actions.get(id).unwrap().created_at;
+                review_job(actions, id, created);
+                let reviewed = actions.get(id).unwrap().updated_at;
+                actions
+                    .confirm_update(id, "hsb8", "operator", reviewed)
+                    .expect("confirm predecessor");
+                let confirmed = actions.get(id).unwrap().updated_at;
+                finish_apply(actions, id, confirmed);
+            })
+            .await;
+        assert_eq!(
+            actions.get(&predecessor).unwrap().state,
+            HostActionState::Succeeded
+        );
+        let job = actions.get(&retried).unwrap();
+        assert_eq!(job.state, HostActionState::QueuedReview);
+        assert!(job.retry_of.is_none());
+        assert_ne!(retried, predecessor);
+        assert_eq!(job.requested_by, ACTOR);
     }
 
     #[tokio::test]
@@ -6565,24 +8833,106 @@ mod tests {
             "authority_epoch": 3
         }))
         .await;
-        assert_eq!(omitted.status(), StatusCode::CREATED);
-        let omitted: Value = omitted.json().await.unwrap();
-        assert_eq!(omitted["backup_observed_at"], "0001-01-01T00:00:00Z");
-        let offset = format_timestamp(now).unwrap().replace('Z', "+00:00");
-        let present = send(json!({
-            "sequence": 2,
-            "kind": "deployment",
-            "outcome": "succeeded",
+        assert_eq!(omitted.status(), StatusCode::BAD_REQUEST);
+        let unconsumed = send(full_deployment(1, "succeeded", now)).await;
+        assert_eq!(unconsumed.status(), StatusCode::CONFLICT);
+        server.abort();
+
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let readiness = json!({
+            "sequence": 1,
+            "kind": "launch_readiness",
+            "outcome": "satisfied",
             "observed_at": format_timestamp(now).unwrap(),
             "authority_epoch": 3,
-            "backup_observed_at": offset
-        }))
-        .await;
-        assert_eq!(present.status(), StatusCode::CREATED);
-        let present: Value = present.json().await.unwrap();
+            "reviewed_plan_digest": "ab".repeat(32),
+            "host": "hsb8",
+            "all_host_eval_passed": true,
+            "target_build_passed": true,
+            "backup_ready": true,
+            "backup_observed_at": format_timestamp(now).unwrap(),
+            "running_kernel": "6.18.1",
+            "expected_kernel": "6.18.2"
+        });
+        let post = |path: String, body: Value, key: Option<&str>| {
+            let client = client.clone();
+            let origin = origin.clone();
+            let bearer = bearer.clone();
+            let key = key.map(str::to_string);
+            async move {
+                let mut request = client
+                    .post(origin.join(&path).unwrap())
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA);
+                if let Some(key) = key {
+                    request = request.header("idempotency-key", key);
+                }
+                request
+                    .body(serde_json::to_vec(&body).unwrap())
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
         assert_eq!(
-            present["backup_observed_at"],
-            format_timestamp(now).unwrap()
+            post(
+                format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"),
+                readiness.clone(),
+                None
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let mut changed = readiness.clone();
+        changed["sequence"] = json!(2);
+        changed["reviewed_plan_digest"] = json!("cd".repeat(32));
+        assert_eq!(
+            post(
+                format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"),
+                changed,
+                None
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        let mut wrong = held_launch_artifact();
+        wrong["digest_sha256"] = json!("2".repeat(64));
+        assert_eq!(
+            post(
+                format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"),
+                wrong,
+                Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post(
+                format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"),
+                held_launch_artifact(),
+                Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+            )
+            .await,
+            StatusCode::OK
+        );
+        fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.consumed = true;
+            handoff.consumed_at = Some(format_timestamp(now).unwrap());
+        });
+        assert_eq!(
+            post(
+                format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"),
+                held_launch_artifact(),
+                Some("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+            )
+            .await,
+            StatusCode::CONFLICT
         );
         server.abort();
     }
@@ -6591,19 +8941,15 @@ mod tests {
     async fn evidence_replay_is_idempotent_and_divergent_replay_conflicts() {
         let now = now_unix();
         let fake = FakeAeon::new(now);
+        fake.update(|inner| {
+            inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap().consumed = true;
+        });
         let (origin, server) = serve(fake.clone()).await;
         let client = reqwest::Client::new();
         let url = origin
             .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
             .unwrap();
-        let body = serde_json::to_vec(&json!({
-            "sequence": 1,
-            "kind": "deployment",
-            "outcome": "succeeded",
-            "observed_at": format_timestamp(now).unwrap(),
-            "authority_epoch": 3
-        }))
-        .unwrap();
+        let body = serde_json::to_vec(&full_deployment(1, "succeeded", now)).unwrap();
         let send = |body: Vec<u8>| {
             let client = client.clone();
             let url = url.clone();
@@ -6678,6 +9024,9 @@ mod tests {
     async fn evidence_sequence_must_be_contiguous_and_replay_reuses_it() {
         let now = now_unix();
         let fake = FakeAeon::new(now);
+        fake.update(|inner| {
+            inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap().consumed = true;
+        });
         let (origin, server) = serve(fake).await;
         let client = reqwest::Client::new();
         let url = origin
@@ -6693,16 +9042,7 @@ mod tests {
                     .post(url)
                     .header(AUTHORIZATION, bearer)
                     .header(CONTENT_TYPE, JSON_MEDIA)
-                    .body(
-                        serde_json::to_vec(&json!({
-                            "sequence": sequence,
-                            "kind": "deployment",
-                            "outcome": "succeeded",
-                            "observed_at": format_timestamp(now).unwrap(),
-                            "authority_epoch": 3
-                        }))
-                        .unwrap(),
-                    )
+                    .body(serde_json::to_vec(&full_deployment(sequence, "succeeded", now)).unwrap())
                     .send()
                     .await
                     .unwrap()
@@ -7009,6 +9349,8 @@ mod tests {
             .is_err());
         fixture.fake.update(|inner| {
             let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.consumed_by_principal_id =
+                Some("88888888-8888-4888-8888-888888888888".to_string());
             for call in handoff.launch_calls.values_mut() {
                 if call.action == "consume" {
                     call.body_digest = "0".repeat(64);
@@ -7156,6 +9498,8 @@ mod tests {
             .is_err());
         unresolved.fake.update(|inner| {
             let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.consumed_by_principal_id =
+                Some("88888888-8888-4888-8888-888888888888".to_string());
             for call in handoff.launch_calls.values_mut() {
                 if call.action == "consume" {
                     call.body_digest = "0".repeat(64);
@@ -7165,6 +9509,10 @@ mod tests {
         let document = fetch_handoff(&unresolved.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
         assert!(document["admission"]["consumed_at"].is_string());
         assert_eq!(document["admission"]["admission_id"], ADMISSION_ID);
+        assert_ne!(
+            document["admission"]["consumed_by_principal_id"],
+            LAUNCH_PRINCIPAL
+        );
         let replay = unresolved.adapter.process_intent(&unresolved.intent).await;
         assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
         let launch = unresolved.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
@@ -7241,12 +9589,620 @@ mod tests {
             }));
         });
         let replay = fixture.adapter.process_intent(&fixture.intent).await;
-        assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
+        assert!(matches!(
+            replay,
+            Err(AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED))
+        ));
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(launch.consume_unresolved.is_none());
+        let receipt = launch.receipt.as_ref().unwrap();
+        assert!(receipt.reconciled_from_get);
+        assert!(receipt.consumed);
+        assert_eq!(receipt.admission_id, ADMISSION_ID);
+        let rendered = serde_json::to_string(&launch).unwrap();
+        assert!(!rendered.contains(LAUNCH_PRINCIPAL));
+        assert!(!rendered.contains("AEON_API_KEY_SENTINEL"));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        fixture.server.abort();
+    }
+
+    async fn closed_authority_is_not_confirmed(edit: impl FnOnce(&mut FakeHandoff)) {
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            edit(handoff);
+        });
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "dependency_failed");
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        );
+        let later = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            later,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        ));
+        assert_eq!(result_posts(&fixture.fake).len(), 1);
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn recorded_result_does_not_queue_a_still_requested_handoff() {
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.state = "requested".to_string();
+            handoff.result = Some(json!({
+                "outcome": "failed",
+                "terminal_sequence": 1,
+                "authority_epoch": handoff.authority_epoch,
+                "prerequisite_seal_sha256": handoff.prerequisite_seal_sha256.clone(),
+                "blocker_code": "dependency_failed",
+                "handoff_id": handoff.id.clone(),
+                "completed_at": handoff.expires_at.clone(),
+            }));
+        });
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        assert!(fixture.adapter.journal.result(DEPLOY_HANDOFF).is_none());
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_handoff_does_not_queue_a_recovered_job() {
+        closed_authority_is_not_confirmed(|handoff| {
+            handoff.state = "failed".to_string();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn moved_authority_epoch_does_not_queue_a_recovered_job() {
+        closed_authority_is_not_confirmed(|handoff| {
+            handoff.authority_epoch = 4;
+        })
+        .await;
+    }
+
+    fn expected_blocker_for_reason(reason: &str) -> &'static str {
+        match reason {
+            LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING
+            | LAUNCH_BLOCK_BACKUP_NOT_READY
+            | LAUNCH_BLOCK_READINESS_FLAG_FALSE => "external_waiting",
+            LAUNCH_BLOCK_READINESS_PLAN_CHANGED
+            | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
+            | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
+            | LAUNCH_BLOCK_LAUNCH_NOT_OWNED
+            | LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED
+            | LAUNCH_BLOCK_ADMISSION_EXPIRED
+            | LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED => "policy_refused",
+            LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
+            | LAUNCH_BLOCK_CONSUME_ABANDONED
+            | LAUNCH_BLOCK_AUTHORITY_CLOSED => "dependency_failed",
+            _ => panic!("reason {reason} has no Aeon blocker code"),
+        }
+    }
+
+    #[test]
+    fn stage_gate_403_is_not_a_credential_error() {
+        for body in [
+            r#"{"error":"stage gate is not approved"}"#,
+            r#"{"error":"stage gate is no longer approved"}"#,
+            r#"{"error":"candidate gate is no longer approved"}"#,
+        ] {
+            assert!(matches!(
+                refusal_from_aeon(StatusCode::FORBIDDEN, body.as_bytes()),
+                AdapterError::LaunchBlocked(LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED)
+            ));
+        }
+        for body in [
+            r#"{"error":"live agent grant required"}"#,
+            r#"{"error":"Pharos is disabled"}"#,
+            r#"{"error":"stage gate is not approved yet"}"#,
+            r#"{"error":"not approved: stage gate is not approved"}"#,
+            "{}",
+        ] {
+            assert!(matches!(
+                refusal_from_aeon(StatusCode::FORBIDDEN, body.as_bytes()),
+                AdapterError::Credential
+            ));
+        }
+        assert!(matches!(
+            refusal_from_aeon(
+                StatusCode::UNAUTHORIZED,
+                br#"{"error":"stage gate is not approved"}"#
+            ),
+            AdapterError::Credential
+        ));
+    }
+
+    #[tokio::test]
+    async fn forbidden_handoff_read_without_a_gate_reason_stays_a_credential_error() {
+        let fixture = harness(true).await;
+        fixture
+            .fake
+            .update(|inner| inner.get_status = Some(StatusCode::FORBIDDEN));
+        let error = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::Credential));
+        assert!(fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .is_none());
+        assert!(posts(&fixture.fake).is_empty());
+        fixture.server.abort();
+    }
+
+    #[test]
+    fn every_launch_block_reason_maps_to_an_accepted_blocker_code() {
+        assert_eq!(
+            AEON_BLOCKER_CODES,
+            [
+                "dependency_pending",
+                "dependency_failed",
+                "reporter_stale",
+                "external_waiting",
+                "policy_refused",
+            ]
+        );
+        assert!(!LAUNCH_BLOCK_REASONS.is_empty());
+        let mut seen = BTreeSet::new();
+        for reason in LAUNCH_BLOCK_REASONS {
+            assert_eq!(launch_block_reason(reason), Some(*reason));
+            let code = aeon_blocker_for_reason(reason)
+                .unwrap_or_else(|| panic!("unmapped reason {reason}"));
+            let wire = blocker_code_wire(code);
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(wire));
+            assert!(
+                AEON_BLOCKER_CODES.contains(&wire),
+                "{reason} maps to {wire}"
+            );
+            assert_eq!(wire, expected_blocker_for_reason(reason), "{reason}");
+            let posted = serde_json::to_value(ResultRequest {
+                outcome: ResultOutcome::Failed,
+                terminal_sequence: 1,
+                authority_epoch: 1,
+                prerequisite_seal_sha256: "ab".repeat(32),
+                blocker_code: Some(code),
+            })
+            .unwrap();
+            assert_eq!(posted["blocker_code"], wire);
+            assert!(posted.get("detail").is_none());
+            assert!(seen.insert(*reason));
+        }
+        assert_eq!(seen.len(), LAUNCH_BLOCK_REASONS.len());
+        assert!(aeon_blocker_for_reason("not_a_pharos_reason").is_none());
+        for code in [
+            BlockerCode::DependencyPending,
+            BlockerCode::DependencyFailed,
+            BlockerCode::ReporterStale,
+            BlockerCode::ExternalWaiting,
+            BlockerCode::PolicyRefused,
+        ] {
+            let wire = blocker_code_wire(code);
+            assert!(AEON_BLOCKER_CODES.contains(&wire));
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(wire));
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_aeon_rejects_a_blocker_code_aeon_would_not_accept() {
+        let fake = FakeAeon::new(now_unix());
+        let (origin, server) = serve(fake).await;
+        let client = reqwest::Client::new();
+        let url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/result"))
+            .unwrap();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let send = |blocker: Value| {
+            let client = client.clone();
+            let url = url.clone();
+            let bearer = bearer.clone();
+            async move {
+                client
+                    .post(url)
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA)
+                    .body(
+                        serde_json::to_vec(&json!({
+                            "outcome": "failed",
+                            "terminal_sequence": 1,
+                            "authority_epoch": 3,
+                            "prerequisite_seal_sha256": hex_chars('d'),
+                            "blocker_code": blocker,
+                        }))
+                        .unwrap(),
+                    )
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        for reason in LAUNCH_BLOCK_REASONS {
+            assert_eq!(
+                send(json!(reason)).await,
+                StatusCode::BAD_REQUEST,
+                "{reason}"
+            );
+        }
+        assert_eq!(send(json!("not_a_blocker")).await, StatusCode::BAD_REQUEST);
+        for code in AEON_BLOCKER_CODES {
+            assert_eq!(send(json!(code)).await, StatusCode::CONFLICT, "{code}");
+        }
+        let succeeded_with_blocker = client
+            .post(url)
+            .header(AUTHORIZATION, bearer)
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(
+                serde_json::to_vec(&json!({
+                    "outcome": "succeeded",
+                    "terminal_sequence": 1,
+                    "authority_epoch": 3,
+                    "prerequisite_seal_sha256": hex_chars('d'),
+                    "blocker_code": "policy_refused",
+                }))
+                .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(succeeded_with_blocker, StatusCode::BAD_REQUEST);
+        server.abort();
+    }
+
+    fn result_posts(fake: &FakeAeon) -> Vec<Value> {
+        posts(fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/result"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect()
+    }
+
+    async fn dropped_consume(fixture: &Harness) -> String {
+        let job_id = prepare_ready_launch(fixture).await;
+        fixture
+            .fake
+            .update(|inner| inner.drop_accepted_consume = true);
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_none());
+        job_id
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_admission_closes_the_handoff_without_confirming() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        FrozenNow::set(now + 3600);
+        fixture.fake.update(|inner| inner.now = now + 3600);
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_some());
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "policy_refused");
+        assert!(results[0].get("detail").is_none());
+        let recorded = fixture.adapter.journal.result(DEPLOY_HANDOFF).unwrap();
+        assert_eq!(
+            recorded.detail.as_deref(),
+            Some(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        );
+        assert!(recorded.receipt.is_some());
+        let document = fetch_handoff(&fixture.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert_eq!(document["state"], "failed");
+        assert_eq!(document["result"]["blocker_code"], "policy_refused");
+        let later = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            later,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        assert_eq!(result_posts(&fixture.fake).len(), 1);
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_admission_is_not_confirmed_after_the_handoff_is_stale() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        FrozenNow::set(now + 4000);
+        fixture.fake.update(|inner| inner.now = now + 4000);
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_some());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_ADMISSION_EXPIRED
+        );
+        assert!(fixture.adapter.journal.result(DEPLOY_HANDOFF).is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        let later = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            later,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        assert!(fixture.adapter.journal.result(DEPLOY_HANDOFF).is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        fixture.server.abort();
+    }
+
+    fn stamp_with_millis(unix_seconds: i64, millis: u32) -> String {
+        assert!(millis < 1000);
+        let whole = format_timestamp(unix_seconds).unwrap();
+        let split = whole.rfind(['Z', '+']).expect("rfc3339 offset");
+        let (bare, suffix) = whole.split_at(split);
+        format!("{bare}.{millis:03}{suffix}")
+    }
+
+    #[test]
+    fn timestamp_nanos_keeps_a_fractional_second() {
+        let whole = format_timestamp(1_800_000_000).unwrap();
+        let fractional = stamp_with_millis(1_800_000_000, 800);
+        assert_eq!(
+            timestamp_nanos(&fractional).unwrap() - timestamp_nanos(&whole).unwrap(),
+            800_000_000
+        );
+    }
+
+    fn set_deploy_expiry(fake: &FakeAeon, expires_at: String) {
+        fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .expect("deploy handoff")
+                .expires_at = expires_at;
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fractional_expiry_still_confirms_inside_the_same_second() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        set_deploy_expiry(&fixture.fake, stamp_with_millis(now + 3600, 800));
+        let job_id = dropped_consume(&fixture).await;
+        let admission = fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .admission
+            .unwrap();
+        assert!(
+            admission.expires_at.contains(".800"),
+            "{}",
+            admission.expires_at
+        );
+        FrozenNow::set(now + 3600);
+        FrozenNow::set_extra_nanos(100_000_000);
+        fixture.fake.update(|inner| inner.now = now + 3600);
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
         assert_eq!(
             fixture.actions.get(&job_id).unwrap().state,
-            HostActionState::AwaitingConfirmation
+            HostActionState::QueuedApply
         );
-        assert!(fixture.actions.get(&job_id).unwrap().confirmed_at.is_none());
+        assert!(fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fractional_expiry_after_the_instant_posts_nothing() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        set_deploy_expiry(&fixture.fake, stamp_with_millis(now + 3600, 200));
+        let job_id = dropped_consume(&fixture).await;
+        FrozenNow::set(now + 3600);
+        FrozenNow::set_extra_nanos(500_000_000);
+        fixture.fake.update(|inner| inner.now = now + 3600);
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_ADMISSION_EXPIRED
+        );
+        assert!(fixture.adapter.journal.result(DEPLOY_HANDOFF).is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unconsumed_expired_admission_reports_policy_refused() {
+        // admission_lifetime_secs is FakeAeon-only. Real Aeon copies the handoff
+        // expiry, so this shorter admission cannot be issued there.
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        fixture
+            .fake
+            .update(|inner| inner.admission_lifetime_secs = Some(30));
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(launch.admission.is_some());
+        assert!(launch.consume_started);
+        assert!(launch.receipt.is_none());
+        let consumes = post_count(&fixture.fake, "/launch/consume");
+        FrozenNow::set(now + 60);
+        fixture.fake.update(|inner| inner.now = now + 60);
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "policy_refused");
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        );
+        let document = fetch_handoff(&fixture.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert_eq!(document["state"], "failed");
+        let later = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            later,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        assert_eq!(result_posts(&fixture.fake).len(), 1);
         fixture.server.abort();
     }
 
@@ -7321,26 +10277,889 @@ mod tests {
                 Some("66666666-6666-4666-8666-666666666666".to_string());
         });
         let replay = other.adapter.process_intent(&other.intent).await;
-        assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
+        assert!(matches!(
+            replay,
+            Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT
+        ));
         assert_eq!(post_count(&other.fake, "/launch/consume"), 0);
         assert_eq!(
             other.actions.get(&other_job).unwrap().state,
             HostActionState::AwaitingConfirmation
         );
+        assert!(other
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .admit_unresolved
+            .is_none());
+        let later = other.adapter.process_intent(&other.intent).await;
+        assert!(matches!(
+            later,
+            Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT
+        ));
+        assert_eq!(post_count(&other.fake, "/launch/admit"), admits_before + 2);
+        assert_eq!(post_count(&other.fake, "/launch/consume"), 0);
+        other.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_consume_replay_refreshes_readiness_then_confirms() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let crashed = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(crashed.consume_started);
+        assert!(crashed.receipt.is_none());
+        FrozenNow::set(now + 1000);
+        fixture.fake.update(|inner| inner.now = now + 1000);
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
         assert_eq!(
-            other
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        let readiness = readiness_bodies(&fixture.fake);
+        assert!(readiness.len() >= 2);
+        assert_eq!(
+            readiness[0]["reviewed_plan_digest"],
+            readiness.last().unwrap()["reviewed_plan_digest"]
+        );
+        assert_ne!(
+            readiness[0]["observed_at"],
+            readiness.last().unwrap()["observed_at"]
+        );
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_some());
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consume_replay_does_not_refresh_after_the_backup_success_disappears() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let consumes = post_count(&fixture.fake, "/launch/consume");
+        let readiness = readiness_post_count(&fixture.fake);
+        // Inside the 600s repost window, and inside Aeon's 900s acceptance.
+        FrozenNow::set(now + 60);
+        fixture.fake.update(|inner| inner.now = now + 60);
+        record_host(&fixture.hosts, now + 60, &fixture.intent.artifact, None);
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING)
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
+        assert_eq!(readiness_post_count(&fixture.fake), readiness);
+        let block = fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .unwrap();
+        assert_eq!(block.reason, LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING);
+        assert!(!block.terminal);
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_none());
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn unconsumed_replay_abandons_a_job_that_is_no_longer_confirmable() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let consumes = post_count(&fixture.fake, "/launch/consume");
+        assert_eq!(consumes, 1);
+        let job = fixture.actions.get(&job_id).unwrap();
+        fixture
+            .actions
+            .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
+            .unwrap();
+        let replay = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(
+            replay,
+            Err(AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED))
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::Cancelled);
+        assert!(job.confirmed_at.is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_CONSUME_ABANDONED
+        );
+        let later = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(
+            later,
+            Err(AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED))
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_after_cancelled_consume_posts_dependency_failed() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(launch.consume_started);
+        assert!(launch.receipt.is_none());
+        let job = fixture.actions.get(&job_id).unwrap();
+        fixture
+            .actions
+            .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
+            .unwrap();
+        let restarted = test_adapter(
+            runtime_config(
+                fixture.adapter.config.aeon_origin.clone(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        );
+        let replay = restarted.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        ));
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "dependency_failed");
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            restarted
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some("consume_abandoned")
+        );
+        let again = restarted.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(matches!(
+            again,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        ));
+        assert_eq!(result_posts(&fixture.fake).len(), 1);
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::Cancelled
+        );
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_consume_replays_unacked_readiness_before_the_failed_result() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(launch.consume_started);
+        assert!(launch.receipt.is_none());
+        let posted = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap();
+        assert_eq!(posted.sequence, 1);
+        assert!(posted.receipt.is_some());
+
+        FrozenNow::set(now + 601);
+        fixture.fake.update(|inner| {
+            inner.now = now + 601;
+            inner.fail_next_post = true;
+        });
+        let refresh = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            refresh,
+            AdapterError::Refused(status) if status == StatusCode::SERVICE_UNAVAILABLE
+        ));
+        let pending = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap();
+        assert_eq!(pending.sequence, 2);
+        assert!(pending.receipt.is_none());
+        assert!(!pending.replay_stopped);
+
+        let job = fixture.actions.get(&job_id).unwrap();
+        fixture
+            .actions
+            .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
+            .unwrap();
+        let restarted = test_adapter(
+            runtime_config(
+                fixture.adapter.config.aeon_origin.clone(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        );
+        let replay = restarted.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        ));
+        let readiness = restarted
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap();
+        assert_eq!(readiness.sequence, 2);
+        assert!(readiness.receipt.is_some());
+        let deployment = restarted
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::Deployment)
+            .unwrap();
+        assert_eq!(deployment.sequence, readiness.sequence + 1);
+        assert!(deployment.receipt.is_some());
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "dependency_failed");
+        assert_eq!(results[0]["terminal_sequence"], deployment.sequence);
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            restarted
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        );
+        let deployment_posts = posts(&fixture.fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/evidence"))
+            .filter(|capture| {
+                serde_json::from_slice::<Value>(&capture.body)
+                    .ok()
+                    .is_some_and(|body| body["kind"] == "deployment")
+            })
+            .count();
+        assert_eq!(deployment_posts, 1);
+        let again = restarted.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(matches!(
+            again,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        ));
+        assert_eq!(result_posts(&fixture.fake).len(), 1);
+        assert_eq!(
+            posts(&fixture.fake)
+                .into_iter()
+                .filter(|capture| capture.path.ends_with("/evidence"))
+                .filter(|capture| {
+                    serde_json::from_slice::<Value>(&capture.body)
+                        .ok()
+                        .is_some_and(|body| body["kind"] == "deployment")
+                })
+                .count(),
+            1
+        );
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn consumed_replay_does_not_confirm_an_unconfirmable_job() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        fixture
+            .fake
+            .update(|inner| inner.drop_accepted_consume = true);
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let consumes = post_count(&fixture.fake, "/launch/consume");
+        let job = fixture.actions.get(&job_id).unwrap();
+        fixture
+            .actions
+            .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
+            .unwrap();
+        let replay = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(
+            replay,
+            Err(AdapterError::LaunchBlocked(
+                LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
+            ))
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes + 1);
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_some());
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::Cancelled);
+        assert!(job.confirmed_at.is_none());
+        assert_eq!(
+            job.events
+                .iter()
+                .filter(|event| event.kind == HostActionEventKind::Confirmed)
+                .count(),
+            0
+        );
+        let later = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(
+            later,
+            Err(AdapterError::LaunchBlocked(
+                LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
+            ))
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes + 1);
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn unconsumed_replay_does_not_send_when_the_handoff_cannot_be_written() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.expires_at = format_timestamp(inner.now - 5).unwrap();
+        });
+        let consumes = post_count(&fixture.fake, "/launch/consume");
+        let replay = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(replay, Err(AdapterError::Contract)));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        assert!(fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .is_none());
+        fixture.server.abort();
+    }
+
+    async fn leave_readiness_unacked(fixture: &Harness) {
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let job_id = fixture.actions.list()[0].id.clone();
+        let created = fixture.actions.get(&job_id).unwrap().created_at;
+        review_job(&fixture.actions, &job_id, created);
+        record_backup(&fixture.hosts, fake_now(&fixture.fake));
+        fixture.fake.update(|inner| inner.fail_next_post = true);
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let pending = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap();
+        assert!(pending.receipt.is_none());
+        assert!(!pending.replay_stopped);
+        assert_eq!(post_count(&fixture.fake, "/evidence"), 1);
+    }
+
+    async fn post_evidence_bytes(origin: &Url, body: &[u8]) -> (StatusCode, Value) {
+        let response = reqwest::Client::new()
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+                    .unwrap(),
+            )
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
+            )
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.bytes().await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+        (status, value)
+    }
+
+    fn readiness_probe(sequence: i64, now: i64) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "sequence": sequence,
+            "kind": "launch_readiness",
+            "outcome": "satisfied",
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "reviewed_plan_digest": "ab".repeat(32),
+            "host": "hsb8",
+            "all_host_eval_passed": true,
+            "target_build_passed": true,
+            "backup_ready": true,
+            "backup_observed_at": format_timestamp(now).unwrap(),
+            "restart_required": true,
+            "running_kernel": "6.18.1",
+            "expected_kernel": "6.18.2"
+        }))
+        .unwrap()
+    }
+
+    fn stopped_readiness(fixture: &Harness) -> EvidenceJournalRecord {
+        let record = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap();
+        assert!(record.replay_stopped);
+        assert!(record.receipt.is_none());
+        record
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unacked_evidence_stops_when_the_handoff_has_expired() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        leave_readiness_unacked(&fixture).await;
+        let body = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap()
+            .body_json;
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.expires_at = format_timestamp(now - 5).unwrap();
+            inner.now = now;
+        });
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&fixture.fake, "/evidence"), 1);
+        stopped_readiness(&fixture);
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&fixture.fake, "/evidence"), 1);
+        let (status, value) =
+            post_evidence_bytes(&fixture.adapter.config.aeon_origin, body.as_bytes()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unacked_evidence_stops_when_aeon_is_ahead_of_the_local_clock() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        leave_readiness_unacked(&fixture).await;
+        let body = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap()
+            .body_json;
+        let expires = now + 120;
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.expires_at = format_timestamp(expires).unwrap();
+            inner.now = expires + 5;
+        });
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&fixture.fake, "/evidence"), 2);
+        stopped_readiness(&fixture);
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&fixture.fake, "/evidence"), 2);
+        let (status, value) =
+            post_evidence_bytes(&fixture.adapter.config.aeon_origin, body.as_bytes()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        let document = fetch_handoff(&fixture.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert!(document.get("force_stale").is_none());
+        assert_eq!(document["expires_at"], format_timestamp(expires).unwrap());
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unacked_evidence_stops_when_the_handoff_is_closed_or_has_a_result() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let closed = harness(true).await;
+        leave_readiness_unacked(&closed).await;
+        let closed_body = closed
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap()
+            .body_json;
+        closed.fake.update(|inner| {
+            inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap().state = "blocked".to_string();
+        });
+        closed.adapter.process_intent(&closed.intent).await.unwrap();
+        assert_eq!(post_count(&closed.fake, "/evidence"), 1);
+        stopped_readiness(&closed);
+        closed.adapter.process_intent(&closed.intent).await.unwrap();
+        assert_eq!(post_count(&closed.fake, "/evidence"), 1);
+        // Aeon still accepts evidence while state is blocked and no result is
+        // stored (report.go). Pharos stops from the GET and must not POST.
+        let (status, _) =
+            post_evidence_bytes(&closed.adapter.config.aeon_origin, closed_body.as_bytes()).await;
+        assert_eq!(status, StatusCode::CREATED);
+        closed.server.abort();
+
+        let resulted = harness(true).await;
+        leave_readiness_unacked(&resulted).await;
+        let resulted_body = resulted
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap()
+            .body_json;
+        resulted.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.state = "failed".to_string();
+            handoff.result = Some(json!({
+                "outcome": "failed",
+                "terminal_sequence": 1,
+                "authority_epoch": handoff.authority_epoch,
+                "prerequisite_seal_sha256": handoff.prerequisite_seal_sha256,
+                "blocker_code": "dependency_failed",
+                "handoff_id": handoff.id,
+                "completed_at": format_timestamp(inner.now).unwrap(),
+            }));
+        });
+        resulted
+            .adapter
+            .process_intent(&resulted.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&resulted.fake, "/evidence"), 1);
+        stopped_readiness(&resulted);
+        let (status, value) = post_evidence_bytes(
+            &resulted.adapter.config.aeon_origin,
+            resulted_body.as_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is terminal");
+        resulted.server.abort();
+    }
+
+    #[tokio::test]
+    async fn fake_aeon_refuses_stale_or_terminal_evidence() {
+        let fixture = harness(false).await;
+        let now = fake_now(&fixture.fake);
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        let stored = readiness_probe(1, now);
+        let later = readiness_probe(2, now);
+        let (status, _) = post_evidence_bytes(&origin, &stored).await;
+        assert_eq!(status, StatusCode::CREATED);
+        fixture.fake.update(|inner| {
+            inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap().force_stale = true;
+        });
+        let document = fetch_handoff(&origin, DEPLOY_HANDOFF).await;
+        assert!(document.get("force_stale").is_none());
+        let (status, value) = post_evidence_bytes(&origin, &stored).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.force_stale = false;
+            handoff.expires_at = format_timestamp(now - 5).unwrap();
+            inner.now = now;
+        });
+        let (status, value) = post_evidence_bytes(&origin, &stored).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        let (status, value) = post_evidence_bytes(&origin, &later).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.expires_at = format_timestamp(now + 3600).unwrap();
+            inner.now = now;
+            handoff.state = "revoked".to_string();
+        });
+        let (status, echoed) = post_evidence_bytes(&origin, &stored).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(echoed["sequence"], 1);
+        let (status, value) = post_evidence_bytes(&origin, &later).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is terminal");
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.state = "failed".to_string();
+            handoff.result = Some(json!({
+                "outcome": "failed",
+                "terminal_sequence": 1,
+                "authority_epoch": handoff.authority_epoch,
+                "prerequisite_seal_sha256": handoff.prerequisite_seal_sha256,
+                "blocker_code": "policy_refused",
+                "handoff_id": handoff.id,
+                "completed_at": format_timestamp(now).unwrap(),
+            }));
+        });
+        let (status, _) = post_evidence_bytes(&origin, &stored).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, value) = post_evidence_bytes(&origin, &later).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is terminal");
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn changed_requester_is_not_confirmed() {
+        let owned = harness(true).await;
+        let job_id = prepare_ready_launch(&owned).await;
+        let actions = Arc::clone(&owned.actions);
+        let confirm_id = job_id.clone();
+        *owned.fake.consume_hook.lock().expect("consume hook") = Some(Box::new(move || {
+            actions.set_requested_by_for_test(&confirm_id, "operator");
+        }));
+        let error = owned
+            .adapter
+            .process_intent(&owned.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_LAUNCH_NOT_OWNED)
+        ));
+        let job = owned.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert_eq!(
+            owned
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_LAUNCH_NOT_OWNED
+        );
+        owned.server.abort();
+
+        let replayed = harness(true).await;
+        let replay_job = prepare_ready_launch(&replayed).await;
+        let fake = replayed.fake.clone();
+        *replayed.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(replayed
+            .adapter
+            .process_intent(&replayed.intent)
+            .await
+            .is_err());
+        replayed
+            .actions
+            .set_requested_by_for_test(&replay_job, "operator");
+        let replay = replayed
+            .adapter
+            .process_intent(&replayed.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        ));
+        let job = replayed.actions.get(&replay_job).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        replayed.server.abort();
+    }
+
+    #[tokio::test]
+    async fn foreign_confirmation_does_not_claim_the_launch() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let actions = Arc::clone(&fixture.actions);
+        let confirm_id = job_id.clone();
+        *fixture.fake.consume_hook.lock().expect("consume hook") = Some(Box::new(move || {
+            let job = actions.get(&confirm_id).expect("job");
+            actions
+                .confirm_update(
+                    &confirm_id,
+                    "hsb8",
+                    "operator",
+                    now_unix().max(job.updated_at),
+                )
+                .expect("operator confirms ahead of the admission");
+        }));
+        let error = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::QueuedApply);
+        assert!(job.events.iter().any(|event| {
+            event.kind == HostActionEventKind::Confirmed
+                && event.source == HostActionEventSource::Operator
+        }));
+        assert!(!confirmation_is_delegated(
+            &job,
+            &fixture
                 .adapter
                 .journal
                 .launch(DEPLOY_HANDOFF)
                 .unwrap()
-                .admit_unresolved,
-            Some(StatusCode::CONFLICT.as_u16())
+                .admission
+                .unwrap()
+                .id
+        ));
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
         );
-        let later = other.adapter.process_intent(&other.intent).await;
-        assert!(matches!(later, Err(AdapterError::LaunchUnresolved)));
-        assert_eq!(post_count(&other.fake, "/launch/admit"), admits_before + 1);
-        assert_eq!(post_count(&other.fake, "/launch/consume"), 0);
-        other.server.abort();
+        let results: Vec<Value> = posts(&fixture.fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/result"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "policy_refused");
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED)
+        );
+        let later = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(
+            later,
+            Err(AdapterError::LaunchBlocked(
+                LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
+            ))
+        ));
+        assert_eq!(
+            posts(&fixture.fake)
+                .iter()
+                .filter(|capture| capture.path.ends_with("/result"))
+                .count(),
+            1
+        );
+        fixture.server.abort();
     }
 
     #[tokio::test]
@@ -7610,18 +11429,101 @@ mod tests {
         assert_eq!(block.reason, LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED);
         assert!(block.terminal);
         assert!(fixture.adapter.journal.launch(DEPLOY_HANDOFF).is_none());
-        let again = fixture
-            .adapter
-            .process_intent(&fixture.intent)
-            .await
-            .unwrap_err();
-        assert_eq!(again.code(), LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED);
+        let again = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(again.is_ok());
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["blocker_code"], "policy_refused");
         assert_eq!(readiness_post_count(&fixture.fake), 0);
         assert_eq!(
             fixture.actions.get(&job_id).unwrap().state,
             HostActionState::AwaitingConfirmation
         );
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_job_reports_a_failed_result_after_a_terminal_launch_block() {
+        let directory = TestDir::new("blocked-cancel");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let actions_path = directory.path().join("host-actions.json");
+        let journal = directory
+            .path()
+            .join("hosts.json.aeon-delivery-journal.json");
+        let fake = FakeAeon::new(now_unix());
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let intent = deploy_intent(true);
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![intent.clone()]),
+            journal.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        );
+        adapter.process_intent(&intent).await.unwrap();
+        let job_id = actions.list()[0].id.clone();
+        review_job(&actions, &job_id, actions.get(&job_id).unwrap().created_at);
+        record_backup(&hosts, fake_now(&fake));
+        fake.update(|inner| inner.drop_accepted_admit = true);
+        assert!(adapter.process_intent(&intent).await.is_err());
+        let mut saved: Value =
+            serde_json::from_slice(&std::fs::read(&actions_path).expect("saved actions")).unwrap();
+        let plan = saved
+            .as_array_mut()
+            .expect("action list")
+            .iter_mut()
+            .find(|job| job["kind"] == "update_restart")
+            .expect("update job")
+            .get_mut("plan")
+            .expect("reviewed plan")
+            .as_object_mut()
+            .expect("plan object");
+        plan["changed_file_count"] = json!(9);
+        std::fs::write(&actions_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let reloaded_actions = Arc::new(HostActionStore::new(Some(actions_path)));
+        let reloaded = test_adapter(
+            runtime_config(
+                adapter.config.aeon_origin.clone(),
+                adapter.config.api_key_file.clone(),
+                vec![intent.clone()],
+            ),
+            journal,
+            hosts,
+            Arc::clone(&reloaded_actions),
+        );
+        let blocked = reloaded.process_intent(&intent).await.unwrap_err();
+        assert_eq!(blocked.code(), LAUNCH_BLOCK_READINESS_PLAN_CHANGED);
+        let job = reloaded_actions.get(&job_id).unwrap();
+        reloaded_actions
+            .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
+            .unwrap();
+        let reported = reloaded.process_intent(&intent).await;
+        assert!(reported.is_ok());
+        let results: Vec<Value> = posts(&fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/result"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "policy_refused");
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            reloaded
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED)
+        );
+        assert_eq!(
+            reloaded_actions.get(&job_id).unwrap().state,
+            HostActionState::Cancelled
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -7715,10 +11617,37 @@ mod tests {
             reloaded_actions.get(&job_id).unwrap().state,
             HostActionState::AwaitingConfirmation
         );
-        let again = reloaded.process_intent(&intent).await.unwrap_err();
-        assert_eq!(again.code(), reason);
+        let results = result_posts(&fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert!(results[0].get("detail").is_none());
+        // Literals, so a mapper that returns the wrong variant fails this test.
+        assert_eq!(
+            results[0]["blocker_code"],
+            match reason {
+                LAUNCH_BLOCK_READINESS_PLAN_CHANGED => "policy_refused",
+                LAUNCH_BLOCK_READINESS_FLAG_FALSE => "external_waiting",
+                other => panic!("settled readiness reason {other} has no literal code"),
+            }
+        );
+        assert_eq!(
+            reloaded
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(reason)
+        );
+        let again = reloaded.process_intent(&intent).await;
+        assert!(again.is_ok());
+        assert_eq!(result_posts(&fake).len(), 1);
         assert_eq!(readiness_post_count(&fake), readiness);
         assert_eq!(post_count(&fake, "/launch/admit"), admits);
+        assert_eq!(
+            reloaded_actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
         server.abort();
     }
 
@@ -7732,19 +11661,17 @@ mod tests {
         fake.update(|inner| inner.drop_accepted_result = true);
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
-        let job_id = completed_update(&actions, now);
         let hosts = Arc::new(Store::new(None).unwrap());
-        record_beacon(&hosts, now - 10, &artifact());
-        let mut intent = deploy_intent(false);
-        intent.update_restart_job_id = Some(job_id);
+        let intent = deploy_intent(true);
         let adapter = test_adapter(
             runtime_config(origin, api, vec![intent.clone()]),
             directory
                 .path()
                 .join("hosts.json.aeon-delivery-journal.json"),
-            hosts,
-            actions,
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
         );
+        advance_delegated_job_to_succeeded(&adapter, &actions, &hosts, &intent).await;
         assert!(adapter.process_intent(&intent).await.is_err());
         let first = posts(&fake)
             .into_iter()
@@ -7784,19 +11711,17 @@ mod tests {
         fake.update(|inner| inner.drop_accepted_result = true);
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
-        let job_id = completed_update(&actions, now);
         let hosts = Arc::new(Store::new(None).unwrap());
-        record_beacon(&hosts, now - 10, &artifact());
-        let mut intent = deploy_intent(false);
-        intent.update_restart_job_id = Some(job_id);
+        let intent = deploy_intent(true);
         let adapter = test_adapter(
             runtime_config(origin, api, vec![intent.clone(), verify_intent()]),
             directory
                 .path()
                 .join("hosts.json.aeon-delivery-journal.json"),
             Arc::clone(&hosts),
-            actions,
+            Arc::clone(&actions),
         );
+        advance_delegated_job_to_succeeded(&adapter, &actions, &hosts, &intent).await;
         assert!(adapter.process_intent(&intent).await.is_err());
         assert!(adapter
             .journal
@@ -7827,5 +11752,1306 @@ mod tests {
             ResultOutcome::Succeeded
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn skewed_aeon_clock_does_not_break_the_confirmed_job() {
+        for skew in [-30_i64, 30] {
+            let fixture = harness(true).await;
+            let job_id = prepare_ready_launch(&fixture).await;
+            let local = now_unix();
+            fixture.fake.update(|inner| inner.now = local + skew);
+            for _ in 0..4 {
+                fixture
+                    .adapter
+                    .process_intent(&fixture.intent)
+                    .await
+                    .unwrap();
+                if fixture.actions.get(&job_id).unwrap().state == HostActionState::QueuedApply {
+                    break;
+                }
+            }
+            let job = fixture.actions.get(&job_id).unwrap();
+            assert_eq!(job.state, HostActionState::QueuedApply);
+            assert!(job.updated_at >= job.created_at);
+            assert!(job.confirmed_at.unwrap() >= job.created_at);
+            assert!(job
+                .events
+                .windows(2)
+                .all(|events| events[0].at <= events[1].at));
+            assert!(job
+                .events
+                .iter()
+                .all(|event| { event.at >= job.created_at && event.at <= job.updated_at }));
+            let consumed_at = unix_of(
+                &fixture
+                    .adapter
+                    .journal
+                    .launch(DEPLOY_HANDOFF)
+                    .unwrap()
+                    .receipt
+                    .unwrap()
+                    .consumed_at,
+            )
+            .unwrap();
+            assert_eq!(consumed_at, local + skew);
+            assert_ne!(job.confirmed_at.unwrap(), consumed_at);
+            finish_apply(&fixture.actions, &job_id, now_unix().max(job.updated_at));
+            assert_eq!(
+                fixture.actions.get(&job_id).unwrap().state,
+                HostActionState::Succeeded
+            );
+            fixture.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn request_trace_records_status_and_request_id_only() {
+        let mut fixture = harness(false).await;
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        fixture.adapter.aeon.enable_trace(Arc::clone(&traces));
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let recorded = traces.lock().expect("traces").clone();
+        assert!(recorded.iter().any(|trace| {
+            trace.method == "GET"
+                && trace.path.starts_with("/api/stage-handoffs/")
+                && !trace.path.contains('?')
+                && trace.status == 200
+                && trace.request_id.as_deref() == Some("fake-aeon-request")
+                && trace.error_excerpt.is_none()
+        }));
+        let rendered = format!("{recorded:?}");
+        assert_no_key(rendered.as_bytes());
+        assert!(!rendered.contains("authorization"));
+        assert_trace_excerpts(&traces);
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn reflected_api_key_is_withheld_from_the_trace_and_the_report() {
+        let directory = TestDir::new("reflect-key");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let report = directory.path().join("report.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reflecting origin");
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|request: Request<Body>| async move {
+                    let path = request.uri().path().to_string();
+                    let authorization = request
+                        .headers()
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let header_key = path.ends_with("/header-key");
+                    let body = if header_key {
+                        "{}".to_string()
+                    } else if path.ends_with("/long-error") {
+                        "n".repeat(500)
+                    } else {
+                        format!("{{\"error\":\"reflected {authorization}\"}}")
+                    };
+                    let mut response = Response::builder()
+                        .status(if header_key {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        })
+                        .header(CONTENT_TYPE.as_str(), JSON_MEDIA);
+                    if header_key {
+                        response = response
+                            .header(CONTENT_ENCODING.as_str(), "gzip")
+                            .header("x-request-id", authorization.clone())
+                            .header("x-echo", authorization);
+                    }
+                    response.body(Body::from(body)).unwrap()
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let origin = loopback_origin_for_tests(&format!("http://127.0.0.1:{port}/"));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let actions = Arc::new(HostActionStore::new(None));
+        let mut adapter = test_adapter(
+            runtime_config(origin, api.clone(), vec![deploy_intent(true)]),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            hosts,
+            actions,
+        );
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        adapter.aeon.enable_trace(Arc::clone(&traces));
+        let credentials = adapter.aeon.credentials().expect("test key");
+        let long = adapter
+            .aeon
+            .exchange(Method::GET, "/long-error", None, None, &credentials)
+            .await
+            .expect("long error body is not a reflected key");
+        drop(credentials);
+        assert_eq!(long.0, StatusCode::BAD_REQUEST);
+        let reflected = adapter.aeon.get_handoff(DEPLOY_HANDOFF).await;
+        assert!(matches!(reflected, Err(AdapterError::Contract)));
+        assert_trace_excerpts(&traces);
+        let recorded = traces.lock().expect("traces").clone();
+        assert!(recorded.iter().any(|trace| {
+            trace.status == 400
+                && trace.error_excerpt.as_deref() == Some(REFLECTED_CREDENTIAL_MARKER)
+        }));
+        assert!(recorded.iter().any(|trace| {
+            trace.path == "/long-error"
+                && trace
+                    .error_excerpt
+                    .as_ref()
+                    .is_some_and(|excerpt| excerpt.len() == TRACE_EXCERPT_MAX_BYTES)
+        }));
+        for trace in &recorded {
+            assert_no_key(format!("{trace:?}").as_bytes());
+        }
+        let message = live_failure(&traces);
+        assert_no_key(message.as_bytes());
+        assert!(message.contains(REFLECTED_CREDENTIAL_MARKER));
+        save_live_failure(&report, &traces, &api, &message);
+        let report_bytes = std::fs::read(&report).unwrap();
+        assert_no_key(&report_bytes);
+        assert_live_bytes_exclude_key(&report_bytes, &api);
+        let credentials = adapter.aeon.credentials().expect("test key");
+        let header_key = adapter
+            .aeon
+            .exchange(Method::GET, "/header-key", None, None, &credentials)
+            .await;
+        drop(credentials);
+        assert!(matches!(header_key, Err(AdapterError::Contract)));
+        let recorded = traces.lock().expect("traces").clone();
+        assert!(recorded.iter().all(|trace| trace.path != "/header-key"));
+        for trace in &recorded {
+            assert_no_key(format!("{trace:?}").as_bytes());
+        }
+        let message = live_failure(&traces);
+        assert_no_key(message.as_bytes());
+        save_live_failure(&report, &traces, &api, &message);
+        let report_bytes = std::fs::read(&report).unwrap();
+        assert_no_key(&report_bytes);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn live_guard_identifies_the_disposable_target_before_any_write() {
+        let allowed = harness(true).await;
+        let identity = confirm_live_target(
+            &allowed.adapter,
+            "lab",
+            "PRJ-17",
+            &allowed.intent.project_node_id,
+            RELEASE_NODE,
+            allowed.intent.artifact.release_sequence,
+            &[allowed.intent.handoff_id.as_str()],
+        )
+        .await
+        .expect("disposable lab target");
+        assert_eq!(identity.project_key, "lab");
+        assert_eq!(identity.node_key, "PRJ-17");
+        assert_eq!(identity.release_number, 123);
+        assert!(posts(&allowed.fake).is_empty());
+        allowed.server.abort();
+
+        let production = harness(true).await;
+        production
+            .fake
+            .update(|inner| inner.journey_project_key = "PHAROS".to_string());
+        let refused = confirm_live_target(
+            &production.adapter,
+            "PHAROS",
+            "PRJ-17",
+            &production.intent.project_node_id,
+            RELEASE_NODE,
+            production.intent.artifact.release_sequence,
+            &[production.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused.unwrap_err().contains("project_key is PHAROS"));
+        assert!(posts(&production.fake).is_empty());
+        production.server.abort();
+
+        let other_tenant = harness(true).await;
+        other_tenant
+            .fake
+            .update(|inner| inner.journey_tenant_slug = "other".to_string());
+        let refused = confirm_live_target(
+            &other_tenant.adapter,
+            "lab",
+            "PRJ-17",
+            &other_tenant.intent.project_node_id,
+            RELEASE_NODE,
+            other_tenant.intent.artifact.release_sequence,
+            &[other_tenant.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused.unwrap_err().contains("tenant is not inspr"));
+        assert!(posts(&other_tenant.fake).is_empty());
+        other_tenant.server.abort();
+
+        let mismatch = harness(true).await;
+        let refused = confirm_live_target(
+            &mismatch.adapter,
+            "lumen",
+            "PRJ-17",
+            &mismatch.intent.project_node_id,
+            RELEASE_NODE,
+            mismatch.intent.artifact.release_sequence,
+            &[mismatch.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused
+            .unwrap_err()
+            .contains("PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY"));
+        assert!(posts(&mismatch.fake).is_empty());
+        mismatch.server.abort();
+
+        let other_release = harness(true).await;
+        other_release.fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .release_node_id = OTHER_RELEASE.to_string();
+        });
+        let refused = confirm_live_target(
+            &other_release.adapter,
+            "lab",
+            "PRJ-17",
+            &other_release.intent.project_node_id,
+            RELEASE_NODE,
+            other_release.intent.artifact.release_sequence,
+            &[other_release.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused
+            .unwrap_err()
+            .contains("PHAROS_AEON_LIVE_RELEASE_NODE_ID"));
+        assert!(posts(&other_release.fake).is_empty());
+        other_release.server.abort();
+
+        let dark_gates = harness(true).await;
+        dark_gates.fake.update(|inner| {
+            inner.journey_candidate_gate_live = false;
+            inner.journey_deploy_gate_live = false;
+        });
+        let refused = confirm_live_target(
+            &dark_gates.adapter,
+            "lab",
+            "PRJ-17",
+            &dark_gates.intent.project_node_id,
+            RELEASE_NODE,
+            dark_gates.intent.artifact.release_sequence,
+            &[dark_gates.intent.handoff_id.as_str()],
+        )
+        .await;
+        let message = refused.unwrap_err();
+        assert!(message.contains("must be live"));
+        assert!(message.contains("stage gate is not approved"));
+        assert!(message.contains("AEON-188"));
+        assert!(posts(&dark_gates.fake).is_empty());
+        assert_eq!(readiness_post_count(&dark_gates.fake), 0);
+        dark_gates.server.abort();
+
+        let deploy_dark = harness(true).await;
+        deploy_dark
+            .fake
+            .update(|inner| inner.journey_deploy_gate_live = false);
+        let refused = confirm_live_target(
+            &deploy_dark.adapter,
+            "lab",
+            "PRJ-17",
+            &deploy_dark.intent.project_node_id,
+            RELEASE_NODE,
+            deploy_dark.intent.artifact.release_sequence,
+            &[deploy_dark.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused.unwrap_err().contains("deploy_live=false"));
+        assert!(posts(&deploy_dark.fake).is_empty());
+        deploy_dark.server.abort();
+
+        let other_node = harness(true).await;
+        let refused = confirm_live_target(
+            &other_node.adapter,
+            "lab",
+            "LAB-1",
+            &other_node.intent.project_node_id,
+            RELEASE_NODE,
+            other_node.intent.artifact.release_sequence,
+            &[other_node.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused
+            .unwrap_err()
+            .contains("PHAROS_AEON_LIVE_EXPECT_NODE_KEY"));
+        assert!(posts(&other_node.fake).is_empty());
+        other_node.server.abort();
+    }
+
+    #[tokio::test]
+    async fn dark_stage_gate_journals_the_admit_refusal_without_touching_the_host() {
+        for darken in [false, true] {
+            let fixture = harness(true).await;
+            let job_id = prepare_ready_launch(&fixture).await;
+            fixture.fake.update(|inner| {
+                if darken {
+                    inner.journey_deploy_gate_live = false;
+                } else {
+                    inner.journey_candidate_gate_live = false;
+                }
+            });
+            let error = fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    AdapterError::LaunchBlocked(LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED)
+                ),
+                "{darken:?} yielded {error}"
+            );
+            let job = fixture.actions.get(&job_id).unwrap();
+            assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+            assert!(job.confirmed_at.is_none());
+            assert_eq!(post_count(&fixture.fake, "/launch/consume"), 0);
+            let block = fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap();
+            assert_eq!(block.reason, LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED);
+            assert!(block.terminal);
+            assert_eq!(expected_blocker_for_reason(&block.reason), "policy_refused");
+            let later = fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                later,
+                AdapterError::LaunchBlocked(LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED)
+            ));
+            assert_eq!(post_count(&fixture.fake, "/launch/admit"), 1);
+            assert_eq!(
+                fixture.actions.get(&job_id).unwrap().state,
+                HostActionState::AwaitingConfirmation
+            );
+            fixture.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn dark_stage_gate_matches_aeon_on_admit_consume_and_result() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let evidence = serde_json::to_vec(&json!({
+            "sequence": 1,
+            "kind": "launch_readiness",
+            "outcome": "satisfied",
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "reviewed_plan_digest": "ab".repeat(32),
+            "host": "hsb8",
+            "all_host_eval_passed": true,
+            "target_build_passed": true,
+            "backup_ready": true,
+            "backup_observed_at": format_timestamp(now).unwrap(),
+            "restart_required": true,
+            "running_kernel": "unknown",
+            "expected_kernel": "unknown"
+        }))
+        .unwrap();
+        let post = |url: String, body: Vec<u8>, key: Option<&str>| {
+            let client = client.clone();
+            let bearer = bearer.clone();
+            let key = key.map(str::to_string);
+            async move {
+                let mut request = client
+                    .post(url)
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA)
+                    .body(body);
+                if let Some(key) = key {
+                    request = request.header("idempotency-key", key);
+                }
+                let response = request.send().await.unwrap();
+                let status = response.status();
+                let value: Value = response.json().await.unwrap_or(json!({}));
+                (status, value)
+            }
+        };
+        let evidence_url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+            .unwrap();
+        let (status, _) = post(evidence_url.to_string(), evidence, None).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let admit = serde_json::to_vec(&json!({
+            "version_scheme": "legacy",
+            "version": "1.2.3",
+            "release_channel": "stable",
+            "release_sequence": 123,
+            "digest_sha256": "1".repeat(64),
+            "commit_digest": "a".repeat(40),
+            "manifest_coordinate": "ghcr:inspr-at/pharos/releases/1.2.3",
+            "manifest_digest_sha256": "9".repeat(64)
+        }))
+        .unwrap();
+        let admit_url = origin
+            .join(&format!(
+                "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"
+            ))
+            .unwrap()
+            .to_string();
+        fake.update(|inner| inner.journey_candidate_gate_live = false);
+        let (status, value) = post(
+            admit_url.clone(),
+            admit.clone(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "stage gate is not approved");
+        fake.update(|inner| {
+            inner.journey_candidate_gate_live = true;
+            inner.journey_deploy_gate_live = false;
+        });
+        let (status, value) = post(
+            admit_url.clone(),
+            admit.clone(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "stage gate is not approved");
+        fake.update(|inner| inner.journey_deploy_gate_live = true);
+        let (status, _) = post(
+            admit_url.clone(),
+            admit.clone(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        fake.update(|inner| inner.journey_deploy_gate_live = false);
+        let (status, replay) = post(
+            admit_url,
+            admit,
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay["id"], ADMISSION_ID);
+        let consume_url = origin
+            .join(&format!(
+                "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/consume"
+            ))
+            .unwrap()
+            .to_string();
+        let consume = serde_json::to_vec(&json!({"admission_id": ADMISSION_ID})).unwrap();
+        let (status, value) = post(
+            consume_url,
+            consume,
+            Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "stage gate is no longer approved");
+        fake.update(|inner| {
+            inner.journey_deploy_gate_live = true;
+            inner.journey_candidate_gate_live = false;
+        });
+        let result_url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/result"))
+            .unwrap()
+            .to_string();
+        let result = serde_json::to_vec(&json!({
+            "outcome": "failed",
+            "terminal_sequence": 1,
+            "authority_epoch": 3,
+            "prerequisite_seal_sha256": hex_chars('d'),
+            "blocker_code": "dependency_failed"
+        }))
+        .unwrap();
+        let (status, value) = post(result_url.clone(), result.clone(), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "candidate gate is no longer approved");
+        fake.update(|inner| {
+            inner.journey_candidate_gate_live = true;
+            inner.journey_deploy_gate_live = false;
+        });
+        let (status, value) = post(result_url, result, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "stage gate is no longer approved");
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "live Aeon roundtrip; set PHAROS_AEON_LIVE_ACK=disposable"]
+    async fn live_roundtrip_against_aeon() {
+        let Some(live) = live_roundtrip_env() else {
+            eprintln!("live Aeon roundtrip skipped: PHAROS_AEON_LIVE_ORIGIN is unset");
+            return;
+        };
+        let directory = TestDir::new("live-roundtrip");
+        let journal = directory
+            .path()
+            .join("hosts.json.aeon-delivery-journal.json");
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let actions = Arc::new(HostActionStore::new(None));
+        let mut intents = vec![live.deploy.clone()];
+        if let Some(verify) = &live.verify {
+            intents.push(verify.clone());
+        }
+        let mut adapter = test_adapter(
+            runtime_config(live.origin.clone(), live.key_file.clone(), intents),
+            journal.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        );
+        adapter.aeon.enable_trace(Arc::clone(&traces));
+        let mut handoff_ids = vec![live.deploy.handoff_id.as_str()];
+        if let Some(verify) = &live.verify {
+            handoff_ids.push(verify.handoff_id.as_str());
+        }
+        // The gate check is before any evidence post. That post is what
+        // moves a requested handoff to active.
+        if let Err(reason) = confirm_live_target(
+            &adapter,
+            &live.expect_project_key,
+            &live.expect_node_key,
+            &live.deploy.project_node_id,
+            &live.deploy.release_node_id,
+            live.artifact.release_sequence,
+            &handoff_ids,
+        )
+        .await
+        {
+            panic!("live Aeon roundtrip refused: {reason}");
+        }
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(90);
+        let now = now_unix();
+        record_beacon_for(
+            &hosts,
+            &live.host,
+            &live.environment,
+            now,
+            &live.artifact,
+            Some(now),
+        );
+        live_step(
+            &adapter,
+            &live.deploy,
+            &traces,
+            &live.report,
+            &live.key_file,
+        )
+        .await;
+        let job_id = actions
+            .list()
+            .into_iter()
+            .find(|job| job.kind == HostActionKind::UpdateRestart)
+            .expect("adapter created the update review")
+            .id;
+        assert_eq!(
+            actions.get(&job_id).unwrap().requested_by,
+            ACTOR,
+            "the adapter must create the job through ensure_update_review_with_id"
+        );
+        review_job_for(&actions, &live.host, &job_id, now_unix());
+        live_until(
+            &adapter,
+            &live.deploy,
+            &traces,
+            &live.report,
+            &live.key_file,
+            deadline,
+            || {
+                let launch = adapter.journal.launch(&live.deploy.handoff_id);
+                let readiness = adapter
+                    .journal
+                    .evidence_with_kind(&live.deploy.handoff_id, EvidenceKind::LaunchReadiness);
+                launch.is_some_and(|launch| launch.admission.is_some() && launch.receipt.is_some())
+                    && readiness.is_some_and(|row| row.receipt.is_some())
+                    && actions.get(&job_id).unwrap().confirmed_at.is_some()
+            },
+        )
+        .await;
+        let confirmed = actions.get(&job_id).unwrap();
+        assert_eq!(confirmed.state, HostActionState::QueuedApply);
+        finish_apply_for(
+            &actions,
+            &live.host,
+            &job_id,
+            now_unix().max(confirmed.updated_at),
+        );
+        live_until(
+            &adapter,
+            &live.deploy,
+            &traces,
+            &live.report,
+            &live.key_file,
+            deadline,
+            || {
+                let applied = actions.get(&job_id).unwrap();
+                let stamp = now_unix().max(applied.updated_at.saturating_add(1));
+                record_beacon_for(
+                    &hosts,
+                    &live.host,
+                    &live.environment,
+                    stamp,
+                    &live.artifact,
+                    None,
+                );
+                let deployment = adapter
+                    .journal
+                    .evidence_with_kind(&live.deploy.handoff_id, EvidenceKind::Deployment);
+                let result = adapter.journal.result(&live.deploy.handoff_id);
+                deployment.is_some_and(|row| row.receipt.is_some())
+                    && result.is_some_and(|row| {
+                        row.receipt
+                            .is_some_and(|receipt| receipt.outcome == ResultOutcome::Succeeded)
+                    })
+            },
+        )
+        .await;
+        if let Some(verify) = &live.verify {
+            let result = adapter.journal.result(&live.deploy.handoff_id).unwrap();
+            let anchor = unix_of(&result.receipt.unwrap().completed_at).unwrap();
+            record_beacon_for(
+                &hosts,
+                &live.host,
+                &live.environment,
+                now_unix().max(anchor.saturating_add(1)),
+                &live.artifact,
+                None,
+            );
+            live_until(
+                &adapter,
+                verify,
+                &traces,
+                &live.report,
+                &live.key_file,
+                deadline,
+                || {
+                    let evidence = adapter
+                        .journal
+                        .evidence_with_kind(&verify.handoff_id, EvidenceKind::Verification);
+                    let result = adapter.journal.result(&verify.handoff_id);
+                    evidence.is_some_and(|row| row.receipt.is_some())
+                        && result.is_some_and(|row| {
+                            row.receipt
+                                .is_some_and(|receipt| receipt.outcome == ResultOutcome::Succeeded)
+                        })
+                },
+            )
+            .await;
+        }
+        let mut handoffs = vec![live_handoff_state(&adapter, &live.deploy.handoff_id).await];
+        if let Some(verify) = &live.verify {
+            handoffs.push(live_handoff_state(&adapter, &verify.handoff_id).await);
+        }
+        let report = live_report(&live, &adapter, &journal, &traces, &handoffs, started);
+        std::fs::write(&live.report, serde_json::to_vec_pretty(&report).unwrap())
+            .expect("write live report");
+        let report_bytes = std::fs::read(&live.report).unwrap();
+        let journal_bytes = std::fs::read(&journal).unwrap();
+        assert_trace_excerpts(&traces);
+        assert_no_key(&report_bytes);
+        assert_live_bytes_exclude_key(&report_bytes, &live.key_file);
+        assert_live_bytes_exclude_key(&journal_bytes, &live.key_file);
+        println!("live Aeon roundtrip report: {}", live.report.display());
+    }
+
+    struct LiveRoundtrip {
+        origin: Url,
+        key_file: PathBuf,
+        expect_project_key: String,
+        expect_node_key: String,
+        host: String,
+        environment: String,
+        artifact: ArtifactEvidence,
+        deploy: DeliveryIntent,
+        verify: Option<DeliveryIntent>,
+        report: PathBuf,
+    }
+
+    fn live_roundtrip_env() -> Option<LiveRoundtrip> {
+        let Ok(origin_text) = std::env::var("PHAROS_AEON_LIVE_ORIGIN") else {
+            return None;
+        };
+        if origin_text.trim().is_empty() {
+            return None;
+        }
+        let ack = std::env::var("PHAROS_AEON_LIVE_ACK").unwrap_or_default();
+        if ack != "disposable" {
+            panic!("live Aeon roundtrip refused: set PHAROS_AEON_LIVE_ACK=disposable");
+        }
+        let origin =
+            parse_origin(origin_text.trim()).expect("PHAROS_AEON_LIVE_ORIGIN https origin");
+        let expect_project_key = std::env::var("PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert!(
+            !expect_project_key.is_empty(),
+            "live Aeon roundtrip missing PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY"
+        );
+        assert!(
+            expect_project_key != "PHAROS",
+            "live Aeon roundtrip refused: PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY is PHAROS"
+        );
+        let expect_node_key = std::env::var("PHAROS_AEON_LIVE_EXPECT_NODE_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert!(
+            !expect_node_key.is_empty(),
+            "live Aeon roundtrip missing PHAROS_AEON_LIVE_EXPECT_NODE_KEY"
+        );
+        let key_file = required_live_path("PHAROS_AEON_LIVE_KEY_FILE");
+        let project = required_live_uuid("PHAROS_AEON_LIVE_PROJECT_NODE_ID");
+        let release = required_live_uuid("PHAROS_AEON_LIVE_RELEASE_NODE_ID");
+        let deploy_handoff = required_live_uuid("PHAROS_AEON_LIVE_DEPLOY_HANDOFF");
+        let verify_handoff = std::env::var("PHAROS_AEON_LIVE_VERIFY_HANDOFF")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let host =
+            std::env::var("PHAROS_AEON_LIVE_HOST").unwrap_or_else(|_| "lab-roundtrip".to_string());
+        let environment =
+            std::env::var("PHAROS_AEON_LIVE_ENVIRONMENT").unwrap_or_else(|_| "lab".to_string());
+        assert!(
+            valid_host(&host),
+            "PHAROS_AEON_LIVE_HOST is not a host name"
+        );
+        assert!(
+            valid_symbol(&environment),
+            "PHAROS_AEON_LIVE_ENVIRONMENT is not a symbol"
+        );
+        let artifact_json = std::env::var("PHAROS_AEON_LIVE_ARTIFACT_JSON").unwrap_or_default();
+        assert!(
+            !artifact_json.trim().is_empty(),
+            "live Aeon roundtrip missing PHAROS_AEON_LIVE_ARTIFACT_JSON"
+        );
+        let artifact: ArtifactEvidence = serde_json::from_str(&artifact_json)
+            .unwrap_or_else(|_| panic!("PHAROS_AEON_LIVE_ARTIFACT_JSON is not ArtifactEvidence"));
+        assert!(artifact.valid(), "live artifact is not valid evidence");
+        assert!(
+            valid_prefixed_sha256(&artifact.digest),
+            "live artifact digest must be sha256-prefixed"
+        );
+        let report = required_live_path("PHAROS_AEON_LIVE_REPORT");
+        let shared = LiveShared {
+            project: &project,
+            release: &release,
+            host: &host,
+            environment: &environment,
+            artifact: &artifact,
+        };
+        let deploy = live_intent(
+            &deploy_handoff,
+            &shared,
+            Operation::Deploy,
+            GuardedWorkflow::DeployProduction,
+            None,
+        );
+        let verify = verify_handoff.map(|handoff| {
+            assert!(
+                valid_uuid(handoff.trim()),
+                "PHAROS_AEON_LIVE_VERIFY_HANDOFF is not a uuid"
+            );
+            assert_ne!(handoff.trim(), deploy_handoff);
+            live_intent(
+                handoff.trim(),
+                &shared,
+                Operation::Verify,
+                GuardedWorkflow::VerifyProduction,
+                Some(deploy_handoff.clone()),
+            )
+        });
+        Some(LiveRoundtrip {
+            origin,
+            key_file,
+            expect_project_key,
+            expect_node_key,
+            host,
+            environment,
+            artifact,
+            deploy,
+            verify,
+            report,
+        })
+    }
+
+    fn required_live_path(name: &str) -> PathBuf {
+        let value = std::env::var(name).unwrap_or_default();
+        assert!(
+            !value.trim().is_empty(),
+            "live Aeon roundtrip missing {name}"
+        );
+        PathBuf::from(value.trim())
+    }
+
+    fn required_live_uuid(name: &str) -> String {
+        let value = std::env::var(name).unwrap_or_default();
+        let value = value.trim().to_string();
+        assert!(
+            valid_uuid(&value),
+            "live Aeon roundtrip missing or invalid {name}"
+        );
+        value
+    }
+
+    struct LiveShared<'a> {
+        project: &'a str,
+        release: &'a str,
+        host: &'a str,
+        environment: &'a str,
+        artifact: &'a ArtifactEvidence,
+    }
+
+    fn live_intent(
+        handoff_id: &str,
+        shared: &LiveShared<'_>,
+        operation: Operation,
+        workflow: GuardedWorkflow,
+        deployment_handoff_id: Option<String>,
+    ) -> DeliveryIntent {
+        DeliveryIntent {
+            handoff_id: handoff_id.to_string(),
+            project_node_id: shared.project.to_string(),
+            release_node_id: shared.release.to_string(),
+            operation,
+            workflow,
+            environment: shared.environment.to_string(),
+            host: shared.host.to_string(),
+            artifact: shared.artifact.clone(),
+            update_restart_job_id: None,
+            deployment_handoff_id,
+            delegated_launch: matches!(operation, Operation::Deploy).then(|| {
+                DelegatedLaunchSelection {
+                    target_ref: shared.artifact.digest.clone(),
+                }
+            }),
+        }
+    }
+
+    #[derive(Debug)]
+    struct LiveIdentity {
+        project_key: String,
+        node_key: String,
+        release_number: i64,
+    }
+
+    fn stage_gate_live(stages: &[Value], key: &str) -> Result<bool, String> {
+        let stage = stages
+            .iter()
+            .find(|stage| stage.get("key").and_then(Value::as_str) == Some(key))
+            .ok_or_else(|| format!("journey stage {key} is missing"))?;
+        stage
+            .get("gate_live")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("journey stage {key} is missing gate_live"))
+    }
+
+    async fn confirm_live_target(
+        adapter: &AeonDeliveryAdapter,
+        expected_project_key: &str,
+        expected_node_key: &str,
+        project_node_id: &str,
+        expected_release_node: &str,
+        release_number: i64,
+        handoff_ids: &[&str],
+    ) -> Result<LiveIdentity, String> {
+        if expected_project_key.is_empty() {
+            return Err(
+                "live Aeon roundtrip missing PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY".to_string(),
+            );
+        }
+        if release_number < 1 {
+            return Err("live Aeon roundtrip release number is missing".to_string());
+        }
+        let journey = adapter
+            .aeon
+            .get_json(&format!("/api/projects/{project_node_id}/journey"))
+            .await
+            .map_err(|error| format!("live Aeon journey read failed ({})", error.code()))?;
+        let project_key = journey
+            .get("project_key")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let node_key = journey
+            .get("node_key")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tenant = journey
+            .get("tenant_slug")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let project_node = journey
+            .get("project_node_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if project_node != project_node_id {
+            return Err(
+                "journey project_node_id differs from PHAROS_AEON_LIVE_PROJECT_NODE_ID".to_string(),
+            );
+        }
+        if project_key != expected_project_key {
+            return Err(
+                "journey project_key differs from PHAROS_AEON_LIVE_EXPECT_PROJECT_KEY".to_string(),
+            );
+        }
+        if project_key == "PHAROS" {
+            return Err("live Aeon roundtrip refused: project_key is PHAROS".to_string());
+        }
+        if tenant != "inspr" {
+            return Err("live Aeon roundtrip refused: tenant is not inspr".to_string());
+        }
+        if expected_node_key.is_empty() {
+            return Err("live Aeon roundtrip missing PHAROS_AEON_LIVE_EXPECT_NODE_KEY".to_string());
+        }
+        if node_key != expected_node_key {
+            return Err(
+                "journey node_key differs from PHAROS_AEON_LIVE_EXPECT_NODE_KEY".to_string(),
+            );
+        }
+        // Admit refuses unless the candidate and deploy gates are live
+        // (launch.go). The build stage carries the candidate gate once that
+        // gate exists (derive.go gateIDFor). Aeon has no disposable-project
+        // field; AEON-188 is the forthcoming operator-only marker.
+        let stages = journey
+            .get("stages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "journey stages are missing".to_string())?;
+        let candidate_live = stage_gate_live(stages, "build")?;
+        let deploy_live = stage_gate_live(stages, "deploy")?;
+        if !candidate_live || !deploy_live {
+            return Err(format!(
+                "live Aeon roundtrip refused: the candidate gate (build stage) and the deploy gate must be live before any write, because admission answers 403 \"stage gate is not approved\" until they are. candidate_live={candidate_live} deploy_live={deploy_live}. Aeon has no operator-only disposable marker yet (AEON-188); until then the operator-supplied project key, node key, and release id are the guard."
+            ));
+        }
+        if handoff_ids.is_empty() {
+            return Err("live Aeon roundtrip has no handoff".to_string());
+        }
+        for handoff_id in handoff_ids {
+            let handoff = adapter
+                .aeon
+                .get_handoff(handoff_id)
+                .await
+                .map_err(|error| format!("live Aeon handoff read failed ({})", error.code()))?;
+            if handoff.release_node_id != expected_release_node {
+                return Err(
+                    "handoff release_node_id differs from PHAROS_AEON_LIVE_RELEASE_NODE_ID"
+                        .to_string(),
+                );
+            }
+            if handoff.project_node_id != project_node_id {
+                return Err(
+                    "handoff project_node_id differs from PHAROS_AEON_LIVE_PROJECT_NODE_ID"
+                        .to_string(),
+                );
+            }
+        }
+        println!(
+            "live Aeon roundtrip target: project_key={project_key} node_key={node_key} release_number={release_number} candidate_gate_live=true deploy_gate_live=true"
+        );
+        Ok(LiveIdentity {
+            project_key: project_key.to_string(),
+            node_key: node_key.to_string(),
+            release_number,
+        })
+    }
+
+    async fn live_step(
+        adapter: &AeonDeliveryAdapter,
+        intent: &DeliveryIntent,
+        traces: &Arc<Mutex<Vec<RequestTrace>>>,
+        report: &Path,
+        key_file: &Path,
+    ) {
+        if let Err(error) = adapter.process_intent(intent).await {
+            let message = format!("{} ({})", live_failure(traces), error.code());
+            save_live_failure(report, traces, key_file, &message);
+            panic!("{message}");
+        }
+    }
+
+    async fn live_until(
+        adapter: &AeonDeliveryAdapter,
+        intent: &DeliveryIntent,
+        traces: &Arc<Mutex<Vec<RequestTrace>>>,
+        report: &Path,
+        key_file: &Path,
+        deadline: std::time::Instant,
+        mut ready: impl FnMut() -> bool,
+    ) {
+        loop {
+            if std::time::Instant::now() >= deadline {
+                let message = format!("live Aeon roundtrip exceeded 90s: {}", live_failure(traces));
+                save_live_failure(report, traces, key_file, &message);
+                panic!("{message}");
+            }
+            live_step(adapter, intent, traces, report, key_file).await;
+            if ready() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    fn save_live_failure(
+        report: &Path,
+        traces: &Arc<Mutex<Vec<RequestTrace>>>,
+        key_file: &Path,
+        message: &str,
+    ) {
+        assert_trace_excerpts(traces);
+        let reason = withheld_live_text(message, key_file);
+        let body = json!({
+            "failed": true,
+            "reason": reason,
+            "requests": live_trace_rows(traces),
+        });
+        let bytes = serde_json::to_vec_pretty(&body).unwrap_or_default();
+        let bytes = if live_bytes_contain_key(&bytes, key_file) {
+            serde_json::to_vec_pretty(&json!({
+                "failed": true,
+                "reason": REFLECTED_CREDENTIAL_MARKER,
+                "requests": [],
+            }))
+            .unwrap_or_default()
+        } else {
+            bytes
+        };
+        if std::fs::write(report, &bytes).is_ok() {
+            eprintln!("live Aeon roundtrip report: {}", report.display());
+        }
+    }
+
+    fn withheld_live_text(text: &str, key_file: &Path) -> String {
+        if live_bytes_contain_key(text.as_bytes(), key_file) {
+            REFLECTED_CREDENTIAL_MARKER.to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn live_bytes_contain_key(bytes: &[u8], key_file: &Path) -> bool {
+        let Ok((mut key, _)) = read_private_file(key_file, MAX_API_KEY_BYTES, None) else {
+            return false;
+        };
+        let leaked = contains_slice(bytes, &key);
+        key.fill(0);
+        leaked
+    }
+
+    fn assert_trace_excerpts(traces: &Arc<Mutex<Vec<RequestTrace>>>) {
+        for trace in traces.lock().expect("traces").iter() {
+            if let Some(excerpt) = &trace.error_excerpt {
+                assert!(
+                    excerpt.len() <= TRACE_EXCERPT_MAX_BYTES,
+                    "trace excerpt exceeds {TRACE_EXCERPT_MAX_BYTES} bytes"
+                );
+            }
+        }
+    }
+
+    fn live_trace_rows(traces: &Arc<Mutex<Vec<RequestTrace>>>) -> Vec<Value> {
+        traces
+            .lock()
+            .expect("traces")
+            .iter()
+            .map(|trace| {
+                json!({
+                    "method": trace.method,
+                    "path": trace.path,
+                    "status": trace.status,
+                    "request_id": trace.request_id,
+                })
+            })
+            .collect()
+    }
+
+    fn live_failure(traces: &Arc<Mutex<Vec<RequestTrace>>>) -> String {
+        let recorded = traces.lock().expect("traces");
+        let Some(trace) = recorded.iter().rev().find(|trace| trace.status >= 400) else {
+            return "no Aeon error status recorded".to_string();
+        };
+        let excerpt = trace.error_excerpt.as_deref().unwrap_or("");
+        if excerpt == REFLECTED_CREDENTIAL_MARKER {
+            return format!(
+                "Aeon {} {} status {} request_id {} {}",
+                trace.method,
+                trace.path,
+                trace.status,
+                trace.request_id.as_deref().unwrap_or(""),
+                REFLECTED_CREDENTIAL_MARKER
+            );
+        }
+        let (code, reason) = live_error_parts(excerpt);
+        format!(
+            "Aeon {} {} status {} request_id {} code {} reason {}",
+            trace.method,
+            trace.path,
+            trace.status,
+            trace.request_id.as_deref().unwrap_or(""),
+            code,
+            reason
+        )
+    }
+
+    fn live_error_parts(excerpt: &str) -> (String, String) {
+        let Ok(value) = serde_json::from_str::<Value>(excerpt) else {
+            return (
+                String::new(),
+                truncate_to_bytes(excerpt, TRACE_EXCERPT_MAX_BYTES),
+            );
+        };
+        let code = value
+            .get("code")
+            .map(|item| match item {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+        let reason = value
+            .get("reason")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("error").and_then(Value::as_str))
+            .unwrap_or("");
+        (
+            truncate_to_bytes(&code, TRACE_EXCERPT_MAX_BYTES),
+            truncate_to_bytes(reason, TRACE_EXCERPT_MAX_BYTES),
+        )
+    }
+
+    async fn live_handoff_state(adapter: &AeonDeliveryAdapter, handoff_id: &str) -> Value {
+        let handoff = match adapter.aeon.get_handoff(handoff_id).await {
+            Ok(handoff) => handoff,
+            Err(error) => panic!(
+                "{} ({})",
+                live_failure(&adapter.aeon.traces.clone().expect("request trace")),
+                error.code()
+            ),
+        };
+        json!({
+            "id": handoff.id,
+            "state": handoff.state.key(),
+        })
+    }
+
+    fn live_report(
+        live: &LiveRoundtrip,
+        adapter: &AeonDeliveryAdapter,
+        journal: &Path,
+        traces: &Arc<Mutex<Vec<RequestTrace>>>,
+        handoffs: &[Value],
+        started: std::time::Instant,
+    ) -> Value {
+        let launch = adapter.journal.launch(&live.deploy.handoff_id).unwrap();
+        let admission = launch.admission.unwrap();
+        let receipt = launch.receipt.unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
+        let mut evidence: Vec<Value> = saved["records"]
+            .as_object()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        evidence.sort_by_key(|row| row["sequence"].as_i64().unwrap_or(0));
+        let mut evidence_cursor = 0usize;
+        let mut results: Vec<Value> = saved["results"]
+            .as_object()
+            .map(|rows| rows.values().cloned().collect())
+            .unwrap_or_default();
+        results.sort_by_key(|row| row["terminal_sequence"].as_i64().unwrap_or(0));
+        let mut result_cursor = 0usize;
+        let requests: Vec<Value> = traces
+            .lock()
+            .expect("traces")
+            .iter()
+            .map(|trace| {
+                let mut item = json!({
+                    "method": trace.method,
+                    "path": trace.path,
+                    "status": trace.status,
+                    "request_id": trace.request_id,
+                });
+                if trace.path.ends_with("/evidence") {
+                    if let Some(row) = evidence.get(evidence_cursor) {
+                        item["sequence"] = row["sequence"].clone();
+                        item["receipt_id"] = json!(format!(
+                            "{}:{}",
+                            row["handoff_id"].as_str().unwrap_or(""),
+                            row["sequence"].as_i64().unwrap_or(0)
+                        ));
+                        evidence_cursor += 1;
+                    }
+                } else if trace.path.ends_with("/launch/admit")
+                    || trace.path.ends_with("/launch/consume")
+                {
+                    item["receipt_id"] = json!(admission.id);
+                } else if trace.path.ends_with("/result") {
+                    if let Some(row) = results.get(result_cursor) {
+                        item["sequence"] = row["terminal_sequence"].clone();
+                        item["receipt_id"] = json!(format!(
+                            "{}:{}",
+                            row["handoff_id"].as_str().unwrap_or(""),
+                            row["terminal_sequence"].as_i64().unwrap_or(0)
+                        ));
+                        result_cursor += 1;
+                    }
+                }
+                item
+            })
+            .collect();
+        json!({
+            "origin": live.origin.as_str(),
+            "host": live.host,
+            "environment": live.environment,
+            "deploy_handoff": live.deploy.handoff_id,
+            "verify_handoff": live.verify.as_ref().map(|intent| intent.handoff_id.clone()),
+            "requests": requests,
+            "handoffs": handoffs,
+            "admission_id": admission.id,
+            "binding_digest": admission.binding_digest_sha256,
+            "consume_receipt": {
+                "handoff_id": receipt.handoff_id,
+                "admission_id": receipt.admission_id,
+                "consumed": receipt.consumed,
+                "consumed_at": receipt.consumed_at,
+            },
+            "timestamps": {
+                "started_at": format_timestamp(now_unix().saturating_sub(started.elapsed().as_secs() as i64)).unwrap(),
+                "finished_at": format_timestamp(now_unix()).unwrap(),
+            },
+        })
+    }
+
+    fn assert_live_bytes_exclude_key(bytes: &[u8], key_file: &Path) {
+        let (mut key, _) = read_private_file(key_file, MAX_API_KEY_BYTES, None).expect("live key");
+        let leaked = !key.is_empty() && contains_slice(bytes, &key);
+        key.fill(0);
+        assert!(!leaked, "live output contains the api key");
     }
 }

@@ -12,6 +12,31 @@
 
 - Add a config-selectable Aeon upstream for the Flow host (`inspr.pharos.flow-host-config.v2`): journey read with strict project node, project key and tenant verification, backwards-revision refusal, `/p/{project_key}?view=journey` navigation with an exact allow-list, and the classic Paimos path left untouched. No production change until the operator switches the config (PHAROS-313).
 - Add an owner-only Aeon delivery adapter selected by `PHAROS_AEON_DELIVERY_CONFIG_FILE`. It reads Aeon stage handoffs, posts typed evidence, consumes one launch admission, and seals the result. The classic Paimos adapter is unchanged. pharosd refuses to start when both delivery configs are set (PHAROS-313).
+- Add an ignored live roundtrip for that adapter. It runs only when `PHAROS_AEON_LIVE_ACK=disposable`, reads the bearer token through the production reader, and writes a value-free request report (PHAROS-313).
+- Require an Aeon deploy intent's `delegated_launch.target_ref` to be that intent's artifact digest (PHAROS-313).
+- Send only an Aeon-accepted blocker code on a stage result, and keep the Pharos reason token in the delivery journal (PHAROS-313).
+- Close an Aeon handoff when its launch admission expires by journaling `admission_expired` and posting `policy_refused` while `now` is not strictly after `expires_at`. Aeon sets that expiry equal to the handoff and refuses a second admit, so there is no fresh attempt on the same handoff (PHAROS-313).
+- Compare admission expiry at sub-second precision. A still-valid fraction of the expiry second stays open, and once that instant has passed the block stays local instead of replaying a result Aeon rejects as stale (PHAROS-313).
+- Stamp failed or cancelled deployment evidence at the current time. A job that failed before the handoff existed would otherwise replay evidence Aeon rejects as predating the handoff (PHAROS-313).
+- Link an Aeon retry to the previous review only when that job is review-retryable and still the host's latest update. A cancelled or succeeded predecessor starts a fresh review (PHAROS-313).
+- Post the mapped Aeon blocker when crash recovery records a terminal launch block, including a consume abandoned after the operator cancels the job (PHAROS-313).
+- Refuse an Aeon deploy intent that names an `update_restart_job_id` the delivery adapter does not own, at startup and before the job is bound (PHAROS-313).
+- Require the live Aeon roundtrip to name the journey node key and to see every stage gate dark before it writes (PHAROS-313).
+- Require the live Aeon roundtrip's candidate and deploy gates to be live before it writes. A dark gate cannot be admitted. Until Aeon ships an operator-only disposable marker (AEON-188), the operator-supplied project key, node key, and release id remain the guard (PHAROS-313).
+- Refuse an Aeon admit when the candidate or deploy gate is dark, and journal `stage_gate_not_approved` without confirming the host job. Aeon answers 403 `stage gate is not approved` (PHAROS-313).
+- Classify an Aeon 403 as `stage_gate_not_approved` only when its error is exactly a stage-gate refusal. Any other 403 stays a credential failure. The live roundtrip checks the gates before the first evidence post (PHAROS-313).
+- Check every Aeon response header for a reflected bearer token before copying a header into a trace, a panic, or the live report (PHAROS-313).
+- Recheck the backup gate on every consume recovery, including while the posted readiness row is still inside the 600-second refresh window (PHAROS-313).
+- Refuse to confirm a recovered Aeon launch when the fetched handoff already has a result or its admission does not match the journal. A newer attempt is not visible on that handoff (PHAROS-313).
+- Withhold a reflected API key from Aeon delivery traces, panic text, and the live roundtrip report (PHAROS-313).
+- Refuse the live Aeon roundtrip unless the journey project key, tenant, and handoff release match the disposable target named in the environment (PHAROS-313).
+- Refuse to confirm a recovered Aeon launch when the handoff is no longer open or its authority no longer matches the journaled admission (PHAROS-313).
+- Recheck the backup success gate before a consume replay refreshes launch readiness (PHAROS-313).
+- Recheck that a recovered Aeon launch still belongs to the delivery adapter before confirming it (PHAROS-313).
+- Post a failed Aeon result for a terminal launch block while the host job is still awaiting confirmation (PHAROS-313).
+- Stop replaying unacknowledged Aeon evidence once the handoff is expired, closed, or already has a result, or once Aeon answers 409 `handoff is stale` or `handoff is terminal`. The row stays in the journal and is not posted again (PHAROS-313).
+- Replay unacknowledged Aeon evidence before allocating the next sequence for a terminal launch block, so a failed deployment is not posted above a readiness row Aeon has not stored (PHAROS-313).
+- Stop replaying verification evidence Aeon rejects as predating the handoff. A later beacon reuses that unstored sequence, and a closed window reports `reporter_stale` instead (PHAROS-313).
 
 ## 260922141211.0.0 - 2026-09-22
 
