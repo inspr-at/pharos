@@ -5408,8 +5408,10 @@ mod tests {
         journey_project_key: String,
         journey_node_key: String,
         journey_tenant_slug: String,
-        /// When true, the journey fixture reports one live gate.
-        journey_gate_live: bool,
+        /// Build stage carries the candidate gate once that gate exists
+        /// (journey derive.go gateIDFor). Admit requires both live.
+        journey_candidate_gate_live: bool,
+        journey_deploy_gate_live: bool,
     }
 
     #[derive(Clone)]
@@ -5456,7 +5458,8 @@ mod tests {
                     journey_project_key: "lab".to_string(),
                     journey_node_key: "PRJ-17".to_string(),
                     journey_tenant_slug: "inspr".to_string(),
-                    journey_gate_live: false,
+                    journey_candidate_gate_live: true,
+                    journey_deploy_gate_live: true,
                 })),
                 captures: Arc::new(Mutex::new(Vec::new())),
                 reread_hook: Arc::new(Mutex::new(None)),
@@ -6079,9 +6082,13 @@ mod tests {
                     "node_key": inner.journey_node_key,
                     "tenant_slug": inner.journey_tenant_slug,
                     "stages": [{
+                        "key": "build",
+                        "state": "done",
+                        "gate_live": inner.journey_candidate_gate_live,
+                    }, {
                         "key": "deploy",
                         "state": "current",
-                        "gate_live": inner.journey_gate_live,
+                        "gate_live": inner.journey_deploy_gate_live,
                     }],
                 }),
             );
@@ -11479,23 +11486,45 @@ mod tests {
         assert!(posts(&other_release.fake).is_empty());
         other_release.server.abort();
 
-        let live_gate = harness(true).await;
-        live_gate
-            .fake
-            .update(|inner| inner.journey_gate_live = true);
+        let dark_gates = harness(true).await;
+        dark_gates.fake.update(|inner| {
+            inner.journey_candidate_gate_live = false;
+            inner.journey_deploy_gate_live = false;
+        });
         let refused = confirm_live_target(
-            &live_gate.adapter,
+            &dark_gates.adapter,
             "lab",
             "PRJ-17",
-            &live_gate.intent.project_node_id,
+            &dark_gates.intent.project_node_id,
             RELEASE_NODE,
-            live_gate.intent.artifact.release_sequence,
-            &[live_gate.intent.handoff_id.as_str()],
+            dark_gates.intent.artifact.release_sequence,
+            &[dark_gates.intent.handoff_id.as_str()],
         )
         .await;
-        assert!(refused.unwrap_err().contains("gate_live is true"));
-        assert!(posts(&live_gate.fake).is_empty());
-        live_gate.server.abort();
+        let message = refused.unwrap_err();
+        assert!(message.contains("must be live"));
+        assert!(message.contains("stage gate is not approved"));
+        assert!(message.contains("AEON-188"));
+        assert!(posts(&dark_gates.fake).is_empty());
+        dark_gates.server.abort();
+
+        let deploy_dark = harness(true).await;
+        deploy_dark
+            .fake
+            .update(|inner| inner.journey_deploy_gate_live = false);
+        let refused = confirm_live_target(
+            &deploy_dark.adapter,
+            "lab",
+            "PRJ-17",
+            &deploy_dark.intent.project_node_id,
+            RELEASE_NODE,
+            deploy_dark.intent.artifact.release_sequence,
+            &[deploy_dark.intent.handoff_id.as_str()],
+        )
+        .await;
+        assert!(refused.unwrap_err().contains("deploy_live=false"));
+        assert!(posts(&deploy_dark.fake).is_empty());
+        deploy_dark.server.abort();
 
         let other_node = harness(true).await;
         let refused = confirm_live_target(
@@ -11872,6 +11901,17 @@ mod tests {
         release_number: i64,
     }
 
+    fn stage_gate_live(stages: &[Value], key: &str) -> Result<bool, String> {
+        let stage = stages
+            .iter()
+            .find(|stage| stage.get("key").and_then(Value::as_str) == Some(key))
+            .ok_or_else(|| format!("journey stage {key} is missing"))?;
+        stage
+            .get("gate_live")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("journey stage {key} is missing gate_live"))
+    }
+
     async fn confirm_live_target(
         adapter: &AeonDeliveryAdapter,
         expected_project_key: &str,
@@ -11934,30 +11974,20 @@ mod tests {
                 "journey node_key differs from PHAROS_AEON_LIVE_EXPECT_NODE_KEY".to_string(),
             );
         }
-        // Aeon has no disposable-project field. gate_live is the current
-        // approval/grant check on each stage (journey doc.go). Every stage
-        // must be dark before this harness writes.
+        // Admit refuses unless the candidate and deploy gates are live
+        // (launch.go). The build stage carries the candidate gate once that
+        // gate exists (derive.go gateIDFor). Aeon has no disposable-project
+        // field; AEON-188 is the forthcoming operator-only marker.
         let stages = journey
             .get("stages")
             .and_then(Value::as_array)
             .ok_or_else(|| "journey stages are missing".to_string())?;
-        if stages.is_empty() {
-            return Err("journey has no stages".to_string());
-        }
-        for stage in stages {
-            match stage.get("gate_live").and_then(Value::as_bool) {
-                Some(false) => {}
-                Some(true) => {
-                    let key = stage
-                        .get("key")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    return Err(format!(
-                        "live Aeon roundtrip refused: journey stage {key} gate_live is true"
-                    ));
-                }
-                None => return Err("journey stage is missing gate_live".to_string()),
-            }
+        let candidate_live = stage_gate_live(stages, "build")?;
+        let deploy_live = stage_gate_live(stages, "deploy")?;
+        if !candidate_live || !deploy_live {
+            return Err(format!(
+                "live Aeon roundtrip refused: the candidate gate (build stage) and the deploy gate must be live before any write, because admission answers 403 \"stage gate is not approved\" until they are. candidate_live={candidate_live} deploy_live={deploy_live}. Aeon has no operator-only disposable marker yet (AEON-188); until then the operator-supplied project key, node key, and release id are the guard."
+            ));
         }
         if handoff_ids.is_empty() {
             return Err("live Aeon roundtrip has no handoff".to_string());
@@ -11982,7 +12012,7 @@ mod tests {
             }
         }
         println!(
-            "live Aeon roundtrip target: project_key={project_key} node_key={node_key} release_number={release_number} gate_live=false"
+            "live Aeon roundtrip target: project_key={project_key} node_key={node_key} release_number={release_number} candidate_gate_live=true deploy_gate_live=true"
         );
         Ok(LiveIdentity {
             project_key: project_key.to_string(),
