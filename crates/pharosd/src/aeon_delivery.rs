@@ -25,8 +25,8 @@ use url::Url;
 
 use crate::durable_file::atomic_write_json;
 use crate::host_actions::{
-    HostActionJob, HostActionPlan, HostActionState, HostActionStore, HostActionStoreError,
-    HostWorkflowKind, UpdateRestartIntent,
+    HostActionEventKind, HostActionEventSource, HostActionJob, HostActionPlan, HostActionState,
+    HostActionStore, HostActionStoreError, HostWorkflowKind, UpdateRestartIntent,
 };
 use crate::paimos_delivery::{
     load_ca_certificates, observed_fresh_config_beacon, read_private_file, reviewed_plan_digest,
@@ -47,7 +47,7 @@ const JSON_MEDIA: &str = "application/json";
 const IDENTITY_ENCODING: &str = "identity";
 const PLUGIN_ID: &str = "pharos";
 const STAGE_DEPLOY: &str = "deploy";
-const ACTOR: &str = "aeon-delivery";
+pub(crate) const ACTOR: &str = "aeon-delivery";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_API_KEY_BYTES: u64 = 512;
@@ -66,6 +66,7 @@ const LAUNCH_BLOCK_READINESS_FLAG_FALSE: &str = "readiness_flag_false";
 const LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED: &str = "delegated_launch_required";
 const LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB: &str = "consumed_without_confirmable_job";
 const LAUNCH_BLOCK_CONSUME_ABANDONED: &str = "consume_abandoned";
+const LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED: &str = "confirmation_not_delegated";
 
 #[derive(Debug)]
 enum AdapterError {
@@ -464,6 +465,7 @@ enum BlockerCode {
     ReporterStale,
     ExternalWaiting,
     PolicyRefused,
+    ConfirmationNotDelegated,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1176,6 +1178,7 @@ fn launch_block_reason(token: &str) -> Option<&'static str> {
             Some(LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB)
         }
         LAUNCH_BLOCK_CONSUME_ABANDONED => Some(LAUNCH_BLOCK_CONSUME_ABANDONED),
+        LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED => Some(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED),
         _ => None,
     }
 }
@@ -2224,10 +2227,14 @@ impl AeonDeliveryAdapter {
     async fn process_intent(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
         self.journal
             .assert_bound(intent, &self.config.aeon_origin)?;
-        if self.replay_started_consume(intent).await? {
-            return Ok(());
+        match self.replay_started_consume(intent).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => return self.finish_blocked_confirmation(intent, error).await,
         }
-        self.confirm_if_consumed(intent)?;
+        if let Err(error) = self.confirm_if_consumed(intent) {
+            return self.finish_blocked_confirmation(intent, error).await;
+        }
         if let Some(pending) = self.journal.pending_evidence(&intent.handoff_id) {
             return self.replay_evidence(intent, &pending).await;
         }
@@ -2276,8 +2283,24 @@ impl AeonDeliveryAdapter {
         if intent.operation == Operation::Deploy {
             self.bind_deployment(intent, &handoff)?;
         }
-        self.maybe_launch(intent, &handoff).await?;
+        if let Err(error) = self.maybe_launch(intent, &handoff).await {
+            return self.finish_blocked_confirmation(intent, error).await;
+        }
         self.maybe_report(intent, &handoff).await
+    }
+
+    async fn finish_blocked_confirmation(
+        &self,
+        intent: &DeliveryIntent,
+        error: AdapterError,
+    ) -> Result<(), AdapterError> {
+        if matches!(
+            error,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED)
+        ) {
+            self.report_confirmation_not_delegated(intent).await?;
+        }
+        Err(error)
     }
 
     fn log_closed(&self, handoff: &HandoffDocument) {
@@ -2380,6 +2403,25 @@ impl AeonDeliveryAdapter {
         }
         self.reject_terminal_block(&intent.handoff_id)?;
         self.finish_confirmation(intent, &launch)
+    }
+
+    async fn report_confirmation_not_delegated(
+        &self,
+        intent: &DeliveryIntent,
+    ) -> Result<(), AdapterError> {
+        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        handoff.validate(intent)?;
+        if handoff.state.is_open() {
+            handoff.open_for_write(now_unix())?;
+        }
+        self.write_observation(
+            intent,
+            &handoff,
+            EvidenceOutcome::Failed,
+            now_unix(),
+            Some(BlockerCode::ConfirmationNotDelegated),
+        )
+        .await
     }
 
     fn reject_terminal_block(&self, handoff_id: &str) -> Result<(), AdapterError> {
@@ -3066,7 +3108,10 @@ impl AeonDeliveryAdapter {
                 | HostActionState::Failed
                 | HostActionState::Cancelled
         ) {
-            return Ok(());
+            if confirmation_is_delegated(&job, &admission.id) {
+                return Ok(());
+            }
+            return self.block_launch(intent, LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED, true);
         }
         Err(AdapterError::LocalBinding)
     }
@@ -3448,6 +3493,14 @@ fn awaiting_ready_review(job: &HostActionJob, host: &str) -> bool {
 
 fn consumable_for_launch(job: &HostActionJob, host: &str) -> bool {
     awaiting_ready_review(job, host) && job.requested_by == ACTOR && job.confirmed_at.is_none()
+}
+
+fn confirmation_is_delegated(job: &HostActionJob, admission_id: &str) -> bool {
+    job.events.iter().any(|event| {
+        event.kind == HostActionEventKind::Confirmed
+            && event.source == HostActionEventSource::Pharos
+            && event.actor.as_deref() == Some(admission_id)
+    })
 }
 
 fn consume_job_confirmable(
@@ -4595,6 +4648,7 @@ mod tests {
         inner: Arc<Mutex<FakeInner>>,
         captures: Arc<Mutex<Vec<Captured>>>,
         reread_hook: RereadHook,
+        consume_hook: RereadHook,
     }
 
     impl FakeAeon {
@@ -4622,6 +4676,7 @@ mod tests {
                 })),
                 captures: Arc::new(Mutex::new(Vec::new())),
                 reread_hook: Arc::new(Mutex::new(None)),
+                consume_hook: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -5011,6 +5066,7 @@ mod tests {
                     | "reporter_stale"
                     | "external_waiting"
                     | "policy_refused"
+                    | "confirmation_not_delegated"
             )
         );
         if (value["outcome"] == "failed" && !failed_blocker)
@@ -5306,6 +5362,11 @@ mod tests {
         drop(inner);
         if fire_reread {
             if let Some(hook) = fake.reread_hook.lock().expect("reread hook").take() {
+                hook();
+            }
+        }
+        if method == "POST" && path.ends_with("/launch/consume") {
+            if let Some(hook) = fake.consume_hook.lock().expect("consume hook").take() {
                 hook();
             }
         }
@@ -7994,6 +8055,83 @@ mod tests {
             .journal
             .launch_block(DEPLOY_HANDOFF)
             .is_none());
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn foreign_confirmation_does_not_claim_the_launch() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let actions = Arc::clone(&fixture.actions);
+        let confirm_id = job_id.clone();
+        *fixture.fake.consume_hook.lock().expect("consume hook") = Some(Box::new(move || {
+            let job = actions.get(&confirm_id).expect("job");
+            actions
+                .confirm_update(
+                    &confirm_id,
+                    "hsb8",
+                    "operator",
+                    now_unix().max(job.updated_at),
+                )
+                .expect("operator confirms ahead of the admission");
+        }));
+        let error = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::QueuedApply);
+        assert!(job.events.iter().any(|event| {
+            event.kind == HostActionEventKind::Confirmed
+                && event.source == HostActionEventSource::Operator
+        }));
+        assert!(!confirmation_is_delegated(
+            &job,
+            &fixture
+                .adapter
+                .journal
+                .launch(DEPLOY_HANDOFF)
+                .unwrap()
+                .admission
+                .unwrap()
+                .id
+        ));
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
+        );
+        let results: Vec<Value> = posts(&fixture.fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/result"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "confirmation_not_delegated");
+        let later = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(
+            later,
+            Err(AdapterError::LaunchBlocked(
+                LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
+            ))
+        ));
+        assert_eq!(
+            posts(&fixture.fake)
+                .iter()
+                .filter(|capture| capture.path.ends_with("/result"))
+                .count(),
+            1
+        );
         fixture.server.abort();
     }
 
