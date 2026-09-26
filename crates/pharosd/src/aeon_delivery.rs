@@ -67,6 +67,7 @@ const LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED: &str = "delegated_launch_required"
 const LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB: &str = "consumed_without_confirmable_job";
 const LAUNCH_BLOCK_CONSUME_ABANDONED: &str = "consume_abandoned";
 const LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED: &str = "confirmation_not_delegated";
+const LAUNCH_BLOCK_ADMISSION_EXPIRED: &str = "admission_expired";
 
 const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING,
@@ -77,6 +78,7 @@ const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB,
     LAUNCH_BLOCK_CONSUME_ABANDONED,
     LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED,
+    LAUNCH_BLOCK_ADMISSION_EXPIRED,
 ];
 
 #[derive(Debug)]
@@ -1231,6 +1233,9 @@ fn aeon_blocker_for_reason(reason: &str) -> Option<BlockerCode> {
         LAUNCH_BLOCK_READINESS_PLAN_CHANGED
         | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
         | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED => BlockerCode::PolicyRefused,
+        // A consumed admission cannot be replaced. While it is still unconsumed
+        // and the handoff is current, the reporter sends external_waiting.
+        LAUNCH_BLOCK_ADMISSION_EXPIRED => BlockerCode::PolicyRefused,
         LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB | LAUNCH_BLOCK_CONSUME_ABANDONED => {
             BlockerCode::DependencyFailed
         }
@@ -2363,6 +2368,12 @@ impl AeonDeliveryAdapter {
         ) {
             self.report_confirmation_not_delegated(intent).await?;
         }
+        if matches!(
+            error,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ) {
+            self.report_admission_expired(intent).await?;
+        }
         Err(error)
     }
 
@@ -2421,6 +2432,11 @@ impl AeonDeliveryAdapter {
             // admission, and the job before sending it again.
             observed.open_for_write(now_unix())?;
             let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
+            if unix_of(&admission.expires_at)? <= now_unix() {
+                return self
+                    .block_launch(intent, LAUNCH_BLOCK_ADMISSION_EXPIRED, true)
+                    .map(|_| true);
+            }
             self.validate_admission(
                 admission,
                 intent,
@@ -2495,6 +2511,44 @@ impl AeonDeliveryAdapter {
             now_unix(),
             Some(blocker),
             Some(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED),
+        )
+        .await
+    }
+
+    async fn report_admission_expired(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
+        if self
+            .journal
+            .result(&intent.handoff_id)
+            .is_some_and(|record| record.receipt.is_some())
+        {
+            return Ok(());
+        }
+        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        handoff.validate(intent)?;
+        let now = now_unix();
+        // Aeon current() stays true until now is strictly after expires_at.
+        // A result posted later is 409 and must not be journaled for replay.
+        let current = handoff.state.is_open() && unix_of(&handoff.expires_at)? >= now;
+        if !current {
+            return Ok(());
+        }
+        let consumed = self
+            .journal
+            .launch(&intent.handoff_id)
+            .is_some_and(|launch| launch.receipt.is_some());
+        // A fresh admit is still possible only before this admission is consumed.
+        let blocker = if consumed {
+            BlockerCode::PolicyRefused
+        } else {
+            BlockerCode::ExternalWaiting
+        };
+        self.write_observation(
+            intent,
+            &handoff,
+            EvidenceOutcome::Failed,
+            now,
+            Some(blocker),
+            Some(LAUNCH_BLOCK_ADMISSION_EXPIRED),
         )
         .await
     }
@@ -2806,6 +2860,9 @@ impl AeonDeliveryAdapter {
             .ensure_admission(intent, handoff, &operation.job_id, &reviewed)
             .await?;
         let admission = launch.admission.clone().ok_or(AdapterError::Journal)?;
+        if unix_of(&admission.expires_at)? <= now_unix() {
+            return self.block_launch(intent, LAUNCH_BLOCK_ADMISSION_EXPIRED, true);
+        }
         self.validate_admission(&admission, intent, handoff, &reviewed, now_unix())?;
         let fresh = self.aeon.get_handoff(&intent.handoff_id).await?;
         fresh.validate(intent)?;
@@ -3207,7 +3264,7 @@ impl AeonDeliveryAdapter {
         if job.state == HostActionState::AwaitingConfirmation {
             let now = now_unix();
             if unix_of(&admission.expires_at)? <= now || unix_of(handoff_expires_at)? <= now {
-                return Err(AdapterError::LocalBinding);
+                return self.block_launch(intent, LAUNCH_BLOCK_ADMISSION_EXPIRED, true);
             }
             // Aeon's consumed_at stays in the journal. The host job clock is
             // local, and never earlier than the review that produced this job.
@@ -4909,6 +4966,7 @@ mod tests {
         reject_result: bool,
         corrupt_binding: bool,
         expire_admission: bool,
+        admission_lifetime_secs: Option<i64>,
         get_status: Option<StatusCode>,
         drop_accepted_consume: bool,
         drop_accepted_admit: bool,
@@ -4951,6 +5009,7 @@ mod tests {
                     reject_result: false,
                     corrupt_binding: false,
                     expire_admission: false,
+                    admission_lifetime_secs: None,
                     get_status: None,
                     drop_accepted_consume: false,
                     drop_accepted_admit: false,
@@ -5302,6 +5361,11 @@ mod tests {
         };
         let expires_at = if flags.expire {
             format_timestamp(flags.now - 120).unwrap()
+        } else if let Some(lifetime) = flags.admission_lifetime_secs {
+            let handoff_expires = parse_timestamp(&handoff.expires_at)
+                .map(|time| time.unix_timestamp())
+                .unwrap_or(flags.now);
+            format_timestamp(flags.now.saturating_add(lifetime).min(handoff_expires)).unwrap()
         } else {
             handoff.expires_at.clone()
         };
@@ -5440,6 +5504,12 @@ mod tests {
         {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
         }
+        let expires_at = parse_timestamp(&handoff.expires_at)
+            .map(|time| time.unix_timestamp())
+            .unwrap_or(0);
+        if expires_at < now {
+            return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
+        }
         let last = handoff.evidence.keys().max().copied();
         if value["prerequisite_seal_sha256"].as_str()
             != Some(handoff.prerequisite_seal_sha256.as_str())
@@ -5523,6 +5593,7 @@ mod tests {
         let now = inner.now;
         let corrupt = inner.corrupt_binding;
         let expire = inner.expire_admission;
+        let admission_lifetime_secs = inner.admission_lifetime_secs;
         let drop_admit =
             matches!(route, ("POST", Some("launch"), Some("admit"))) && inner.drop_accepted_admit;
         let drop_consume = matches!(route, ("POST", Some("launch"), Some("consume")))
@@ -5544,6 +5615,7 @@ mod tests {
                     now,
                     corrupt,
                     expire,
+                    admission_lifetime_secs,
                     principal,
                     idempotency,
                     drop_response: drop_admit,
@@ -5568,6 +5640,7 @@ mod tests {
         now: i64,
         corrupt: bool,
         expire: bool,
+        admission_lifetime_secs: Option<i64>,
         principal: &'a str,
         idempotency: &'a str,
         drop_response: bool,
@@ -8240,7 +8313,8 @@ mod tests {
             | LAUNCH_BLOCK_READINESS_FLAG_FALSE => "external_waiting",
             LAUNCH_BLOCK_READINESS_PLAN_CHANGED
             | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
-            | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED => "policy_refused",
+            | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
+            | LAUNCH_BLOCK_ADMISSION_EXPIRED => "policy_refused",
             LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB | LAUNCH_BLOCK_CONSUME_ABANDONED => {
                 "dependency_failed"
             }
@@ -8367,12 +8441,16 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn expired_admission_is_not_confirmed_on_replay() {
-        let now = now_unix();
-        let _clock = FrozenNow::at(now);
-        let fixture = harness(true).await;
-        let job_id = prepare_ready_launch(&fixture).await;
+    fn result_posts(fake: &FakeAeon) -> Vec<Value> {
+        posts(fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/result"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect()
+    }
+
+    async fn dropped_consume(fixture: &Harness) -> String {
+        let job_id = prepare_ready_launch(fixture).await;
         fixture
             .fake
             .update(|inner| inner.drop_accepted_consume = true);
@@ -8381,10 +8459,33 @@ mod tests {
             .process_intent(&fixture.intent)
             .await
             .is_err());
-        FrozenNow::set(now + 4000);
-        fixture.fake.update(|inner| inner.now = now + 4000);
-        let replay = fixture.adapter.process_intent(&fixture.intent).await;
-        assert!(matches!(replay, Err(AdapterError::LocalBinding)));
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_none());
+        job_id
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_admission_closes_the_handoff_without_confirming() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        FrozenNow::set(now + 3600);
+        fixture.fake.update(|inner| inner.now = now + 3600);
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
         let job = fixture.actions.get(&job_id).unwrap();
         assert_eq!(job.state, HostActionState::AwaitingConfirmation);
         assert!(job.confirmed_at.is_none());
@@ -8395,6 +8496,150 @@ mod tests {
             .unwrap()
             .receipt
             .is_some());
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "policy_refused");
+        assert!(results[0].get("detail").is_none());
+        let recorded = fixture.adapter.journal.result(DEPLOY_HANDOFF).unwrap();
+        assert_eq!(
+            recorded.detail.as_deref(),
+            Some(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        );
+        assert!(recorded.receipt.is_some());
+        let document = fetch_handoff(&fixture.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert_eq!(document["state"], "failed");
+        assert_eq!(document["result"]["blocker_code"], "policy_refused");
+        let later = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            later,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        assert_eq!(result_posts(&fixture.fake).len(), 1);
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_admission_is_not_confirmed_after_the_handoff_is_stale() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        FrozenNow::set(now + 4000);
+        fixture.fake.update(|inner| inner.now = now + 4000);
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_some());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_ADMISSION_EXPIRED
+        );
+        assert!(fixture.adapter.journal.result(DEPLOY_HANDOFF).is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        let later = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            later,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        assert!(fixture.adapter.journal.result(DEPLOY_HANDOFF).is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unconsumed_expired_admission_reports_external_waiting() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        fixture
+            .fake
+            .update(|inner| inner.admission_lifetime_secs = Some(30));
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(launch.admission.is_some());
+        assert!(launch.consume_started);
+        assert!(launch.receipt.is_none());
+        let consumes = post_count(&fixture.fake, "/launch/consume");
+        FrozenNow::set(now + 60);
+        fixture.fake.update(|inner| inner.now = now + 60);
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "external_waiting");
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        );
+        let document = fetch_handoff(&fixture.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert_eq!(document["state"], "failed");
+        let later = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            later,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
+        ));
+        assert_eq!(result_posts(&fixture.fake).len(), 1);
         fixture.server.abort();
     }
 
