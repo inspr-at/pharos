@@ -6126,13 +6126,22 @@ mod tests {
         ) {
             return response;
         }
-        // launch.go checks current() before the gates. A superseded attempt
-        // is 409 "handoff is stale". Exact replay already returned.
+        // launch.go refuses a new key once an admission is stored, before
+        // current(). A superseded handoff that already has an admission
+        // answers "launch admission already exists", not "handoff is stale".
+        if handoff.admission.is_some() {
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "launch admission already exists"}),
+            );
+        }
+        // current() is later (launch.go). A superseded attempt with no
+        // admission is 409 "handoff is stale". Exact replay already returned.
         if handoff.superseded_by.is_some() || handoff.force_stale {
             return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
         }
-        // launch.go checks both gates after an exact replay has already
-        // returned. A new admit uses "stage gate is not approved".
+        // launch.go checks both gates after current(). A new admit uses
+        // "stage gate is not approved".
         if let Some(response) = launch_gate_refusal(
             flags.candidate_gate_live,
             flags.deploy_gate_live,
@@ -6170,9 +6179,6 @@ mod tests {
                 && satisfying_readiness(&evidence.body, flags.now).is_none()
         });
         if contradicted {
-            return json_response(StatusCode::CONFLICT, &json!({}));
-        }
-        if handoff.admission.is_some() {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
         let binding = if flags.corrupt {
@@ -10035,9 +10041,22 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(value["error"], "handoff is stale");
         let (status, value) = post(
+            admit_url.clone(),
+            admit.clone(),
+            Some("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "launch admission already exists");
+        fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.admission = None;
+            handoff.launch_calls.clear();
+        });
+        let (status, value) = post(
             admit_url,
             admit,
-            Some("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+            Some("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
