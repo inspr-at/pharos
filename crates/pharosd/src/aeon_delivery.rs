@@ -25,8 +25,8 @@ use url::Url;
 
 use crate::durable_file::atomic_write_json;
 use crate::host_actions::{
-    HostActionEventKind, HostActionEventSource, HostActionJob, HostActionPlan, HostActionState,
-    HostActionStore, HostActionStoreError, HostWorkflowKind, UpdateRestartIntent,
+    HostActionEventKind, HostActionEventSource, HostActionJob, HostActionKind, HostActionPlan,
+    HostActionState, HostActionStore, HostActionStoreError, HostWorkflowKind, UpdateRestartIntent,
 };
 use crate::paimos_delivery::{
     load_ca_certificates, observed_fresh_config_beacon, read_private_file, reviewed_plan_digest,
@@ -1221,6 +1221,50 @@ impl LaunchBlock {
             && valid_hex64(&self.intent_digest)
             && launch_block_reason(&self.reason).is_some()
     }
+}
+
+/// Same predicate as `HostActionJob::review_retryable`, which is private to
+/// the host-action store. Failed, unconfirmed, and still without a plan or result.
+fn review_retryable_job(job: &HostActionJob) -> bool {
+    job.kind == HostActionKind::UpdateRestart
+        && job.state == HostActionState::Failed
+        && job.confirmed_at.is_none()
+        && job.plan.is_none()
+        && job.result.is_none()
+}
+
+/// `latest_update_for` is private. Rank updates the same way: created_at, then
+/// updated_at, then id. `except_job_id` drops a job inserted before this check.
+fn latest_update_id(
+    actions: &HostActionStore,
+    host: &str,
+    except_job_id: Option<&str>,
+) -> Option<String> {
+    actions
+        .list()
+        .into_iter()
+        .filter(|job| {
+            job.kind == HostActionKind::UpdateRestart
+                && job.host == host
+                && except_job_id != Some(job.id.as_str())
+        })
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .map(|job| job.id)
+}
+
+fn job_links_as_review_retry(
+    actions: &HostActionStore,
+    predecessor: &HostActionJob,
+    except_job_id: Option<&str>,
+) -> bool {
+    review_retryable_job(predecessor)
+        && latest_update_id(actions, &predecessor.host, except_job_id)
+            .is_some_and(|id| id == predecessor.id)
 }
 
 fn launch_block_reason(token: &str) -> Option<&'static str> {
@@ -2758,21 +2802,29 @@ impl AeonDeliveryAdapter {
         } else {
             let job_id = deterministic_job_id(&intent.host, &operation_id)?;
             let predecessor = self.journal.retry_predecessor(intent, handoff)?;
-            let job = match predecessor.as_ref() {
-                Some(predecessor) => self.host_actions.retry_update_review_with_id(
-                    &predecessor.job_id,
+            // retry_update_review only accepts a review-retryable predecessor
+            // that is still this host's latest update. A cancelled or succeeded
+            // predecessor, or one an operator already retried, takes a fresh review.
+            let job = if let Some(binding) = predecessor.as_ref().filter(|binding| {
+                self.host_actions
+                    .get(&binding.job_id)
+                    .is_some_and(|job| job_links_as_review_retry(&self.host_actions, &job, None))
+            }) {
+                self.host_actions.retry_update_review_with_id(
+                    &binding.job_id,
                     &job_id,
                     &intent.host,
                     ACTOR,
                     now_unix(),
-                ),
-                None => self.host_actions.ensure_update_review_with_id(
+                )
+            } else {
+                self.host_actions.ensure_update_review_with_id(
                     &job_id,
                     &intent.host,
                     ACTOR,
                     UpdateRestartIntent::Update,
                     now_unix(),
-                ),
+                )
             }
             .map_err(map_host_action_error)?;
             self.validate_new_owned_job(intent, handoff, &job)?;
@@ -2857,12 +2909,18 @@ impl AeonDeliveryAdapter {
         job: &HostActionJob,
     ) -> Result<(), AdapterError> {
         let predecessor = self.journal.retry_predecessor(intent, handoff)?;
+        // The new job is already inserted, so it is the latest update. Compare
+        // the predecessor with every other update on the host.
+        let linked_to = predecessor.as_ref().and_then(|binding| {
+            let previous = self.host_actions.get(&binding.job_id)?;
+            job_links_as_review_retry(&self.host_actions, &previous, Some(job.id.as_str()))
+                .then(|| binding.job_id.clone())
+        });
         if job.host != intent.host
             || job.workflow_kind() != HostWorkflowKind::UpdateRestart
             || job.update_restart_intent() != UpdateRestartIntent::Update
             || job.requested_by != ACTOR
-            || job.retry_of.as_deref()
-                != predecessor.as_ref().map(|binding| binding.job_id.as_str())
+            || job.retry_of != linked_to
         {
             return Err(AdapterError::LocalBinding);
         }
@@ -7716,6 +7774,93 @@ mod tests {
         );
         assert_ne!(other_job, lineage_job);
         server.abort();
+    }
+
+    async fn attempt_two_after(
+        label: &str,
+        settle: impl FnOnce(&HostActionStore, &str),
+    ) -> (Arc<HostActionStore>, String, String) {
+        let now = now_unix();
+        let directory = TestDir::new(label);
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now);
+        fake.update(|inner| {
+            let mut next = FakeHandoff::deploy(now);
+            next.id = NEW_HANDOFF.to_string();
+            next.attempt = 2;
+            next.plan_digest = hex_chars('e');
+            next.predecessor_digest = hex_chars('f');
+            inner.handoffs.insert(NEW_HANDOFF.to_string(), next);
+        });
+        let (origin, server) = serve(fake).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let first = deploy_intent(false);
+        let mut next = deploy_intent(false);
+        next.handoff_id = NEW_HANDOFF.to_string();
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![first.clone(), next.clone()]),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            hosts,
+            Arc::clone(&actions),
+        );
+        adapter.process_intent(&first).await.unwrap();
+        let predecessor = adapter.journal.operation(DEPLOY_HANDOFF).unwrap().job_id;
+        settle(&actions, &predecessor);
+        adapter.process_intent(&next).await.unwrap();
+        let retried = adapter.journal.operation(NEW_HANDOFF).unwrap().job_id;
+        adapter.process_intent(&next).await.unwrap();
+        server.abort();
+        (actions, predecessor, retried)
+    }
+
+    #[tokio::test]
+    async fn cancelled_predecessor_starts_a_fresh_review() {
+        let (actions, predecessor, retried) =
+            attempt_two_after("retry-cancelled", |actions, id| {
+                let at = now_unix().max(actions.get(id).unwrap().updated_at);
+                actions
+                    .cancel_update_review(id, "hsb8", "operator", at)
+                    .expect("cancel predecessor");
+            })
+            .await;
+        assert_eq!(
+            actions.get(&predecessor).unwrap().state,
+            HostActionState::Cancelled
+        );
+        let job = actions.get(&retried).unwrap();
+        assert_eq!(job.state, HostActionState::QueuedReview);
+        assert!(job.retry_of.is_none());
+        assert_ne!(retried, predecessor);
+        assert_eq!(job.requested_by, ACTOR);
+    }
+
+    #[tokio::test]
+    async fn succeeded_predecessor_starts_a_fresh_review() {
+        let (actions, predecessor, retried) =
+            attempt_two_after("retry-succeeded", |actions, id| {
+                let created = actions.get(id).unwrap().created_at;
+                review_job(actions, id, created);
+                let reviewed = actions.get(id).unwrap().updated_at;
+                actions
+                    .confirm_update(id, "hsb8", "operator", reviewed)
+                    .expect("confirm predecessor");
+                let confirmed = actions.get(id).unwrap().updated_at;
+                finish_apply(actions, id, confirmed);
+            })
+            .await;
+        assert_eq!(
+            actions.get(&predecessor).unwrap().state,
+            HostActionState::Succeeded
+        );
+        let job = actions.get(&retried).unwrap();
+        assert_eq!(job.state, HostActionState::QueuedReview);
+        assert!(job.retry_of.is_none());
+        assert_ne!(retried, predecessor);
+        assert_eq!(job.requested_by, ACTOR);
     }
 
     #[tokio::test]
