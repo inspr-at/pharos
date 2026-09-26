@@ -64,6 +64,8 @@ const LAUNCH_BLOCK_BACKUP_NOT_READY: &str = "backup_not_ready";
 const LAUNCH_BLOCK_READINESS_PLAN_CHANGED: &str = "readiness_plan_changed";
 const LAUNCH_BLOCK_READINESS_FLAG_FALSE: &str = "readiness_flag_false";
 const LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED: &str = "delegated_launch_required";
+const LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB: &str = "consumed_without_confirmable_job";
+const LAUNCH_BLOCK_CONSUME_ABANDONED: &str = "consume_abandoned";
 
 #[derive(Debug)]
 enum AdapterError {
@@ -1169,6 +1171,10 @@ fn launch_block_reason(token: &str) -> Option<&'static str> {
         LAUNCH_BLOCK_READINESS_PLAN_CHANGED => Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED),
         LAUNCH_BLOCK_READINESS_FLAG_FALSE => Some(LAUNCH_BLOCK_READINESS_FLAG_FALSE),
         LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED => Some(LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED),
+        LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB => {
+            Some(LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB)
+        }
+        LAUNCH_BLOCK_CONSUME_ABANDONED => Some(LAUNCH_BLOCK_CONSUME_ABANDONED),
         _ => None,
     }
 }
@@ -2255,7 +2261,9 @@ impl AeonDeliveryAdapter {
         if intent.delegated_launch.is_none() || !launch.valid() {
             return Err(AdapterError::LocalBinding);
         }
+        self.reject_terminal_block(&intent.handoff_id)?;
         let observed = self.aeon.get_handoff(&intent.handoff_id).await?;
+        observed.validate(intent)?;
         let server_consumed_ours = observed.admission.as_ref().is_some_and(|admission| {
             admission.consumed_at.is_some()
                 && launch
@@ -2263,16 +2271,46 @@ impl AeonDeliveryAdapter {
                     .as_ref()
                     .is_some_and(|stored| stored.id == admission.admission_id)
         });
+        let job = self
+            .host_actions
+            .get(&launch.job_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        let confirmable = consume_job_confirmable(intent, &job, &launch.reviewed_plan_digest)?;
         if server_consumed_ours {
             tracing::debug!(
                 handoff_id = %intent.handoff_id,
                 "Aeon shows the journaled admission consumed; replaying that consume"
             );
+            if !confirmable {
+                return self
+                    .replay_consume_without_confirming(
+                        intent,
+                        &launch,
+                        LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB,
+                    )
+                    .await;
+            }
+        } else {
+            // The consume has not committed. Re-check the handoff, the journaled
+            // admission, and the job before sending it again.
+            observed.open_for_write(now_unix())?;
+            let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
+            self.validate_admission(
+                admission,
+                intent,
+                &observed,
+                &launch.reviewed_plan_digest,
+                now_unix(),
+            )?;
+            if !confirmable {
+                return self
+                    .block_launch(intent, LAUNCH_BLOCK_CONSUME_ABANDONED, true)
+                    .map(|_| true);
+            }
+            // A same-plan refresh is not a contradiction. An exact replay of a
+            // consume that did commit still returns the stored receipt.
+            self.refresh_readiness_for_consume(intent).await?;
         }
-        // A consume that never committed is checked against readiness freshness.
-        // A same-plan refresh is not a contradiction, and an exact replay still
-        // returns the stored receipt.
-        self.refresh_readiness_for_consume(intent).await?;
         let launch = self
             .journal
             .launch(&intent.handoff_id)
@@ -2302,7 +2340,41 @@ impl AeonDeliveryAdapter {
         if launch.receipt.is_none() {
             return Ok(());
         }
+        self.reject_terminal_block(&intent.handoff_id)?;
         self.finish_confirmation(intent, &launch)
+    }
+
+    fn reject_terminal_block(&self, handoff_id: &str) -> Result<(), AdapterError> {
+        let Some(block) = self.journal.launch_block(handoff_id) else {
+            return Ok(());
+        };
+        if !block.terminal {
+            return Ok(());
+        }
+        let reason = launch_block_reason(&block.reason).ok_or(AdapterError::Journal)?;
+        Err(AdapterError::LaunchBlocked(reason))
+    }
+
+    async fn replay_consume_without_confirming(
+        &self,
+        intent: &DeliveryIntent,
+        launch: &LaunchJournalRecord,
+        reason: &'static str,
+    ) -> Result<bool, AdapterError> {
+        match self.aeon.post_consume(launch).await {
+            Ok(response) => {
+                let receipt = consume_receipt(&response)?;
+                self.journal
+                    .acknowledge_consume(&intent.handoff_id, receipt)?;
+                self.block_launch(intent, reason, true).map(|_| true)
+            }
+            Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
+                self.journal
+                    .mark_consume_unresolved(&intent.handoff_id, status)?;
+                Err(AdapterError::LaunchUnresolved)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn replay_evidence(
@@ -3242,6 +3314,24 @@ fn awaiting_ready_review(job: &HostActionJob, host: &str) -> bool {
 
 fn consumable_for_launch(job: &HostActionJob, host: &str) -> bool {
     awaiting_ready_review(job, host) && job.requested_by == ACTOR && job.confirmed_at.is_none()
+}
+
+fn consume_job_confirmable(
+    intent: &DeliveryIntent,
+    job: &HostActionJob,
+    reviewed: &str,
+) -> Result<bool, AdapterError> {
+    if job.host != intent.host
+        || job.workflow_kind() != HostWorkflowKind::UpdateRestart
+        || job.state != HostActionState::AwaitingConfirmation
+    {
+        return Ok(false);
+    }
+    match reviewed_plan_digest(job) {
+        Ok(digest) => Ok(digest == reviewed),
+        Err(SharedError::LocalBinding) => Ok(false),
+        Err(error) => Err(map_shared(error)),
+    }
 }
 
 fn consume_receipt(response: &ConsumeResponse) -> Result<ConsumeReceipt, AdapterError> {
@@ -7519,6 +7609,140 @@ mod tests {
             .unwrap()
             .receipt
             .is_some());
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn unconsumed_replay_abandons_a_job_that_is_no_longer_confirmable() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let consumes = post_count(&fixture.fake, "/launch/consume");
+        assert_eq!(consumes, 1);
+        let job = fixture.actions.get(&job_id).unwrap();
+        fixture
+            .actions
+            .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
+            .unwrap();
+        let replay = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(
+            replay,
+            Err(AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED))
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::Cancelled);
+        assert!(job.confirmed_at.is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_CONSUME_ABANDONED
+        );
+        let later = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(
+            later,
+            Err(AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED))
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn consumed_replay_does_not_confirm_an_unconfirmable_job() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        fixture
+            .fake
+            .update(|inner| inner.drop_accepted_consume = true);
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let consumes = post_count(&fixture.fake, "/launch/consume");
+        let job = fixture.actions.get(&job_id).unwrap();
+        fixture
+            .actions
+            .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
+            .unwrap();
+        let replay = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(
+            replay,
+            Err(AdapterError::LaunchBlocked(
+                LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
+            ))
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes + 1);
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_some());
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::Cancelled);
+        assert!(job.confirmed_at.is_none());
+        assert_eq!(
+            job.events
+                .iter()
+                .filter(|event| event.kind == HostActionEventKind::Confirmed)
+                .count(),
+            0
+        );
+        let later = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(
+            later,
+            Err(AdapterError::LaunchBlocked(
+                LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
+            ))
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes + 1);
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn unconsumed_replay_does_not_send_when_the_handoff_cannot_be_written() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.expires_at = format_timestamp(inner.now - 5).unwrap();
+        });
+        let consumes = post_count(&fixture.fake, "/launch/consume");
+        let replay = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(replay, Err(AdapterError::Contract)));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        assert!(fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .is_none());
         fixture.server.abort();
     }
 
