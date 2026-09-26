@@ -949,6 +949,8 @@ struct LaunchJournalRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     consume_unresolved: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    admit_unresolved: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt: Option<ConsumeReceipt>,
 }
 
@@ -976,13 +978,21 @@ impl LaunchJournalRecord {
             return false;
         }
         let Some(admission) = &self.admission else {
+            let admit_marker_ok = match self.admit_unresolved {
+                None => true,
+                Some(status) => status == StatusCode::CONFLICT.as_u16(),
+            };
             return self.consume_digest.is_none()
                 && self.consume_idempotency_key.is_none()
                 && self.consume_body_json.is_none()
                 && !self.consume_started
                 && self.consume_unresolved.is_none()
-                && self.receipt.is_none();
+                && self.receipt.is_none()
+                && admit_marker_ok;
         };
+        if self.admit_unresolved.is_some() {
+            return false;
+        }
         if !valid_uuid(&admission.id)
             || admission.handoff_id != self.handoff_id
             || !valid_hex64(&admission.binding_digest_sha256)
@@ -1460,6 +1470,43 @@ impl JournalStore {
             .get_mut(handoff_id)
             .expect("launch record remains present");
         launch.consume_unresolved = Some(status.as_u16());
+        let saved = launch.clone();
+        if !saved.valid() {
+            return Err(AdapterError::Journal);
+        }
+        persist_journal(&self.path, &mut document, updated)?;
+        Ok(saved)
+    }
+
+    fn mark_admit_unresolved(
+        &self,
+        handoff_id: &str,
+        status: StatusCode,
+    ) -> Result<LaunchJournalRecord, AdapterError> {
+        if status != StatusCode::CONFLICT {
+            return Err(AdapterError::Journal);
+        }
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        let existing = document
+            .launches
+            .get(handoff_id)
+            .ok_or(AdapterError::Journal)?
+            .clone();
+        if existing.admission.is_some() || existing.consume_started || existing.receipt.is_some() {
+            return Err(AdapterError::Journal);
+        }
+        if existing.admit_unresolved == Some(status.as_u16()) {
+            return Ok(existing);
+        }
+        if existing.admit_unresolved.is_some() {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        let launch = updated
+            .launches
+            .get_mut(handoff_id)
+            .expect("launch record remains present");
+        launch.admit_unresolved = Some(status.as_u16());
         let saved = launch.clone();
         if !saved.valid() {
             return Err(AdapterError::Journal);
@@ -2190,7 +2237,10 @@ impl AeonDeliveryAdapter {
             }
             // Consume was journaled. Admit must not run again, even when the
             // one-use consume came back unresolved.
-            if launch.consume_started || launch.consume_unresolved.is_some() {
+            if launch.consume_started
+                || launch.consume_unresolved.is_some()
+                || launch.admit_unresolved.is_some()
+            {
                 return Err(AdapterError::LaunchUnresolved);
             }
         }
@@ -2303,11 +2353,13 @@ impl AeonDeliveryAdapter {
             if existing.reviewed_plan_digest != reviewed || existing.job_id != job_id {
                 return Err(AdapterError::LocalBinding);
             }
+            if existing.admit_unresolved.is_some() {
+                return Err(AdapterError::LaunchUnresolved);
+            }
             if existing.admission.is_some() {
                 return Ok(existing);
             }
-            let admission = self.aeon.post_admit(&existing).await?;
-            return self.journal.store_admission(&intent.handoff_id, admission);
+            return self.replay_admit(intent, &existing).await;
         }
         let readiness = self
             .journal
@@ -2335,11 +2387,30 @@ impl AeonDeliveryAdapter {
             consume_body_json: None,
             consume_started: false,
             consume_unresolved: None,
+            admit_unresolved: None,
             receipt: None,
         };
         let record = self.journal.ensure_launch(record)?;
-        let admission = self.aeon.post_admit(&record).await?;
-        self.journal.store_admission(&intent.handoff_id, admission)
+        self.replay_admit(intent, &record).await
+    }
+
+    async fn replay_admit(
+        &self,
+        intent: &DeliveryIntent,
+        record: &LaunchJournalRecord,
+    ) -> Result<LaunchJournalRecord, AdapterError> {
+        if record.consume_started {
+            return Err(AdapterError::LaunchUnresolved);
+        }
+        match self.aeon.post_admit(record).await {
+            Ok(admission) => self.journal.store_admission(&intent.handoff_id, admission),
+            Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
+                self.journal
+                    .mark_admit_unresolved(&intent.handoff_id, status)?;
+                Err(AdapterError::LaunchUnresolved)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn validate_admission(
@@ -4881,5 +4952,91 @@ mod tests {
             HostActionState::AwaitingConfirmation
         );
         fixture.server.abort();
+    }
+
+    async fn prepare_ready_launch(fixture: &Harness) -> String {
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let job_id = fixture.actions.list()[0].id.clone();
+        review_job(
+            &fixture.actions,
+            &job_id,
+            fixture.actions.get(&job_id).unwrap().created_at,
+        );
+        job_id
+    }
+
+    #[tokio::test]
+    async fn admit_replay_same_key_recovers_and_different_key_is_unresolved() {
+        let same = harness(true).await;
+        let same_job = prepare_ready_launch(&same).await;
+        same.fake.update(|inner| inner.drop_accepted_admit = true);
+        assert!(same.adapter.process_intent(&same.intent).await.is_err());
+        assert_eq!(post_count(&same.fake, "/launch/consume"), 0);
+        assert_eq!(
+            same.actions.get(&same_job).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        for _ in 0..4 {
+            same.adapter.process_intent(&same.intent).await.unwrap();
+            if same.actions.get(&same_job).unwrap().state == HostActionState::QueuedApply {
+                break;
+            }
+        }
+        assert_eq!(
+            same.actions.get(&same_job).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        assert_eq!(post_count(&same.fake, "/launch/consume"), 1);
+        assert_eq!(post_count(&same.fake, "/launch/admit"), 2);
+        let admit_keys: Vec<_> = same
+            .fake
+            .captures
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|capture| capture.path.ends_with("/launch/admit"))
+            .map(|capture| capture.idempotency.clone())
+            .collect();
+        assert_eq!(admit_keys.len(), 2);
+        assert_eq!(admit_keys[0], admit_keys[1]);
+        same.server.abort();
+
+        let other = harness(true).await;
+        let other_job = prepare_ready_launch(&other).await;
+        other.fake.update(|inner| inner.drop_accepted_admit = true);
+        assert!(other.adapter.process_intent(&other.intent).await.is_err());
+        let admits_before = post_count(&other.fake, "/launch/admit");
+        other.fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .admit_idempotency_key = Some("different-admit-key".to_string());
+        });
+        let replay = other.adapter.process_intent(&other.intent).await;
+        assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
+        assert_eq!(post_count(&other.fake, "/launch/consume"), 0);
+        assert_eq!(
+            other.actions.get(&other_job).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        assert_eq!(
+            other
+                .adapter
+                .journal
+                .launch(DEPLOY_HANDOFF)
+                .unwrap()
+                .admit_unresolved,
+            Some(StatusCode::CONFLICT.as_u16())
+        );
+        let later = other.adapter.process_intent(&other.intent).await;
+        assert!(matches!(later, Err(AdapterError::LaunchUnresolved)));
+        assert_eq!(post_count(&other.fake, "/launch/admit"), admits_before + 1);
+        assert_eq!(post_count(&other.fake, "/launch/consume"), 0);
+        other.server.abort();
     }
 }
