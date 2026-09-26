@@ -75,6 +75,8 @@ const LAUNCH_BLOCK_ADMISSION_EXPIRED: &str = "admission_expired";
 const LAUNCH_BLOCK_AUTHORITY_CLOSED: &str = "handoff_authority_closed";
 const LAUNCH_BLOCK_AUTHORITY_NOT_OPEN: &str = "handoff_authority_not_open";
 const LAUNCH_BLOCK_AUTHORITY_SIGNAL_MISSING: &str = "authority_signal_missing";
+const JOURNAL_ORIGIN_MISMATCH: &str =
+    "a delivery journal belongs to one Aeon origin; a new origin needs its own journal path";
 const LAUNCH_BLOCK_LAUNCH_NOT_OWNED: &str = "launch_not_owned";
 const LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED: &str = "configured_job_not_owned";
 const LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED: &str = "stage_gate_not_approved";
@@ -1403,10 +1405,22 @@ struct JournalDocument {
     results: BTreeMap<String, ResultJournalRecord>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     launch_blocks: BTreeMap<String, LaunchBlock>,
-    /// Origin that has already returned `authority_open` on a handoff read.
-    /// One journal talks to one Aeon origin. Absent until the first such read.
+    /// Origin this journal is bound to. Absent until the first handoff read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound_origin: Option<String>,
+    /// Origins whose handoff reads included `authority_open`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    authority_signals: BTreeMap<String, AuthoritySignalFact>,
+    /// Earlier journals stored one capability origin here. Load folds it into
+    /// `bound_origin` and `authority_signals`, then stops writing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     authority_signal_origin: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthoritySignalFact {
+    authority_open_observed: bool,
 }
 
 impl Default for JournalDocument {
@@ -1419,6 +1433,8 @@ impl Default for JournalDocument {
             launches: BTreeMap::new(),
             results: BTreeMap::new(),
             launch_blocks: BTreeMap::new(),
+            bound_origin: None,
+            authority_signals: BTreeMap::new(),
             authority_signal_origin: None,
         }
     }
@@ -1431,20 +1447,46 @@ struct JournalStore {
 
 impl JournalStore {
     fn new(path: PathBuf) -> Result<Self, AdapterError> {
-        let document = if path.exists() {
+        let mut document = if path.exists() {
             let (bytes, _) = read_private_file(&path, MAX_JOURNAL_BYTES, None)
                 .map_err(|_| AdapterError::Journal)?;
             decode_strict::<JournalDocument>(&bytes).map_err(|_| AdapterError::Journal)?
         } else {
             JournalDocument::default()
         };
+        let migrated = fold_legacy_authority_origin(&mut document)?;
         if !journal_document_valid(&document) {
             return Err(AdapterError::Journal);
         }
-        Ok(Self {
+        let store = Self {
             path,
             document: Mutex::new(document),
-        })
+        };
+        if migrated {
+            let mut document = store.document.lock().expect("Aeon delivery journal lock");
+            let updated = document.clone();
+            persist_journal(&store.path, &mut document, updated)?;
+        }
+        Ok(store)
+    }
+
+    fn require_configured_origin(&self, origin: &Url) -> Result<(), String> {
+        let key = authority_signal_origin(origin);
+        if !valid_authority_signal_origin(&key) {
+            return Err(AdapterError::Configuration.to_string());
+        }
+        let document = self.document.lock().expect("Aeon delivery journal lock");
+        let conflicts = match &document.bound_origin {
+            Some(bound) => bound != &key,
+            None => document
+                .authority_signals
+                .keys()
+                .any(|recorded| recorded != &key),
+        };
+        if conflicts {
+            return Err(JOURNAL_ORIGIN_MISMATCH.to_string());
+        }
+        Ok(())
     }
 
     fn assert_bound(&self, intent: &DeliveryIntent, origin: &Url) -> Result<(), AdapterError> {
@@ -2085,19 +2127,31 @@ impl JournalStore {
     }
 
     fn note_authority_signal(&self, origin: &Url, observed: bool) -> Result<(), AdapterError> {
-        if !observed {
-            return Ok(());
-        }
         let key = authority_signal_origin(origin);
         if !valid_authority_signal_origin(&key) {
             return Err(AdapterError::Contract);
         }
         let mut document = self.document.lock().expect("Aeon delivery journal lock");
-        if document.authority_signal_origin.is_some() {
+        let bind = document.bound_origin.is_none();
+        let record_signal = observed && !document.authority_signals.contains_key(&key);
+        if !bind && !record_signal {
             return Ok(());
         }
+        if record_signal && document.authority_signals.len() >= MAX_INTENTS {
+            return Err(AdapterError::Journal);
+        }
         let mut updated = document.clone();
-        updated.authority_signal_origin = Some(key);
+        if bind {
+            updated.bound_origin = Some(key.clone());
+        }
+        if record_signal {
+            updated.authority_signals.insert(
+                key,
+                AuthoritySignalFact {
+                    authority_open_observed: true,
+                },
+            );
+        }
         persist_journal(&self.path, &mut document, updated)
     }
 
@@ -2106,9 +2160,18 @@ impl JournalStore {
         self.document
             .lock()
             .expect("Aeon delivery journal lock")
-            .authority_signal_origin
-            .as_deref()
-            == Some(key.as_str())
+            .authority_signals
+            .get(&key)
+            .is_some_and(|fact| fact.authority_open_observed)
+    }
+
+    #[cfg(test)]
+    fn bound_origin(&self) -> Option<String> {
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .bound_origin
+            .clone()
     }
 }
 
@@ -2142,9 +2205,46 @@ fn journal_document_valid(document: &JournalDocument) -> bool {
             .iter()
             .all(|(key, block)| key == &block.handoff_id && block.valid())
         && document
-            .authority_signal_origin
+            .bound_origin
             .as_deref()
             .is_none_or(valid_authority_signal_origin)
+        && document.authority_signal_origin.is_none()
+        && document.authority_signals.len() <= MAX_INTENTS
+        && document.authority_signals.iter().all(|(origin, fact)| {
+            valid_authority_signal_origin(origin) && fact.authority_open_observed
+        })
+}
+
+fn fold_legacy_authority_origin(document: &mut JournalDocument) -> Result<bool, AdapterError> {
+    let Some(legacy) = document.authority_signal_origin.clone() else {
+        return Ok(false);
+    };
+    if !valid_authority_signal_origin(&legacy) {
+        return Err(AdapterError::Journal);
+    }
+    if let Some(bound) = &document.bound_origin {
+        if bound != &legacy {
+            return Err(AdapterError::Journal);
+        }
+    } else {
+        document.bound_origin = Some(legacy.clone());
+    }
+    if let Some(fact) = document.authority_signals.get(&legacy) {
+        if !fact.authority_open_observed {
+            return Err(AdapterError::Journal);
+        }
+    } else if document.authority_signals.len() >= MAX_INTENTS {
+        return Err(AdapterError::Journal);
+    } else {
+        document.authority_signals.insert(
+            legacy,
+            AuthoritySignalFact {
+                authority_open_observed: true,
+            },
+        );
+    }
+    document.authority_signal_origin = None;
+    Ok(true)
 }
 
 fn authority_signal_origin(origin: &Url) -> String {
@@ -2569,23 +2669,41 @@ impl AeonDeliveryAdapter {
             .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
         refuse_unowned_configured_jobs(&config, &host_actions)
             .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
-        let journal = JournalStore::new(derived_journal_path(host_store_path))
+        let adapter = Self::open(
+            config,
+            derived_journal_path(host_store_path),
+            hosts,
+            host_actions,
+        )?;
+        tracing::info!("Aeon delivery adapter enabled");
+        Ok(Some(adapter))
+    }
+
+    fn open(
+        config: AdapterConfig,
+        journal_path: PathBuf,
+        hosts: Arc<Store>,
+        host_actions: Arc<HostActionStore>,
+    ) -> Result<Self, String> {
+        let journal = JournalStore::new(journal_path)
             .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
+        journal
+            .require_configured_origin(&config.aeon_origin)
+            .map_err(|message| format!("Aeon delivery adapter startup failed: {message}"))?;
         let aeon = AeonClient::new(
             config.aeon_origin.clone(),
             config.api_key_file.clone(),
             &config.aeon_ca_certificates,
         )
         .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
-        tracing::info!("Aeon delivery adapter enabled");
-        Ok(Some(Self {
+        Ok(Self {
             config,
             journal,
             aeon,
             hosts,
             host_actions,
             principal_id: Mutex::new(None),
-        }))
+        })
     }
 
     pub(crate) fn spawn(self) {
@@ -2924,8 +3042,9 @@ impl AeonDeliveryAdapter {
         // The inferred check existed because GET showed only this row: its
         // attempt and epoch do not move when a newer attempt is inserted, and
         // there is no list route. That inference remains the fallback until
-        // this origin has returned authority_open. After that, a handoff read
-        // that omits the field is a silent downgrade and is refused on its own.
+        // this origin has returned authority_open. That fact is kept per origin.
+        // After that, a handoff read that omits the field is a silent downgrade
+        // and is refused on its own.
         // A false authority_open, or a superseded_by, is an additional refusal.
         // It is journaled on its own and never waives the inferred check.
         // launchReplay still returns the stored receipt before current().
@@ -5606,6 +5725,57 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn legacy_authority_signal_origin_binds_that_origin() {
+        let directory = TestDir::new("legacy-origin");
+        let path = directory
+            .path()
+            .join("hosts.json.aeon-delivery-journal.json");
+        let origin = "https://aeon.example.test";
+        write_private(
+            &path,
+            format!(
+                r#"{{"schema":"{JOURNAL_SCHEMA}","schema_version":{JOURNAL_SCHEMA_VERSION},"records":{{}},"authority_signal_origin":"{origin}"}}"#
+            )
+            .as_bytes(),
+        );
+        let loaded = JournalStore::new(path.clone()).unwrap();
+        let origin_url = Url::parse(&format!("{origin}/")).unwrap();
+        assert_eq!(loaded.bound_origin().as_deref(), Some(origin));
+        assert!(loaded.authority_signal_required(&origin_url));
+        let rendered = std::fs::read_to_string(&path).unwrap();
+        assert!(!rendered.contains("authority_signal_origin"));
+        assert!(rendered.contains("\"bound_origin\""));
+        assert!(rendered.contains("authority_open_observed"));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let actions = Arc::new(HostActionStore::new(None));
+        let api = directory.path().join("api-key");
+        let mismatch = match AeonDeliveryAdapter::open(
+            runtime_config(
+                Url::parse("https://other.example.test").unwrap(),
+                api.clone(),
+                vec![deploy_intent(true), verify_intent()],
+            ),
+            path.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        ) {
+            Ok(_) => panic!("a different Aeon origin started"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            mismatch,
+            format!("Aeon delivery adapter startup failed: {JOURNAL_ORIGIN_MISMATCH}")
+        );
+        AeonDeliveryAdapter::open(
+            runtime_config(origin_url, api, vec![deploy_intent(true), verify_intent()]),
+            path,
+            hosts,
+            actions,
+        )
+        .expect("the recorded origin still starts");
+    }
+
     fn hex_chars(byte: char) -> String {
         byte.to_string().repeat(64)
     }
@@ -6901,21 +7071,7 @@ mod tests {
         hosts: Arc<Store>,
         actions: Arc<HostActionStore>,
     ) -> AeonDeliveryAdapter {
-        let journal = JournalStore::new(journal_path).expect("test journal");
-        let aeon = AeonClient::new(
-            config.aeon_origin.clone(),
-            config.api_key_file.clone(),
-            &config.aeon_ca_certificates,
-        )
-        .expect("test Aeon client");
-        AeonDeliveryAdapter {
-            config,
-            journal,
-            aeon,
-            hosts,
-            host_actions: actions,
-            principal_id: Mutex::new(None),
-        }
+        AeonDeliveryAdapter::open(config, journal_path, hosts, actions).expect("test adapter")
     }
 
     fn ready_plan() -> HostActionPlan {
@@ -9973,9 +10129,12 @@ mod tests {
             open.actions.get(&open_job).unwrap().state,
             HostActionState::QueuedApply
         );
-        assert!(!JournalStore::new(open.journal.clone())
-            .unwrap()
-            .authority_signal_required(&open.adapter.config.aeon_origin));
+        let saved = JournalStore::new(open.journal.clone()).unwrap();
+        assert!(!saved.authority_signal_required(&open.adapter.config.aeon_origin));
+        assert_eq!(
+            saved.bound_origin().as_deref(),
+            Some(authority_signal_origin(&open.adapter.config.aeon_origin).as_str())
+        );
         open.server.abort();
 
         let closed = harness(true).await;
@@ -10043,6 +10202,173 @@ mod tests {
         assert!(JournalStore::new(fixture.journal.clone())
             .unwrap()
             .authority_signal_required(&fixture.adapter.config.aeon_origin));
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn authority_signal_stays_required_after_another_origin_is_recorded() {
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        let other = Url::parse("https://other.example.test").unwrap();
+        fixture
+            .adapter
+            .journal
+            .note_authority_signal(&other, true)
+            .unwrap();
+        assert_eq!(
+            fixture.adapter.journal.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        assert!(fixture.adapter.journal.authority_signal_required(&origin));
+        assert!(fixture.adapter.journal.authority_signal_required(&other));
+        fixture.fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .omit_supersession_fields = true;
+        });
+        let reloaded = test_adapter(
+            runtime_config(
+                origin.clone(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        );
+        let error = reloaded.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_SIGNAL_MISSING)
+            ),
+            "{error:?}"
+        );
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        let saved = JournalStore::new(fixture.journal.clone()).unwrap();
+        assert!(saved.authority_signal_required(&origin));
+        assert!(saved.authority_signal_required(&other));
+        assert_eq!(
+            saved.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn journal_recorded_against_one_origin_refuses_a_different_origin_at_startup() {
+        let fixture = harness(true).await;
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        let recorded = JournalStore::new(fixture.journal.clone()).unwrap();
+        assert_eq!(
+            recorded.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        let mismatch = match AeonDeliveryAdapter::open(
+            runtime_config(
+                Url::parse("https://other.example.test").unwrap(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone(), verify_intent()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        ) {
+            Ok(_) => panic!("a different Aeon origin started"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            mismatch,
+            format!("Aeon delivery adapter startup failed: {JOURNAL_ORIGIN_MISMATCH}")
+        );
+        AeonDeliveryAdapter::open(
+            runtime_config(
+                origin,
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone(), verify_intent()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        )
+        .expect("the recorded origin still starts");
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn preexisting_journal_without_an_origin_records_it_on_first_read() {
+        let directory = TestDir::new("prior-journal");
+        let journal = directory
+            .path()
+            .join("hosts.json.aeon-delivery-journal.json");
+        write_private(
+            &journal,
+            format!(
+                r#"{{"schema":"{JOURNAL_SCHEMA}","schema_version":{JOURNAL_SCHEMA_VERSION},"records":{{}}}}"#
+            )
+            .as_bytes(),
+        );
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now_unix());
+        fake.update(|inner| {
+            for id in [DEPLOY_HANDOFF, VERIFY_HANDOFF] {
+                inner.handoffs.get_mut(id).unwrap().omit_supersession_fields = true;
+            }
+        });
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let intent = deploy_intent(true);
+        let adapter = AeonDeliveryAdapter::open(
+            runtime_config(origin.clone(), api, vec![intent.clone(), verify_intent()]),
+            journal.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        )
+        .expect("a journal with no origin record starts");
+        assert!(adapter.journal.bound_origin().is_none());
+        let fixture = Harness {
+            fake,
+            server,
+            adapter,
+            actions,
+            hosts,
+            journal: journal.clone(),
+            intent,
+            _directory: directory,
+        };
+        let job_id = dropped_consume(&fixture).await;
+        assert_eq!(
+            fixture.adapter.journal.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        assert!(!fixture.adapter.journal.authority_signal_required(&origin));
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        let saved = JournalStore::new(journal).unwrap();
+        assert_eq!(
+            saved.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        assert!(!saved.authority_signal_required(&origin));
         fixture.server.abort();
     }
 
