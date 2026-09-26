@@ -2672,7 +2672,19 @@ impl AeonDeliveryAdapter {
             .operation(&intent.handoff_id)
             .ok_or(AdapterError::LocalBinding)?;
         let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
+        // GET /api/stage-handoffs/{id} returns this row only. Its attempt and
+        // epoch do not change when a newer attempt is created, and there is no
+        // list route. launchReplay returns the stored consume receipt before
+        // current() (launch.go). Journey stages[].handoff_id is the newest
+        // handoff in the stage by created_at, not this operation's latest
+        // attempt, and it has no attempt or epoch. These fields are the whole
+        // of what that GET can show.
+        let admission_matches = handoff.admission.as_ref().is_some_and(|embedded| {
+            embedded.admission_id == admission.id && embedded.epoch == admission.authority_epoch
+        });
         let current = handoff.state.is_open()
+            && handoff.result.is_none()
+            && admission_matches
             && handoff.authority_epoch == admission.authority_epoch
             && handoff.release_node_id == operation.release_node_id
             && handoff.operation == intent.operation
@@ -8923,6 +8935,40 @@ mod tests {
             AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
         ));
         assert_eq!(result_posts(&fixture.fake).len(), 1);
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn recorded_result_does_not_queue_a_still_requested_handoff() {
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.state = "requested".to_string();
+            handoff.result = Some(json!({
+                "outcome": "failed",
+                "terminal_sequence": 1,
+                "authority_epoch": handoff.authority_epoch,
+                "prerequisite_seal_sha256": handoff.prerequisite_seal_sha256.clone(),
+                "blocker_code": "dependency_failed",
+                "handoff_id": handoff.id.clone(),
+                "completed_at": handoff.expires_at.clone(),
+            }));
+        });
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
+        assert!(fixture.adapter.journal.result(DEPLOY_HANDOFF).is_none());
         fixture.server.abort();
     }
 

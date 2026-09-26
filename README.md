@@ -550,7 +550,10 @@ deploy result. Epochs are per release, stage, and operation. Every mutation
 is journaled as exact request bytes before it is sent. After a crash, admit
 and consume are replayed with the journaled Idempotency-Key. An exact replay
 returns the stored admission or receipt, and a conflicting replay stays
-unresolved without changing the host. The bearer token stays in its referenced
+unresolved without changing the host. Confirmation after that replay still
+requires the fetched handoff to be `requested` or `active`, to have no result,
+and to match the journaled admission. A newer attempt of the same operation
+is not visible on that handoff. The bearer token stays in its referenced
 file and is not written to the journal. The adapter does nothing until the
 config variable is set.
 
