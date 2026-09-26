@@ -4401,12 +4401,9 @@ mod tests {
         if !observation_fresh(value["observed_at"].as_str()?, now) {
             return None;
         }
-        // A ready backup needs its own fresh success. A missing or stale
-        // backup_observed_at does not satisfy the provider.
-        if !value["backup_observed_at"]
-            .as_str()
-            .is_some_and(|stamp| observation_fresh(stamp, now))
-        {
+        // Aeon checks the 900s window on observed_at only. backup_observed_at
+        // has to be present, non-zero, and no more than five minutes ahead.
+        if !acceptable_backup_stamp(value["backup_observed_at"].as_str(), now) {
             return None;
         }
         value["reviewed_plan_digest"].as_str().map(str::to_string)
@@ -4422,12 +4419,6 @@ mod tests {
         if value["all_host_eval_passed"] != true
             || value["target_build_passed"] != true
             || value["backup_ready"] != true
-        {
-            return false;
-        }
-        if !value["backup_observed_at"]
-            .as_str()
-            .is_some_and(|stamp| observation_fresh(stamp, now))
         {
             return false;
         }
@@ -4464,8 +4455,14 @@ mod tests {
         if value["authority_epoch"].as_i64() != Some(handoff.authority_epoch) {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
-        if value["kind"] == "launch_readiness" && !launch_readiness_tokens(&value) {
-            return json_response(StatusCode::BAD_REQUEST, &json!({}));
+        if value["kind"] == "launch_readiness"
+            && (!launch_readiness_tokens(&value)
+                || !acceptable_backup_stamp(value["backup_observed_at"].as_str(), now))
+        {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "invalid launch readiness"}),
+            );
         }
         let received_at = format_timestamp(now).unwrap();
         let response = evidence_echo(body, &handoff.id, &received_at);
@@ -6415,6 +6412,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_readiness_backup_time_is_present_and_not_ahead() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake).await;
+        let url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+            .unwrap();
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let send = |body: Value| {
+            let client = client.clone();
+            let url = url.clone();
+            let bearer = bearer.clone();
+            async move {
+                client
+                    .post(url)
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA)
+                    .body(serde_json::to_vec(&body).unwrap())
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+        let mut readiness = json!({
+            "sequence": 1,
+            "kind": "launch_readiness",
+            "outcome": "satisfied",
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "reviewed_plan_digest": "ab".repeat(32),
+            "host": "hsb8",
+            "all_host_eval_passed": true,
+            "target_build_passed": true,
+            "backup_ready": true,
+            "restart_required": true,
+            "running_kernel": "unknown",
+            "expected_kernel": "unknown"
+        });
+        let missing = send(readiness.clone()).await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let missing: Value = missing.json().await.unwrap();
+        assert_eq!(missing["error"], "invalid launch readiness");
+        readiness["backup_observed_at"] = json!("0001-01-01T00:00:00Z");
+        let zero = send(readiness.clone()).await;
+        assert_eq!(zero.status(), StatusCode::BAD_REQUEST);
+        readiness["backup_observed_at"] = json!("yesterday");
+        let unparsed = send(readiness.clone()).await;
+        assert_eq!(unparsed.status(), StatusCode::BAD_REQUEST);
+        readiness["backup_observed_at"] = json!(format_timestamp(now + 301).unwrap());
+        let ahead = send(readiness.clone()).await;
+        assert_eq!(ahead.status(), StatusCode::BAD_REQUEST);
+        readiness["backup_observed_at"] = json!(format_timestamp(now - 901).unwrap());
+        let aged = send(readiness).await;
+        assert_eq!(aged.status(), StatusCode::CREATED);
+        let admitted = client
+            .post(
+                origin
+                    .join(&format!(
+                        "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"
+                    ))
+                    .unwrap(),
+            )
+            .header(AUTHORIZATION, bearer)
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .header("idempotency-key", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+            .body(
+                serde_json::to_vec(&json!({
+                    "version_scheme": "legacy",
+                    "version": "1.2.3",
+                    "release_channel": "stable",
+                    "release_sequence": 123,
+                    "digest_sha256": "1".repeat(64),
+                    "commit_digest": "a".repeat(40),
+                    "manifest_coordinate": "ghcr:inspr-at/pharos/releases/1.2.3",
+                    "manifest_digest_sha256": "9".repeat(64)
+                }))
+                .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn backup_clock_echo_uses_go_zero_time_when_omitted() {
         let now = now_unix();
         let fake = FakeAeon::new(now);
@@ -7386,12 +7470,16 @@ mod tests {
             &stale_job,
             stale.actions.get(&stale_job).unwrap().created_at,
         );
-        let stale_error = stale
-            .adapter
-            .process_intent(&stale.intent)
-            .await
-            .unwrap_err();
-        assert!(matches!(stale_error, AdapterError::LaunchUnresolved));
+        for _ in 0..4 {
+            stale.adapter.process_intent(&stale.intent).await.unwrap();
+            if stale.actions.get(&stale_job).unwrap().state == HostActionState::QueuedApply {
+                break;
+            }
+        }
+        assert_eq!(
+            stale.actions.get(&stale_job).unwrap().state,
+            HostActionState::QueuedApply
+        );
         let stale_body: Value = posts(&stale.fake)
             .into_iter()
             .find(|capture| capture.path.ends_with("/evidence"))
@@ -7401,16 +7489,7 @@ mod tests {
             stale_body["backup_observed_at"],
             format_timestamp(stale_at).unwrap()
         );
-        assert_eq!(post_count(&stale.fake, "/launch/consume"), 0);
-        assert_eq!(
-            stale
-                .adapter
-                .journal
-                .launch(DEPLOY_HANDOFF)
-                .unwrap()
-                .admit_unresolved,
-            Some(StatusCode::CONFLICT.as_u16())
-        );
+        assert_eq!(post_count(&stale.fake, "/launch/consume"), 1);
         stale.server.abort();
 
         let present = harness(true).await;
