@@ -14,6 +14,7 @@
 - Add an owner-only Aeon delivery adapter selected by `PHAROS_AEON_DELIVERY_CONFIG_FILE`. It reads Aeon stage handoffs, posts typed evidence, consumes one launch admission, and seals the result. The classic Paimos adapter is unchanged. pharosd refuses to start when both delivery configs are set (PHAROS-313).
 - Add an ignored live roundtrip for that adapter. It runs only when `PHAROS_AEON_LIVE_ACK=disposable`, reads the bearer token through the production reader, and writes a value-free request report (PHAROS-313).
 - Require an Aeon deploy intent's `delegated_launch.target_ref` to be that intent's artifact digest (PHAROS-313).
+- Send only an Aeon-accepted blocker code on a stage result, and keep the Pharos reason token in the delivery journal (PHAROS-313).
 
 ## 260922141211.0.0 - 2026-09-22
 

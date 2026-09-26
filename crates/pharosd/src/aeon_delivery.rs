@@ -68,6 +68,17 @@ const LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB: &str = "consumed_without_co
 const LAUNCH_BLOCK_CONSUME_ABANDONED: &str = "consume_abandoned";
 const LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED: &str = "confirmation_not_delegated";
 
+const LAUNCH_BLOCK_REASONS: &[&str] = &[
+    LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING,
+    LAUNCH_BLOCK_BACKUP_NOT_READY,
+    LAUNCH_BLOCK_READINESS_PLAN_CHANGED,
+    LAUNCH_BLOCK_READINESS_FLAG_FALSE,
+    LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED,
+    LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB,
+    LAUNCH_BLOCK_CONSUME_ABANDONED,
+    LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED,
+];
+
 #[derive(Debug)]
 enum AdapterError {
     Configuration,
@@ -464,7 +475,34 @@ enum BlockerCode {
     ReporterStale,
     ExternalWaiting,
     PolicyRefused,
-    ConfirmationNotDelegated,
+}
+
+/// Codes Aeon accepts on a stage result. Anything else is HTTP 400, and a
+/// journaled body with that code would replay forever.
+const AEON_BLOCKER_CODES: &[&str] = &[
+    "dependency_pending",
+    "dependency_failed",
+    "reporter_stale",
+    "external_waiting",
+    "policy_refused",
+];
+
+fn blocker_code_wire(code: BlockerCode) -> &'static str {
+    match code {
+        BlockerCode::DependencyPending => "dependency_pending",
+        BlockerCode::DependencyFailed => "dependency_failed",
+        BlockerCode::ReporterStale => "reporter_stale",
+        BlockerCode::ExternalWaiting => "external_waiting",
+        BlockerCode::PolicyRefused => "policy_refused",
+    }
+}
+
+fn require_accepted_blocker(code: BlockerCode) -> Result<(), AdapterError> {
+    if AEON_BLOCKER_CODES.contains(&blocker_code_wire(code)) {
+        Ok(())
+    } else {
+        Err(AdapterError::Contract)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1094,6 +1132,10 @@ struct ResultJournalRecord {
     request_digest: String,
     idempotency_key: String,
     body_json: String,
+    /// Pharos reason token. Aeon rejects unknown result fields, so this stays
+    /// off the posted bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt: Option<ResultReceipt>,
 }
@@ -1117,6 +1159,7 @@ impl ResultJournalRecord {
             ),
             request_digest,
             body_json: String::from_utf8(body.to_vec()).map_err(|_| AdapterError::Contract)?,
+            detail: None,
             receipt: None,
         })
     }
@@ -1134,6 +1177,10 @@ impl ResultJournalRecord {
                 )
             && decode_strict::<ResultRequest>(self.body_json.as_bytes())
                 .is_ok_and(|request| request.terminal_sequence == self.terminal_sequence)
+            && self
+                .detail
+                .as_deref()
+                .is_none_or(|detail| launch_block_reason(detail).is_some())
             && self
                 .receipt
                 .as_ref()
@@ -1167,19 +1214,28 @@ impl LaunchBlock {
 }
 
 fn launch_block_reason(token: &str) -> Option<&'static str> {
-    match token {
-        LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING => Some(LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING),
-        LAUNCH_BLOCK_BACKUP_NOT_READY => Some(LAUNCH_BLOCK_BACKUP_NOT_READY),
-        LAUNCH_BLOCK_READINESS_PLAN_CHANGED => Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED),
-        LAUNCH_BLOCK_READINESS_FLAG_FALSE => Some(LAUNCH_BLOCK_READINESS_FLAG_FALSE),
-        LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED => Some(LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED),
-        LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB => {
-            Some(LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB)
+    LAUNCH_BLOCK_REASONS
+        .iter()
+        .copied()
+        .find(|reason| *reason == token)
+}
+
+fn aeon_blocker_for_reason(reason: &str) -> Option<BlockerCode> {
+    Some(match reason {
+        LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING | LAUNCH_BLOCK_BACKUP_NOT_READY => {
+            BlockerCode::ExternalWaiting
         }
-        LAUNCH_BLOCK_CONSUME_ABANDONED => Some(LAUNCH_BLOCK_CONSUME_ABANDONED),
-        LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED => Some(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED),
-        _ => None,
-    }
+        // A false flag after a posted readiness row is a local precondition,
+        // not a refused plan. The same wait applies before the first row.
+        LAUNCH_BLOCK_READINESS_FLAG_FALSE => BlockerCode::ExternalWaiting,
+        LAUNCH_BLOCK_READINESS_PLAN_CHANGED
+        | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
+        | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED => BlockerCode::PolicyRefused,
+        LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB | LAUNCH_BLOCK_CONSUME_ABANDONED => {
+            BlockerCode::DependencyFailed
+        }
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2269,6 +2325,7 @@ impl AeonDeliveryAdapter {
                     request.terminal_sequence,
                     request.outcome,
                     request.blocker_code,
+                    pending.detail.as_deref(),
                 )
                 .await;
         }
@@ -2429,12 +2486,15 @@ impl AeonDeliveryAdapter {
         if handoff.state.is_open() {
             handoff.open_for_write(now_unix())?;
         }
+        let blocker = aeon_blocker_for_reason(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED)
+            .ok_or(AdapterError::Journal)?;
         self.write_observation(
             intent,
             &handoff,
             EvidenceOutcome::Failed,
             now_unix(),
-            Some(BlockerCode::ConfirmationNotDelegated),
+            Some(blocker),
+            Some(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED),
         )
         .await
     }
@@ -3204,12 +3264,17 @@ impl AeonDeliveryAdapter {
         }
         match job.state {
             HostActionState::Failed | HostActionState::Cancelled => {
+                let detail = self
+                    .journal
+                    .launch_block(&intent.handoff_id)
+                    .map(|block| block.reason);
                 self.write_observation(
                     intent,
                     handoff,
                     EvidenceOutcome::Failed,
                     job.updated_at,
                     Some(BlockerCode::DependencyFailed),
+                    detail.as_deref(),
                 )
                 .await
             }
@@ -3241,6 +3306,7 @@ impl AeonDeliveryAdapter {
                                 EvidenceOutcome::Failed,
                                 now,
                                 Some(BlockerCode::ReporterStale),
+                                None,
                             )
                             .await;
                     }
@@ -3258,6 +3324,7 @@ impl AeonDeliveryAdapter {
                     handoff,
                     EvidenceOutcome::Succeeded,
                     observed_at,
+                    None,
                     None,
                 )
                 .await
@@ -3315,6 +3382,7 @@ impl AeonDeliveryAdapter {
                     EvidenceOutcome::Succeeded,
                     observed_at,
                     None,
+                    None,
                 )
                 .await
             }
@@ -3327,6 +3395,7 @@ impl AeonDeliveryAdapter {
                     EvidenceOutcome::Failed,
                     now,
                     Some(BlockerCode::ReporterStale),
+                    None,
                 )
                 .await
             }
@@ -3338,6 +3407,7 @@ impl AeonDeliveryAdapter {
                     EvidenceOutcome::Failed,
                     now,
                     Some(BlockerCode::DependencyFailed),
+                    None,
                 )
                 .await
             }
@@ -3352,6 +3422,7 @@ impl AeonDeliveryAdapter {
         outcome: EvidenceOutcome,
         observed_at: i64,
         blocker: Option<BlockerCode>,
+        detail: Option<&str>,
     ) -> Result<(), AdapterError> {
         let kind = intent.operation.evidence_kind();
         let record =
@@ -3395,8 +3466,15 @@ impl AeonDeliveryAdapter {
             return Err(AdapterError::LocalBinding);
         }
         let result_outcome = ResultOutcome::from_evidence(outcome)?;
-        self.finish_result(intent, handoff, record.sequence, result_outcome, blocker)
-            .await
+        self.finish_result(
+            intent,
+            handoff,
+            record.sequence,
+            result_outcome,
+            blocker,
+            detail,
+        )
+        .await
     }
 
     async fn send_new_evidence(
@@ -3427,6 +3505,7 @@ impl AeonDeliveryAdapter {
         terminal_sequence: i64,
         outcome: ResultOutcome,
         blocker: Option<BlockerCode>,
+        detail: Option<&str>,
     ) -> Result<(), AdapterError> {
         if self
             .journal
@@ -3435,7 +3514,8 @@ impl AeonDeliveryAdapter {
         {
             return Ok(());
         }
-        let record = self.stage_result(intent, handoff, terminal_sequence, outcome, blocker)?;
+        let record =
+            self.stage_result(intent, handoff, terminal_sequence, outcome, blocker, detail)?;
         match self.aeon.post_result(&record).await {
             Ok(receipt) => self.journal.acknowledge_result(&record, receipt),
             Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
@@ -3452,6 +3532,7 @@ impl AeonDeliveryAdapter {
         terminal_sequence: i64,
         outcome: ResultOutcome,
         blocker: Option<BlockerCode>,
+        detail: Option<&str>,
     ) -> Result<ResultJournalRecord, AdapterError> {
         if let Some(existing) = self.journal.result(&intent.handoff_id) {
             // Replay the journaled bytes. A different seal replaces this record
@@ -3461,6 +3542,12 @@ impl AeonDeliveryAdapter {
         if (outcome == ResultOutcome::Succeeded) != blocker.is_none() {
             return Err(AdapterError::Contract);
         }
+        if detail.is_some_and(|token| launch_block_reason(token).is_none()) {
+            return Err(AdapterError::Journal);
+        }
+        if let Some(code) = blocker {
+            require_accepted_blocker(code)?;
+        }
         let request = ResultRequest {
             outcome,
             terminal_sequence,
@@ -3469,8 +3556,9 @@ impl AeonDeliveryAdapter {
             blocker_code: blocker,
         };
         let body = serde_json::to_vec(&request).map_err(|_| AdapterError::Contract)?;
-        let record =
+        let mut record =
             ResultJournalRecord::new(intent, &self.config.aeon_origin, terminal_sequence, &body)?;
+        record.detail = detail.map(str::to_string);
         self.journal.ensure_result(record)
     }
 
@@ -3497,12 +3585,13 @@ impl AeonDeliveryAdapter {
             blocker_code: failed_request.blocker_code,
         };
         let body = serde_json::to_vec(&request).map_err(|_| AdapterError::Contract)?;
-        let record = ResultJournalRecord::new(
+        let mut record = ResultJournalRecord::new(
             intent,
             &self.config.aeon_origin,
             request.terminal_sequence,
             &body,
         )?;
+        record.detail = failed.detail.clone();
         let record = self.journal.replace_unacked_result(record)?;
         let receipt = self.aeon.post_result(&record).await?;
         self.journal.acknowledge_result(&record, receipt)
@@ -5345,17 +5434,7 @@ mod tests {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
         };
         let blocker = value["blocker_code"].as_str();
-        let failed_blocker = matches!(
-            blocker,
-            Some(
-                "dependency_pending"
-                    | "dependency_failed"
-                    | "reporter_stale"
-                    | "external_waiting"
-                    | "policy_refused"
-                    | "confirmation_not_delegated"
-            )
-        );
+        let failed_blocker = blocker.is_some_and(|code| AEON_BLOCKER_CODES.contains(&code));
         if (value["outcome"] == "failed" && !failed_blocker)
             || (value["outcome"] == "succeeded" && blocker.is_some())
         {
@@ -8154,6 +8233,140 @@ mod tests {
         fixture.server.abort();
     }
 
+    fn expected_blocker_for_reason(reason: &str) -> &'static str {
+        match reason {
+            LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING
+            | LAUNCH_BLOCK_BACKUP_NOT_READY
+            | LAUNCH_BLOCK_READINESS_FLAG_FALSE => "external_waiting",
+            LAUNCH_BLOCK_READINESS_PLAN_CHANGED
+            | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
+            | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED => "policy_refused",
+            LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB | LAUNCH_BLOCK_CONSUME_ABANDONED => {
+                "dependency_failed"
+            }
+            _ => panic!("reason {reason} has no Aeon blocker code"),
+        }
+    }
+
+    #[test]
+    fn every_launch_block_reason_maps_to_an_accepted_blocker_code() {
+        assert_eq!(
+            AEON_BLOCKER_CODES,
+            [
+                "dependency_pending",
+                "dependency_failed",
+                "reporter_stale",
+                "external_waiting",
+                "policy_refused",
+            ]
+        );
+        assert!(!LAUNCH_BLOCK_REASONS.is_empty());
+        let mut seen = BTreeSet::new();
+        for reason in LAUNCH_BLOCK_REASONS {
+            assert_eq!(launch_block_reason(reason), Some(*reason));
+            let code = aeon_blocker_for_reason(reason)
+                .unwrap_or_else(|| panic!("unmapped reason {reason}"));
+            let wire = blocker_code_wire(code);
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(wire));
+            assert!(
+                AEON_BLOCKER_CODES.contains(&wire),
+                "{reason} maps to {wire}"
+            );
+            assert_eq!(wire, expected_blocker_for_reason(reason), "{reason}");
+            let posted = serde_json::to_value(ResultRequest {
+                outcome: ResultOutcome::Failed,
+                terminal_sequence: 1,
+                authority_epoch: 1,
+                prerequisite_seal_sha256: "ab".repeat(32),
+                blocker_code: Some(code),
+            })
+            .unwrap();
+            assert_eq!(posted["blocker_code"], wire);
+            assert!(posted.get("detail").is_none());
+            assert!(seen.insert(*reason));
+        }
+        assert_eq!(seen.len(), LAUNCH_BLOCK_REASONS.len());
+        assert!(aeon_blocker_for_reason("not_a_pharos_reason").is_none());
+        for code in [
+            BlockerCode::DependencyPending,
+            BlockerCode::DependencyFailed,
+            BlockerCode::ReporterStale,
+            BlockerCode::ExternalWaiting,
+            BlockerCode::PolicyRefused,
+        ] {
+            let wire = blocker_code_wire(code);
+            assert!(AEON_BLOCKER_CODES.contains(&wire));
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(wire));
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_aeon_rejects_a_blocker_code_aeon_would_not_accept() {
+        let fake = FakeAeon::new(now_unix());
+        let (origin, server) = serve(fake).await;
+        let client = reqwest::Client::new();
+        let url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/result"))
+            .unwrap();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let send = |blocker: Value| {
+            let client = client.clone();
+            let url = url.clone();
+            let bearer = bearer.clone();
+            async move {
+                client
+                    .post(url)
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA)
+                    .body(
+                        serde_json::to_vec(&json!({
+                            "outcome": "failed",
+                            "terminal_sequence": 1,
+                            "authority_epoch": 3,
+                            "prerequisite_seal_sha256": hex_chars('d'),
+                            "blocker_code": blocker,
+                        }))
+                        .unwrap(),
+                    )
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        for reason in LAUNCH_BLOCK_REASONS {
+            assert_eq!(
+                send(json!(reason)).await,
+                StatusCode::BAD_REQUEST,
+                "{reason}"
+            );
+        }
+        assert_eq!(send(json!("not_a_blocker")).await, StatusCode::BAD_REQUEST);
+        for code in AEON_BLOCKER_CODES {
+            assert_eq!(send(json!(code)).await, StatusCode::CONFLICT, "{code}");
+        }
+        let succeeded_with_blocker = client
+            .post(url)
+            .header(AUTHORIZATION, bearer)
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(
+                serde_json::to_vec(&json!({
+                    "outcome": "succeeded",
+                    "terminal_sequence": 1,
+                    "authority_epoch": 3,
+                    "prerequisite_seal_sha256": hex_chars('d'),
+                    "blocker_code": "policy_refused",
+                }))
+                .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(succeeded_with_blocker, StatusCode::BAD_REQUEST);
+        server.abort();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn expired_admission_is_not_confirmed_on_replay() {
         let now = now_unix();
@@ -8524,7 +8737,18 @@ mod tests {
             .collect();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["outcome"], "failed");
-        assert_eq!(results[0]["blocker_code"], "confirmation_not_delegated");
+        assert_eq!(results[0]["blocker_code"], "policy_refused");
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED)
+        );
         let later = fixture.adapter.process_intent(&fixture.intent).await;
         assert!(matches!(
             later,
@@ -8890,6 +9114,16 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["outcome"], "failed");
         assert_eq!(results[0]["blocker_code"], "dependency_failed");
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            reloaded
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED)
+        );
         assert_eq!(
             reloaded_actions.get(&job_id).unwrap().state,
             HostActionState::Cancelled

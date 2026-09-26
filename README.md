@@ -529,7 +529,11 @@ A deploy intent binds one guarded `UpdateRestart` review and requires
 A ready review posts `launch_readiness`, checks a one-use
 admission — including a binding digest recomputed locally — consumes that
 admission, and only then confirms the same job. Deployment evidence follows a
-fresh config-class beacon, or a failed or cancelled job. Verification evidence
+fresh config-class beacon, or a failed or cancelled job. A failed result uses
+one of Aeon's blocker codes (`dependency_pending`, `dependency_failed`,
+`reporter_stale`, `external_waiting`, `policy_refused`). The precise Pharos
+reason stays in the journal and is not sent as the code: Aeon rejects any
+other result field. Verification evidence
 requires `plan_digest` to equal the deploy binding plan digest and
 `predecessor_digest` to equal the dependency seal recomputed from the journaled
 deploy result. Epochs are per release, stage, and operation. Every mutation
