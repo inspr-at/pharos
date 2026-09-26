@@ -174,6 +174,19 @@ impl BindingTarget {
         }
     }
 
+    /// Cache discriminator: classic pairs the numeric id with the ref, so two
+    /// bindings declaring the same ref for different projects never share an
+    /// entry; the revision material (`identity`) stays what classic always used.
+    fn cache_material(&self) -> String {
+        match self {
+            Self::Classic {
+                project_id,
+                expected_project_ref,
+            } => format!("{project_id}:{expected_project_ref}"),
+            Self::Aeon { .. } => self.identity(),
+        }
+    }
+
     fn classic_project_id(&self) -> Option<u64> {
         match self {
             Self::Classic { project_id, .. } => Some(*project_id),
@@ -407,14 +420,20 @@ impl FlowHostService {
         };
         // Every routed intent carries the mounted projection so the review
         // link can retain the stage Aeon returned and the allow-list can pin it.
-        let projection = if matches!(
-            intent_type,
-            "flow:start-intent"
-                | "flow:review-batch"
-                | "flow:view-drafts"
-                | "flow:save-proposal"
-                | "flow:header-project"
-        ) {
+        // Start always needs the projection. Review and header navigation need
+        // it only for Aeon (to retain the journey stage); classic navigation
+        // stays independent of any upstream fetch.
+        let needs_projection = match intent_type {
+            "flow:start-intent" => true,
+            "flow:review-batch"
+            | "flow:view-drafts"
+            | "flow:save-proposal"
+            | "flow:header-project" => {
+                matches!(self.config.upstream, FlowUpstream::Aeon { .. })
+            }
+            _ => false,
+        };
+        let projection = if needs_projection {
             self.fetch_projection(&context, now).await.ok()
         } else {
             None
@@ -698,7 +717,7 @@ impl FlowHostService {
         // Aeon project node plus key) and operator, so two bindings can never
         // share a validated journey.
         let key = CacheKey {
-            project: context.binding.target.identity(),
+            project: context.binding.target.cache_material(),
             operator_ref: context.user.operator_ref.clone(),
             host: None,
         };
@@ -1412,11 +1431,15 @@ fn aeon_shell_state(journey: &Value, binding: &FlowBinding, now: i64) -> Value {
     let stage_evidence: Vec<&str> = folded
         .iter()
         .map(|keys| {
+            // A skipped substage is neutral: a profile that skips "shape" still
+            // performed the define stage once inspire and requirements are done.
             let states: Vec<String> = keys.iter().map(|key| stage_state(key)).collect();
-            if states.iter().all(|state| state == "done") {
-                "performed"
-            } else if states.iter().any(|state| state == "skipped") {
+            let considered: Vec<&String> =
+                states.iter().filter(|state| *state != "skipped").collect();
+            if considered.is_empty() {
                 "not_in_batch"
+            } else if considered.iter().all(|state| *state == "done") {
+                "performed"
             } else {
                 "unknown"
             }
@@ -2927,6 +2950,17 @@ mod tests {
         let projected = aeon_shell_state(&live, &service.config.bindings[0], now);
         assert_eq!(projected["delivery"]["status"], "completed");
         assert_eq!(projected["delivery"]["activeStage"], 3);
+        // A profile that skips "shape" still performed the define stage.
+        let mut personal = sample_journey(8);
+        personal["stages"][1]["state"] = json!("skipped");
+        let projected = aeon_shell_state(&personal, &service.config.bindings[0], now);
+        assert_eq!(projected["delivery"]["stageEvidence"][0], "performed");
+        let mut all_skipped = sample_journey(8);
+        for index in 0..3 {
+            all_skipped["stages"][index]["state"] = json!("skipped");
+        }
+        let projected = aeon_shell_state(&all_skipped, &service.config.bindings[0], now);
+        assert_eq!(projected["delivery"]["stageEvidence"][0], "not_in_batch");
         server.abort();
         cleanup_fixture_dir(&fixture_dir);
     }
@@ -3181,6 +3215,35 @@ mod tests {
             expected,
             "pharos-test:src-".to_string() + &expected["pharos-test:src-".len()..]
         );
+    }
+
+    #[test]
+    fn classic_bindings_sharing_a_ref_never_share_a_cache_entry() {
+        let a = BindingTarget::Classic {
+            project_id: 17,
+            expected_project_ref: PAIMOS_PROJECT_REF_17.to_string(),
+        };
+        let b = BindingTarget::Classic {
+            project_id: 18,
+            expected_project_ref: PAIMOS_PROJECT_REF_17.to_string(),
+        };
+        assert_eq!(
+            a.identity(),
+            b.identity(),
+            "revision material stays the ref"
+        );
+        assert_ne!(a.cache_material(), b.cache_material());
+        let key_a = CacheKey {
+            project: a.cache_material(),
+            operator_ref: "operator-a".to_string(),
+            host: None,
+        };
+        let key_b = CacheKey {
+            project: b.cache_material(),
+            operator_ref: "operator-a".to_string(),
+            host: None,
+        };
+        assert_ne!(key_a, key_b);
     }
 
     #[test]

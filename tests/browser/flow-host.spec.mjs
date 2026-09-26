@@ -68,9 +68,10 @@ async function dispatchFlowIntent(page, intentKind) {
   });
   const attempted = [];
   const originPrefix = paimosOrigin.replace(/\/$/, "");
+  // One predicate instance, reused for unroute: Playwright matches routes by identity.
+  const upstreamUrl = (url) => url.href.startsWith(`${originPrefix}/`);
   if (originPrefix) {
-    // Predicate, not glob: the target carries a query string.
-    await page.route((url) => url.href.startsWith(`${originPrefix}/`), (route) => {
+    await page.route(upstreamUrl, (route) => {
       attempted.push(route.request().url());
       route.abort();
     });
@@ -123,17 +124,19 @@ async function dispatchFlowIntent(page, intentKind) {
   if (paimosOrigin && captured?.body?.location) {
     const target = captured.body.location.replace(/#.*$/, "");
     await expect
-      .poll(() => attempted.includes(target), { timeout: 10_000 })
-      .toBe(true)
+      .poll(() => attempted.length, { timeout: 10_000 })
+      .toBeGreaterThan(0)
       .catch(() => {
         throw new Error(
           `bootstrap did not attempt ${target}; origin=${JSON.stringify(paimosOrigin)} attempted=${JSON.stringify(attempted)}`,
         );
       });
+    // Exactly one navigation, to exactly the returned location.
+    expect(attempted).toEqual([target]);
   }
   await page.unroute("**/flow/intents**");
   if (originPrefix) {
-    await page.unroute((url) => url.href.startsWith(`${originPrefix}/`));
+    await page.unroute(upstreamUrl);
   }
   return captured;
 }
