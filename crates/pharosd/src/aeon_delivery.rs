@@ -736,6 +736,7 @@ struct ConsumeResponse {
     handoff_id: String,
     admission_id: String,
     consumed: bool,
+    consumed_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1874,6 +1875,7 @@ impl AeonClient {
         if !response.consumed
             || response.handoff_id != record.handoff_id
             || response.admission_id != record.admission.as_ref().ok_or(AdapterError::Journal)?.id
+            || parse_timestamp(&response.consumed_at).is_err()
         {
             return Err(AdapterError::Contract);
         }
@@ -2098,7 +2100,7 @@ impl AeonDeliveryAdapter {
         }
         match self.aeon.post_consume(&launch).await {
             Ok(response) => {
-                let receipt = consume_receipt(&response, now_unix())?;
+                let receipt = consume_receipt(&response)?;
                 let launch = self
                     .journal
                     .acknowledge_consume(&intent.handoff_id, receipt)?;
@@ -2522,7 +2524,7 @@ impl AeonDeliveryAdapter {
     async fn consume_and_confirm(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
         let launch = self.journal.mark_consume_started(&intent.handoff_id)?;
         let response = self.aeon.post_consume(&launch).await?;
-        let receipt = consume_receipt(&response, now_unix())?;
+        let receipt = consume_receipt(&response)?;
         let launch = self
             .journal
             .acknowledge_consume(&intent.handoff_id, receipt)?;
@@ -2924,15 +2926,15 @@ fn consumable_for_launch(job: &HostActionJob, host: &str) -> bool {
     awaiting_ready_review(job, host) && job.requested_by == ACTOR && job.confirmed_at.is_none()
 }
 
-fn consume_receipt(response: &ConsumeResponse, now: i64) -> Result<ConsumeReceipt, AdapterError> {
-    if !response.consumed {
+fn consume_receipt(response: &ConsumeResponse) -> Result<ConsumeReceipt, AdapterError> {
+    if !response.consumed || parse_timestamp(&response.consumed_at).is_err() {
         return Err(AdapterError::Contract);
     }
     Ok(ConsumeReceipt {
         handoff_id: response.handoff_id.clone(),
         admission_id: response.admission_id.clone(),
         consumed: true,
-        consumed_at: format_timestamp(now)?,
+        consumed_at: response.consumed_at.clone(),
     })
 }
 
@@ -3872,6 +3874,7 @@ mod tests {
         evidence: BTreeMap<i64, StoredEvidence>,
         admission: Option<Value>,
         admit_idempotency_key: Option<String>,
+        launch_calls: BTreeMap<String, StoredLaunchCall>,
         consumed: bool,
         result_body: Option<Vec<u8>>,
         result: Option<Value>,
@@ -3913,6 +3916,7 @@ mod tests {
                 evidence: BTreeMap::new(),
                 admission: None,
                 admit_idempotency_key: None,
+                launch_calls: BTreeMap::new(),
                 consumed: false,
                 result_body: None,
                 result: None,
@@ -4192,6 +4196,16 @@ mod tests {
         if digest != flags.approved {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
+        if let Some(response) = replay_response(launch_replay(
+            handoff,
+            "admit",
+            flags.principal,
+            flags.idempotency,
+            body,
+            flags.now,
+        )) {
+            return response;
+        }
         let mut reviewed = None;
         let mut best_sequence = 0;
         let mut saw_stale = false;
@@ -4265,6 +4279,14 @@ mod tests {
         });
         handoff.admission = Some(admission.clone());
         handoff.admit_idempotency_key = Some(flags.idempotency.to_string());
+        remember_launch(
+            handoff,
+            "admit",
+            flags.principal,
+            flags.idempotency,
+            body,
+            &admission,
+        );
         if flags.drop_response {
             return json_response(StatusCode::OK, &json!({}));
         }
@@ -4274,8 +4296,21 @@ mod tests {
     fn handle_consume(
         handoff: &mut FakeHandoff,
         body: &[u8],
+        principal: &str,
+        idempotency: &str,
+        now: i64,
         drop_response: bool,
     ) -> Response<Body> {
+        if let Some(response) = replay_response(launch_replay(
+            handoff,
+            "consume",
+            principal,
+            idempotency,
+            body,
+            now,
+        )) {
+            return response;
+        }
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
         };
@@ -4291,18 +4326,18 @@ mod tests {
         if handoff.consumed {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
+        let response = json!({
+            "handoff_id": handoff.id,
+            "admission_id": admission_id,
+            "consumed": true,
+            "consumed_at": format_timestamp(now).unwrap(),
+        });
         handoff.consumed = true;
+        remember_launch(handoff, "consume", principal, idempotency, body, &response);
         if drop_response {
             return json_response(StatusCode::OK, &json!({}));
         }
-        json_response(
-            StatusCode::OK,
-            &json!({
-                "handoff_id": handoff.id,
-                "admission_id": admission_id,
-                "consumed": true,
-            }),
-        )
+        json_response(StatusCode::OK, &response)
     }
 
     fn handle_result(inner: &mut FakeInner, id: &str, body: &[u8]) -> Response<Body> {
@@ -4390,6 +4425,7 @@ mod tests {
         method: &str,
         path: &str,
         body: &[u8],
+        principal: &str,
         idempotency: &str,
     ) -> Response<Body> {
         let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
@@ -4438,16 +4474,24 @@ mod tests {
                     corrupt,
                     expire,
                     approved,
+                    principal,
                     idempotency,
                     drop_response: drop_admit,
                 };
                 handle_admit(&flags, handoff, body)
             }
             ("POST", Some("launch"), Some("consume")) => {
-                handle_consume(handoff, body, drop_consume)
+                handle_consume(handoff, body, principal, idempotency, now, drop_consume)
             }
             _ => json_response(StatusCode::NOT_FOUND, &json!({})),
         }
+    }
+
+    struct StoredLaunchCall {
+        action: String,
+        principal: String,
+        body_digest: String,
+        response: Value,
     }
 
     struct AdmitFlags<'a> {
@@ -4455,8 +4499,135 @@ mod tests {
         corrupt: bool,
         expire: bool,
         approved: String,
+        principal: &'a str,
         idempotency: &'a str,
         drop_response: bool,
+    }
+
+    fn canonical_body_digest(body: &[u8]) -> Result<String, ()> {
+        let value: Value = serde_json::from_slice(body).map_err(|_| ())?;
+        let canonical = canonical_json(&value).ok_or(())?;
+        Ok(hex_digest(canonical.as_bytes()))
+    }
+
+    fn canonical_json(value: &Value) -> Option<String> {
+        match value {
+            Value::Null => Some("null".to_string()),
+            Value::Bool(bit) => Some(if *bit { "true" } else { "false" }.to_string()),
+            Value::Number(number) => Some(number.to_string()),
+            Value::String(text) => serde_json::to_string(text).ok(),
+            Value::Array(items) => {
+                let mut rendered = String::from("[");
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        rendered.push(',');
+                    }
+                    rendered.push_str(&canonical_json(item)?);
+                }
+                rendered.push(']');
+                Some(rendered)
+            }
+            Value::Object(entries) => {
+                let mut keys: Vec<_> = entries.keys().collect();
+                keys.sort();
+                let mut rendered = String::from("{");
+                for (index, key) in keys.iter().enumerate() {
+                    if index > 0 {
+                        rendered.push(',');
+                    }
+                    rendered.push_str(&serde_json::to_string(key).ok()?);
+                    rendered.push(':');
+                    rendered.push_str(&canonical_json(&entries[*key])?);
+                }
+                rendered.push('}');
+                Some(rendered)
+            }
+        }
+    }
+
+    fn launch_replay_expired(handoff: &FakeHandoff, now: i64) -> bool {
+        let Some(result) = &handoff.result else {
+            return false;
+        };
+        let Some(completed_at) = result.get("completed_at").and_then(Value::as_str) else {
+            return false;
+        };
+        let Ok(completed) = parse_timestamp(completed_at) else {
+            return false;
+        };
+        matches!(handoff.state.as_str(), "succeeded" | "failed")
+            && now >= completed.unix_timestamp().saturating_add(24 * 60 * 60)
+    }
+
+    enum LaunchReplay {
+        Miss,
+        Hit(Value),
+        Conflict,
+        BadRequest,
+    }
+
+    fn launch_replay(
+        handoff: &FakeHandoff,
+        action: &str,
+        principal: &str,
+        key: &str,
+        body: &[u8],
+        now: i64,
+    ) -> LaunchReplay {
+        if key.is_empty() {
+            return LaunchReplay::Miss;
+        }
+        let Some(stored) = handoff.launch_calls.get(key) else {
+            return LaunchReplay::Miss;
+        };
+        let Ok(digest) = canonical_body_digest(body) else {
+            return LaunchReplay::BadRequest;
+        };
+        if stored.action != action
+            || stored.principal != principal
+            || stored.body_digest != digest
+            || launch_replay_expired(handoff, now)
+        {
+            return LaunchReplay::Conflict;
+        }
+        LaunchReplay::Hit(stored.response.clone())
+    }
+
+    fn replay_response(replay: LaunchReplay) -> Option<Response<Body>> {
+        match replay {
+            LaunchReplay::Miss => None,
+            LaunchReplay::Hit(response) => Some(json_response(StatusCode::OK, &response)),
+            LaunchReplay::Conflict => Some(json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "idempotency_conflict"}),
+            )),
+            LaunchReplay::BadRequest => Some(json_response(StatusCode::BAD_REQUEST, &json!({}))),
+        }
+    }
+
+    fn remember_launch(
+        handoff: &mut FakeHandoff,
+        action: &str,
+        principal: &str,
+        key: &str,
+        body: &[u8],
+        response: &Value,
+    ) {
+        if key.is_empty() {
+            return;
+        }
+        let Ok(digest) = canonical_body_digest(body) else {
+            return;
+        };
+        handoff.launch_calls.insert(
+            key.to_string(),
+            StoredLaunchCall {
+                action: action.to_string(),
+                principal: principal.to_string(),
+                body_digest: digest,
+                response: response.clone(),
+            },
+        );
     }
 
     async fn handler(State(fake): State<FakeAeon>, request: Request<Body>) -> Response<Body> {
@@ -4496,7 +4667,14 @@ mod tests {
         }
         let mut inner = fake.inner.lock().expect("fake lock");
         let idempotency = header_text(&headers, "idempotency-key");
-        dispatch(&mut inner, &method, &path, &body, &idempotency)
+        dispatch(
+            &mut inner,
+            &method,
+            &path,
+            &body,
+            &authorization,
+            &idempotency,
+        )
     }
 
     async fn serve(fake: FakeAeon) -> (Url, tokio::task::JoinHandle<()>) {
@@ -6302,20 +6480,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_crash_before_ack_marks_unresolved_and_leaves_the_job() {
+    async fn consume_crash_before_ack_recovers_on_replay_and_confirms_once() {
         let fixture = harness(true).await;
-        fixture
-            .adapter
-            .process_intent(&fixture.intent)
-            .await
-            .unwrap();
-        let job_id = fixture.actions.list()[0].id.clone();
-        review_job(
-            &fixture.actions,
-            &job_id,
-            fixture.actions.get(&job_id).unwrap().created_at,
-        );
-        record_backup(&fixture.hosts, fake_now(&fixture.fake));
+        let job_id = prepare_ready_launch(&fixture).await;
         fixture
             .fake
             .update(|inner| inner.drop_accepted_consume = true);
@@ -6328,17 +6495,85 @@ mod tests {
             fixture.actions.get(&job_id).unwrap().state,
             HostActionState::AwaitingConfirmation
         );
-        assert!(fixture
-            .adapter
-            .journal
-            .launch(DEPLOY_HANDOFF)
-            .unwrap()
-            .consume_unresolved
-            .is_none());
+        let crashed = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(crashed.consume_started);
+        assert!(crashed.receipt.is_none());
+        assert!(crashed.consume_unresolved.is_none());
         let consumes_after_crash = post_count(&fixture.fake, "/launch/consume");
         let admits_after_crash = post_count(&fixture.fake, "/launch/admit");
         assert_eq!(consumes_after_crash, 1);
 
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        let receipt = launch.receipt.unwrap();
+        assert!(receipt.consumed);
+        assert_eq!(receipt.admission_id, ADMISSION_ID);
+        assert!(parse_timestamp(&receipt.consumed_at).is_ok());
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::QueuedApply);
+        assert_eq!(
+            job.events
+                .iter()
+                .filter(|event| event.kind == HostActionEventKind::Confirmed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            post_count(&fixture.fake, "/launch/consume"),
+            consumes_after_crash + 1
+        );
+        assert_eq!(
+            post_count(&fixture.fake, "/launch/admit"),
+            admits_after_crash
+        );
+
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .actions
+                .get(&job_id)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| event.kind == HostActionEventKind::Confirmed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            post_count(&fixture.fake, "/launch/consume"),
+            consumes_after_crash + 1
+        );
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn divergent_consume_replay_is_unresolved_without_a_host_change() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        fixture
+            .fake
+            .update(|inner| inner.drop_accepted_consume = true);
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            for call in handoff.launch_calls.values_mut() {
+                if call.action == "consume" {
+                    call.body_digest = "0".repeat(64);
+                }
+            }
+        });
         let replay = fixture.adapter.process_intent(&fixture.intent).await;
         assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
         let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
@@ -6352,29 +6587,49 @@ mod tests {
             HostActionState::AwaitingConfirmation
         );
         assert!(fixture.actions.get(&job_id).unwrap().confirmed_at.is_none());
-        assert_eq!(
-            post_count(&fixture.fake, "/launch/consume"),
-            consumes_after_crash + 1
-        );
-        assert_eq!(
-            post_count(&fixture.fake, "/launch/admit"),
-            admits_after_crash
-        );
-
+        let consumes = post_count(&fixture.fake, "/launch/consume");
         let later = fixture.adapter.process_intent(&fixture.intent).await;
         assert!(matches!(later, Err(AdapterError::LaunchUnresolved)));
-        assert_eq!(
-            post_count(&fixture.fake, "/launch/consume"),
-            consumes_after_crash + 1
-        );
-        assert_eq!(
-            post_count(&fixture.fake, "/launch/admit"),
-            admits_after_crash
-        );
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
         assert_eq!(
             fixture.actions.get(&job_id).unwrap().state,
             HostActionState::AwaitingConfirmation
         );
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn exact_consume_replay_expires_a_day_after_the_handoff_is_terminal() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        fixture
+            .fake
+            .update(|inner| inner.drop_accepted_consume = true);
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            let completed_at = format_timestamp(inner.now - 24 * 60 * 60 - 5).unwrap();
+            handoff.state = "succeeded".to_string();
+            handoff.result = Some(json!({
+                "outcome": "succeeded",
+                "terminal_sequence": 1,
+                "authority_epoch": 3,
+                "prerequisite_seal_sha256": hex_chars('d'),
+                "handoff_id": DEPLOY_HANDOFF,
+                "completed_at": completed_at,
+            }));
+        });
+        let replay = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        assert!(fixture.actions.get(&job_id).unwrap().confirmed_at.is_none());
         fixture.server.abort();
     }
 
@@ -6436,11 +6691,17 @@ mod tests {
         assert!(other.adapter.process_intent(&other.intent).await.is_err());
         let admits_before = post_count(&other.fake, "/launch/admit");
         other.fake.update(|inner| {
-            inner
-                .handoffs
-                .get_mut(DEPLOY_HANDOFF)
-                .unwrap()
-                .admit_idempotency_key = Some("different-admit-key".to_string());
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            let stored: Vec<_> = std::mem::take(&mut handoff.launch_calls)
+                .into_values()
+                .collect();
+            for call in stored {
+                handoff
+                    .launch_calls
+                    .insert("66666666-6666-4666-8666-666666666666".to_string(), call);
+            }
+            handoff.admit_idempotency_key =
+                Some("66666666-6666-4666-8666-666666666666".to_string());
         });
         let replay = other.adapter.process_intent(&other.intent).await;
         assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
