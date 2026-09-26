@@ -63,6 +63,7 @@ const LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING: &str = "backup_success_missing";
 const LAUNCH_BLOCK_BACKUP_NOT_READY: &str = "backup_not_ready";
 const LAUNCH_BLOCK_READINESS_PLAN_CHANGED: &str = "readiness_plan_changed";
 const LAUNCH_BLOCK_READINESS_FLAG_FALSE: &str = "readiness_flag_false";
+const LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED: &str = "delegated_launch_required";
 
 #[derive(Debug)]
 enum AdapterError {
@@ -1167,6 +1168,7 @@ fn launch_block_reason(token: &str) -> Option<&'static str> {
         LAUNCH_BLOCK_BACKUP_NOT_READY => Some(LAUNCH_BLOCK_BACKUP_NOT_READY),
         LAUNCH_BLOCK_READINESS_PLAN_CHANGED => Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED),
         LAUNCH_BLOCK_READINESS_FLAG_FALSE => Some(LAUNCH_BLOCK_READINESS_FLAG_FALSE),
+        LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED => Some(LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED),
         _ => None,
     }
 }
@@ -2412,8 +2414,11 @@ impl AeonDeliveryAdapter {
         intent: &DeliveryIntent,
         handoff: &HandoffDocument,
     ) -> Result<(), AdapterError> {
-        if intent.operation != Operation::Deploy || intent.delegated_launch.is_none() {
+        if intent.operation != Operation::Deploy {
             return Ok(());
+        }
+        if intent.delegated_launch.is_none() {
+            return self.refuse_undelegated_launch(intent);
         }
         if let Some(launch) = self.journal.launch(&intent.handoff_id) {
             if launch.receipt.is_some() {
@@ -2485,6 +2490,22 @@ impl AeonDeliveryAdapter {
         }
         self.validate_admission(&admission, intent, &fresh, &reviewed, now_unix())?;
         self.consume_and_confirm(intent).await
+    }
+
+    fn refuse_undelegated_launch(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
+        let Some(operation) = self.journal.operation(&intent.handoff_id) else {
+            return Ok(());
+        };
+        let Some(job) = self.host_actions.get(&operation.job_id) else {
+            return Ok(());
+        };
+        if job.host != intent.host
+            || job.workflow_kind() != HostWorkflowKind::UpdateRestart
+            || job.state != HostActionState::AwaitingConfirmation
+        {
+            return Ok(());
+        }
+        self.block_launch(intent, LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED, true)
     }
 
     fn block_launch(
@@ -7523,6 +7544,57 @@ mod tests {
         );
         assert_eq!(post_count(&present.fake, "/launch/consume"), 1);
         present.server.abort();
+    }
+
+    #[tokio::test]
+    async fn in_memory_deploy_without_delegated_launch_does_not_start() {
+        let fixture = harness(false).await;
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert!(fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .is_none());
+        let job_id = fixture.actions.list()[0].id.clone();
+        review_job(
+            &fixture.actions,
+            &job_id,
+            fixture.actions.get(&job_id).unwrap().created_at,
+        );
+        record_backup(&fixture.hosts, fake_now(&fixture.fake));
+        let blocked = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.code(), LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED);
+        assert_eq!(readiness_post_count(&fixture.fake), 0);
+        assert_eq!(post_count(&fixture.fake, "/launch/admit"), 0);
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), 0);
+        let block = fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .unwrap();
+        assert_eq!(block.reason, LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED);
+        assert!(block.terminal);
+        assert!(fixture.adapter.journal.launch(DEPLOY_HANDOFF).is_none());
+        let again = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert_eq!(again.code(), LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED);
+        assert_eq!(readiness_post_count(&fixture.fake), 0);
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        fixture.server.abort();
     }
 
     #[tokio::test]
