@@ -7262,6 +7262,7 @@ mod tests {
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
         let job_id = completed_update(&actions, now);
+        actions.set_requested_by_for_test(&job_id, ACTOR);
         let hosts = Arc::new(Store::new(None).unwrap());
         let mut intent = deploy_intent(false);
         intent.update_restart_job_id = Some(job_id);
@@ -7415,7 +7416,7 @@ mod tests {
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
         let job = actions
-            .create_update_review("hsb8", "operator", now - 10_000)
+            .create_update_review("hsb8", ACTOR, now - 10_000)
             .expect("old review");
         fail_review(&actions, &job.id, now - 9_999);
         let failed = actions.get(&job.id).unwrap();
