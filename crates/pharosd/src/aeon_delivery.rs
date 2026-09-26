@@ -2719,6 +2719,11 @@ impl AeonDeliveryAdapter {
         terminal_sequence: i64,
         outcome: ResultOutcome,
     ) -> Result<ResultJournalRecord, AdapterError> {
+        if let Some(existing) = self.journal.result(&intent.handoff_id) {
+            // Replay the journaled bytes. A different seal replaces this record
+            // only after Aeon rejects those exact bytes.
+            return Ok(existing);
+        }
         let request = ResultRequest {
             outcome,
             terminal_sequence,
@@ -2728,20 +2733,6 @@ impl AeonDeliveryAdapter {
         let body = serde_json::to_vec(&request).map_err(|_| AdapterError::Contract)?;
         let record =
             ResultJournalRecord::new(intent, &self.config.aeon_origin, terminal_sequence, &body)?;
-        if let Some(existing) = self.journal.result(&intent.handoff_id) {
-            if existing.receipt.is_some() || existing.body_json == record.body_json {
-                return Ok(existing);
-            }
-            let existing_request: ResultRequest = decode_strict(existing.body_json.as_bytes())?;
-            if existing_request.authority_epoch == request.authority_epoch
-                && existing_request.outcome == request.outcome
-                && existing_request.terminal_sequence == request.terminal_sequence
-                && existing_request.prerequisite_seal_sha256 != request.prerequisite_seal_sha256
-            {
-                return self.journal.replace_unacked_result(record);
-            }
-            return Ok(existing);
-        }
         self.journal.ensure_result(record)
     }
 
@@ -5086,5 +5077,58 @@ mod tests {
         );
         assert!(fixture.actions.get(&job_id).unwrap().confirmed_at.is_none());
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn result_replay_after_accepted_send_does_not_replace_the_journal() {
+        let now = now_unix();
+        let directory = TestDir::new("result-replay");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now);
+        fake.update(|inner| inner.drop_accepted_result = true);
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let job_id = completed_update(&actions, now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        record_beacon(&hosts, now - 10, &artifact());
+        let mut intent = deploy_intent(false);
+        intent.update_restart_job_id = Some(job_id);
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![intent.clone()]),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            hosts,
+            actions,
+        );
+        assert!(adapter.process_intent(&intent).await.is_err());
+        let first = posts(&fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/result"))
+            .unwrap();
+        let journaled = adapter.journal.result(DEPLOY_HANDOFF).unwrap().body_json;
+        assert_eq!(first.body, journaled.as_bytes());
+        fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .prerequisite_seal_sha256 = hex_chars('f');
+        });
+        adapter.process_intent(&intent).await.unwrap();
+        let result_posts: Vec<_> = posts(&fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/result"))
+            .collect();
+        assert_eq!(result_posts.len(), 2);
+        assert_eq!(result_posts[0].body, result_posts[1].body);
+        let saved = adapter.journal.result(DEPLOY_HANDOFF).unwrap();
+        assert_eq!(saved.body_json, journaled);
+        assert_eq!(
+            saved.receipt.unwrap().prerequisite_seal_sha256,
+            hex_chars('d')
+        );
+        server.abort();
     }
 }
