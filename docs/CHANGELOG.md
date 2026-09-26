@@ -40,6 +40,7 @@
 - Refuse to confirm an Aeon launch when the fetched handoff reports `authority_open` false or `superseded_by` is set, and journal that as `handoff_authority_not_open`, which maps to `policy_refused`. When those fields are absent, confirmation still infers an open authority from the handoff state, an empty result, and the journaled admission (PHAROS-321).
 - Select the live Aeon roundtrip's candidate and deploy gates by `gate_scope` (`journey.candidate` and `journey.deploy`). A dark or missing scope is named in the refusal. Stage keys are not that identity (PHAROS-321).
 - Require the live Aeon journey to report `disposable: true` before any write. An operator marks the project with `aeon journey mark-disposable`. The operator-supplied project key, node key, project node, and release id remain required (PHAROS-321).
+- Note that Aeon's handoff create response now matches GET (AEON-177). The delivery adapter still reads that handoff with GET (PHAROS-321).
 
 ## 260922141211.0.0 - 2026-09-22
 

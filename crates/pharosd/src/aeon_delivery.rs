@@ -2863,6 +2863,9 @@ impl AeonDeliveryAdapter {
         // A false authority_open, or a superseded_by, is an additional refusal.
         // It is journaled on its own and never waives the inferred check.
         // launchReplay still returns the stored receipt before current().
+        // Aeon's handoff create response now matches GET (AEON-177). This
+        // adapter does not create handoffs, and GET remains the source of
+        // truth for the row it confirms.
         // Expiry stays on the admission check below this function: a false
         // authority_open caused only by an elapsed expires_at must not replace
         // admission_expired.
