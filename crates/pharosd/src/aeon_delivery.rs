@@ -6972,6 +6972,15 @@ mod tests {
 
         let stale_now = now + 700;
         let stale = FakeAeon::new(stale_now);
+        // 1000s is past the 900s freshness window. The handoff has to exist
+        // by the observation, or Aeon rejects it as predating the handoff.
+        stale.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .expect("deploy handoff")
+                .created_at = stale_now - 1000;
+        });
         let (origin, server) = serve(stale).await;
         let client = reqwest::Client::new();
         let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
