@@ -525,7 +525,8 @@ same host, environment, and artifact. No Aeon field becomes a command, path,
 or host selector.
 
 A deploy intent binds one guarded `UpdateRestart` review and requires
-`delegated_launch`. A ready review posts `launch_readiness`, checks a one-use
+`delegated_launch`, whose `target_ref` is that intent's artifact digest.
+A ready review posts `launch_readiness`, checks a one-use
 admission — including a binding digest recomputed locally — consumes that
 admission, and only then confirms the same job. Deployment evidence follows a
 fresh config-class beacon, or a failed or cancelled job. Verification evidence

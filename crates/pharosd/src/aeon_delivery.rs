@@ -219,10 +219,9 @@ impl DeliveryIntent {
                             .as_deref()
                             .is_none_or(valid_action_id)
                         && self.deployment_handoff_id.is_none()
-                        && self
-                            .delegated_launch
-                            .as_ref()
-                            .is_some_and(DelegatedLaunchSelection::valid)
+                        && self.delegated_launch.as_ref().is_some_and(|selection| {
+                            selection.valid() && selection.target_ref == self.artifact.digest
+                        })
                 }
                 Operation::Verify => {
                     self.workflow == GuardedWorkflow::VerifyProduction
@@ -4355,7 +4354,7 @@ mod tests {
             update_restart_job_id: None,
             deployment_handoff_id: None,
             delegated_launch: delegated.then(|| DelegatedLaunchSelection {
-                target_ref: format!("sha256:{}", "a".repeat(64)),
+                target_ref: artifact().digest,
             }),
         }
     }
@@ -4415,7 +4414,7 @@ mod tests {
             "host": "hsb8",
             "artifact": artifact(),
             "delegated_launch": {
-                "target_ref": format!("sha256:{}", "a".repeat(64)),
+                "target_ref": artifact().digest,
             },
         })
     }
@@ -4508,6 +4507,19 @@ mod tests {
         assert!(valid_symbol("production-eu1"));
         assert!(!valid_symbol("1production"));
         assert!(!valid_symbol(&"a".repeat(129)));
+
+        document = config_document(
+            &api,
+            "https://aeon.example.test",
+            json!([deploy_intent_json()]),
+        );
+        document["intents"][0]["delegated_launch"]["target_ref"] =
+            json!(format!("sha256:{}", "b".repeat(64)));
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            AdapterConfig::load(&config_path),
+            Err(AdapterError::Configuration)
+        ));
 
         document = config_document(
             &api,
