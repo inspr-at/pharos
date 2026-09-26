@@ -58,6 +58,9 @@ const MAX_JOURNAL_RECORDS: usize = MAX_INTENTS * 8;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const OBSERVED_AT_SKEW_SECS: i64 = 5 * 60;
 const READINESS_REFRESH_SECS: i64 = 600;
+const BACKUP_FUTURE_SKEW_SECS: i64 = 5 * 60;
+const LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING: &str = "backup_success_missing";
+const LAUNCH_BLOCK_BACKUP_NOT_READY: &str = "backup_not_ready";
 
 #[derive(Debug)]
 enum AdapterError {
@@ -70,6 +73,7 @@ enum AdapterError {
     Transport,
     Refused(StatusCode),
     LaunchUnresolved,
+    LaunchBlocked(&'static str),
 }
 
 impl AdapterError {
@@ -84,6 +88,7 @@ impl AdapterError {
             Self::Transport => "transport_unavailable",
             Self::Refused(_) => "aeon_refused",
             Self::LaunchUnresolved => "launch_consume_unresolved",
+            Self::LaunchBlocked(reason) => reason,
         }
     }
 }
@@ -1136,6 +1141,30 @@ impl ResultJournalRecord {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LaunchBlock {
+    handoff_id: String,
+    intent_digest: String,
+    reason: String,
+}
+
+impl LaunchBlock {
+    fn valid(&self) -> bool {
+        valid_uuid(&self.handoff_id)
+            && valid_hex64(&self.intent_digest)
+            && launch_block_reason(&self.reason).is_some()
+    }
+}
+
+fn launch_block_reason(token: &str) -> Option<&'static str> {
+    match token {
+        LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING => Some(LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING),
+        LAUNCH_BLOCK_BACKUP_NOT_READY => Some(LAUNCH_BLOCK_BACKUP_NOT_READY),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct JournalDocument {
@@ -1148,6 +1177,8 @@ struct JournalDocument {
     launches: BTreeMap<String, LaunchJournalRecord>,
     #[serde(default)]
     results: BTreeMap<String, ResultJournalRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    launch_blocks: BTreeMap<String, LaunchBlock>,
 }
 
 impl Default for JournalDocument {
@@ -1159,6 +1190,7 @@ impl Default for JournalDocument {
             operations: BTreeMap::new(),
             launches: BTreeMap::new(),
             results: BTreeMap::new(),
+            launch_blocks: BTreeMap::new(),
         }
     }
 }
@@ -1203,7 +1235,13 @@ impl JournalStore {
             .is_some_and(|record| {
                 record.intent_digest != intent.binding_digest(origin).unwrap_or_default()
             });
-        if records_diverge || result_diverges || launch_diverges {
+        let block_diverges = document
+            .launch_blocks
+            .get(&intent.handoff_id)
+            .is_some_and(|block| {
+                block.intent_digest != intent.binding_digest(origin).unwrap_or_default()
+            });
+        if records_diverge || result_diverges || launch_diverges || block_diverges {
             return Err(AdapterError::LocalBinding);
         }
         Ok(())
@@ -1383,6 +1421,46 @@ impl JournalStore {
             .launches
             .get(handoff_id)
             .cloned()
+    }
+
+    #[cfg(test)]
+    fn launch_block(&self, handoff_id: &str) -> Option<LaunchBlock> {
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .launch_blocks
+            .get(handoff_id)
+            .cloned()
+    }
+
+    fn record_launch_block(&self, block: LaunchBlock) -> Result<(), AdapterError> {
+        if !block.valid() {
+            return Err(AdapterError::Journal);
+        }
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        if document.launch_blocks.get(&block.handoff_id) == Some(&block) {
+            return Ok(());
+        }
+        if document.launch_blocks.len() >= MAX_INTENTS
+            && !document.launch_blocks.contains_key(&block.handoff_id)
+        {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        updated
+            .launch_blocks
+            .insert(block.handoff_id.clone(), block);
+        persist_journal(&self.path, &mut document, updated)
+    }
+
+    fn clear_launch_block(&self, handoff_id: &str) -> Result<(), AdapterError> {
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        if !document.launch_blocks.contains_key(handoff_id) {
+            return Ok(());
+        }
+        let mut updated = document.clone();
+        updated.launch_blocks.remove(handoff_id);
+        persist_journal(&self.path, &mut document, updated)
     }
 
     fn ensure_launch(
@@ -1699,6 +1777,7 @@ fn journal_document_valid(document: &JournalDocument) -> bool {
         && document.operations.len() <= MAX_JOURNAL_RECORDS
         && document.launches.len() <= MAX_INTENTS
         && document.results.len() <= MAX_INTENTS
+        && document.launch_blocks.len() <= MAX_INTENTS
         && document
             .records
             .iter()
@@ -1715,6 +1794,10 @@ fn journal_document_valid(document: &JournalDocument) -> bool {
             .results
             .iter()
             .all(|(key, result)| key == &result.handoff_id && result.valid())
+        && document
+            .launch_blocks
+            .iter()
+            .all(|(key, block)| key == &block.handoff_id && block.valid())
 }
 
 fn persist_journal(
@@ -2328,6 +2411,13 @@ impl AeonDeliveryAdapter {
         let Some(job) = self.host_actions.get(&operation.job_id) else {
             return Err(AdapterError::LocalBinding);
         };
+        if job.host == intent.host
+            && job.workflow_kind() == HostWorkflowKind::UpdateRestart
+            && job.state == HostActionState::AwaitingConfirmation
+            && job.plan.as_ref().is_some_and(|plan| !plan.backup_ready)
+        {
+            return self.block_launch(intent, LAUNCH_BLOCK_BACKUP_NOT_READY);
+        }
         if !awaiting_ready_review(&job, &intent.host) {
             return Ok(());
         }
@@ -2362,6 +2452,36 @@ impl AeonDeliveryAdapter {
         self.consume_and_confirm(intent).await
     }
 
+    fn block_launch(
+        &self,
+        intent: &DeliveryIntent,
+        reason: &'static str,
+    ) -> Result<(), AdapterError> {
+        self.journal.record_launch_block(LaunchBlock {
+            handoff_id: intent.handoff_id.clone(),
+            intent_digest: intent.binding_digest(&self.config.aeon_origin)?,
+            reason: reason.to_string(),
+        })?;
+        Err(AdapterError::LaunchBlocked(reason))
+    }
+
+    fn withhold_unusable_readiness(
+        &self,
+        intent: &DeliveryIntent,
+        job_id: &str,
+    ) -> Result<(), AdapterError> {
+        let job = self
+            .host_actions
+            .get(job_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
+        let backup_at = backup_observed_at(&self.hosts, &intent.host);
+        if let Some(reason) = readiness_wait_reason(plan, backup_at.as_deref(), now_unix()) {
+            return self.block_launch(intent, reason);
+        }
+        self.journal.clear_launch_block(&intent.handoff_id)
+    }
+
     async fn send_readiness(
         &self,
         intent: &DeliveryIntent,
@@ -2385,6 +2505,7 @@ impl AeonDeliveryAdapter {
                 return Err(AdapterError::LocalBinding);
             }
             let observed = evidence_string_field(&current.body_json, "observed_at")?;
+            self.withhold_unusable_readiness(intent, job_id)?;
             if now_unix().saturating_sub(unix_of(&observed)?) <= READINESS_REFRESH_SECS {
                 return Ok(());
             }
@@ -2409,8 +2530,9 @@ impl AeonDeliveryAdapter {
         let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
         let observed_at = format_timestamp(now_unix())?;
         let bare_reviewed = bare_plan_digest(reviewed)?;
-        // The plan has backup_ready and no clock. Aeon's backup time is
-        // optional, so omit it unless the host store has a success.
+        // Aeon returns 400 for a zero or future backup_observed_at. Wait until
+        // the host store has a success inside that window, and keep backup_ready.
+        self.withhold_unusable_readiness(intent, job_id)?;
         let backup_at = backup_observed_at(&self.hosts, &intent.host);
         let running_kernel = kernel_token(plan.running_kernel.as_deref());
         let expected_kernel = kernel_token(plan.expected_kernel.as_deref());
@@ -3017,6 +3139,34 @@ fn handoff_result_matches(result: &HandoffResult, body: &str, handoff_id: &str) 
 
 fn beacon_window_closed(anchor: i64, now: i64, freshness_secs: i64) -> bool {
     now.saturating_sub(anchor) > freshness_secs
+}
+
+fn readiness_wait_reason(
+    plan: &HostActionPlan,
+    backup_at: Option<&str>,
+    now: i64,
+) -> Option<&'static str> {
+    if !plan.backup_ready {
+        return Some(LAUNCH_BLOCK_BACKUP_NOT_READY);
+    }
+    if !acceptable_backup_stamp(backup_at, now) {
+        return Some(LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING);
+    }
+    None
+}
+
+fn acceptable_backup_stamp(stamp: Option<&str>, now: i64) -> bool {
+    let Some(stamp) = stamp else {
+        return false;
+    };
+    let Ok(parsed) = parse_timestamp(stamp) else {
+        return false;
+    };
+    if parsed.year() <= 1 {
+        return false;
+    }
+    let unix = parsed.unix_timestamp();
+    unix > 0 && unix <= now.saturating_add(BACKUP_FUTURE_SKEW_SECS)
 }
 
 fn backup_observed_at(hosts: &Store, host_name: &str) -> Option<String> {
@@ -5191,12 +5341,12 @@ mod tests {
                 at,
             )
             .expect("review without kernels");
-        let error = missing
+        record_backup(&missing.hosts, fake_now(&missing.fake));
+        missing
             .adapter
             .process_intent(&missing.intent)
             .await
-            .unwrap_err();
-        assert!(matches!(error, AdapterError::LaunchUnresolved));
+            .unwrap();
         let omitted: Value = posts(&missing.fake)
             .into_iter()
             .find(|capture| capture.path.ends_with("/evidence"))
@@ -6520,6 +6670,19 @@ mod tests {
         fixture.server.abort();
     }
 
+    fn readiness_bodies(fake: &FakeAeon) -> Vec<Value> {
+        posts(fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/evidence"))
+            .filter_map(|capture| serde_json::from_slice::<Value>(&capture.body).ok())
+            .filter(|body| body["kind"] == "launch_readiness")
+            .collect()
+    }
+
+    fn readiness_post_count(fake: &FakeAeon) -> usize {
+        readiness_bodies(fake).len()
+    }
+
     fn post_count(fake: &FakeAeon, suffix: &str) -> usize {
         fake.captures
             .lock()
@@ -6979,7 +7142,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_backup_observation_omits_the_clock_and_refuses_admit() {
+    async fn readiness_waits_for_a_backup_success_before_posting() {
         let missing = harness(true).await;
         missing
             .adapter
@@ -6992,39 +7155,130 @@ mod tests {
             &missing_job,
             missing.actions.get(&missing_job).unwrap().created_at,
         );
-        let error = missing
+        let waiting = missing
             .adapter
             .process_intent(&missing.intent)
             .await
             .unwrap_err();
-        assert!(matches!(error, AdapterError::LaunchUnresolved));
-        let readiness: Value = posts(&missing.fake)
-            .into_iter()
-            .find(|capture| capture.path.ends_with("/evidence"))
-            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
-            .unwrap();
-        assert_eq!(readiness["kind"], "launch_readiness");
-        assert_eq!(readiness["backup_ready"], true);
-        assert!(readiness.get("backup_observed_at").is_none());
-        assert_eq!(post_count(&missing.fake, "/launch/admit"), 1);
+        assert_eq!(waiting.code(), LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING);
+        assert_eq!(readiness_post_count(&missing.fake), 0);
+        assert_eq!(post_count(&missing.fake, "/launch/admit"), 0);
         assert_eq!(post_count(&missing.fake, "/launch/consume"), 0);
         assert_eq!(
             missing
                 .adapter
                 .journal
-                .launch(DEPLOY_HANDOFF)
+                .launch_block(DEPLOY_HANDOFF)
                 .unwrap()
-                .admit_unresolved,
-            Some(StatusCode::CONFLICT.as_u16())
+                .reason,
+            LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING
         );
+        assert!(missing.adapter.journal.launch(DEPLOY_HANDOFF).is_none());
         assert_eq!(
             missing.actions.get(&missing_job).unwrap().state,
             HostActionState::AwaitingConfirmation
         );
-        let later = missing.adapter.process_intent(&missing.intent).await;
-        assert!(matches!(later, Err(AdapterError::LaunchUnresolved)));
-        assert_eq!(post_count(&missing.fake, "/launch/admit"), 1);
+        let still_waiting = missing.adapter.process_intent(&missing.intent).await;
+        assert!(matches!(
+            still_waiting,
+            Err(AdapterError::LaunchBlocked(
+                LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING
+            ))
+        ));
+        assert_eq!(readiness_post_count(&missing.fake), 0);
+
+        record_backup(&missing.hosts, fake_now(&missing.fake));
+        for _ in 0..4 {
+            missing
+                .adapter
+                .process_intent(&missing.intent)
+                .await
+                .unwrap();
+            if missing.actions.get(&missing_job).unwrap().state == HostActionState::QueuedApply {
+                break;
+            }
+        }
+        assert_eq!(
+            missing.actions.get(&missing_job).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        assert!(missing
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .is_none());
+        let readiness = readiness_bodies(&missing.fake);
+        assert_eq!(readiness.len(), 1);
+        assert_eq!(readiness[0]["backup_ready"], true);
+        assert_eq!(
+            readiness[0]["backup_observed_at"],
+            format_timestamp(fake_now(&missing.fake)).unwrap()
+        );
+        assert_eq!(post_count(&missing.fake, "/launch/consume"), 1);
+        let saved = JournalStore::new(missing.journal.clone()).unwrap();
+        assert!(saved.launch_block(DEPLOY_HANDOFF).is_none());
+        assert!(saved.launch(DEPLOY_HANDOFF).unwrap().receipt.is_some());
         missing.server.abort();
+
+        let unready = harness(true).await;
+        unready
+            .adapter
+            .process_intent(&unready.intent)
+            .await
+            .unwrap();
+        let unready_job = unready.actions.list()[0].id.clone();
+        let at = unready.actions.get(&unready_job).unwrap().created_at;
+        let review = unready
+            .actions
+            .claim("hsb8", at)
+            .expect("claim")
+            .expect("lease");
+        let mut plan = ready_plan();
+        plan.backup_ready = false;
+        unready
+            .actions
+            .record_agent_result(
+                &unready_job,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: review.phase,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(plan),
+                    result: None,
+                },
+                at,
+            )
+            .expect("review without a ready backup");
+        record_backup(&unready.hosts, fake_now(&unready.fake));
+        let blocked = unready
+            .adapter
+            .process_intent(&unready.intent)
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.code(), LAUNCH_BLOCK_BACKUP_NOT_READY);
+        assert_eq!(readiness_post_count(&unready.fake), 0);
+        assert_eq!(post_count(&unready.fake, "/launch/admit"), 0);
+        assert_eq!(
+            unready
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_BACKUP_NOT_READY
+        );
+        let later = unready.adapter.process_intent(&unready.intent).await;
+        assert!(matches!(
+            later,
+            Err(AdapterError::LaunchBlocked(LAUNCH_BLOCK_BACKUP_NOT_READY))
+        ));
+        assert_eq!(readiness_post_count(&unready.fake), 0);
+        assert_eq!(
+            unready.actions.get(&unready_job).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        unready.server.abort();
 
         let stale = harness(true).await;
         let stale_at = fake_now(&stale.fake) - 901;
