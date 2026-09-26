@@ -4167,10 +4167,12 @@ fn strip_sha256(value: &str) -> Result<String, AdapterError> {
 }
 
 fn valid_symbol(value: &str) -> bool {
-    (1..=64).contains(&value.len())
-        && value.as_bytes()[0].is_ascii_lowercase()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+    // Aeon symbolicRE: ^[a-z][a-z0-9_-]{0,127}$
+    let bytes = value.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
         })
 }
 
@@ -4474,6 +4476,21 @@ mod tests {
             AdapterConfig::load(&config_path),
             Err(AdapterError::Configuration)
         ));
+
+        document = config_document(
+            &api,
+            "https://aeon.example.test",
+            json!([deploy_intent_json()]),
+        );
+        document["intents"][0]["environment"] = json!("production.eu1");
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            AdapterConfig::load(&config_path),
+            Err(AdapterError::Configuration)
+        ));
+        assert!(valid_symbol("production-eu1"));
+        assert!(!valid_symbol("1production"));
+        assert!(!valid_symbol(&"a".repeat(129)));
 
         document = config_document(
             &api,
