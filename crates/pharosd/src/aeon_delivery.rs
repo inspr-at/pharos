@@ -3415,6 +3415,25 @@ impl AeonDeliveryAdapter {
         if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
             return Err(AdapterError::LocalBinding);
         }
+        if let Some(block) = self.journal.launch_block(&intent.handoff_id) {
+            if block.terminal {
+                let reason = launch_block_reason(&block.reason).ok_or(AdapterError::Journal)?;
+                if reason == LAUNCH_BLOCK_ADMISSION_EXPIRED {
+                    return self.report_admission_expired(intent).await;
+                }
+                let blocker = aeon_blocker_for_reason(reason).ok_or(AdapterError::Journal)?;
+                return self
+                    .write_observation(
+                        intent,
+                        handoff,
+                        EvidenceOutcome::Failed,
+                        now_unix(),
+                        Some(blocker),
+                        Some(reason),
+                    )
+                    .await;
+            }
+        }
         match job.state {
             HostActionState::Failed | HostActionState::Cancelled => {
                 let detail = self
@@ -9595,12 +9614,11 @@ mod tests {
         assert_eq!(block.reason, LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED);
         assert!(block.terminal);
         assert!(fixture.adapter.journal.launch(DEPLOY_HANDOFF).is_none());
-        let again = fixture
-            .adapter
-            .process_intent(&fixture.intent)
-            .await
-            .unwrap_err();
-        assert_eq!(again.code(), LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED);
+        let again = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(again.is_ok());
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["blocker_code"], "policy_refused");
         assert_eq!(readiness_post_count(&fixture.fake), 0);
         assert_eq!(
             fixture.actions.get(&job_id).unwrap().state,
@@ -9666,8 +9684,8 @@ mod tests {
         reloaded_actions
             .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
             .unwrap();
-        let reported = reloaded.process_intent(&intent).await.unwrap_err();
-        assert_eq!(reported.code(), LAUNCH_BLOCK_READINESS_PLAN_CHANGED);
+        let reported = reloaded.process_intent(&intent).await;
+        assert!(reported.is_ok());
         let results: Vec<Value> = posts(&fake)
             .into_iter()
             .filter(|capture| capture.path.ends_with("/result"))
@@ -9675,7 +9693,7 @@ mod tests {
             .collect();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["outcome"], "failed");
-        assert_eq!(results[0]["blocker_code"], "dependency_failed");
+        assert_eq!(results[0]["blocker_code"], "policy_refused");
         assert!(results[0].get("detail").is_none());
         assert_eq!(
             reloaded
@@ -9784,10 +9802,30 @@ mod tests {
             reloaded_actions.get(&job_id).unwrap().state,
             HostActionState::AwaitingConfirmation
         );
-        let again = reloaded.process_intent(&intent).await.unwrap_err();
-        assert_eq!(again.code(), reason);
+        let results = result_posts(&fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert!(results[0].get("detail").is_none());
+        let blocker = aeon_blocker_for_reason(reason).unwrap();
+        assert_eq!(results[0]["blocker_code"], blocker_code_wire(blocker));
+        assert_eq!(
+            reloaded
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(reason)
+        );
+        let again = reloaded.process_intent(&intent).await;
+        assert!(again.is_ok());
+        assert_eq!(result_posts(&fake).len(), 1);
         assert_eq!(readiness_post_count(&fake), readiness);
         assert_eq!(post_count(&fake, "/launch/admit"), admits);
+        assert_eq!(
+            reloaded_actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
         server.abort();
     }
 

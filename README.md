@@ -529,7 +529,8 @@ A deploy intent binds one guarded `UpdateRestart` review and requires
 A ready review posts `launch_readiness`, checks a one-use
 admission — including a binding digest recomputed locally — consumes that
 admission, and only then confirms the same job. Deployment evidence follows a
-fresh config-class beacon, or a failed or cancelled job. A failed result uses
+fresh config-class beacon, a failed or cancelled job, or a terminal launch
+block while the job is still awaiting confirmation. A failed result uses
 one of Aeon's blocker codes (`dependency_pending`, `dependency_failed`,
 `reporter_stale`, `external_waiting`, `policy_refused`). The precise Pharos
 reason stays in the journal and is not sent as the code: Aeon rejects any

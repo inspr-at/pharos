@@ -21,6 +21,7 @@
 - Refuse to confirm a recovered Aeon launch when the handoff is no longer open or its authority no longer matches the journaled admission (PHAROS-313).
 - Recheck the backup success gate before a consume replay refreshes launch readiness (PHAROS-313).
 - Recheck that a recovered Aeon launch still belongs to the delivery adapter before confirming it (PHAROS-313).
+- Post a failed Aeon result for a terminal launch block while the host job is still awaiting confirmation (PHAROS-313).
 
 ## 260922141211.0.0 - 2026-09-22
 
