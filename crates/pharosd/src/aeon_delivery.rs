@@ -2278,7 +2278,9 @@ impl AeonDeliveryAdapter {
             .host_actions
             .get(&operation.job_id)
             .ok_or(AdapterError::LocalBinding)?;
-        if reviewed_plan_digest(&fresh_job).map_err(map_shared)? != reviewed {
+        if !consumable_for_launch(&fresh_job, &intent.host)
+            || reviewed_plan_digest(&fresh_job).map_err(map_shared)? != reviewed
+        {
             return Err(AdapterError::LocalBinding);
         }
         self.validate_admission(&admission, intent, &fresh, &reviewed, now_unix())?;
@@ -2781,6 +2783,10 @@ fn awaiting_ready_review(job: &HostActionJob, host: &str) -> bool {
         && job.workflow_kind() == HostWorkflowKind::UpdateRestart
         && job.state == HostActionState::AwaitingConfirmation
         && job.plan.as_ref().is_some_and(HostActionPlan::ready)
+}
+
+fn consumable_for_launch(job: &HostActionJob, host: &str) -> bool {
+    awaiting_ready_review(job, host) && job.requested_by == ACTOR && job.confirmed_at.is_none()
 }
 
 fn consume_receipt(response: &ConsumeResponse, now: i64) -> Result<ConsumeReceipt, AdapterError> {
@@ -3709,10 +3715,13 @@ mod tests {
         body: Vec<u8>,
     }
 
+    type RereadHook = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
+
     #[derive(Clone)]
     struct FakeAeon {
         inner: Arc<Mutex<FakeInner>>,
         captures: Arc<Mutex<Vec<Captured>>>,
+        reread_hook: RereadHook,
     }
 
     impl FakeAeon {
@@ -3737,6 +3746,7 @@ mod tests {
                     drift_plan_on_next_get: false,
                 })),
                 captures: Arc::new(Mutex::new(Vec::new())),
+                reread_hook: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -4087,6 +4097,18 @@ mod tests {
             inner.fail_next_post = false;
             return json_response(StatusCode::SERVICE_UNAVAILABLE, &json!({}));
         }
+        let fire_reread = method == "GET"
+            && inner
+                .handoffs
+                .values()
+                .any(|handoff| path.contains(&handoff.id) && handoff.admission.is_some());
+        drop(inner);
+        if fire_reread {
+            if let Some(hook) = fake.reread_hook.lock().expect("reread hook").take() {
+                hook();
+            }
+        }
+        let mut inner = fake.inner.lock().expect("fake lock");
         let idempotency = header_text(&headers, "idempotency-key");
         dispatch(&mut inner, &method, &path, &body, &idempotency)
     }
@@ -5038,5 +5060,31 @@ mod tests {
         assert_eq!(post_count(&other.fake, "/launch/admit"), admits_before + 1);
         assert_eq!(post_count(&other.fake, "/launch/consume"), 0);
         other.server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_job_between_admit_and_consume_sends_no_consume() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let actions = Arc::clone(&fixture.actions);
+        let cancel_id = job_id.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            actions
+                .cancel_update_review(&cancel_id, "hsb8", "operator", now_unix())
+                .expect("cancel between admit and consume");
+        }));
+        let error = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::LocalBinding));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), 0);
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::Cancelled
+        );
+        assert!(fixture.actions.get(&job_id).unwrap().confirmed_at.is_none());
+        fixture.server.abort();
     }
 }
