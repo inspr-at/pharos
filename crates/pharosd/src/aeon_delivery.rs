@@ -2850,7 +2850,9 @@ impl AeonDeliveryAdapter {
         intent: &DeliveryIntent,
         launch: &LaunchJournalRecord,
     ) -> Result<(), AdapterError> {
-        let receipt = launch.receipt.as_ref().ok_or(AdapterError::Journal)?;
+        if launch.receipt.is_none() {
+            return Err(AdapterError::Journal);
+        }
         let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
         let job = self
             .host_actions
@@ -2863,13 +2865,11 @@ impl AeonDeliveryAdapter {
             return Err(AdapterError::LocalBinding);
         }
         if job.state == HostActionState::AwaitingConfirmation {
+            // Aeon's consumed_at stays in the journal. The host job clock is
+            // local, and never earlier than the review that produced this job.
+            let confirmed_at = now_unix().max(job.updated_at);
             self.host_actions
-                .confirm_update_delegated(
-                    &launch.job_id,
-                    &intent.host,
-                    &admission.id,
-                    unix_of(&receipt.consumed_at)?,
-                )
+                .confirm_update_delegated(&launch.job_id, &intent.host, &admission.id, confirmed_at)
                 .map_err(map_host_action_error)?;
             return Ok(());
         }
@@ -7949,6 +7949,57 @@ mod tests {
             ResultOutcome::Succeeded
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn skewed_aeon_clock_does_not_break_the_confirmed_job() {
+        for skew in [-30_i64, 30] {
+            let fixture = harness(true).await;
+            let job_id = prepare_ready_launch(&fixture).await;
+            let local = now_unix();
+            fixture.fake.update(|inner| inner.now = local + skew);
+            for _ in 0..4 {
+                fixture
+                    .adapter
+                    .process_intent(&fixture.intent)
+                    .await
+                    .unwrap();
+                if fixture.actions.get(&job_id).unwrap().state == HostActionState::QueuedApply {
+                    break;
+                }
+            }
+            let job = fixture.actions.get(&job_id).unwrap();
+            assert_eq!(job.state, HostActionState::QueuedApply);
+            assert!(job.updated_at >= job.created_at);
+            assert!(job.confirmed_at.unwrap() >= job.created_at);
+            assert!(job
+                .events
+                .windows(2)
+                .all(|events| events[0].at <= events[1].at));
+            assert!(job
+                .events
+                .iter()
+                .all(|event| { event.at >= job.created_at && event.at <= job.updated_at }));
+            let consumed_at = unix_of(
+                &fixture
+                    .adapter
+                    .journal
+                    .launch(DEPLOY_HANDOFF)
+                    .unwrap()
+                    .receipt
+                    .unwrap()
+                    .consumed_at,
+            )
+            .unwrap();
+            assert_eq!(consumed_at, local + skew);
+            assert_ne!(job.confirmed_at.unwrap(), consumed_at);
+            finish_apply(&fixture.actions, &job_id, now_unix().max(job.updated_at));
+            assert_eq!(
+                fixture.actions.get(&job_id).unwrap().state,
+                HostActionState::Succeeded
+            );
+            fixture.server.abort();
+        }
     }
 
     #[tokio::test]
