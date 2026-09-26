@@ -11,6 +11,7 @@
 ## Unreleased
 
 - Add a config-selectable Aeon upstream for the Flow host (`inspr.pharos.flow-host-config.v2`): journey read with strict project node, project key and tenant verification, backwards-revision refusal, `/p/{project_key}?view=journey` navigation with an exact allow-list, and the classic Paimos path left untouched. No production change until the operator switches the config (PHAROS-313).
+- Add an owner-only Aeon delivery adapter selected by `PHAROS_AEON_DELIVERY_CONFIG_FILE`. It reads Aeon stage handoffs, posts typed evidence, consumes one launch admission, and seals the result. The classic Paimos adapter is unchanged. pharosd refuses to start when both delivery configs are set (PHAROS-313).
 
 ## 260922141211.0.0 - 2026-09-22
 
