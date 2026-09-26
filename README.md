@@ -508,6 +508,37 @@ review. Live host proof still requires operator-configured container
 allowlisting plus a completed guarded apply—this repository does not claim that
 proof from fixtures.
 
+### Aeon delivery adapter
+
+`PHAROS_AEON_DELIVERY_CONFIG_FILE` selects an owner-only Aeon delivery
+adapter (`inspr.pharos.aeon-delivery-adapter.v1`). It requires `PHAROS_DB`.
+The journal is `{PHAROS_DB}.aeon-delivery-journal.json`. The classic Paimos
+adapter is unchanged and stays on its own config. If both delivery config
+variables are set, pharosd refuses to start: one delivery owner per process.
+
+The document names the HTTPS Aeon origin, a bearer-token file, an optional CA
+bundle, the poll and freshness windows, and closed intents. Each intent fixes
+the handoff, project node, release node, operation (`deploy` or `verify`),
+one compiled workflow (`deploy-production` or `verify-production`), environment,
+host, and artifact. A verify intent names a distinct deploy intent with the
+same host, environment, and artifact. No Aeon field becomes a command, path,
+or host selector.
+
+A deploy intent binds one guarded `UpdateRestart` review and requires
+`delegated_launch`. A ready review posts `launch_readiness`, checks a one-use
+admission — including a binding digest recomputed locally — consumes that
+admission, and only then confirms the same job. Deployment evidence follows a
+fresh config-class beacon, or a failed or cancelled job. Verification evidence
+requires `plan_digest` to equal the deploy binding plan digest and
+`predecessor_digest` to equal the dependency seal recomputed from the journaled
+deploy result. Epochs are per release, stage, and operation. Every mutation
+is journaled as exact request bytes before it is sent. After a crash, admit
+and consume are replayed with the journaled Idempotency-Key. An exact replay
+returns the stored admission or receipt, and a conflicting replay stays
+unresolved without changing the host. The bearer token stays in its referenced
+file and is not written to the journal. The adapter does nothing until the
+config variable is set.
+
 ### 5. Requested is never presented as applied
 
 Nix host settings become declared only after the configured nixcfg artifact is
@@ -1013,6 +1044,7 @@ HTTPS-only boundary. Store Flow config and API key files under an operator-owned
 | `PHAROS_ALLOW_OPEN`                                            | Explicitly allow unauthenticated human routes; valid only for a loopback public address                                                                                                                                                                |
 | `PHAROS_DB`                                                    | JSON host-store path; enables derived persistent sidecars and is required for paid provider actions unless their sidecar is set explicitly                                                                                                             |
 | `PHAROS_PAIMOS_DELIVERY_CONFIG_FILE`                           | Optional owner-only reporter intent document; requires `PHAROS_DB` for the derived exact-replay journal and keeps API-key and per-handoff secret values in separate referenced owner-only files                                                        |
+| `PHAROS_AEON_DELIVERY_CONFIG_FILE`                             | Optional owner-only Aeon delivery intent document; requires `PHAROS_DB` for its journal. pharosd refuses to start when `PHAROS_PAIMOS_DELIVERY_CONFIG_FILE` is also set                                                                                    |
 | `PHAROS_FLOW_CONFIG_FILE`                                      | Optional owner-only Flow host config (`inspr.pharos.flow-host-config.v1`) enabling bounded `@inspr/flow-shell` projection and guarded Review/Start navigation                                                                                          |
 | `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN`                            | When `true` or `1`, allow cleartext loopback Paimos origins only while **both** `PHAROS_ADDR` and `PHAROS_PUBLIC_ADDR` are loopback; for local harnesses only                                                                                           |
 | `PHAROS_PROVISIONING_JOBS_DB`                                  | Optional explicit provisioning-job sidecar path; required for paid provider actions when `PHAROS_DB` is unset                                                                                                                                          |
