@@ -2923,12 +2923,18 @@ impl AeonDeliveryAdapter {
             .get(job_id)
             .ok_or(AdapterError::LocalBinding)?;
         let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
-        let observed_at = format_timestamp(now_unix())?;
+        let now = now_unix();
+        let observed_at = format_timestamp(now)?;
         let bare_reviewed = bare_plan_digest(reviewed)?;
-        // Aeon returns 400 for a zero or future backup_observed_at. Wait until
-        // the host store has a success inside that window, and keep backup_ready.
-        self.withhold_unusable_readiness(intent, job_id)?;
-        let backup_at = backup_observed_at(&self.hosts, &intent.host);
+        // One host snapshot feeds both the gate and the posted stamp. A second
+        // read could omit backup_observed_at after the gate had passed.
+        let host = self.hosts.get(&intent.host);
+        let backup_at = backup_stamp(host.as_ref());
+        let posted_backup = match validated_readiness_backup(plan, backup_at.as_deref(), now) {
+            Ok(stamp) => stamp.to_string(),
+            Err(reason) => return self.block_launch(intent, reason, false),
+        };
+        self.journal.clear_launch_block(&intent.handoff_id)?;
         let running_kernel = kernel_token(plan.running_kernel.as_deref());
         let expected_kernel = kernel_token(plan.expected_kernel.as_deref());
         let sequence = self.journal.next_sequence(&intent.handoff_id)?;
@@ -2946,7 +2952,7 @@ impl AeonDeliveryAdapter {
             all_host_eval_passed: Some(plan.all_host_eval_passed),
             target_build_passed: Some(plan.target_build_passed),
             backup_ready: Some(plan.backup_ready),
-            backup_observed_at: backup_at.as_deref(),
+            backup_observed_at: Some(posted_backup.as_str()),
             restart_required: Some(plan.restart_required),
             running_kernel: Some(running_kernel),
             expected_kernel: Some(expected_kernel),
@@ -3609,6 +3615,17 @@ fn refresh_refusal(previous: &str, refreshed: &[u8]) -> Result<Option<&'static s
     Ok(None)
 }
 
+fn validated_readiness_backup<'a>(
+    plan: &HostActionPlan,
+    backup_at: Option<&'a str>,
+    now: i64,
+) -> Result<&'a str, &'static str> {
+    if let Some(reason) = readiness_wait_reason(plan, backup_at, now) {
+        return Err(reason);
+    }
+    backup_at.ok_or(LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING)
+}
+
 fn readiness_wait_reason(
     plan: &HostActionPlan,
     backup_at: Option<&str>,
@@ -3638,7 +3655,11 @@ fn acceptable_backup_stamp(stamp: Option<&str>, now: i64) -> bool {
 }
 
 fn backup_observed_at(hosts: &Store, host_name: &str) -> Option<String> {
-    let host = hosts.get(host_name)?;
+    backup_stamp(hosts.get(host_name).as_ref())
+}
+
+fn backup_stamp(host: Option<&pharos_core::Host>) -> Option<String> {
+    let host = host?;
     let at = host
         .backup_observations
         .iter()
@@ -4473,6 +4494,27 @@ mod tests {
             launch_binding_digest(&"1".repeat(64), 3, DEPLOY_HANDOFF, RELEASE_NODE, &reviewed)
                 .unwrap(),
             "6ce52bc92820607606e43a5dc3edc86ac6220d3aeed5d6e6c5f1df593f5148fd"
+        );
+    }
+
+    #[test]
+    fn readiness_row_posts_the_backup_stamp_it_validated() {
+        let plan = ready_plan();
+        let now = 1_700_000_100;
+        let stamp = format_timestamp(now - 30).unwrap();
+        assert_eq!(
+            validated_readiness_backup(&plan, Some(&stamp), now).unwrap(),
+            stamp
+        );
+        assert_eq!(
+            validated_readiness_backup(&plan, None, now).unwrap_err(),
+            LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING
+        );
+        let mut unready = plan;
+        unready.backup_ready = false;
+        assert_eq!(
+            validated_readiness_backup(&unready, Some(&stamp), now).unwrap_err(),
+            LAUNCH_BLOCK_BACKUP_NOT_READY
         );
     }
 
