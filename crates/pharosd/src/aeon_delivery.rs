@@ -58,6 +58,10 @@ const MAX_JOURNAL_RECORDS: usize = MAX_INTENTS * 8;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const OBSERVED_AT_SKEW_SECS: i64 = 5 * 60;
 const READINESS_REFRESH_SECS: i64 = 600;
+#[cfg(test)]
+const TRACE_EXCERPT_MAX_BYTES: usize = 300;
+#[cfg(test)]
+const REFLECTED_CREDENTIAL_MARKER: &str = "<body withheld: reflected credential>";
 const BACKUP_FUTURE_SKEW_SECS: i64 = 5 * 60;
 const LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING: &str = "backup_success_missing";
 const LAUNCH_BLOCK_BACKUP_NOT_READY: &str = "backup_not_ready";
@@ -1966,6 +1970,7 @@ impl AeonClient {
         status: StatusCode,
         request_id: Option<String>,
         body: &[u8],
+        credentials: &Credentials,
     ) {
         let Some(traces) = &self.traces else {
             return;
@@ -1974,8 +1979,7 @@ impl AeonClient {
         let error_excerpt = if status.is_success() {
             None
         } else {
-            let end = body.len().min(300);
-            Some(String::from_utf8_lossy(&body[..end]).into_owned())
+            Some(trace_body_excerpt(body, credentials))
         };
         traces
             .lock()
@@ -2186,7 +2190,7 @@ impl AeonClient {
             .map(str::to_string);
         if response.headers().contains_key(CONTENT_ENCODING) {
             #[cfg(test)]
-            self.note_exchange(&method_name, path, status, request_id, &[]);
+            self.note_exchange(&method_name, path, status, request_id, &[], credentials);
             return Err(AdapterError::Contract);
         }
         reject_reflected_headers(response.headers(), credentials)?;
@@ -2195,12 +2199,12 @@ impl AeonClient {
             Ok(bytes) => bytes,
             Err(error) => {
                 #[cfg(test)]
-                self.note_exchange(&method_name, path, status, request_id, &[]);
+                self.note_exchange(&method_name, path, status, request_id, &[], credentials);
                 return Err(error);
             }
         };
         #[cfg(test)]
-        self.note_exchange(&method_name, path, status, request_id, &bytes);
+        self.note_exchange(&method_name, path, status, request_id, &bytes, credentials);
         reject_reflected_bytes(&bytes, credentials)?;
         if status.is_success() && !media_ok {
             return Err(AdapterError::Contract);
@@ -4217,6 +4221,30 @@ fn reject_reflected_bytes(bytes: &[u8], credentials: &Credentials) -> Result<(),
         return Err(AdapterError::Contract);
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn trace_body_excerpt(body: &[u8], credentials: &Credentials) -> String {
+    if contains_slice(body, &credentials.api_key) {
+        return REFLECTED_CREDENTIAL_MARKER.to_string();
+    }
+    let end = body.len().min(TRACE_EXCERPT_MAX_BYTES);
+    truncate_to_bytes(
+        &String::from_utf8_lossy(&body[..end]),
+        TRACE_EXCERPT_MAX_BYTES,
+    )
+}
+
+#[cfg(test)]
+fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -9650,7 +9678,93 @@ mod tests {
         let rendered = format!("{recorded:?}");
         assert_no_key(rendered.as_bytes());
         assert!(!rendered.contains("authorization"));
+        assert_trace_excerpts(&traces);
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn reflected_api_key_is_withheld_from_the_trace_and_the_report() {
+        let directory = TestDir::new("reflect-key");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let report = directory.path().join("report.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reflecting origin");
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|request: Request<Body>| async move {
+                    let path = request.uri().path().to_string();
+                    let authorization = request
+                        .headers()
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let body = if path.ends_with("/long-error") {
+                        "n".repeat(500)
+                    } else {
+                        format!("{{\"error\":\"reflected {authorization}\"}}")
+                    };
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header(CONTENT_TYPE.as_str(), JSON_MEDIA)
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let origin = loopback_origin_for_tests(&format!("http://127.0.0.1:{port}/"));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let actions = Arc::new(HostActionStore::new(None));
+        let mut adapter = test_adapter(
+            runtime_config(origin, api.clone(), vec![deploy_intent(true)]),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            hosts,
+            actions,
+        );
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        adapter.aeon.enable_trace(Arc::clone(&traces));
+        let credentials = adapter.aeon.credentials().expect("test key");
+        let long = adapter
+            .aeon
+            .exchange(Method::GET, "/long-error", None, None, &credentials)
+            .await
+            .expect("long error body is not a reflected key");
+        drop(credentials);
+        assert_eq!(long.0, StatusCode::BAD_REQUEST);
+        let reflected = adapter.aeon.get_handoff(DEPLOY_HANDOFF).await;
+        assert!(matches!(reflected, Err(AdapterError::Contract)));
+        assert_trace_excerpts(&traces);
+        let recorded = traces.lock().expect("traces").clone();
+        assert!(recorded.iter().any(|trace| {
+            trace.status == 400
+                && trace.error_excerpt.as_deref() == Some(REFLECTED_CREDENTIAL_MARKER)
+        }));
+        assert!(recorded.iter().any(|trace| {
+            trace.path == "/long-error"
+                && trace
+                    .error_excerpt
+                    .as_ref()
+                    .is_some_and(|excerpt| excerpt.len() == TRACE_EXCERPT_MAX_BYTES)
+        }));
+        for trace in &recorded {
+            assert_no_key(format!("{trace:?}").as_bytes());
+        }
+        let message = live_failure(&traces);
+        assert_no_key(message.as_bytes());
+        assert!(message.contains(REFLECTED_CREDENTIAL_MARKER));
+        save_live_failure(&report, &traces, &api, &message);
+        let report_bytes = std::fs::read(&report).unwrap();
+        assert_no_key(&report_bytes);
+        assert_live_bytes_exclude_key(&report_bytes, &api);
+        server.abort();
     }
 
     #[tokio::test]
@@ -9689,7 +9803,14 @@ mod tests {
             &live.artifact,
             Some(now),
         );
-        live_step(&adapter, &live.deploy, &traces, &live.report).await;
+        live_step(
+            &adapter,
+            &live.deploy,
+            &traces,
+            &live.report,
+            &live.key_file,
+        )
+        .await;
         let job_id = actions
             .list()
             .into_iter()
@@ -9707,6 +9828,7 @@ mod tests {
             &live.deploy,
             &traces,
             &live.report,
+            &live.key_file,
             deadline,
             || {
                 let launch = adapter.journal.launch(&live.deploy.handoff_id);
@@ -9732,6 +9854,7 @@ mod tests {
             &live.deploy,
             &traces,
             &live.report,
+            &live.key_file,
             deadline,
             || {
                 let applied = actions.get(&job_id).unwrap();
@@ -9767,17 +9890,25 @@ mod tests {
                 &live.artifact,
                 None,
             );
-            live_until(&adapter, verify, &traces, &live.report, deadline, || {
-                let evidence = adapter
-                    .journal
-                    .evidence_with_kind(&verify.handoff_id, EvidenceKind::Verification);
-                let result = adapter.journal.result(&verify.handoff_id);
-                evidence.is_some_and(|row| row.receipt.is_some())
-                    && result.is_some_and(|row| {
-                        row.receipt
-                            .is_some_and(|receipt| receipt.outcome == ResultOutcome::Succeeded)
-                    })
-            })
+            live_until(
+                &adapter,
+                verify,
+                &traces,
+                &live.report,
+                &live.key_file,
+                deadline,
+                || {
+                    let evidence = adapter
+                        .journal
+                        .evidence_with_kind(&verify.handoff_id, EvidenceKind::Verification);
+                    let result = adapter.journal.result(&verify.handoff_id);
+                    evidence.is_some_and(|row| row.receipt.is_some())
+                        && result.is_some_and(|row| {
+                            row.receipt
+                                .is_some_and(|receipt| receipt.outcome == ResultOutcome::Succeeded)
+                        })
+                },
+            )
             .await;
         }
         let mut handoffs = vec![live_handoff_state(&adapter, &live.deploy.handoff_id).await];
@@ -9789,6 +9920,7 @@ mod tests {
             .expect("write live report");
         let report_bytes = std::fs::read(&live.report).unwrap();
         let journal_bytes = std::fs::read(&journal).unwrap();
+        assert_trace_excerpts(&traces);
         assert_no_key(&report_bytes);
         assert_live_bytes_exclude_key(&report_bytes, &live.key_file);
         assert_live_bytes_exclude_key(&journal_bytes, &live.key_file);
@@ -9949,10 +10081,11 @@ mod tests {
         intent: &DeliveryIntent,
         traces: &Arc<Mutex<Vec<RequestTrace>>>,
         report: &Path,
+        key_file: &Path,
     ) {
         if let Err(error) = adapter.process_intent(intent).await {
             let message = format!("{} ({})", live_failure(traces), error.code());
-            save_live_failure(report, traces, &message);
+            save_live_failure(report, traces, key_file, &message);
             panic!("{message}");
         }
     }
@@ -9962,16 +10095,17 @@ mod tests {
         intent: &DeliveryIntent,
         traces: &Arc<Mutex<Vec<RequestTrace>>>,
         report: &Path,
+        key_file: &Path,
         deadline: std::time::Instant,
         mut ready: impl FnMut() -> bool,
     ) {
         loop {
             if std::time::Instant::now() >= deadline {
                 let message = format!("live Aeon roundtrip exceeded 90s: {}", live_failure(traces));
-                save_live_failure(report, traces, &message);
+                save_live_failure(report, traces, key_file, &message);
                 panic!("{message}");
             }
-            live_step(adapter, intent, traces, report).await;
+            live_step(adapter, intent, traces, report, key_file).await;
             if ready() {
                 return;
             }
@@ -9979,14 +10113,60 @@ mod tests {
         }
     }
 
-    fn save_live_failure(report: &Path, traces: &Arc<Mutex<Vec<RequestTrace>>>, message: &str) {
+    fn save_live_failure(
+        report: &Path,
+        traces: &Arc<Mutex<Vec<RequestTrace>>>,
+        key_file: &Path,
+        message: &str,
+    ) {
+        assert_trace_excerpts(traces);
+        let reason = withheld_live_text(message, key_file);
         let body = json!({
             "failed": true,
-            "reason": message,
+            "reason": reason,
             "requests": live_trace_rows(traces),
         });
-        if std::fs::write(report, serde_json::to_vec_pretty(&body).unwrap_or_default()).is_ok() {
+        let bytes = serde_json::to_vec_pretty(&body).unwrap_or_default();
+        let bytes = if live_bytes_contain_key(&bytes, key_file) {
+            serde_json::to_vec_pretty(&json!({
+                "failed": true,
+                "reason": REFLECTED_CREDENTIAL_MARKER,
+                "requests": [],
+            }))
+            .unwrap_or_default()
+        } else {
+            bytes
+        };
+        if std::fs::write(report, &bytes).is_ok() {
             eprintln!("live Aeon roundtrip report: {}", report.display());
+        }
+    }
+
+    fn withheld_live_text(text: &str, key_file: &Path) -> String {
+        if live_bytes_contain_key(text.as_bytes(), key_file) {
+            REFLECTED_CREDENTIAL_MARKER.to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn live_bytes_contain_key(bytes: &[u8], key_file: &Path) -> bool {
+        let Ok((mut key, _)) = read_private_file(key_file, MAX_API_KEY_BYTES, None) else {
+            return false;
+        };
+        let leaked = contains_slice(bytes, &key);
+        key.fill(0);
+        leaked
+    }
+
+    fn assert_trace_excerpts(traces: &Arc<Mutex<Vec<RequestTrace>>>) {
+        for trace in traces.lock().expect("traces").iter() {
+            if let Some(excerpt) = &trace.error_excerpt {
+                assert!(
+                    excerpt.len() <= TRACE_EXCERPT_MAX_BYTES,
+                    "trace excerpt exceeds {TRACE_EXCERPT_MAX_BYTES} bytes"
+                );
+            }
         }
     }
 
@@ -10011,7 +10191,18 @@ mod tests {
         let Some(trace) = recorded.iter().rev().find(|trace| trace.status >= 400) else {
             return "no Aeon error status recorded".to_string();
         };
-        let (code, reason) = live_error_parts(trace.error_excerpt.as_deref().unwrap_or(""));
+        let excerpt = trace.error_excerpt.as_deref().unwrap_or("");
+        if excerpt == REFLECTED_CREDENTIAL_MARKER {
+            return format!(
+                "Aeon {} {} status {} request_id {} {}",
+                trace.method,
+                trace.path,
+                trace.status,
+                trace.request_id.as_deref().unwrap_or(""),
+                REFLECTED_CREDENTIAL_MARKER
+            );
+        }
+        let (code, reason) = live_error_parts(excerpt);
         format!(
             "Aeon {} {} status {} request_id {} code {} reason {}",
             trace.method,
@@ -10025,7 +10216,10 @@ mod tests {
 
     fn live_error_parts(excerpt: &str) -> (String, String) {
         let Ok(value) = serde_json::from_str::<Value>(excerpt) else {
-            return (String::new(), excerpt.chars().take(300).collect());
+            return (
+                String::new(),
+                truncate_to_bytes(excerpt, TRACE_EXCERPT_MAX_BYTES),
+            );
         };
         let code = value
             .get("code")
@@ -10039,9 +10233,11 @@ mod tests {
             .get("reason")
             .and_then(Value::as_str)
             .or_else(|| value.get("error").and_then(Value::as_str))
-            .unwrap_or("")
-            .to_string();
-        (code, reason)
+            .unwrap_or("");
+        (
+            truncate_to_bytes(&code, TRACE_EXCERPT_MAX_BYTES),
+            truncate_to_bytes(reason, TRACE_EXCERPT_MAX_BYTES),
+        )
     }
 
     async fn live_handoff_state(adapter: &AeonDeliveryAdapter, handoff_id: &str) -> Value {
