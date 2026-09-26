@@ -526,6 +526,8 @@ or host selector.
 
 A deploy intent binds one guarded `UpdateRestart` review and requires
 `delegated_launch`, whose `target_ref` is that intent's artifact digest.
+A configured `update_restart_job_id` must already be requested by
+`aeon-delivery`; an operator-owned job is refused at startup and is not bound.
 A ready review posts `launch_readiness`, checks a one-use
 admission — including a binding digest recomputed locally — consumes that
 admission, and only then confirms the same job. Deployment evidence follows a

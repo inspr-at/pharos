@@ -74,6 +74,7 @@ const LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED: &str = "confirmation_not_delegate
 const LAUNCH_BLOCK_ADMISSION_EXPIRED: &str = "admission_expired";
 const LAUNCH_BLOCK_AUTHORITY_CLOSED: &str = "handoff_authority_closed";
 const LAUNCH_BLOCK_LAUNCH_NOT_OWNED: &str = "launch_not_owned";
+const LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED: &str = "configured_job_not_owned";
 
 const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING,
@@ -87,6 +88,7 @@ const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_ADMISSION_EXPIRED,
     LAUNCH_BLOCK_AUTHORITY_CLOSED,
     LAUNCH_BLOCK_LAUNCH_NOT_OWNED,
+    LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED,
 ];
 
 #[derive(Debug)]
@@ -1257,6 +1259,38 @@ fn latest_update_id(
         .map(|job| job.id)
 }
 
+/// A configured `update_restart_job_id` must already belong to this adapter.
+/// Checked at startup, before the first poll, and again when the intent binds.
+fn refuse_unowned_configured_jobs(
+    config: &AdapterConfig,
+    actions: &HostActionStore,
+) -> Result<(), String> {
+    for intent in &config.intents {
+        let Some(job_id) = intent.update_restart_job_id.as_deref() else {
+            continue;
+        };
+        let Some(job) = actions.get(job_id) else {
+            return Err(format!(
+                "Aeon delivery intent {} names update_restart_job_id {job_id}, which is not in the host action store",
+                intent.handoff_id
+            ));
+        };
+        if job.requested_by != ACTOR {
+            return Err(format!(
+                "Aeon delivery intent {} names update_restart_job_id {job_id} requested by {}, not {ACTOR}",
+                intent.handoff_id, job.requested_by
+            ));
+        }
+        if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
+            return Err(format!(
+                "Aeon delivery intent {} names update_restart_job_id {job_id} for a different host or workflow",
+                intent.handoff_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn job_links_as_review_retry(
     actions: &HostActionStore,
     predecessor: &HostActionJob,
@@ -1286,6 +1320,7 @@ fn aeon_blocker_for_reason(reason: &str) -> Option<BlockerCode> {
         | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
         | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
         | LAUNCH_BLOCK_LAUNCH_NOT_OWNED
+        | LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED
         | LAUNCH_BLOCK_ADMISSION_EXPIRED => BlockerCode::PolicyRefused,
         LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
         | LAUNCH_BLOCK_CONSUME_ABANDONED
@@ -2301,6 +2336,8 @@ impl AeonDeliveryAdapter {
         })?;
         let config = AdapterConfig::load(Path::new(&config_path))
             .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
+        refuse_unowned_configured_jobs(&config, &host_actions)
+            .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
         let journal = JournalStore::new(derived_journal_path(host_store_path))
             .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
         let aeon = AeonClient::new(
@@ -2776,6 +2813,11 @@ impl AeonDeliveryAdapter {
             if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
                 return Err(AdapterError::LocalBinding);
             }
+            // An operator-owned job can be confirmed through the operator route.
+            // Binding it here would let that confirmation apply before any admission.
+            if job.requested_by != ACTOR {
+                return self.block_launch(intent, LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED, true);
+            }
             configured.to_string()
         } else {
             let job_id = deterministic_job_id(&intent.host, &operation_id)?;
@@ -2854,6 +2896,9 @@ impl AeonDeliveryAdapter {
             .ok_or(AdapterError::LocalBinding)?;
         if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
             return Err(AdapterError::LocalBinding);
+        }
+        if intent.update_restart_job_id.is_some() && job.requested_by != ACTOR {
+            return self.block_launch(intent, LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED, true);
         }
         if intent.update_restart_job_id.is_none() {
             self.validate_bound_owned_job(intent, existing, &job)?;
@@ -7250,6 +7295,89 @@ mod tests {
         (status, payload)
     }
 
+    fn test_adapter_config(intents: Vec<DeliveryIntent>) -> AdapterConfig {
+        AdapterConfig {
+            aeon_origin: Url::parse("https://aeon.example.test").unwrap(),
+            api_key_file: PathBuf::from("api-key"),
+            aeon_ca_certificates: Vec::new(),
+            poll_interval: Duration::from_secs(5),
+            verification_freshness_secs: 300,
+            intents,
+        }
+    }
+
+    #[test]
+    fn startup_refuses_a_configured_job_the_adapter_does_not_own() {
+        let actions = HostActionStore::new(None);
+        let operator = actions
+            .create_update_review("hsb8", "operator", 1_700_000_000)
+            .unwrap();
+        let mut intent = deploy_intent(true);
+        intent.update_restart_job_id = Some(operator.id.clone());
+        let error = refuse_unowned_configured_jobs(&test_adapter_config(vec![intent]), &actions)
+            .unwrap_err();
+        assert!(error.contains(operator.id.as_str()));
+        assert!(error.contains("not aeon-delivery"));
+        assert!(error.contains("operator"));
+
+        let mut missing = deploy_intent(true);
+        missing.update_restart_job_id = Some("missingjob".to_string());
+        let error = refuse_unowned_configured_jobs(&test_adapter_config(vec![missing]), &actions)
+            .unwrap_err();
+        assert!(error.contains("not in the host action store"));
+
+        let owned_store = HostActionStore::new(None);
+        let owned = owned_store
+            .create_update_review("hsb8", ACTOR, 1_700_000_000)
+            .unwrap();
+        let mut owned_intent = deploy_intent(true);
+        owned_intent.update_restart_job_id = Some(owned.id);
+        assert!(refuse_unowned_configured_jobs(
+            &test_adapter_config(vec![owned_intent]),
+            &owned_store
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn operator_owned_configured_job_never_binds() {
+        let fixture = harness(true).await;
+        let job = fixture
+            .actions
+            .create_update_review("hsb8", "operator", now_unix())
+            .unwrap();
+        let mut intent = fixture.intent.clone();
+        intent.update_restart_job_id = Some(job.id.clone());
+        let blocked = fixture.adapter.process_intent(&intent).await.unwrap_err();
+        assert!(matches!(
+            blocked,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED)
+        ));
+        assert!(fixture.adapter.journal.operation(DEPLOY_HANDOFF).is_none());
+        assert_eq!(readiness_post_count(&fixture.fake), 0);
+        assert_eq!(post_count(&fixture.fake, "/launch/admit"), 0);
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), 0);
+        let block = fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .unwrap();
+        assert_eq!(block.reason, LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED);
+        assert!(block.terminal);
+        let stored = fixture.actions.get(&job.id).unwrap();
+        assert_eq!(stored.requested_by, "operator");
+        assert!(stored.confirmed_at.is_none());
+        assert_eq!(stored.state, HostActionState::QueuedReview);
+        let again = fixture.adapter.process_intent(&intent).await.unwrap_err();
+        assert!(matches!(
+            again,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED)
+        ));
+        assert!(fixture.adapter.journal.operation(DEPLOY_HANDOFF).is_none());
+        assert_eq!(readiness_post_count(&fixture.fake), 0);
+        fixture.server.abort();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn failed_job_that_predates_the_handoff_posts_evidence_at_now() {
         let now = now_unix();
@@ -8809,6 +8937,7 @@ mod tests {
             | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
             | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
             | LAUNCH_BLOCK_LAUNCH_NOT_OWNED
+            | LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED
             | LAUNCH_BLOCK_ADMISSION_EXPIRED => "policy_refused",
             LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
             | LAUNCH_BLOCK_CONSUME_ABANDONED
