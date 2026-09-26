@@ -3218,14 +3218,6 @@ impl AeonDeliveryAdapter {
                 if job.confirmed_at.is_none() || job.result.is_none() {
                     return Err(AdapterError::LocalBinding);
                 }
-                if intent.delegated_launch.is_some()
-                    && self
-                        .journal
-                        .launch(&intent.handoff_id)
-                        .is_none_or(|launch| launch.receipt.is_none())
-                {
-                    return Err(AdapterError::LocalBinding);
-                }
                 let host = self.hosts.get(&intent.host);
                 let now = now_unix();
                 let observed = observed_fresh_config_beacon(
@@ -3255,6 +3247,13 @@ impl AeonDeliveryAdapter {
                     }
                     return Ok(());
                 };
+                if self
+                    .journal
+                    .launch(&intent.handoff_id)
+                    .is_none_or(|launch| launch.receipt.is_none())
+                {
+                    return Err(AdapterError::LocalBinding);
+                }
                 self.write_observation(
                     intent,
                     handoff,
@@ -4312,6 +4311,24 @@ mod tests {
         }
     }
 
+    fn held_launch_artifact() -> Value {
+        serde_json::to_value(WireArtifact::from_evidence(&artifact()).expect("held artifact"))
+            .expect("held artifact json")
+    }
+
+    fn full_deployment(sequence: i64, outcome: &str, now: i64) -> Value {
+        json!({
+            "sequence": sequence,
+            "kind": "deployment",
+            "outcome": outcome,
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "workflow": "deploy-production",
+            "environment": "production-eu1",
+            "artifact": held_launch_artifact(),
+        })
+    }
+
     fn artifact() -> ArtifactEvidence {
         ArtifactEvidence {
             version_scheme: pharos_core::ArtifactVersionScheme::Legacy,
@@ -4690,6 +4707,7 @@ mod tests {
         consumed: bool,
         consumed_at: Option<String>,
         consumed_by_principal_id: Option<String>,
+        held_artifact: Value,
         result_body: Option<Vec<u8>>,
         result: Option<Value>,
     }
@@ -4699,6 +4717,7 @@ mod tests {
             let mut handoff = Self::open(DEPLOY_HANDOFF, "deploy", "deployment", now);
             handoff.evidence_ceiling =
                 vec!["deployment".to_string(), "launch_readiness".to_string()];
+            handoff.held_artifact = held_launch_artifact();
             handoff
         }
 
@@ -4734,6 +4753,7 @@ mod tests {
                 consumed: false,
                 consumed_at: None,
                 consumed_by_principal_id: None,
+                held_artifact: Value::Null,
                 result_body: None,
                 result: None,
             }
@@ -4789,7 +4809,6 @@ mod tests {
         corrupt_binding: bool,
         expire_admission: bool,
         get_status: Option<StatusCode>,
-        approved_digest: String,
         drop_accepted_consume: bool,
         drop_accepted_admit: bool,
         drop_accepted_result: bool,
@@ -4832,7 +4851,6 @@ mod tests {
                     corrupt_binding: false,
                     expire_admission: false,
                     get_status: None,
-                    approved_digest: "1".repeat(64),
                     drop_accepted_consume: false,
                     drop_accepted_admit: false,
                     drop_accepted_result: false,
@@ -4971,6 +4989,67 @@ mod tests {
         now.saturating_sub(parsed.unix_timestamp()) > 900
     }
 
+    fn same_held_artifact(body: &Value, held: &Value) -> bool {
+        [
+            "version_scheme",
+            "version",
+            "release_channel",
+            "release_sequence",
+            "digest_sha256",
+            "commit_digest",
+            "manifest_coordinate",
+            "manifest_digest_sha256",
+        ]
+        .iter()
+        .all(|key| body.get(*key).is_some() && body.get(*key) == held.get(*key))
+    }
+
+    fn pharos_evidence_complete(value: &Value) -> bool {
+        value["workflow"].as_str().is_some_and(valid_symbol)
+            && value["environment"].as_str().is_some_and(valid_symbol)
+            && value.get("artifact").is_some_and(|artifact| {
+                artifact["version"]
+                    .as_str()
+                    .is_some_and(|item| !item.is_empty())
+                    && artifact["release_channel"]
+                        .as_str()
+                        .is_some_and(|item| !item.is_empty())
+                    && artifact["release_sequence"]
+                        .as_i64()
+                        .is_some_and(|item| item >= 1)
+                    && artifact["digest_sha256"].as_str().is_some_and(valid_hex64)
+                    && artifact["commit_digest"]
+                        .as_str()
+                        .is_some_and(|item| !item.is_empty())
+                    && artifact["manifest_coordinate"]
+                        .as_str()
+                        .is_some_and(|item| !item.is_empty())
+                    && artifact["manifest_digest_sha256"]
+                        .as_str()
+                        .is_some_and(valid_hex64)
+                    && artifact["version_scheme"]
+                        .as_str()
+                        .is_some_and(|item| !item.is_empty())
+            })
+    }
+
+    fn readiness_contradicts(handoff: &FakeHandoff, value: &Value) -> bool {
+        let Some((_, first)) = handoff.evidence.iter().find(|(_, evidence)| {
+            serde_json::from_slice::<Value>(&evidence.body)
+                .ok()
+                .is_some_and(|stored| stored["kind"] == "launch_readiness")
+        }) else {
+            return false;
+        };
+        let Ok(first) = serde_json::from_slice::<Value>(&first.body) else {
+            return false;
+        };
+        first["reviewed_plan_digest"] != value["reviewed_plan_digest"]
+            || value["all_host_eval_passed"] != true
+            || value["target_build_passed"] != true
+            || value["backup_ready"] != true
+    }
+
     fn handle_evidence(handoff: &mut FakeHandoff, body: &[u8], now: i64) -> Response<Body> {
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
@@ -5002,6 +5081,29 @@ mod tests {
             return json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": "invalid launch readiness"}),
+            );
+        }
+        if value["kind"] == "launch_readiness" && readiness_contradicts(handoff, &value) {
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "launch readiness was contradicted"}),
+            );
+        }
+        if matches!(value["kind"].as_str(), Some("deployment" | "verification"))
+            && !pharos_evidence_complete(&value)
+        {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "invalid Pharos evidence"}),
+            );
+        }
+        if value["kind"] == "deployment"
+            && matches!(value["outcome"].as_str(), Some("succeeded" | "satisfied"))
+            && !handoff.consumed
+        {
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "deployment lacks consumed launch admission"}),
             );
         }
         let received_at = format_timestamp(now).unwrap();
@@ -5037,7 +5139,7 @@ mod tests {
         let Some(digest) = value["digest_sha256"].as_str() else {
             return json_response(StatusCode::CONFLICT, &json!({}));
         };
-        if digest != flags.approved {
+        if !same_held_artifact(&value, &handoff.held_artifact) {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
         if let Some(response) = replay_response(launch_replay(
@@ -5082,19 +5184,8 @@ mod tests {
         if contradicted {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
-        if let Some(existing) = &handoff.admission {
-            let expires_at = existing["expires_at"]
-                .as_str()
-                .and_then(|value| parse_timestamp(value).ok())
-                .map(|time| time.unix_timestamp())
-                .unwrap_or(0);
-            let open = !handoff.consumed && expires_at > flags.now;
-            if open && handoff.admit_idempotency_key.as_deref() == Some(flags.idempotency) {
-                return json_response(StatusCode::OK, existing);
-            }
-            if open {
-                return json_response(StatusCode::CONFLICT, &json!({}));
-            }
+        if handoff.admission.is_some() {
+            return json_response(StatusCode::CONFLICT, &json!({}));
         }
         let binding = if flags.corrupt {
             "0".repeat(64)
@@ -5171,6 +5262,25 @@ mod tests {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         }
         if handoff.consumed {
+            return json_response(StatusCode::CONFLICT, &json!({}));
+        }
+        let admission_expires = admission["expires_at"]
+            .as_str()
+            .and_then(|stamp| parse_timestamp(stamp).ok())
+            .map(|time| time.unix_timestamp())
+            .unwrap_or(0);
+        let handoff_expires = parse_timestamp(&handoff.expires_at)
+            .map(|time| time.unix_timestamp())
+            .unwrap_or(0);
+        let fresh = handoff
+            .evidence
+            .values()
+            .any(|evidence| satisfying_readiness(&evidence.body, now).is_some());
+        if admission_expires <= now
+            || handoff_expires <= now
+            || !matches!(handoff.state.as_str(), "requested" | "active")
+            || !fresh
+        {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
         let consumed_at = format_timestamp(now).unwrap();
@@ -5322,7 +5432,6 @@ mod tests {
         let now = inner.now;
         let corrupt = inner.corrupt_binding;
         let expire = inner.expire_admission;
-        let approved = inner.approved_digest.clone();
         let drop_admit =
             matches!(route, ("POST", Some("launch"), Some("admit"))) && inner.drop_accepted_admit;
         let drop_consume = matches!(route, ("POST", Some("launch"), Some("consume")))
@@ -5344,7 +5453,6 @@ mod tests {
                     now,
                     corrupt,
                     expire,
-                    approved,
                     principal,
                     idempotency,
                     drop_response: drop_admit,
@@ -5369,7 +5477,6 @@ mod tests {
         now: i64,
         corrupt: bool,
         expire: bool,
-        approved: String,
         principal: &'a str,
         idempotency: &'a str,
         drop_response: bool,
@@ -5876,6 +5983,32 @@ mod tests {
 
     fn fake_now(fake: &FakeAeon) -> i64 {
         fake.update(|inner| inner.now)
+    }
+
+    async fn advance_delegated_job_to_succeeded(
+        adapter: &AeonDeliveryAdapter,
+        actions: &HostActionStore,
+        hosts: &Store,
+        intent: &DeliveryIntent,
+    ) -> String {
+        adapter.process_intent(intent).await.unwrap();
+        let job_id = actions.list()[0].id.clone();
+        review_job(actions, &job_id, actions.get(&job_id).unwrap().created_at);
+        record_backup(hosts, now_unix());
+        for _ in 0..8 {
+            adapter.process_intent(intent).await.unwrap();
+            if actions.get(&job_id).unwrap().state == HostActionState::QueuedApply {
+                break;
+            }
+        }
+        assert_eq!(
+            actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        let at = now_unix().max(actions.get(&job_id).unwrap().updated_at);
+        finish_apply(actions, &job_id, at);
+        record_beacon(hosts, at + 1, &intent.artifact);
+        job_id
     }
 
     fn completed_update(store: &HostActionStore, now: i64) -> String {
@@ -6702,22 +6835,20 @@ mod tests {
         let api = directory.path().join("api-key");
         write_private(&api, API_KEY);
         let fake = FakeAeon::new(now);
-        fake.update(|inner| inner.reject_result = true);
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
-        let job_id = completed_update(&actions, now);
         let hosts = Arc::new(Store::new(None).unwrap());
-        record_beacon(&hosts, now - 10, &artifact());
-        let mut intent = deploy_intent(false);
-        intent.update_restart_job_id = Some(job_id.clone());
+        let intent = deploy_intent(true);
         let adapter = test_adapter(
             runtime_config(origin, api, vec![intent.clone()]),
             directory
                 .path()
                 .join("hosts.json.aeon-delivery-journal.json"),
-            hosts,
+            Arc::clone(&hosts),
             Arc::clone(&actions),
         );
+        let job_id = advance_delegated_job_to_succeeded(&adapter, &actions, &hosts, &intent).await;
+        fake.update(|inner| inner.reject_result = true);
         let error = adapter.process_intent(&intent).await.unwrap_err();
         assert!(matches!(error, AdapterError::Refused(status) if status == StatusCode::CONFLICT));
         assert_eq!(
@@ -6744,25 +6875,23 @@ mod tests {
         let api = directory.path().join("api-key");
         write_private(&api, API_KEY);
         let fake = FakeAeon::new(now);
-        fake.update(|inner| {
-            inner.bump_seal_on_result = true;
-            inner.arm_lineage_drift = true;
-        });
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
-        let job_id = completed_update(&actions, now);
         let hosts = Arc::new(Store::new(None).unwrap());
-        record_beacon(&hosts, now - 10, &artifact());
-        let mut intent = deploy_intent(false);
-        intent.update_restart_job_id = Some(job_id);
+        let intent = deploy_intent(true);
         let adapter = test_adapter(
             runtime_config(origin, api, vec![intent.clone()]),
             directory
                 .path()
                 .join("hosts.json.aeon-delivery-journal.json"),
-            hosts,
-            actions,
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
         );
+        advance_delegated_job_to_succeeded(&adapter, &actions, &hosts, &intent).await;
+        fake.update(|inner| {
+            inner.bump_seal_on_result = true;
+            inner.arm_lineage_drift = true;
+        });
         let error = adapter.process_intent(&intent).await.unwrap_err();
         assert!(matches!(error, AdapterError::LocalBinding));
         assert_eq!(
@@ -6797,19 +6926,17 @@ mod tests {
         let fake = FakeAeon::new(now);
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
-        let job_id = completed_update(&actions, now);
         let hosts = Arc::new(Store::new(None).unwrap());
-        record_beacon(&hosts, now - 10, &artifact());
-        let mut intent = deploy_intent(false);
-        intent.update_restart_job_id = Some(job_id);
+        let intent = deploy_intent(true);
         let adapter = test_adapter(
             runtime_config(origin, api, vec![intent.clone(), verify_intent()]),
             directory
                 .path()
                 .join("hosts.json.aeon-delivery-journal.json"),
             Arc::clone(&hosts),
-            actions,
+            Arc::clone(&actions),
         );
+        advance_delegated_job_to_succeeded(&adapter, &actions, &hosts, &intent).await;
         adapter.process_intent(&intent).await.unwrap();
         SealedDeploy {
             fake,
@@ -7236,24 +7363,106 @@ mod tests {
             "authority_epoch": 3
         }))
         .await;
-        assert_eq!(omitted.status(), StatusCode::CREATED);
-        let omitted: Value = omitted.json().await.unwrap();
-        assert_eq!(omitted["backup_observed_at"], "0001-01-01T00:00:00Z");
-        let offset = format_timestamp(now).unwrap().replace('Z', "+00:00");
-        let present = send(json!({
-            "sequence": 2,
-            "kind": "deployment",
-            "outcome": "succeeded",
+        assert_eq!(omitted.status(), StatusCode::BAD_REQUEST);
+        let unconsumed = send(full_deployment(1, "succeeded", now)).await;
+        assert_eq!(unconsumed.status(), StatusCode::CONFLICT);
+        server.abort();
+
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let readiness = json!({
+            "sequence": 1,
+            "kind": "launch_readiness",
+            "outcome": "satisfied",
             "observed_at": format_timestamp(now).unwrap(),
             "authority_epoch": 3,
-            "backup_observed_at": offset
-        }))
-        .await;
-        assert_eq!(present.status(), StatusCode::CREATED);
-        let present: Value = present.json().await.unwrap();
+            "reviewed_plan_digest": "ab".repeat(32),
+            "host": "hsb8",
+            "all_host_eval_passed": true,
+            "target_build_passed": true,
+            "backup_ready": true,
+            "backup_observed_at": format_timestamp(now).unwrap(),
+            "running_kernel": "6.18.1",
+            "expected_kernel": "6.18.2"
+        });
+        let post = |path: String, body: Value, key: Option<&str>| {
+            let client = client.clone();
+            let origin = origin.clone();
+            let bearer = bearer.clone();
+            let key = key.map(str::to_string);
+            async move {
+                let mut request = client
+                    .post(origin.join(&path).unwrap())
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA);
+                if let Some(key) = key {
+                    request = request.header("idempotency-key", key);
+                }
+                request
+                    .body(serde_json::to_vec(&body).unwrap())
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
         assert_eq!(
-            present["backup_observed_at"],
-            format_timestamp(now).unwrap()
+            post(
+                format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"),
+                readiness.clone(),
+                None
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let mut changed = readiness.clone();
+        changed["sequence"] = json!(2);
+        changed["reviewed_plan_digest"] = json!("cd".repeat(32));
+        assert_eq!(
+            post(
+                format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"),
+                changed,
+                None
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        let mut wrong = held_launch_artifact();
+        wrong["digest_sha256"] = json!("2".repeat(64));
+        assert_eq!(
+            post(
+                format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"),
+                wrong,
+                Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post(
+                format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"),
+                held_launch_artifact(),
+                Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+            )
+            .await,
+            StatusCode::OK
+        );
+        fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.consumed = true;
+            handoff.consumed_at = Some(format_timestamp(now).unwrap());
+        });
+        assert_eq!(
+            post(
+                format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"),
+                held_launch_artifact(),
+                Some("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+            )
+            .await,
+            StatusCode::CONFLICT
         );
         server.abort();
     }
@@ -7262,19 +7471,15 @@ mod tests {
     async fn evidence_replay_is_idempotent_and_divergent_replay_conflicts() {
         let now = now_unix();
         let fake = FakeAeon::new(now);
+        fake.update(|inner| {
+            inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap().consumed = true;
+        });
         let (origin, server) = serve(fake.clone()).await;
         let client = reqwest::Client::new();
         let url = origin
             .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
             .unwrap();
-        let body = serde_json::to_vec(&json!({
-            "sequence": 1,
-            "kind": "deployment",
-            "outcome": "succeeded",
-            "observed_at": format_timestamp(now).unwrap(),
-            "authority_epoch": 3
-        }))
-        .unwrap();
+        let body = serde_json::to_vec(&full_deployment(1, "succeeded", now)).unwrap();
         let send = |body: Vec<u8>| {
             let client = client.clone();
             let url = url.clone();
@@ -7349,6 +7554,9 @@ mod tests {
     async fn evidence_sequence_must_be_contiguous_and_replay_reuses_it() {
         let now = now_unix();
         let fake = FakeAeon::new(now);
+        fake.update(|inner| {
+            inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap().consumed = true;
+        });
         let (origin, server) = serve(fake).await;
         let client = reqwest::Client::new();
         let url = origin
@@ -7364,16 +7572,7 @@ mod tests {
                     .post(url)
                     .header(AUTHORIZATION, bearer)
                     .header(CONTENT_TYPE, JSON_MEDIA)
-                    .body(
-                        serde_json::to_vec(&json!({
-                            "sequence": sequence,
-                            "kind": "deployment",
-                            "outcome": "succeeded",
-                            "observed_at": format_timestamp(now).unwrap(),
-                            "authority_epoch": 3
-                        }))
-                        .unwrap(),
-                    )
+                    .body(serde_json::to_vec(&full_deployment(sequence, "succeeded", now)).unwrap())
                     .send()
                     .await
                     .unwrap()
@@ -8794,19 +8993,17 @@ mod tests {
         fake.update(|inner| inner.drop_accepted_result = true);
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
-        let job_id = completed_update(&actions, now);
         let hosts = Arc::new(Store::new(None).unwrap());
-        record_beacon(&hosts, now - 10, &artifact());
-        let mut intent = deploy_intent(false);
-        intent.update_restart_job_id = Some(job_id);
+        let intent = deploy_intent(true);
         let adapter = test_adapter(
             runtime_config(origin, api, vec![intent.clone()]),
             directory
                 .path()
                 .join("hosts.json.aeon-delivery-journal.json"),
-            hosts,
-            actions,
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
         );
+        advance_delegated_job_to_succeeded(&adapter, &actions, &hosts, &intent).await;
         assert!(adapter.process_intent(&intent).await.is_err());
         let first = posts(&fake)
             .into_iter()
@@ -8846,19 +9043,17 @@ mod tests {
         fake.update(|inner| inner.drop_accepted_result = true);
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
-        let job_id = completed_update(&actions, now);
         let hosts = Arc::new(Store::new(None).unwrap());
-        record_beacon(&hosts, now - 10, &artifact());
-        let mut intent = deploy_intent(false);
-        intent.update_restart_job_id = Some(job_id);
+        let intent = deploy_intent(true);
         let adapter = test_adapter(
             runtime_config(origin, api, vec![intent.clone(), verify_intent()]),
             directory
                 .path()
                 .join("hosts.json.aeon-delivery-journal.json"),
             Arc::clone(&hosts),
-            actions,
+            Arc::clone(&actions),
         );
+        advance_delegated_job_to_succeeded(&adapter, &actions, &hosts, &intent).await;
         assert!(adapter.process_intent(&intent).await.is_err());
         assert!(adapter
             .journal
