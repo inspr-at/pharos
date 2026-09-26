@@ -72,6 +72,7 @@ const LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB: &str = "consumed_without_co
 const LAUNCH_BLOCK_CONSUME_ABANDONED: &str = "consume_abandoned";
 const LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED: &str = "confirmation_not_delegated";
 const LAUNCH_BLOCK_ADMISSION_EXPIRED: &str = "admission_expired";
+const LAUNCH_BLOCK_AUTHORITY_CLOSED: &str = "handoff_authority_closed";
 
 const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING,
@@ -83,6 +84,7 @@ const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_CONSUME_ABANDONED,
     LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED,
     LAUNCH_BLOCK_ADMISSION_EXPIRED,
+    LAUNCH_BLOCK_AUTHORITY_CLOSED,
 ];
 
 #[derive(Debug)]
@@ -1240,9 +1242,9 @@ fn aeon_blocker_for_reason(reason: &str) -> Option<BlockerCode> {
         // A consumed admission cannot be replaced. While it is still unconsumed
         // and the handoff is current, the reporter sends external_waiting.
         LAUNCH_BLOCK_ADMISSION_EXPIRED => BlockerCode::PolicyRefused,
-        LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB | LAUNCH_BLOCK_CONSUME_ABANDONED => {
-            BlockerCode::DependencyFailed
-        }
+        LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
+        | LAUNCH_BLOCK_CONSUME_ABANDONED
+        | LAUNCH_BLOCK_AUTHORITY_CLOSED => BlockerCode::DependencyFailed,
         _ => return None,
     })
 }
@@ -2390,6 +2392,12 @@ impl AeonDeliveryAdapter {
         ) {
             self.report_admission_expired(intent).await?;
         }
+        if matches!(
+            error,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        ) {
+            self.report_authority_closed(intent).await?;
+        }
         Err(error)
     }
 
@@ -2479,7 +2487,7 @@ impl AeonDeliveryAdapter {
                 let launch = self
                     .journal
                     .acknowledge_consume(&intent.handoff_id, receipt)?;
-                self.finish_confirmation(intent, &launch, &observed.expires_at)?;
+                self.confirm_consumed(intent, &launch).await?;
                 Ok(true)
             }
             Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
@@ -2501,12 +2509,10 @@ impl AeonDeliveryAdapter {
             .host_actions
             .get(&launch.job_id)
             .ok_or(AdapterError::LocalBinding)?;
-        let handoff_expires = if job.state == HostActionState::AwaitingConfirmation {
-            self.aeon.get_handoff(&intent.handoff_id).await?.expires_at
-        } else {
-            String::new()
-        };
-        self.finish_confirmation(intent, &launch, &handoff_expires)
+        if job.state == HostActionState::AwaitingConfirmation {
+            return self.confirm_consumed(intent, &launch).await;
+        }
+        self.finish_confirmation(intent, &launch, "")
     }
 
     async fn report_confirmation_not_delegated(
@@ -2565,6 +2571,66 @@ impl AeonDeliveryAdapter {
             now,
             Some(blocker),
             Some(LAUNCH_BLOCK_ADMISSION_EXPIRED),
+        )
+        .await
+    }
+
+    async fn confirm_consumed(
+        &self,
+        intent: &DeliveryIntent,
+        launch: &LaunchJournalRecord,
+    ) -> Result<(), AdapterError> {
+        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        handoff.validate(intent)?;
+        self.require_open_authority(intent, launch, &handoff)?;
+        self.finish_confirmation(intent, launch, &handoff.expires_at)
+    }
+
+    fn require_open_authority(
+        &self,
+        intent: &DeliveryIntent,
+        launch: &LaunchJournalRecord,
+        handoff: &HandoffDocument,
+    ) -> Result<(), AdapterError> {
+        let operation = self
+            .journal
+            .operation(&intent.handoff_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
+        let current = handoff.state.is_open()
+            && handoff.authority_epoch == admission.authority_epoch
+            && handoff.release_node_id == operation.release_node_id
+            && handoff.operation == intent.operation
+            && handoff.attempt == operation.attempt;
+        if current {
+            return Ok(());
+        }
+        self.block_launch(intent, LAUNCH_BLOCK_AUTHORITY_CLOSED, true)
+    }
+
+    async fn report_authority_closed(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
+        if self
+            .journal
+            .result(&intent.handoff_id)
+            .is_some_and(|record| record.receipt.is_some())
+        {
+            return Ok(());
+        }
+        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        handoff.validate(intent)?;
+        let now = now_unix();
+        if unix_of(&handoff.expires_at)? < now || handoff.result.is_some() {
+            return Ok(());
+        }
+        let blocker =
+            aeon_blocker_for_reason(LAUNCH_BLOCK_AUTHORITY_CLOSED).ok_or(AdapterError::Journal)?;
+        self.write_observation(
+            intent,
+            &handoff,
+            EvidenceOutcome::Failed,
+            now,
+            Some(blocker),
+            Some(LAUNCH_BLOCK_AUTHORITY_CLOSED),
         )
         .await
     }
@@ -2631,8 +2697,7 @@ impl AeonDeliveryAdapter {
             .journal
             .launch(&intent.handoff_id)
             .ok_or(AdapterError::Journal)?;
-        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
-        self.finish_confirmation(intent, &launch, &handoff.expires_at)?;
+        self.confirm_consumed(intent, &launch).await?;
         Ok(true)
     }
 
@@ -2900,7 +2965,7 @@ impl AeonDeliveryAdapter {
             return Err(AdapterError::LocalBinding);
         }
         self.validate_admission(&admission, intent, &fresh, &reviewed, now_unix())?;
-        self.consume_and_confirm(intent, &fresh).await
+        self.consume_and_confirm(intent).await
     }
 
     fn refuse_undelegated_launch(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
@@ -3243,18 +3308,14 @@ impl AeonDeliveryAdapter {
         Ok(())
     }
 
-    async fn consume_and_confirm(
-        &self,
-        intent: &DeliveryIntent,
-        handoff: &HandoffDocument,
-    ) -> Result<(), AdapterError> {
+    async fn consume_and_confirm(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
         let launch = self.journal.mark_consume_started(&intent.handoff_id)?;
         let response = self.aeon.post_consume(&launch).await?;
         let receipt = consume_receipt(&response)?;
         let launch = self
             .journal
             .acknowledge_consume(&intent.handoff_id, receipt)?;
-        self.finish_confirmation(intent, &launch, &handoff.expires_at)
+        self.confirm_consumed(intent, &launch).await
     }
 
     fn finish_confirmation(
@@ -8345,7 +8406,10 @@ mod tests {
             }));
         });
         let replay = fixture.adapter.process_intent(&fixture.intent).await;
-        assert!(replay.is_ok());
+        assert!(matches!(
+            replay,
+            Err(AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED))
+        ));
         let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
         assert!(launch.consume_unresolved.is_none());
         let receipt = launch.receipt.as_ref().unwrap();
@@ -8356,16 +8420,73 @@ mod tests {
         assert!(!rendered.contains(LAUNCH_PRINCIPAL));
         assert!(!rendered.contains("AEON_API_KEY_SENTINEL"));
         let job = fixture.actions.get(&job_id).unwrap();
-        assert_eq!(job.state, HostActionState::QueuedApply);
-        assert!(job.confirmed_at.is_some());
-        assert_eq!(
-            job.events
-                .iter()
-                .filter(|event| event.kind == HostActionEventKind::Confirmed)
-                .count(),
-            1
-        );
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert!(result_posts(&fixture.fake).is_empty());
         fixture.server.abort();
+    }
+
+    async fn closed_authority_is_not_confirmed(edit: impl FnOnce(&mut FakeHandoff)) {
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            edit(handoff);
+        });
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        ));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "dependency_failed");
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        );
+        let later = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            later,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        ));
+        assert_eq!(result_posts(&fixture.fake).len(), 1);
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_handoff_does_not_queue_a_recovered_job() {
+        closed_authority_is_not_confirmed(|handoff| {
+            handoff.state = "failed".to_string();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn moved_authority_epoch_does_not_queue_a_recovered_job() {
+        closed_authority_is_not_confirmed(|handoff| {
+            handoff.authority_epoch = 4;
+        })
+        .await;
     }
 
     fn expected_blocker_for_reason(reason: &str) -> &'static str {
@@ -8377,9 +8498,9 @@ mod tests {
             | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
             | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
             | LAUNCH_BLOCK_ADMISSION_EXPIRED => "policy_refused",
-            LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB | LAUNCH_BLOCK_CONSUME_ABANDONED => {
-                "dependency_failed"
-            }
+            LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
+            | LAUNCH_BLOCK_CONSUME_ABANDONED
+            | LAUNCH_BLOCK_AUTHORITY_CLOSED => "dependency_failed",
             _ => panic!("reason {reason} has no Aeon blocker code"),
         }
     }
