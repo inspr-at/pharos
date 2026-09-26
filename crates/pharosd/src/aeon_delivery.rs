@@ -529,6 +529,20 @@ struct HandoffDocument {
     prerequisite_seal_sha256: String,
     #[serde(default)]
     result: Option<HandoffResult>,
+    #[serde(default)]
+    admission: Option<HandoffAdmission>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HandoffAdmission {
+    admission_id: String,
+    epoch: i64,
+    expires_at: String,
+    #[serde(default)]
+    consumed_at: Option<String>,
+    #[serde(default)]
+    consumed_by_principal_id: Option<String>,
 }
 
 impl HandoffDocument {
@@ -2098,6 +2112,20 @@ impl AeonDeliveryAdapter {
         if intent.delegated_launch.is_none() || !launch.valid() {
             return Err(AdapterError::LocalBinding);
         }
+        let observed = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let server_consumed_ours = observed.admission.as_ref().is_some_and(|admission| {
+            admission.consumed_at.is_some()
+                && launch
+                    .admission
+                    .as_ref()
+                    .is_some_and(|stored| stored.id == admission.admission_id)
+        });
+        if server_consumed_ours {
+            tracing::debug!(
+                handoff_id = %intent.handoff_id,
+                "Aeon shows the journaled admission consumed; replaying that consume"
+            );
+        }
         match self.aeon.post_consume(&launch).await {
             Ok(response) => {
                 let receipt = consume_receipt(&response)?;
@@ -3506,6 +3534,7 @@ mod tests {
     const OTHER_HANDOFF: &str = "88888888-8888-4888-8888-888888888888";
     const NEW_HANDOFF: &str = "77777777-7777-4777-8777-777777777777";
     const API_KEY: &[u8] = b"AEON_API_KEY_SENTINEL_0123456789ABCD";
+    const LAUNCH_PRINCIPAL: &str = "99999999-9999-4999-8999-999999999999";
 
     struct TestDir {
         path: PathBuf,
@@ -3876,6 +3905,8 @@ mod tests {
         admit_idempotency_key: Option<String>,
         launch_calls: BTreeMap<String, StoredLaunchCall>,
         consumed: bool,
+        consumed_at: Option<String>,
+        consumed_by_principal_id: Option<String>,
         result_body: Option<Vec<u8>>,
         result: Option<Value>,
     }
@@ -3918,6 +3949,8 @@ mod tests {
                 admit_idempotency_key: None,
                 launch_calls: BTreeMap::new(),
                 consumed: false,
+                consumed_at: None,
+                consumed_by_principal_id: None,
                 result_body: None,
                 result: None,
             }
@@ -3944,6 +3977,20 @@ mod tests {
             });
             if let Some(result) = &self.result {
                 value["result"] = result.clone();
+            }
+            if let Some(admission) = &self.admission {
+                let mut view = json!({
+                    "admission_id": admission["id"],
+                    "epoch": admission["authority_epoch"],
+                    "expires_at": admission["expires_at"],
+                });
+                if let Some(consumed_at) = &self.consumed_at {
+                    view["consumed_at"] = json!(consumed_at);
+                }
+                if let Some(principal) = &self.consumed_by_principal_id {
+                    view["consumed_by_principal_id"] = json!(principal);
+                }
+                value["admission"] = view;
             }
             value
         }
@@ -4326,13 +4373,16 @@ mod tests {
         if handoff.consumed {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
+        let consumed_at = format_timestamp(now).unwrap();
         let response = json!({
             "handoff_id": handoff.id,
             "admission_id": admission_id,
             "consumed": true,
-            "consumed_at": format_timestamp(now).unwrap(),
+            "consumed_at": consumed_at,
         });
         handoff.consumed = true;
+        handoff.consumed_at = Some(consumed_at);
+        handoff.consumed_by_principal_id = Some(LAUNCH_PRINCIPAL.to_string());
         remember_launch(handoff, "consume", principal, idempotency, body, &response);
         if drop_response {
             return json_response(StatusCode::OK, &json!({}));
@@ -6596,6 +6646,182 @@ mod tests {
             HostActionState::AwaitingConfirmation
         );
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn get_admission_does_not_stand_in_for_the_consume_receipt() {
+        let admitted = harness(true).await;
+        let _job = prepare_ready_launch(&admitted).await;
+        admitted
+            .fake
+            .update(|inner| inner.drop_accepted_admit = true);
+        assert!(admitted
+            .adapter
+            .process_intent(&admitted.intent)
+            .await
+            .is_err());
+        let document = fetch_handoff(&admitted.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert_eq!(
+            admission_keys(&document),
+            vec!["admission_id", "epoch", "expires_at"]
+        );
+        assert_eq!(document["admission"]["admission_id"], ADMISSION_ID);
+        assert_eq!(document["admission"]["epoch"], 3);
+        assert!(document["admission"]["expires_at"].is_string());
+        admitted.server.abort();
+
+        let recovered = harness(true).await;
+        let job_id = prepare_ready_launch(&recovered).await;
+        recovered
+            .fake
+            .update(|inner| inner.drop_accepted_consume = true);
+        assert!(recovered
+            .adapter
+            .process_intent(&recovered.intent)
+            .await
+            .is_err());
+        let before = recovered.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(before.consume_started);
+        assert!(before.receipt.is_none());
+        let document = fetch_handoff(&recovered.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert_eq!(
+            admission_keys(&document),
+            vec![
+                "admission_id",
+                "consumed_at",
+                "consumed_by_principal_id",
+                "epoch",
+                "expires_at",
+            ]
+        );
+        assert_eq!(document["admission"]["admission_id"], ADMISSION_ID);
+        assert!(document["admission"]["consumed_at"].is_string());
+        assert_eq!(
+            document["admission"]["consumed_by_principal_id"],
+            LAUNCH_PRINCIPAL
+        );
+        assert!(recovered
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_none());
+        let consumes = post_count(&recovered.fake, "/launch/consume");
+        recovered
+            .adapter
+            .process_intent(&recovered.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&recovered.fake, "/launch/consume"), consumes + 1);
+        let launch = recovered.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        let receipt = launch.receipt.unwrap();
+        assert!(receipt.consumed);
+        assert_eq!(receipt.admission_id, ADMISSION_ID);
+        assert!(parse_timestamp(&receipt.consumed_at).is_ok());
+        assert_eq!(
+            recovered.actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        assert_eq!(
+            recovered
+                .actions
+                .get(&job_id)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| event.kind == HostActionEventKind::Confirmed)
+                .count(),
+            1
+        );
+        recovered
+            .adapter
+            .process_intent(&recovered.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&recovered.fake, "/launch/consume"), consumes + 1);
+        assert_eq!(
+            recovered
+                .actions
+                .get(&job_id)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| event.kind == HostActionEventKind::Confirmed)
+                .count(),
+            1
+        );
+        recovered.server.abort();
+
+        let unresolved = harness(true).await;
+        let unresolved_job = prepare_ready_launch(&unresolved).await;
+        unresolved
+            .fake
+            .update(|inner| inner.drop_accepted_consume = true);
+        assert!(unresolved
+            .adapter
+            .process_intent(&unresolved.intent)
+            .await
+            .is_err());
+        unresolved.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            for call in handoff.launch_calls.values_mut() {
+                if call.action == "consume" {
+                    call.body_digest = "0".repeat(64);
+                }
+            }
+        });
+        let document = fetch_handoff(&unresolved.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert!(document["admission"]["consumed_at"].is_string());
+        assert_eq!(document["admission"]["admission_id"], ADMISSION_ID);
+        let replay = unresolved.adapter.process_intent(&unresolved.intent).await;
+        assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
+        let launch = unresolved.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert_eq!(
+            launch.consume_unresolved,
+            Some(StatusCode::CONFLICT.as_u16())
+        );
+        assert!(launch.receipt.is_none());
+        assert_eq!(
+            unresolved.actions.get(&unresolved_job).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        assert!(unresolved
+            .actions
+            .get(&unresolved_job)
+            .unwrap()
+            .confirmed_at
+            .is_none());
+        let consumes = post_count(&unresolved.fake, "/launch/consume");
+        let later = unresolved.adapter.process_intent(&unresolved.intent).await;
+        assert!(matches!(later, Err(AdapterError::LaunchUnresolved)));
+        assert_eq!(post_count(&unresolved.fake, "/launch/consume"), consumes);
+        unresolved.server.abort();
+    }
+
+    async fn fetch_handoff(origin: &Url, id: &str) -> Value {
+        let response = reqwest::Client::new()
+            .get(origin.join(&format!("/api/stage-handoffs/{id}")).unwrap())
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.json().await.unwrap()
+    }
+
+    fn admission_keys(document: &Value) -> Vec<String> {
+        let mut keys: Vec<_> = document["admission"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
     }
 
     #[tokio::test]
