@@ -2915,11 +2915,7 @@ fn evidence_echo_matches(response: &EvidenceResponse, body: &str) -> bool {
             response.reviewed_plan_digest.as_deref(),
         )
         && opt_str_matches(&request, "host", response.host.as_deref())
-        && opt_str_matches(
-            &request,
-            "backup_observed_at",
-            response.backup_observed_at.as_deref(),
-        )
+        && backup_clocks_match(&request, response.backup_observed_at.as_deref())
         && opt_str_matches(
             &request,
             "running_kernel",
@@ -2943,6 +2939,25 @@ fn evidence_echo_matches(response: &EvidenceResponse, body: &str) -> bool {
         && opt_bool_matches(&request, "backup_ready", response.backup_ready)
         && opt_bool_matches(&request, "restart_required", response.restart_required)
         && artifact_echo_matches(&request, response.artifact.as_ref())
+}
+
+fn backup_clocks_match(request: &serde_json::Value, echoed: Option<&str>) -> bool {
+    let sent = request
+        .get("backup_observed_at")
+        .and_then(serde_json::Value::as_str);
+    match (present_instant(sent), present_instant(echoed)) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn present_instant(stamp: Option<&str>) -> Option<i128> {
+    let parsed = parse_timestamp(stamp?).ok()?;
+    if parsed.year() <= 1 {
+        return None;
+    }
+    Some(parsed.unix_timestamp_nanos() / 1_000)
 }
 
 fn opt_str_matches(request: &serde_json::Value, key: &str, actual: Option<&str>) -> bool {
@@ -3886,8 +3901,30 @@ mod tests {
         if let Some(object) = value.as_object_mut() {
             object.insert("handoff_id".to_string(), json!(handoff_id));
             object.insert("received_at".to_string(), json!(received_at));
+            let echoed = object
+                .get("backup_observed_at")
+                .and_then(Value::as_str)
+                .and_then(go_backup_time)
+                .unwrap_or_else(|| "0001-01-01T00:00:00Z".to_string());
+            object.insert("backup_observed_at".to_string(), json!(echoed));
         }
         value
+    }
+
+    fn go_backup_time(stamp: &str) -> Option<String> {
+        let parsed = parse_timestamp(stamp).ok()?;
+        if parsed.year() <= 1 {
+            return None;
+        }
+        let micros = parsed.unix_timestamp_nanos() / 1_000;
+        let truncated = time::OffsetDateTime::from_unix_timestamp_nanos(micros * 1_000).ok()?;
+        if truncated.nanosecond() == 0 {
+            return format_timestamp(truncated.unix_timestamp()).ok();
+        }
+        let whole = format_timestamp(truncated.unix_timestamp()).ok()?;
+        let fraction = format!("{:06}", truncated.nanosecond() / 1_000);
+        let fraction = fraction.trim_end_matches('0');
+        Some(format!("{}.{}Z", whole.trim_end_matches('Z'), fraction))
     }
 
     fn plain_token(value: &str, max: usize) -> bool {
@@ -5318,6 +5355,61 @@ mod tests {
             OTHER_RELEASE
         );
         assert_ne!(other_job, lineage_job);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backup_clock_echo_uses_go_zero_time_when_omitted() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake).await;
+        let client = reqwest::Client::new();
+        let url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+            .unwrap();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let send = |body: Value| {
+            let client = client.clone();
+            let url = url.clone();
+            let bearer = bearer.clone();
+            async move {
+                client
+                    .post(url)
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA)
+                    .body(serde_json::to_vec(&body).unwrap())
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+        let omitted = send(json!({
+            "sequence": 1,
+            "kind": "deployment",
+            "outcome": "succeeded",
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3
+        }))
+        .await;
+        assert_eq!(omitted.status(), StatusCode::CREATED);
+        let omitted: Value = omitted.json().await.unwrap();
+        assert_eq!(omitted["backup_observed_at"], "0001-01-01T00:00:00Z");
+        let offset = format_timestamp(now).unwrap().replace('Z', "+00:00");
+        let present = send(json!({
+            "sequence": 2,
+            "kind": "deployment",
+            "outcome": "succeeded",
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "backup_observed_at": offset
+        }))
+        .await;
+        assert_eq!(present.status(), StatusCode::CREATED);
+        let present: Value = present.json().await.unwrap();
+        assert_eq!(
+            present["backup_observed_at"],
+            format_timestamp(now).unwrap()
+        );
         server.abort();
     }
 
