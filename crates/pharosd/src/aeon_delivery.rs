@@ -144,12 +144,11 @@ impl Operation {
         }
     }
 
-    fn ceilings_allow(self, delegated_launch: bool, ceiling: &[EvidenceCeiling]) -> bool {
+    fn ceilings_allow(self, ceiling: &[EvidenceCeiling]) -> bool {
         match self {
-            Self::Deploy => {
-                ceiling.contains(&EvidenceCeiling::Deployment)
-                    && (!delegated_launch || ceiling.contains(&EvidenceCeiling::LaunchReadiness))
-            }
+            // Aeon accepts launch_readiness on a pharos deploy even when the
+            // stored ceiling was written before that kind existed.
+            Self::Deploy => ceiling.contains(&EvidenceCeiling::Deployment),
             Self::Verify => ceiling.contains(&EvidenceCeiling::Verification),
         }
     }
@@ -575,9 +574,7 @@ impl HandoffDocument {
             || unique.len() != self.evidence_ceiling.len()
             || self.evidence_ceiling.is_empty()
             || self.evidence_ceiling.len() > 4
-            || !intent
-                .operation
-                .ceilings_allow(intent.delegated_launch.is_some(), &self.evidence_ceiling)
+            || !intent.operation.ceilings_allow(&self.evidence_ceiling)
             || !valid_hex64(&self.plan_digest)
             || !valid_hex64(&self.predecessor_digest)
             || !valid_hex64(&self.context_digest)
@@ -5724,23 +5721,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegated_deploy_requires_launch_readiness_on_the_ceiling() {
-        let fixture = harness(true).await;
-        fixture.fake.update(|inner| {
+    async fn delegated_deploy_allows_launch_readiness_without_that_ceiling() {
+        let allowed = harness(true).await;
+        allowed.fake.update(|inner| {
             inner
                 .handoffs
                 .get_mut(DEPLOY_HANDOFF)
                 .unwrap()
                 .evidence_ceiling = vec!["deployment".to_string()];
         });
-        let error = fixture
+        allowed
             .adapter
-            .process_intent(&fixture.intent)
+            .process_intent(&allowed.intent)
+            .await
+            .unwrap();
+        assert_eq!(allowed.actions.list().len(), 1);
+        allowed.server.abort();
+
+        let refused = harness(true).await;
+        refused.fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .evidence_ceiling = vec!["launch_readiness".to_string()];
+        });
+        let error = refused
+            .adapter
+            .process_intent(&refused.intent)
             .await
             .unwrap_err();
         assert!(matches!(error, AdapterError::Contract));
-        assert!(fixture.actions.list().is_empty());
-        fixture.server.abort();
+        assert!(refused.actions.list().is_empty());
+        refused.server.abort();
     }
 
     #[tokio::test]
