@@ -68,6 +68,7 @@ enum AdapterError {
     LocalBinding,
     Transport,
     Refused(StatusCode),
+    LaunchUnresolved,
 }
 
 impl AdapterError {
@@ -81,6 +82,7 @@ impl AdapterError {
             Self::LocalBinding => "local_binding_refused",
             Self::Transport => "transport_unavailable",
             Self::Refused(_) => "aeon_refused",
+            Self::LaunchUnresolved => "launch_consume_unresolved",
         }
     }
 }
@@ -945,6 +947,8 @@ struct LaunchJournalRecord {
     #[serde(default)]
     consume_started: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    consume_unresolved: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt: Option<ConsumeReceipt>,
 }
 
@@ -976,6 +980,7 @@ impl LaunchJournalRecord {
                 && self.consume_idempotency_key.is_none()
                 && self.consume_body_json.is_none()
                 && !self.consume_started
+                && self.consume_unresolved.is_none()
                 && self.receipt.is_none();
         };
         if !valid_uuid(&admission.id)
@@ -1001,8 +1006,17 @@ impl LaunchJournalRecord {
         {
             return false;
         }
+        if let Some(status) = self.consume_unresolved {
+            if status != StatusCode::CONFLICT.as_u16()
+                || !self.consume_started
+                || self.receipt.is_some()
+            {
+                return false;
+            }
+        }
         self.receipt.as_ref().is_none_or(|receipt| {
             self.consume_started
+                && self.consume_unresolved.is_none()
                 && receipt.consumed
                 && receipt.handoff_id == self.handoff_id
                 && receipt.admission_id == admission.id
@@ -1408,6 +1422,44 @@ impl JournalStore {
             .get_mut(handoff_id)
             .expect("launch record remains present");
         launch.consume_started = true;
+        launch.consume_unresolved = None;
+        let saved = launch.clone();
+        if !saved.valid() {
+            return Err(AdapterError::Journal);
+        }
+        persist_journal(&self.path, &mut document, updated)?;
+        Ok(saved)
+    }
+
+    fn mark_consume_unresolved(
+        &self,
+        handoff_id: &str,
+        status: StatusCode,
+    ) -> Result<LaunchJournalRecord, AdapterError> {
+        if status != StatusCode::CONFLICT {
+            return Err(AdapterError::Journal);
+        }
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        let existing = document
+            .launches
+            .get(handoff_id)
+            .ok_or(AdapterError::Journal)?
+            .clone();
+        if !existing.consume_started || existing.receipt.is_some() {
+            return Err(AdapterError::Journal);
+        }
+        if existing.consume_unresolved == Some(status.as_u16()) {
+            return Ok(existing);
+        }
+        if existing.consume_unresolved.is_some() {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        let launch = updated
+            .launches
+            .get_mut(handoff_id)
+            .expect("launch record remains present");
+        launch.consume_unresolved = Some(status.as_u16());
         let saved = launch.clone();
         if !saved.valid() {
             return Err(AdapterError::Journal);
@@ -1945,19 +1997,31 @@ impl AeonDeliveryAdapter {
         let Some(launch) = self.journal.launch(&intent.handoff_id) else {
             return Ok(false);
         };
+        if launch.consume_unresolved.is_some() {
+            return Err(AdapterError::LaunchUnresolved);
+        }
         if !launch.consume_started || launch.receipt.is_some() {
             return Ok(false);
         }
         if intent.delegated_launch.is_none() || !launch.valid() {
             return Err(AdapterError::LocalBinding);
         }
-        let response = self.aeon.post_consume(&launch).await?;
-        let receipt = consume_receipt(&response, now_unix())?;
-        let launch = self
-            .journal
-            .acknowledge_consume(&intent.handoff_id, receipt)?;
-        self.finish_confirmation(intent, &launch)?;
-        Ok(true)
+        match self.aeon.post_consume(&launch).await {
+            Ok(response) => {
+                let receipt = consume_receipt(&response, now_unix())?;
+                let launch = self
+                    .journal
+                    .acknowledge_consume(&intent.handoff_id, receipt)?;
+                self.finish_confirmation(intent, &launch)?;
+                Ok(true)
+            }
+            Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
+                self.journal
+                    .mark_consume_unresolved(&intent.handoff_id, status)?;
+                Err(AdapterError::LaunchUnresolved)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn confirm_if_consumed(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
@@ -2120,12 +2184,15 @@ impl AeonDeliveryAdapter {
         if intent.operation != Operation::Deploy || intent.delegated_launch.is_none() {
             return Ok(());
         }
-        if self
-            .journal
-            .launch(&intent.handoff_id)
-            .is_some_and(|launch| launch.receipt.is_some())
-        {
-            return Ok(());
+        if let Some(launch) = self.journal.launch(&intent.handoff_id) {
+            if launch.receipt.is_some() {
+                return Ok(());
+            }
+            // Consume was journaled. Admit must not run again, even when the
+            // one-use consume came back unresolved.
+            if launch.consume_started || launch.consume_unresolved.is_some() {
+                return Err(AdapterError::LaunchUnresolved);
+            }
         }
         let Some(operation) = self.journal.operation(&intent.handoff_id) else {
             return Ok(());
@@ -2267,6 +2334,7 @@ impl AeonDeliveryAdapter {
             consume_idempotency_key: None,
             consume_body_json: None,
             consume_started: false,
+            consume_unresolved: None,
             receipt: None,
         };
         let record = self.journal.ensure_launch(record)?;
@@ -3475,6 +3543,7 @@ mod tests {
         prerequisite_seal_sha256: String,
         evidence: BTreeMap<i64, StoredEvidence>,
         admission: Option<Value>,
+        admit_idempotency_key: Option<String>,
         consumed: bool,
         result_body: Option<Vec<u8>>,
         result: Option<Value>,
@@ -3511,6 +3580,7 @@ mod tests {
                 prerequisite_seal_sha256: hex_chars('d'),
                 evidence: BTreeMap::new(),
                 admission: None,
+                admit_idempotency_key: None,
                 consumed: false,
                 result_body: None,
                 result: None,
@@ -3553,6 +3623,10 @@ mod tests {
         expire_admission: bool,
         get_status: Option<StatusCode>,
         approved_digest: String,
+        drop_accepted_consume: bool,
+        drop_accepted_admit: bool,
+        drop_accepted_result: bool,
+        drift_plan_on_next_get: bool,
     }
 
     #[derive(Clone)]
@@ -3586,6 +3660,10 @@ mod tests {
                     expire_admission: false,
                     get_status: None,
                     approved_digest: "1".repeat(64),
+                    drop_accepted_consume: false,
+                    drop_accepted_admit: false,
+                    drop_accepted_result: false,
+                    drift_plan_on_next_get: false,
                 })),
                 captures: Arc::new(Mutex::new(Vec::new())),
             }
@@ -3711,11 +3789,18 @@ mod tests {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
         if let Some(existing) = &handoff.admission {
-            return if existing["artifact_digest_sha256"] == digest {
-                json_response(StatusCode::OK, existing)
-            } else {
-                json_response(StatusCode::CONFLICT, &json!({}))
-            };
+            let expires_at = existing["expires_at"]
+                .as_str()
+                .and_then(|value| parse_timestamp(value).ok())
+                .map(|time| time.unix_timestamp())
+                .unwrap_or(0);
+            let open = !handoff.consumed && expires_at > flags.now;
+            if open && handoff.admit_idempotency_key.as_deref() == Some(flags.idempotency) {
+                return json_response(StatusCode::OK, existing);
+            }
+            if open {
+                return json_response(StatusCode::CONFLICT, &json!({}));
+            }
         }
         let binding = if flags.corrupt {
             "0".repeat(64)
@@ -3743,10 +3828,18 @@ mod tests {
             "expires_at": expires_at,
         });
         handoff.admission = Some(admission.clone());
+        handoff.admit_idempotency_key = Some(flags.idempotency.to_string());
+        if flags.drop_response {
+            return json_response(StatusCode::OK, &json!({}));
+        }
         json_response(StatusCode::OK, &admission)
     }
 
-    fn handle_consume(handoff: &mut FakeHandoff, body: &[u8]) -> Response<Body> {
+    fn handle_consume(
+        handoff: &mut FakeHandoff,
+        body: &[u8],
+        drop_response: bool,
+    ) -> Response<Body> {
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
         };
@@ -3763,6 +3856,9 @@ mod tests {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
         handoff.consumed = true;
+        if drop_response {
+            return json_response(StatusCode::OK, &json!({}));
+        }
         json_response(
             StatusCode::OK,
             &json!({
@@ -3783,6 +3879,8 @@ mod tests {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
         let now = inner.now;
+        let drop_result = inner.drop_accepted_result;
+        inner.drop_accepted_result = false;
         let Some(handoff) = inner.handoffs.get_mut(id) else {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         };
@@ -3814,16 +3912,31 @@ mod tests {
         });
         handoff.result_body = Some(body.to_vec());
         handoff.result = Some(response.clone());
+        if drop_result {
+            return json_response(StatusCode::OK, &json!({}));
+        }
         json_response(StatusCode::OK, &response)
     }
 
-    fn dispatch(inner: &mut FakeInner, method: &str, path: &str, body: &[u8]) -> Response<Body> {
+    fn dispatch(
+        inner: &mut FakeInner,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        idempotency: &str,
+    ) -> Response<Body> {
         let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
         if parts.len() < 3 || parts[0] != "api" || parts[1] != "stage-handoffs" {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         }
         let id = parts[2].to_string();
         if method == "GET" {
+            if inner.drift_plan_on_next_get {
+                inner.drift_plan_on_next_get = false;
+                if let Some(handoff) = inner.handoffs.get_mut(&id) {
+                    handoff.plan_digest = hex_chars('e');
+                }
+            }
             if let Some(status) = inner.get_status {
                 return json_response(status, &json!({}));
             }
@@ -3836,6 +3949,16 @@ mod tests {
         let corrupt = inner.corrupt_binding;
         let expire = inner.expire_admission;
         let approved = inner.approved_digest.clone();
+        let drop_admit =
+            matches!(route, ("POST", Some("launch"), Some("admit"))) && inner.drop_accepted_admit;
+        let drop_consume = matches!(route, ("POST", Some("launch"), Some("consume")))
+            && inner.drop_accepted_consume;
+        if drop_admit {
+            inner.drop_accepted_admit = false;
+        }
+        if drop_consume {
+            inner.drop_accepted_consume = false;
+        }
         let Some(handoff) = inner.handoffs.get_mut(&id) else {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         };
@@ -3848,19 +3971,25 @@ mod tests {
                     corrupt,
                     expire,
                     approved,
+                    idempotency,
+                    drop_response: drop_admit,
                 };
                 handle_admit(&flags, handoff, body)
             }
-            ("POST", Some("launch"), Some("consume")) => handle_consume(handoff, body),
+            ("POST", Some("launch"), Some("consume")) => {
+                handle_consume(handoff, body, drop_consume)
+            }
             _ => json_response(StatusCode::NOT_FOUND, &json!({})),
         }
     }
 
-    struct AdmitFlags {
+    struct AdmitFlags<'a> {
         now: i64,
         corrupt: bool,
         expire: bool,
         approved: String,
+        idempotency: &'a str,
+        drop_response: bool,
     }
 
     async fn handler(State(fake): State<FakeAeon>, request: Request<Body>) -> Response<Body> {
@@ -3887,7 +4016,8 @@ mod tests {
             inner.fail_next_post = false;
             return json_response(StatusCode::SERVICE_UNAVAILABLE, &json!({}));
         }
-        dispatch(&mut inner, &method, &path, &body)
+        let idempotency = header_text(&headers, "idempotency-key");
+        dispatch(&mut inner, &method, &path, &body, &idempotency)
     }
 
     async fn serve(fake: FakeAeon) -> (Url, tokio::task::JoinHandle<()>) {
@@ -4666,5 +4796,90 @@ mod tests {
         statuses.sort_by_key(|status| status.as_u16());
         assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
         server.abort();
+    }
+
+    fn post_count(fake: &FakeAeon, suffix: &str) -> usize {
+        fake.captures
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|capture| capture.method == "POST" && capture.path.ends_with(suffix))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn consume_crash_before_ack_marks_unresolved_and_leaves_the_job() {
+        let fixture = harness(true).await;
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let job_id = fixture.actions.list()[0].id.clone();
+        review_job(
+            &fixture.actions,
+            &job_id,
+            fixture.actions.get(&job_id).unwrap().created_at,
+        );
+        fixture
+            .fake
+            .update(|inner| inner.drop_accepted_consume = true);
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .consume_unresolved
+            .is_none());
+        let consumes_after_crash = post_count(&fixture.fake, "/launch/consume");
+        let admits_after_crash = post_count(&fixture.fake, "/launch/admit");
+        assert_eq!(consumes_after_crash, 1);
+
+        let replay = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert_eq!(
+            launch.consume_unresolved,
+            Some(StatusCode::CONFLICT.as_u16())
+        );
+        assert!(launch.receipt.is_none());
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        assert!(fixture.actions.get(&job_id).unwrap().confirmed_at.is_none());
+        assert_eq!(
+            post_count(&fixture.fake, "/launch/consume"),
+            consumes_after_crash + 1
+        );
+        assert_eq!(
+            post_count(&fixture.fake, "/launch/admit"),
+            admits_after_crash
+        );
+
+        let later = fixture.adapter.process_intent(&fixture.intent).await;
+        assert!(matches!(later, Err(AdapterError::LaunchUnresolved)));
+        assert_eq!(
+            post_count(&fixture.fake, "/launch/consume"),
+            consumes_after_crash + 1
+        );
+        assert_eq!(
+            post_count(&fixture.fake, "/launch/admit"),
+            admits_after_crash
+        );
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        fixture.server.abort();
     }
 }
