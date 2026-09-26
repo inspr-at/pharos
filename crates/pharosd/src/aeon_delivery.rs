@@ -3809,21 +3809,21 @@ mod tests {
         }
     }
 
+    /// Known answer, computed outside this function:
+    /// ```text
+    /// DIGEST=$(python3 -c 'print("1"*64)')
+    /// REVIEWED=$(python3 -c 'print("ab"*32)')
+    /// CANON=$(printf '{"artifact_digest_sha256":"%s","authority_epoch":3,"handoff_id":"11111111-1111-4111-8111-111111111111","release_node_id":"44444444-4444-4444-8444-444444444444","reviewed_plan_digest":"%s"}' "$DIGEST" "$REVIEWED")
+    /// { printf 'inspr.aeon.launch-binding.v1'; printf '\0'; printf '%s' "$CANON"; } | shasum -a 256
+    /// 6ce52bc92820607606e43a5dc3edc86ac6220d3aeed5d6e6c5f1df593f5148fd
+    /// ```
     #[test]
-    fn launch_binding_digest_uses_sorted_canonical_json() {
-        let digest = "1".repeat(64);
+    fn launch_binding_digest_matches_an_independent_vector() {
         let reviewed = format!("sha256:{}", "ab".repeat(32));
-        let bare = "ab".repeat(32);
-        let canonical = format!(
-            "{{\"artifact_digest_sha256\":\"{digest}\",\"authority_epoch\":3,\"handoff_id\":\"{DEPLOY_HANDOFF}\",\"release_node_id\":\"{RELEASE_NODE}\",\"reviewed_plan_digest\":\"{bare}\"}}"
-        );
-        assert!(!canonical.contains(' '));
-        let mut hasher = Sha256::new();
-        hasher.update(b"inspr.aeon.launch-binding.v1\0");
-        hasher.update(canonical.as_bytes());
         assert_eq!(
-            launch_binding_digest(&digest, 3, DEPLOY_HANDOFF, RELEASE_NODE, &reviewed).unwrap(),
-            hex_bytes(&hasher.finalize())
+            launch_binding_digest(&"1".repeat(64), 3, DEPLOY_HANDOFF, RELEASE_NODE, &reviewed)
+                .unwrap(),
+            "6ce52bc92820607606e43a5dc3edc86ac6220d3aeed5d6e6c5f1df593f5148fd"
         );
     }
 
@@ -3951,6 +3951,7 @@ mod tests {
         handoffs: BTreeMap<String, FakeHandoff>,
         fail_next_post: bool,
         bump_seal_on_result: bool,
+        reject_result: bool,
         corrupt_binding: bool,
         expire_admission: bool,
         get_status: Option<StatusCode>,
@@ -3992,6 +3993,7 @@ mod tests {
                     ]),
                     fail_next_post: false,
                     bump_seal_on_result: false,
+                    reject_result: false,
                     corrupt_binding: false,
                     expire_admission: false,
                     get_status: None,
@@ -4300,6 +4302,9 @@ mod tests {
     }
 
     fn handle_result(inner: &mut FakeInner, id: &str, body: &[u8]) -> Response<Body> {
+        if inner.reject_result {
+            return json_response(StatusCode::CONFLICT, &json!({}));
+        }
         if inner.bump_seal_on_result {
             inner.bump_seal_on_result = false;
             if inner.arm_lineage_drift {
@@ -5539,13 +5544,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_result_seal_is_retried_with_the_current_seal() {
+    async fn wrong_result_seal_is_refused() {
         let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let status = reqwest::Client::new()
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/result"))
+                    .unwrap(),
+            )
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
+            )
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(
+                serde_json::to_vec(&json!({
+                    "outcome": "succeeded",
+                    "terminal_sequence": 1,
+                    "authority_epoch": 3,
+                    "prerequisite_seal_sha256": hex_chars('e')
+                }))
+                .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::CONFLICT);
+        server.abort();
+
         let directory = TestDir::new("seal");
         let api = directory.path().join("api-key");
         write_private(&api, API_KEY);
         let fake = FakeAeon::new(now);
-        fake.update(|inner| inner.bump_seal_on_result = true);
+        fake.update(|inner| inner.reject_result = true);
         let (origin, server) = serve(fake.clone()).await;
         let actions = Arc::new(HostActionStore::new(None));
         let job_id = completed_update(&actions, now);
@@ -5561,30 +5595,22 @@ mod tests {
             hosts,
             Arc::clone(&actions),
         );
-        adapter.process_intent(&intent).await.unwrap();
-        let results: Vec<_> = posts(&fake)
-            .into_iter()
-            .filter(|capture| capture.path.ends_with("/result"))
-            .collect();
-        assert_eq!(results.len(), 2);
-        let first: Value = serde_json::from_slice(&results[0].body).unwrap();
-        let second: Value = serde_json::from_slice(&results[1].body).unwrap();
-        assert_eq!(first["prerequisite_seal_sha256"], hex_chars('d'));
-        assert_eq!(second["prerequisite_seal_sha256"], hex_chars('f'));
+        let error = adapter.process_intent(&intent).await.unwrap_err();
+        assert!(matches!(error, AdapterError::Refused(status) if status == StatusCode::CONFLICT));
         assert_eq!(
-            adapter
-                .journal
-                .result(DEPLOY_HANDOFF)
-                .unwrap()
-                .receipt
-                .unwrap()
-                .prerequisite_seal_sha256,
-            hex_chars('f')
+            posts(&fake)
+                .iter()
+                .filter(|capture| capture.path.ends_with("/result"))
+                .count(),
+            1
         );
-        assert_eq!(
-            actions.get(&job_id).unwrap().state,
-            HostActionState::Succeeded
-        );
+        assert!(adapter
+            .journal
+            .result(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_none());
+        assert_ne!(actions.get(&job_id).unwrap().state, HostActionState::Failed);
         server.abort();
     }
 
@@ -6009,6 +6035,47 @@ mod tests {
             StatusCode::CONFLICT
         );
         server.abort();
+
+        let replayed = harness(false).await;
+        replayed
+            .adapter
+            .process_intent(&replayed.intent)
+            .await
+            .unwrap();
+        let job_id = replayed.actions.list()[0].id.clone();
+        fail_review(&replayed.actions, &job_id, now_unix());
+        replayed.fake.update(|inner| inner.fail_next_post = true);
+        assert!(replayed
+            .adapter
+            .process_intent(&replayed.intent)
+            .await
+            .is_err());
+        let journaled = replayed
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::Deployment)
+            .unwrap();
+        assert!(journaled.receipt.is_none());
+        replayed
+            .adapter
+            .process_intent(&replayed.intent)
+            .await
+            .unwrap();
+        let saved = replayed
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::Deployment)
+            .unwrap();
+        assert!(saved.receipt.is_some());
+        let bodies: Vec<_> = posts(&replayed.fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/evidence"))
+            .map(|capture| capture.body)
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[0], journaled.body_json.as_bytes());
+        replayed.server.abort();
     }
 
     #[tokio::test]
@@ -6098,6 +6165,47 @@ mod tests {
         statuses.sort_by_key(|status| status.as_u16());
         assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
         server.abort();
+
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        for _ in 0..4 {
+            fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap();
+            if fixture.actions.get(&job_id).unwrap().state == HostActionState::QueuedApply {
+                break;
+            }
+        }
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), 1);
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        let again = reqwest::Client::new()
+            .post(
+                fixture
+                    .adapter
+                    .config
+                    .aeon_origin
+                    .join(&format!(
+                        "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/consume"
+                    ))
+                    .unwrap(),
+            )
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
+            )
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(launch.consume_body_json.unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+        fixture.server.abort();
     }
 
     fn post_count(fake: &FakeAeon, suffix: &str) -> usize {
