@@ -891,6 +891,7 @@ struct OperationBinding {
     host: String,
     workflow: String,
     environment: String,
+    release_node_id: String,
     artifact: ArtifactEvidence,
     plan_digest: String,
     predecessor_digest: String,
@@ -907,6 +908,7 @@ impl OperationBinding {
             && valid_host(&self.host)
             && valid_symbol(&self.workflow)
             && valid_symbol(&self.environment)
+            && valid_uuid(&self.release_node_id)
             && self.artifact.valid()
             && valid_hex64(&self.plan_digest)
             && valid_hex64(&self.predecessor_digest)
@@ -1283,21 +1285,18 @@ impl JournalStore {
         intent: &DeliveryIntent,
         handoff: &HandoffDocument,
     ) -> Result<Option<OperationBinding>, AdapterError> {
-        let Some(prior_attempt) = handoff
-            .attempt
-            .checked_sub(1)
-            .filter(|attempt| *attempt >= 1)
-        else {
+        if handoff.attempt < 2 {
             return Ok(None);
-        };
+        }
         let document = self.document.lock().expect("Aeon delivery journal lock");
         let mut matches = document.operations.values().filter(|binding| {
-            binding.attempt == prior_attempt
+            binding.handoff_id != intent.handoff_id
                 && binding.host == intent.host
                 && binding.workflow == intent.workflow.key()
                 && binding.environment == intent.environment
                 && binding.artifact == intent.artifact
-                && binding.plan_digest == handoff.plan_digest
+                && binding.release_node_id == intent.release_node_id
+                && binding.plan_digest == handoff.predecessor_digest
         });
         let predecessor = matches.next().cloned();
         if predecessor.is_some() && matches.next().is_some() {
@@ -2140,6 +2139,7 @@ impl AeonDeliveryAdapter {
             host: intent.host.clone(),
             workflow: intent.workflow.key().to_string(),
             environment: intent.environment.clone(),
+            release_node_id: intent.release_node_id.clone(),
             artifact: intent.artifact.clone(),
             plan_digest: handoff.plan_digest.clone(),
             predecessor_digest: handoff.predecessor_digest.clone(),
@@ -2160,6 +2160,7 @@ impl AeonDeliveryAdapter {
         if existing.host != intent.host
             || existing.workflow != intent.workflow.key()
             || existing.environment != intent.environment
+            || existing.release_node_id != intent.release_node_id
             || existing.artifact != intent.artifact
             || !existing.matches_handoff(handoff)
         {
@@ -3268,6 +3269,9 @@ mod tests {
     const PROJECT_NODE: &str = "33333333-3333-4333-8333-333333333333";
     const RELEASE_NODE: &str = "44444444-4444-4444-8444-444444444444";
     const ADMISSION_ID: &str = "55555555-5555-4555-8555-555555555555";
+    const OTHER_RELEASE: &str = "66666666-6666-4666-8666-666666666666";
+    const OTHER_HANDOFF: &str = "88888888-8888-4888-8888-888888888888";
+    const NEW_HANDOFF: &str = "77777777-7777-4777-8777-777777777777";
     const API_KEY: &[u8] = b"AEON_API_KEY_SENTINEL_0123456789ABCD";
 
     struct TestDir {
@@ -4217,6 +4221,28 @@ mod tests {
             .expect("record review");
     }
 
+    fn fail_review(store: &HostActionStore, job_id: &str, at: i64) {
+        let review = store
+            .claim("hsb8", at)
+            .expect("claim review")
+            .expect("review lease");
+        assert_eq!(review.id, job_id);
+        store
+            .record_agent_result(
+                job_id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: review.phase,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                },
+                at,
+            )
+            .expect("fail review");
+    }
+
     fn finish_apply(store: &HostActionStore, job_id: &str, at: i64) {
         let apply = store
             .claim("hsb8", at)
@@ -4863,6 +4889,85 @@ mod tests {
             .iter()
             .all(|capture| !capture.path.contains(VERIFY_HANDOFF)));
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_predecessor_follows_the_release_lineage() {
+        let now = now_unix();
+        let directory = TestDir::new("retry-lineage");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now);
+        fake.update(|inner| {
+            let mut other = FakeHandoff::deploy(now);
+            other.id = OTHER_HANDOFF.to_string();
+            other.release_node_id = OTHER_RELEASE.to_string();
+            inner.handoffs.insert(OTHER_HANDOFF.to_string(), other);
+            let mut next = FakeHandoff::deploy(now);
+            next.id = NEW_HANDOFF.to_string();
+            next.attempt = 2;
+            next.plan_digest = hex_chars('e');
+            next.predecessor_digest = hex_chars('a');
+            inner.handoffs.insert(NEW_HANDOFF.to_string(), next);
+        });
+        let (origin, server) = serve(fake).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let mut other_intent = deploy_intent(false);
+        other_intent.handoff_id = OTHER_HANDOFF.to_string();
+        other_intent.release_node_id = OTHER_RELEASE.to_string();
+        let lineage_intent = deploy_intent(false);
+        let mut next_intent = deploy_intent(false);
+        next_intent.handoff_id = NEW_HANDOFF.to_string();
+        next_intent.release_node_id = RELEASE_NODE.to_string();
+        let adapter = test_adapter(
+            runtime_config(
+                origin,
+                api,
+                vec![
+                    other_intent.clone(),
+                    lineage_intent.clone(),
+                    next_intent.clone(),
+                ],
+            ),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            hosts,
+            Arc::clone(&actions),
+        );
+
+        adapter.process_intent(&other_intent).await.unwrap();
+        let other_job = adapter.journal.operation(OTHER_HANDOFF).unwrap().job_id;
+        actions
+            .cancel_update_review(&other_job, "hsb8", "operator", now_unix())
+            .expect("cancel the other release");
+        let other_created = actions.get(&other_job).unwrap().created_at;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while now_unix() <= other_created && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(now_unix() > other_created);
+
+        adapter.process_intent(&lineage_intent).await.unwrap();
+        let lineage_job = adapter.journal.operation(DEPLOY_HANDOFF).unwrap().job_id;
+        fail_review(&actions, &lineage_job, now_unix());
+        adapter.process_intent(&next_intent).await.unwrap();
+        let retried = adapter.journal.operation(NEW_HANDOFF).unwrap().job_id;
+        assert_eq!(
+            actions.get(&retried).unwrap().retry_of.as_deref(),
+            Some(lineage_job.as_str())
+        );
+        assert_eq!(
+            adapter
+                .journal
+                .operation(OTHER_HANDOFF)
+                .unwrap()
+                .release_node_id,
+            OTHER_RELEASE
+        );
+        assert_ne!(other_job, lineage_job);
+        server.abort();
     }
 
     #[tokio::test]
