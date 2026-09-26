@@ -4497,7 +4497,21 @@ mod tests {
         json_response(StatusCode::CREATED, &response)
     }
 
+    fn rejected_launch_key(key: &str) -> Option<Response<Body>> {
+        if valid_uuid(key) {
+            None
+        } else {
+            Some(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "Idempotency-Key must be a UUID"}),
+            ))
+        }
+    }
+
     fn handle_admit(flags: &AdmitFlags, handoff: &mut FakeHandoff, body: &[u8]) -> Response<Body> {
+        if let Some(response) = rejected_launch_key(flags.idempotency) {
+            return response;
+        }
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
         };
@@ -4612,6 +4626,9 @@ mod tests {
         now: i64,
         drop_response: bool,
     ) -> Response<Body> {
+        if let Some(response) = rejected_launch_key(idempotency) {
+            return response;
+        }
         if let Some(response) = replay_response(launch_replay(
             handoff,
             "consume",
@@ -4888,9 +4905,6 @@ mod tests {
         body: &[u8],
         now: i64,
     ) -> LaunchReplay {
-        if key.is_empty() {
-            return LaunchReplay::Miss;
-        }
         let Some(stored) = handoff.launch_calls.get(key) else {
             return LaunchReplay::Miss;
         };
@@ -4927,9 +4941,6 @@ mod tests {
         body: &[u8],
         response: &Value,
     ) {
-        if key.is_empty() {
-            return;
-        }
         let Ok(digest) = canonical_body_digest(body) else {
             return;
         };
@@ -5717,6 +5728,7 @@ mod tests {
                 format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
             )
             .header(CONTENT_TYPE, JSON_MEDIA)
+            .header("idempotency-key", "dddddddd-dddd-4ddd-8ddd-dddddddddddd")
             .body(launch.consume_body_json.clone().unwrap())
             .send()
             .await
@@ -5852,6 +5864,7 @@ mod tests {
             )
             .header(AUTHORIZATION, &bearer)
             .header(CONTENT_TYPE, JSON_MEDIA)
+            .header("idempotency-key", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
             .body(
                 serde_json::to_vec(&json!({
                     "version_scheme": "legacy",
@@ -6790,16 +6803,27 @@ mod tests {
             "manifest_digest_sha256": "9".repeat(64)
         }))
         .unwrap();
-        let admitted = client
-            .post(
-                origin
-                    .join(&format!(
-                        "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"
-                    ))
-                    .unwrap(),
-            )
+        let admit_url = origin
+            .join(&format!(
+                "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"
+            ))
+            .unwrap();
+        let missing_key = client
+            .post(admit_url.clone())
             .header(AUTHORIZATION, &bearer)
             .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(admit.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_key.status(), StatusCode::BAD_REQUEST);
+        let missing_key: Value = missing_key.json().await.unwrap();
+        assert_eq!(missing_key["error"], "Idempotency-Key must be a UUID");
+        let admitted = client
+            .post(admit_url)
+            .header(AUTHORIZATION, &bearer)
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .header("idempotency-key", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
             .body(admit)
             .send()
             .await
@@ -6815,12 +6839,14 @@ mod tests {
             .post(consume_url.clone())
             .header(AUTHORIZATION, &bearer)
             .header(CONTENT_TYPE, JSON_MEDIA)
+            .header("idempotency-key", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
             .body(consume_body.clone())
             .send();
         let second = client
             .post(consume_url)
             .header(AUTHORIZATION, bearer)
             .header(CONTENT_TYPE, JSON_MEDIA)
+            .header("idempotency-key", "cccccccc-cccc-4ccc-8ccc-cccccccccccc")
             .body(consume_body)
             .send();
         let (left, right) = tokio::join!(first, second);
@@ -6863,6 +6889,7 @@ mod tests {
                 format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
             )
             .header(CONTENT_TYPE, JSON_MEDIA)
+            .header("idempotency-key", "dddddddd-dddd-4ddd-8ddd-dddddddddddd")
             .body(launch.consume_body_json.unwrap())
             .send()
             .await
