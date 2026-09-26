@@ -3138,12 +3138,10 @@ impl AeonDeliveryAdapter {
             .evidence_with_kind(&intent.handoff_id, EvidenceKind::LaunchReadiness)
             .ok_or(AdapterError::Journal)?;
         let observed = evidence_string_field(&current.body_json, "observed_at")?;
-        if now_unix().saturating_sub(unix_of(&observed)?) <= READINESS_REFRESH_SECS {
-            return Ok(());
-        }
         let now = now_unix();
-        let observed_at = format_timestamp(now)?;
-        let sequence = self.journal.next_sequence(&intent.handoff_id)?;
+        // Aeon still accepts the posted row for 900s (LaunchFreshness). The
+        // backup gate runs on every recovery, including inside the 600s window
+        // that skips reposting the row.
         let launch = self
             .journal
             .launch(&intent.handoff_id)
@@ -3159,6 +3157,12 @@ impl AeonDeliveryAdapter {
             Ok(stamp) => stamp.to_string(),
             Err(reason) => return self.block_launch(intent, reason, false),
         };
+        if now.saturating_sub(unix_of(&observed)?) <= READINESS_REFRESH_SECS {
+            self.journal.clear_launch_block(&intent.handoff_id)?;
+            return Ok(());
+        }
+        let observed_at = format_timestamp(now)?;
+        let sequence = self.journal.next_sequence(&intent.handoff_id)?;
         let reviewed = bare_plan_digest(&reviewed_plan_digest(&job).map_err(map_shared)?)?;
         let mut value: serde_json::Value = decode_strict(&readiness_refresh_candidate(
             &current.body_json,
@@ -9546,9 +9550,10 @@ mod tests {
             .is_err());
         let consumes = post_count(&fixture.fake, "/launch/consume");
         let readiness = readiness_post_count(&fixture.fake);
-        FrozenNow::set(now + 1000);
-        fixture.fake.update(|inner| inner.now = now + 1000);
-        record_host(&fixture.hosts, now + 1000, &fixture.intent.artifact, None);
+        // Inside the 600s repost window, and inside Aeon's 900s acceptance.
+        FrozenNow::set(now + 60);
+        fixture.fake.update(|inner| inner.now = now + 60);
+        record_host(&fixture.hosts, now + 60, &fixture.intent.artifact, None);
         let replay = fixture
             .adapter
             .process_intent(&fixture.intent)
