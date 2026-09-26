@@ -1592,6 +1592,15 @@ impl JournalStore {
             })
     }
 
+    fn has_unacknowledged_evidence(&self, handoff_id: &str) -> bool {
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .records
+            .values()
+            .any(|record| record.handoff_id == handoff_id && record.receipt.is_none())
+    }
+
     fn operation(&self, handoff_id: &str) -> Option<OperationBinding> {
         self.document
             .lock()
@@ -2915,6 +2924,25 @@ impl AeonDeliveryAdapter {
         }
     }
 
+    /// Aeon stores evidence only at max(sequence)+1 (report.go). Replay every
+    /// unacknowledged row before allocating another, lowest sequence first.
+    async fn settle_unacknowledged_evidence(
+        &self,
+        intent: &DeliveryIntent,
+    ) -> Result<bool, AdapterError> {
+        while let Some(pending) = self.journal.pending_evidence(&intent.handoff_id) {
+            self.replay_evidence(intent, &pending).await?;
+            let replayed = self
+                .journal
+                .evidence_sequence(&intent.handoff_id, pending.sequence)
+                .ok_or(AdapterError::Journal)?;
+            if replayed.replay_stopped || replayed.receipt.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(!self.journal.has_unacknowledged_evidence(&intent.handoff_id))
+    }
+
     fn bind_deployment(
         &self,
         intent: &DeliveryIntent,
@@ -3790,6 +3818,9 @@ impl AeonDeliveryAdapter {
         blocker: Option<BlockerCode>,
         detail: Option<&str>,
     ) -> Result<(), AdapterError> {
+        if !self.settle_unacknowledged_evidence(intent).await? {
+            return Ok(());
+        }
         let kind = intent.operation.evidence_kind();
         let record =
             if let Some(existing) = self.journal.evidence_with_kind(&intent.handoff_id, kind) {
@@ -9917,6 +9948,133 @@ mod tests {
         assert_eq!(
             fixture.actions.get(&job_id).unwrap().state,
             HostActionState::Cancelled
+        );
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_consume_replays_unacked_readiness_before_the_failed_result() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(launch.consume_started);
+        assert!(launch.receipt.is_none());
+        let posted = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap();
+        assert_eq!(posted.sequence, 1);
+        assert!(posted.receipt.is_some());
+
+        FrozenNow::set(now + 601);
+        fixture.fake.update(|inner| {
+            inner.now = now + 601;
+            inner.fail_next_post = true;
+        });
+        let refresh = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            refresh,
+            AdapterError::Refused(status) if status == StatusCode::SERVICE_UNAVAILABLE
+        ));
+        let pending = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap();
+        assert_eq!(pending.sequence, 2);
+        assert!(pending.receipt.is_none());
+        assert!(!pending.replay_stopped);
+
+        let job = fixture.actions.get(&job_id).unwrap();
+        fixture
+            .actions
+            .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
+            .unwrap();
+        let restarted = test_adapter(
+            runtime_config(
+                fixture.adapter.config.aeon_origin.clone(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        );
+        let replay = restarted.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        ));
+        let readiness = restarted
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap();
+        assert_eq!(readiness.sequence, 2);
+        assert!(readiness.receipt.is_some());
+        let deployment = restarted
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::Deployment)
+            .unwrap();
+        assert_eq!(deployment.sequence, readiness.sequence + 1);
+        assert!(deployment.receipt.is_some());
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "dependency_failed");
+        assert_eq!(results[0]["terminal_sequence"], deployment.sequence);
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            restarted
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        );
+        let deployment_posts = posts(&fixture.fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/evidence"))
+            .filter(|capture| {
+                serde_json::from_slice::<Value>(&capture.body)
+                    .ok()
+                    .is_some_and(|body| body["kind"] == "deployment")
+            })
+            .count();
+        assert_eq!(deployment_posts, 1);
+        let again = restarted.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(matches!(
+            again,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        ));
+        assert_eq!(result_posts(&fixture.fake).len(), 1);
+        assert_eq!(
+            posts(&fixture.fake)
+                .into_iter()
+                .filter(|capture| capture.path.ends_with("/evidence"))
+                .filter(|capture| {
+                    serde_json::from_slice::<Value>(&capture.body)
+                        .ok()
+                        .is_some_and(|body| body["kind"] == "deployment")
+                })
+                .count(),
+            1
         );
         fixture.server.abort();
     }

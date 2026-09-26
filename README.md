@@ -551,7 +551,10 @@ is journaled as exact request bytes before it is sent. An unacknowledged
 evidence row is read from Aeon before it is posted again. The replay stops
 when that handoff is expired, no longer requested or active, or already has
 a result, and when Aeon answers 409 `handoff is stale` or `handoff is terminal`.
-Those bytes stay in the journal and are not posted again. After a crash, admit
+Those bytes stay in the journal and are not posted again. A failed
+deployment after a terminal launch block replays any unacknowledged
+evidence first, and allocates the next sequence only after those rows
+are stored. After a crash, admit
 and consume are replayed with the journaled Idempotency-Key. An exact replay
 returns the stored admission or receipt, and a conflicting replay stays
 unresolved without changing the host. Confirmation after that replay still
