@@ -529,7 +529,9 @@ A deploy intent binds one guarded `UpdateRestart` review and requires
 admission — including a binding digest recomputed locally — consumes that
 admission, and only then confirms the same job. Deployment evidence follows a
 fresh config-class beacon, or a failed or cancelled job. Verification evidence
-follows the deploy handoff's plan digest and authority epoch. Every mutation
+requires `plan_digest` to equal the deploy binding plan digest and
+`predecessor_digest` to equal the dependency seal recomputed from the journaled
+deploy result. Epochs are per release, stage, and operation. Every mutation
 is journaled as exact request bytes before it is sent. After a crash, admit
 and consume are replayed with the journaled Idempotency-Key. An exact replay
 returns the stored admission or receipt, and a conflicting replay stays
