@@ -3423,11 +3423,14 @@ impl AeonDeliveryAdapter {
                     .journal
                     .launch_block(&intent.handoff_id)
                     .map(|block| block.reason);
+                // Aeon rejects evidence observed more than a minute before the
+                // handoff was created (report.go). The job clock can be older
+                // than that, and a 409 on those bytes would replay forever.
                 self.write_observation(
                     intent,
                     handoff,
                     EvidenceOutcome::Failed,
-                    job.updated_at,
+                    now_unix(),
                     Some(BlockerCode::DependencyFailed),
                     detail.as_deref(),
                 )
@@ -5010,6 +5013,10 @@ mod tests {
         predecessor_digest: String,
         context_digest: String,
         prerequisite_seal_sha256: String,
+        /// When the handoff was opened. Not part of the GET document. Aeon
+        /// stores this as `created_at` and rejects evidence observed more than
+        /// a minute earlier.
+        created_at: i64,
         evidence: BTreeMap<i64, StoredEvidence>,
         admission: Option<Value>,
         admit_idempotency_key: Option<String>,
@@ -5056,6 +5063,7 @@ mod tests {
                 predecessor_digest: hex_chars('b'),
                 context_digest: hex_chars('c'),
                 prerequisite_seal_sha256: hex_chars('d'),
+                created_at: now,
                 evidence: BTreeMap::new(),
                 admission: None,
                 admit_idempotency_key: None,
@@ -5398,6 +5406,18 @@ mod tests {
         }
         if value["authority_epoch"].as_i64() != Some(handoff.authority_epoch) {
             return json_response(StatusCode::CONFLICT, &json!({}));
+        }
+        // report.go: observed_at before created_at minus one minute is 409.
+        // Before is strict, so the exact one-minute boundary is still accepted.
+        if value["observed_at"].as_str().is_some_and(|stamp| {
+            parse_timestamp(stamp)
+                .map(|time| time.unix_timestamp().saturating_add(60) < handoff.created_at)
+                .unwrap_or(false)
+        }) {
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "evidence predates handoff"}),
+            );
         }
         if value["kind"] == "launch_readiness"
             && (!launch_readiness_tokens(&value)
@@ -7155,6 +7175,102 @@ mod tests {
             .map(|capture| serde_json::from_slice(&capture.body).unwrap())
             .unwrap();
         assert_eq!(stale["blocker_code"], "reporter_stale");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn evidence_predating_the_handoff_is_refused() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake).await;
+        let early =
+            post_deployment_evidence(&origin, &full_deployment(1, "failed", now - 61)).await;
+        assert_eq!(early.0, StatusCode::CONFLICT);
+        assert_eq!(early.1["error"], "evidence predates handoff");
+        let boundary =
+            post_deployment_evidence(&origin, &full_deployment(1, "failed", now - 60)).await;
+        assert_eq!(boundary.0, StatusCode::CREATED);
+        server.abort();
+    }
+
+    async fn post_deployment_evidence(origin: &Url, body: &Value) -> (StatusCode, Value) {
+        let response = reqwest::Client::new()
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+                    .unwrap(),
+            )
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
+            )
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(serde_json::to_vec(body).unwrap())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let payload = response.json::<Value>().await.unwrap_or(Value::Null);
+        (status, payload)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_job_that_predates_the_handoff_posts_evidence_at_now() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let directory = TestDir::new("predate-evidence");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let job = actions
+            .create_update_review("hsb8", "operator", now - 10_000)
+            .expect("old review");
+        fail_review(&actions, &job.id, now - 9_999);
+        let failed = actions.get(&job.id).unwrap();
+        assert_eq!(failed.state, HostActionState::Failed);
+        assert!(failed.updated_at + 60 < now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let mut intent = deploy_intent(false);
+        intent.update_restart_job_id = Some(job.id);
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![intent.clone()]),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            hosts,
+            actions,
+        );
+        adapter.process_intent(&intent).await.unwrap();
+        let evidence: Value = posts(&fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/evidence"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(evidence["kind"], "deployment");
+        assert_eq!(evidence["outcome"], "failed");
+        assert_eq!(evidence["observed_at"], format_timestamp(now).unwrap());
+        let recorded = adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::Deployment)
+            .unwrap();
+        let journaled: Value = serde_json::from_str(&recorded.body_json).unwrap();
+        assert_eq!(journaled["observed_at"], evidence["observed_at"]);
+        assert!(recorded.receipt.is_some());
+        let result: Value = posts(&fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/result"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(result["outcome"], "failed");
+        assert_eq!(result["blocker_code"], "dependency_failed");
+        assert!(adapter
+            .journal
+            .result(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_some());
         server.abort();
     }
 
