@@ -915,6 +915,10 @@ struct EvidenceJournalRecord {
     body_json: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt: Option<EvidenceReceipt>,
+    /// Set when Aeon will not accept these bytes again. The row stays
+    /// unacknowledged and is not replayed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    replay_stopped: bool,
 }
 
 impl EvidenceJournalRecord {
@@ -938,6 +942,7 @@ impl EvidenceJournalRecord {
             request_digest,
             body_json: String::from_utf8(body.to_vec()).map_err(|_| AdapterError::Contract)?,
             receipt: None,
+            replay_stopped: false,
         })
     }
 
@@ -966,6 +971,10 @@ impl EvidenceJournalRecord {
                 .binding_digest(origin)
                 .is_ok_and(|digest| digest == self.intent_digest)
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn json_kind_matches(body: &str, kind: EvidenceKind, sequence: i64) -> bool {
@@ -1417,7 +1426,11 @@ impl JournalStore {
             .expect("Aeon delivery journal lock")
             .records
             .values()
-            .filter(|record| record.handoff_id == handoff_id && record.receipt.is_none())
+            .filter(|record| {
+                record.handoff_id == handoff_id
+                    && record.receipt.is_none()
+                    && !record.replay_stopped
+            })
             .min_by_key(|record| record.sequence)
             .cloned()
     }
@@ -1531,6 +1544,52 @@ impl JournalStore {
             return Err(AdapterError::Journal);
         }
         persist_journal(&self.path, &mut document, updated)
+    }
+
+    fn stop_evidence_replay(&self, record: &EvidenceJournalRecord) -> Result<(), AdapterError> {
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        let existing = document
+            .records
+            .get(&record.key())
+            .ok_or(AdapterError::Journal)?;
+        if existing.body_json != record.body_json {
+            return Err(AdapterError::Journal);
+        }
+        if existing.replay_stopped || existing.receipt.is_some() {
+            return Ok(());
+        }
+        let mut updated = document.clone();
+        updated
+            .records
+            .get_mut(&record.key())
+            .expect("evidence record remains present")
+            .replay_stopped = true;
+        let saved = updated.records.get(&record.key()).expect("saved").clone();
+        if !saved.valid() {
+            return Err(AdapterError::Journal);
+        }
+        persist_journal(&self.path, &mut document, updated)
+    }
+
+    fn evidence_sequence(&self, handoff_id: &str, sequence: i64) -> Option<EvidenceJournalRecord> {
+        let key = format!("{handoff_id}:{sequence}");
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .records
+            .get(&key)
+            .cloned()
+    }
+
+    fn has_stopped_evidence(&self, handoff_id: &str) -> bool {
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .records
+            .values()
+            .any(|record| {
+                record.handoff_id == handoff_id && record.replay_stopped && record.receipt.is_none()
+            })
     }
 
     fn operation(&self, handoff_id: &str) -> Option<OperationBinding> {
@@ -1997,6 +2056,11 @@ struct RequestTrace {
     error_excerpt: Option<String>,
 }
 
+enum PostedEvidence {
+    Accepted(EvidenceReceipt),
+    Rejected { status: StatusCode, body: Vec<u8> },
+}
+
 struct AeonClient {
     origin: Url,
     api_key_file: PathBuf,
@@ -2139,6 +2203,16 @@ impl AeonClient {
         &self,
         record: &EvidenceJournalRecord,
     ) -> Result<EvidenceReceipt, AdapterError> {
+        match self.post_evidence_raw(record).await? {
+            PostedEvidence::Accepted(receipt) => Ok(receipt),
+            PostedEvidence::Rejected { status, .. } => Err(status_error(status)),
+        }
+    }
+
+    async fn post_evidence_raw(
+        &self,
+        record: &EvidenceJournalRecord,
+    ) -> Result<PostedEvidence, AdapterError> {
         let credentials = self.credentials()?;
         let (status, bytes) = self
             .exchange(
@@ -2150,7 +2224,10 @@ impl AeonClient {
             )
             .await?;
         if status != StatusCode::CREATED {
-            return Err(status_error(status));
+            return Ok(PostedEvidence::Rejected {
+                status,
+                body: bytes,
+            });
         }
         let response: EvidenceResponse = decode_strict(&bytes)?;
         let receipt = EvidenceReceipt::from_response(&response)?;
@@ -2159,7 +2236,7 @@ impl AeonClient {
         {
             return Err(AdapterError::Contract);
         }
-        Ok(receipt)
+        Ok(PostedEvidence::Accepted(receipt))
     }
 
     async fn post_admit(
@@ -2435,6 +2512,9 @@ impl AeonDeliveryAdapter {
                     pending.detail.as_deref(),
                 )
                 .await;
+        }
+        if self.journal.has_stopped_evidence(&intent.handoff_id) {
+            return Ok(());
         }
         let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
@@ -2803,11 +2883,36 @@ impl AeonDeliveryAdapter {
         intent: &DeliveryIntent,
         record: &EvidenceJournalRecord,
     ) -> Result<(), AdapterError> {
+        if record.replay_stopped {
+            return Ok(());
+        }
         if !record.bound_to(intent, &self.config.aeon_origin) || !record.valid() {
             return Err(AdapterError::Journal);
         }
-        let receipt = self.aeon.post_evidence(record).await?;
-        self.journal.acknowledge_evidence(record, receipt)
+        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        handoff.validate(intent)?;
+        // report.go answers 409 "handoff is terminal" when a result is set or
+        // the handoff is revoked, and 409 "handoff is stale" once current()
+        // is false. current() runs before the stored-evidence replay, so an
+        // exact replay is refused after expiry. Expiry, a closed state, and
+        // a recorded result are on the GET. Clock skew and a recomputed plan
+        // digest are not: those arrive as 409. A contiguous-sequence 409 is
+        // not one of these; that row can still be stored after its predecessor.
+        if !handoff.state.is_open()
+            || handoff.result.is_some()
+            || stamp_passed(&handoff.expires_at)?
+        {
+            self.journal.stop_evidence_replay(record)?;
+            return Ok(());
+        }
+        match self.aeon.post_evidence_raw(record).await? {
+            PostedEvidence::Accepted(receipt) => self.journal.acknowledge_evidence(record, receipt),
+            PostedEvidence::Rejected { status, body } if evidence_replay_refusal(status, &body) => {
+                self.journal.stop_evidence_replay(record)?;
+                Ok(())
+            }
+            PostedEvidence::Rejected { status, .. } => Err(status_error(status)),
+        }
     }
 
     fn bind_deployment(
@@ -3144,11 +3249,21 @@ impl AeonDeliveryAdapter {
         };
         if existing.receipt.is_none() {
             self.replay_evidence(intent, &existing).await?;
+            let replayed = self
+                .journal
+                .evidence_sequence(&intent.handoff_id, existing.sequence)
+                .ok_or(AdapterError::Journal)?;
+            if replayed.replay_stopped {
+                return Err(AdapterError::Contract);
+            }
         }
         let current = self
             .journal
             .evidence_with_kind(&intent.handoff_id, EvidenceKind::LaunchReadiness)
             .ok_or(AdapterError::Journal)?;
+        if current.replay_stopped {
+            return Err(AdapterError::Contract);
+        }
         let observed = evidence_string_field(&current.body_json, "observed_at")?;
         let now = now_unix();
         // Aeon still accepts the posted row for 900s (LaunchFreshness). The
@@ -3221,6 +3336,9 @@ impl AeonDeliveryAdapter {
                 .journal
                 .evidence_with_kind(&intent.handoff_id, EvidenceKind::LaunchReadiness)
                 .ok_or(AdapterError::Journal)?;
+            if current.replay_stopped {
+                return Err(AdapterError::Contract);
+            }
             let posted = evidence_string_field(&current.body_json, "reviewed_plan_digest")?;
             if posted != bare_plan_digest(reviewed)? {
                 return self.block_launch(intent, LAUNCH_BLOCK_READINESS_PLAN_CHANGED, true);
@@ -3678,9 +3796,16 @@ impl AeonDeliveryAdapter {
                 if existing.receipt.is_none() {
                     self.replay_evidence(intent, &existing).await?;
                 }
-                self.journal
+                let current = self
+                    .journal
                     .evidence_with_kind(&intent.handoff_id, kind)
-                    .ok_or(AdapterError::Journal)?
+                    .ok_or(AdapterError::Journal)?;
+                if current.replay_stopped {
+                    return Ok(());
+                }
+                current
+            } else if self.journal.has_stopped_evidence(&intent.handoff_id) {
+                return Ok(());
             } else {
                 let observed_at = format_timestamp(observed_at)?;
                 if unix_of(&observed_at)? > now_unix().saturating_add(OBSERVED_AT_SKEW_SECS) {
@@ -4372,6 +4497,21 @@ fn status_error(status: StatusCode) -> AdapterError {
         401 | 403 => AdapterError::Credential,
         _ => AdapterError::Refused(status),
     }
+}
+
+/// report.go uses these two 409 texts once the handoff will not store another
+/// row. A contiguous-sequence 409 is not terminal for this row.
+fn evidence_replay_refusal(status: StatusCode, body: &[u8]) -> bool {
+    if status != StatusCode::CONFLICT {
+        return false;
+    }
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    matches!(
+        document.get("error").and_then(serde_json::Value::as_str),
+        Some("handoff is stale" | "handoff is terminal")
+    )
 }
 
 async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, AdapterError> {
@@ -5107,6 +5247,9 @@ mod tests {
         /// stores this as `created_at` and rejects evidence observed more than
         /// a minute earlier.
         created_at: i64,
+        /// FakeAeon only. Real `current()` is false when the recomputed plan
+        /// digest or authority epoch differs, and GET does not show that.
+        force_stale: bool,
         evidence: BTreeMap<i64, StoredEvidence>,
         admission: Option<Value>,
         admit_idempotency_key: Option<String>,
@@ -5154,6 +5297,7 @@ mod tests {
                 context_digest: hex_chars('c'),
                 prerequisite_seal_sha256: hex_chars('d'),
                 created_at: now,
+                force_stale: false,
                 evidence: BTreeMap::new(),
                 admission: None,
                 admit_idempotency_key: None,
@@ -5483,20 +5627,6 @@ mod tests {
         let Some(sequence) = value["sequence"].as_i64().filter(|sequence| *sequence >= 1) else {
             return json_response(StatusCode::CONFLICT, &json!({}));
         };
-        if let Some(stored) = handoff.evidence.get(&sequence) {
-            return if stored.body == body {
-                json_response(
-                    StatusCode::CREATED,
-                    &evidence_echo(body, &handoff.id, &stored.received_at),
-                )
-            } else {
-                json_response(StatusCode::CONFLICT, &json!({}))
-            };
-        }
-        let max_sequence = handoff.evidence.keys().max().copied().unwrap_or(0);
-        if sequence != max_sequence + 1 {
-            return json_response(StatusCode::CONFLICT, &json!({}));
-        }
         if value["authority_epoch"].as_i64() != Some(handoff.authority_epoch) {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
@@ -5511,6 +5641,54 @@ mod tests {
                 StatusCode::CONFLICT,
                 &json!({"error": "evidence predates handoff"}),
             );
+        }
+        let stored_exact = handoff
+            .evidence
+            .get(&sequence)
+            .is_some_and(|stored| stored.body == body);
+        // report.go: a recorded result or state revoked replays an exact stored
+        // row and otherwise answers 409 "handoff is terminal", before current().
+        // failed, blocked, and succeeded without a result are not that refusal.
+        if handoff.result.is_some() || handoff.state == "revoked" {
+            if stored_exact {
+                let received_at = handoff
+                    .evidence
+                    .get(&sequence)
+                    .map(|stored| stored.received_at.clone())
+                    .unwrap_or_default();
+                return json_response(
+                    StatusCode::CREATED,
+                    &evidence_echo(body, &handoff.id, &received_at),
+                );
+            }
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "handoff is terminal"}),
+            );
+        }
+        // current() is false after expiry and when the plan digest or epoch
+        // drifts. report.go returns 409 "handoff is stale" before the stored
+        // replay, so an exact replay is refused as well. force_stale is the
+        // stand-in for the recomputed digest, which GET does not carry.
+        let expires_at = parse_timestamp(&handoff.expires_at)
+            .map(|time| time.unix_timestamp())
+            .unwrap_or(0);
+        if handoff.force_stale || expires_at < now {
+            return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
+        }
+        if let Some(stored) = handoff.evidence.get(&sequence) {
+            return if stored.body == body {
+                json_response(
+                    StatusCode::CREATED,
+                    &evidence_echo(body, &handoff.id, &stored.received_at),
+                )
+            } else {
+                json_response(StatusCode::CONFLICT, &json!({}))
+            };
+        }
+        let max_sequence = handoff.evidence.keys().max().copied().unwrap_or(0);
+        if sequence != max_sequence + 1 {
+            return json_response(StatusCode::CONFLICT, &json!({}));
         }
         if value["kind"] == "launch_readiness"
             && (!launch_readiness_tokens(&value)
@@ -9827,6 +10005,290 @@ mod tests {
             .journal
             .launch_block(DEPLOY_HANDOFF)
             .is_none());
+        fixture.server.abort();
+    }
+
+    async fn leave_readiness_unacked(fixture: &Harness) {
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let job_id = fixture.actions.list()[0].id.clone();
+        let created = fixture.actions.get(&job_id).unwrap().created_at;
+        review_job(&fixture.actions, &job_id, created);
+        record_backup(&fixture.hosts, fake_now(&fixture.fake));
+        fixture.fake.update(|inner| inner.fail_next_post = true);
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let pending = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap();
+        assert!(pending.receipt.is_none());
+        assert!(!pending.replay_stopped);
+        assert_eq!(post_count(&fixture.fake, "/evidence"), 1);
+    }
+
+    async fn post_evidence_bytes(origin: &Url, body: &[u8]) -> (StatusCode, Value) {
+        let response = reqwest::Client::new()
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+                    .unwrap(),
+            )
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
+            )
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.bytes().await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+        (status, value)
+    }
+
+    fn readiness_probe(sequence: i64, now: i64) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "sequence": sequence,
+            "kind": "launch_readiness",
+            "outcome": "satisfied",
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "reviewed_plan_digest": "ab".repeat(32),
+            "host": "hsb8",
+            "all_host_eval_passed": true,
+            "target_build_passed": true,
+            "backup_ready": true,
+            "backup_observed_at": format_timestamp(now).unwrap(),
+            "restart_required": true,
+            "running_kernel": "6.18.1",
+            "expected_kernel": "6.18.2"
+        }))
+        .unwrap()
+    }
+
+    fn stopped_readiness(fixture: &Harness) -> EvidenceJournalRecord {
+        let record = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap();
+        assert!(record.replay_stopped);
+        assert!(record.receipt.is_none());
+        record
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unacked_evidence_stops_when_the_handoff_has_expired() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        leave_readiness_unacked(&fixture).await;
+        let body = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap()
+            .body_json;
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.expires_at = format_timestamp(now - 5).unwrap();
+            inner.now = now;
+        });
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&fixture.fake, "/evidence"), 1);
+        stopped_readiness(&fixture);
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&fixture.fake, "/evidence"), 1);
+        let (status, value) =
+            post_evidence_bytes(&fixture.adapter.config.aeon_origin, body.as_bytes()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unacked_evidence_stops_when_aeon_is_ahead_of_the_local_clock() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        leave_readiness_unacked(&fixture).await;
+        let body = fixture
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap()
+            .body_json;
+        let expires = now + 120;
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.expires_at = format_timestamp(expires).unwrap();
+            inner.now = expires + 5;
+        });
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&fixture.fake, "/evidence"), 2);
+        stopped_readiness(&fixture);
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&fixture.fake, "/evidence"), 2);
+        let (status, value) =
+            post_evidence_bytes(&fixture.adapter.config.aeon_origin, body.as_bytes()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        let document = fetch_handoff(&fixture.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert!(document.get("force_stale").is_none());
+        assert_eq!(document["expires_at"], format_timestamp(expires).unwrap());
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unacked_evidence_stops_when_the_handoff_is_closed_or_has_a_result() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let closed = harness(true).await;
+        leave_readiness_unacked(&closed).await;
+        let closed_body = closed
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap()
+            .body_json;
+        closed.fake.update(|inner| {
+            inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap().state = "blocked".to_string();
+        });
+        closed.adapter.process_intent(&closed.intent).await.unwrap();
+        assert_eq!(post_count(&closed.fake, "/evidence"), 1);
+        stopped_readiness(&closed);
+        closed.adapter.process_intent(&closed.intent).await.unwrap();
+        assert_eq!(post_count(&closed.fake, "/evidence"), 1);
+        // Aeon still accepts evidence while state is blocked and no result is
+        // stored (report.go). Pharos stops from the GET and must not POST.
+        let (status, _) =
+            post_evidence_bytes(&closed.adapter.config.aeon_origin, closed_body.as_bytes()).await;
+        assert_eq!(status, StatusCode::CREATED);
+        closed.server.abort();
+
+        let resulted = harness(true).await;
+        leave_readiness_unacked(&resulted).await;
+        let resulted_body = resulted
+            .adapter
+            .journal
+            .evidence_with_kind(DEPLOY_HANDOFF, EvidenceKind::LaunchReadiness)
+            .unwrap()
+            .body_json;
+        resulted.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.state = "failed".to_string();
+            handoff.result = Some(json!({
+                "outcome": "failed",
+                "terminal_sequence": 1,
+                "authority_epoch": handoff.authority_epoch,
+                "prerequisite_seal_sha256": handoff.prerequisite_seal_sha256,
+                "blocker_code": "dependency_failed",
+                "handoff_id": handoff.id,
+                "completed_at": format_timestamp(inner.now).unwrap(),
+            }));
+        });
+        resulted
+            .adapter
+            .process_intent(&resulted.intent)
+            .await
+            .unwrap();
+        assert_eq!(post_count(&resulted.fake, "/evidence"), 1);
+        stopped_readiness(&resulted);
+        let (status, value) = post_evidence_bytes(
+            &resulted.adapter.config.aeon_origin,
+            resulted_body.as_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is terminal");
+        resulted.server.abort();
+    }
+
+    #[tokio::test]
+    async fn fake_aeon_refuses_stale_or_terminal_evidence() {
+        let fixture = harness(false).await;
+        let now = fake_now(&fixture.fake);
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        let stored = readiness_probe(1, now);
+        let later = readiness_probe(2, now);
+        let (status, _) = post_evidence_bytes(&origin, &stored).await;
+        assert_eq!(status, StatusCode::CREATED);
+        fixture.fake.update(|inner| {
+            inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap().force_stale = true;
+        });
+        let document = fetch_handoff(&origin, DEPLOY_HANDOFF).await;
+        assert!(document.get("force_stale").is_none());
+        let (status, value) = post_evidence_bytes(&origin, &stored).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.force_stale = false;
+            handoff.expires_at = format_timestamp(now - 5).unwrap();
+            inner.now = now;
+        });
+        let (status, value) = post_evidence_bytes(&origin, &stored).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        let (status, value) = post_evidence_bytes(&origin, &later).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.expires_at = format_timestamp(now + 3600).unwrap();
+            inner.now = now;
+            handoff.state = "revoked".to_string();
+        });
+        let (status, echoed) = post_evidence_bytes(&origin, &stored).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(echoed["sequence"], 1);
+        let (status, value) = post_evidence_bytes(&origin, &later).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is terminal");
+        fixture.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.state = "failed".to_string();
+            handoff.result = Some(json!({
+                "outcome": "failed",
+                "terminal_sequence": 1,
+                "authority_epoch": handoff.authority_epoch,
+                "prerequisite_seal_sha256": handoff.prerequisite_seal_sha256,
+                "blocker_code": "policy_refused",
+                "handoff_id": handoff.id,
+                "completed_at": format_timestamp(now).unwrap(),
+            }));
+        });
+        let (status, _) = post_evidence_bytes(&origin, &stored).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, value) = post_evidence_bytes(&origin, &later).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is terminal");
         fixture.server.abort();
     }
 

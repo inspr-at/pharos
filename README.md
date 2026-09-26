@@ -547,7 +547,11 @@ Verification evidence
 requires `plan_digest` to equal the deploy binding plan digest and
 `predecessor_digest` to equal the dependency seal recomputed from the journaled
 deploy result. Epochs are per release, stage, and operation. Every mutation
-is journaled as exact request bytes before it is sent. After a crash, admit
+is journaled as exact request bytes before it is sent. An unacknowledged
+evidence row is read from Aeon before it is posted again. The replay stops
+when that handoff is expired, no longer requested or active, or already has
+a result, and when Aeon answers 409 `handoff is stale` or `handoff is terminal`.
+Those bytes stay in the journal and are not posted again. After a crash, admit
 and consume are replayed with the journaled Idempotency-Key. An exact replay
 returns the stored admission or receipt, and a conflicting replay stays
 unresolved without changing the host. Confirmation after that replay still
