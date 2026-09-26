@@ -572,10 +572,12 @@ unresolved without changing the host. Confirmation after that replay still
 requires the fetched handoff to be `requested` or `active`, to have no result,
 and to match the journaled admission. When that handoff carries
 `authority_open` or `superseded_by`, a false `authority_open` or a set
-`superseded_by` is an additional refusal. It is journaled as
-`handoff_authority_not_open` and maps to `policy_refused`. Those fields are
-optional. An older Aeon that omits them keeps the inferred check, and a true
-`authority_open` does not waive it. A newer attempt of the same operation is
+`superseded_by` is an additional refusal while the handoff is still inside
+`expires_at`. It is journaled as `handoff_authority_not_open` and maps to
+`policy_refused`. A handoff already past `expires_at` is journaled as
+`admission_expired` instead, which also maps to `policy_refused`, and no
+result is posted. Those fields are optional. An older Aeon that omits them
+keeps the inferred check, and a true `authority_open` does not waive it. A newer attempt of the same operation is
 not visible as a change to this handoff's attempt or epoch. Aeon's handoff
 create response now matches GET (AEON-177). This adapter does not create
 handoffs, and GET remains the source of truth for the handoff it confirms.
