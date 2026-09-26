@@ -3383,13 +3383,7 @@ impl AeonDeliveryAdapter {
         let fresh = self.aeon.get_handoff(&intent.handoff_id).await?;
         fresh.validate(intent)?;
         fresh.open_for_write(now_unix())?;
-        let operation = self
-            .journal
-            .operation(&intent.handoff_id)
-            .ok_or(AdapterError::LocalBinding)?;
-        if !operation.matches_handoff(&fresh) {
-            return Err(AdapterError::LocalBinding);
-        }
+        self.result_retry_binding(intent, &fresh)?;
         let failed_request: ResultRequest = decode_strict(failed.body_json.as_bytes())?;
         if fresh.authority_epoch != failed_request.authority_epoch
             || fresh.prerequisite_seal_sha256 == failed_request.prerequisite_seal_sha256
@@ -3413,6 +3407,38 @@ impl AeonDeliveryAdapter {
         let record = self.journal.replace_unacked_result(record)?;
         let receipt = self.aeon.post_result(&record).await?;
         self.journal.acknowledge_result(&record, receipt)
+    }
+
+    fn result_retry_binding(
+        &self,
+        intent: &DeliveryIntent,
+        fresh: &HandoffDocument,
+    ) -> Result<(), AdapterError> {
+        if intent.operation == Operation::Verify {
+            let deploy_id = intent
+                .deployment_handoff_id
+                .as_deref()
+                .ok_or(AdapterError::LocalBinding)?;
+            let operation = self
+                .journal
+                .operation(deploy_id)
+                .ok_or(AdapterError::LocalBinding)?;
+            if operation.host != intent.host
+                || operation.environment != intent.environment
+                || operation.artifact != intent.artifact
+            {
+                return Err(AdapterError::LocalBinding);
+            }
+            return Ok(());
+        }
+        let operation = self
+            .journal
+            .operation(&intent.handoff_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        if !operation.matches_handoff(fresh) {
+            return Err(AdapterError::LocalBinding);
+        }
+        Ok(())
     }
 }
 
@@ -6613,6 +6639,49 @@ mod tests {
                 .fake
                 .update(|inner| inner.handoffs[VERIFY_HANDOFF].predecessor_digest.clone()),
             dependency_digest(DEPLOY_HANDOFF, "deployment", receipt.terminal_sequence)
+        );
+        sealed.server.abort();
+    }
+
+    #[tokio::test]
+    async fn verify_result_rotated_seal_retry_succeeds() {
+        let sealed = sealed_deploy().await;
+        let receipt = sealed
+            .adapter
+            .journal
+            .result(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .unwrap();
+        let seal = dependency_digest(DEPLOY_HANDOFF, "deployment", receipt.terminal_sequence);
+        arm_verify_seal(&sealed.fake, &seal, 11);
+        record_beacon(&sealed.hosts, now_unix() + 1, &artifact());
+        sealed.fake.update(|inner| inner.bump_seal_on_result = true);
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        let results: Vec<Value> = posts(&sealed.fake)
+            .into_iter()
+            .filter(|capture| {
+                capture.path.contains(VERIFY_HANDOFF) && capture.path.ends_with("/result")
+            })
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["prerequisite_seal_sha256"], seal);
+        assert_eq!(results[1]["prerequisite_seal_sha256"], hex_chars('f'));
+        assert_eq!(
+            sealed
+                .adapter
+                .journal
+                .result(VERIFY_HANDOFF)
+                .unwrap()
+                .receipt
+                .unwrap()
+                .outcome,
+            ResultOutcome::Succeeded
         );
         sealed.server.abort();
     }
