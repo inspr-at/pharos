@@ -539,6 +539,12 @@ unresolved without changing the host. The bearer token stays in its referenced
 file and is not written to the journal. The adapter does nothing until the
 config variable is set.
 
+`live_roundtrip_against_aeon` is an ignored test that drives this adapter
+against a live HTTPS Aeon origin. It runs only when `PHAROS_AEON_LIVE_ORIGIN`
+is set and `PHAROS_AEON_LIVE_ACK=disposable`, reads the bearer token from
+`PHAROS_AEON_LIVE_KEY_FILE` with the production reader, and writes a value-free
+JSON report to `PHAROS_AEON_LIVE_REPORT`. It does not run in CI.
+
 ### 5. Requested is never presented as applied
 
 Nix host settings become declared only after the configured nixcfg artifact is
