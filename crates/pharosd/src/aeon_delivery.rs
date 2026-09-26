@@ -73,6 +73,7 @@ const LAUNCH_BLOCK_CONSUME_ABANDONED: &str = "consume_abandoned";
 const LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED: &str = "confirmation_not_delegated";
 const LAUNCH_BLOCK_ADMISSION_EXPIRED: &str = "admission_expired";
 const LAUNCH_BLOCK_AUTHORITY_CLOSED: &str = "handoff_authority_closed";
+const LAUNCH_BLOCK_LAUNCH_NOT_OWNED: &str = "launch_not_owned";
 
 const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING,
@@ -85,6 +86,7 @@ const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED,
     LAUNCH_BLOCK_ADMISSION_EXPIRED,
     LAUNCH_BLOCK_AUTHORITY_CLOSED,
+    LAUNCH_BLOCK_LAUNCH_NOT_OWNED,
 ];
 
 #[derive(Debug)]
@@ -1238,7 +1240,8 @@ fn aeon_blocker_for_reason(reason: &str) -> Option<BlockerCode> {
         LAUNCH_BLOCK_READINESS_FLAG_FALSE => BlockerCode::ExternalWaiting,
         LAUNCH_BLOCK_READINESS_PLAN_CHANGED
         | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
-        | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED => BlockerCode::PolicyRefused,
+        | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
+        | LAUNCH_BLOCK_LAUNCH_NOT_OWNED => BlockerCode::PolicyRefused,
         // A consumed admission cannot be replaced. While it is still unconsumed
         // and the handoff is current, the reporter sends external_waiting.
         LAUNCH_BLOCK_ADMISSION_EXPIRED => BlockerCode::PolicyRefused,
@@ -3348,6 +3351,9 @@ impl AeonDeliveryAdapter {
         if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
             return Err(AdapterError::LocalBinding);
         }
+        if job.requested_by != ACTOR {
+            return self.block_launch(intent, LAUNCH_BLOCK_LAUNCH_NOT_OWNED, true);
+        }
         if reviewed_plan_digest(&job).map_err(map_shared)? != launch.reviewed_plan_digest {
             return Err(AdapterError::LocalBinding);
         }
@@ -3803,6 +3809,7 @@ fn consume_job_confirmable(
 ) -> Result<bool, AdapterError> {
     if job.host != intent.host
         || job.workflow_kind() != HostWorkflowKind::UpdateRestart
+        || job.requested_by != ACTOR
         || job.state != HostActionState::AwaitingConfirmation
     {
         return Ok(false);
@@ -8510,6 +8517,7 @@ mod tests {
             LAUNCH_BLOCK_READINESS_PLAN_CHANGED
             | LAUNCH_BLOCK_DELEGATED_LAUNCH_REQUIRED
             | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
+            | LAUNCH_BLOCK_LAUNCH_NOT_OWNED
             | LAUNCH_BLOCK_ADMISSION_EXPIRED => "policy_refused",
             LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
             | LAUNCH_BLOCK_CONSUME_ABANDONED
@@ -9169,6 +9177,67 @@ mod tests {
             .launch_block(DEPLOY_HANDOFF)
             .is_none());
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn changed_requester_is_not_confirmed() {
+        let owned = harness(true).await;
+        let job_id = prepare_ready_launch(&owned).await;
+        let actions = Arc::clone(&owned.actions);
+        let confirm_id = job_id.clone();
+        *owned.fake.consume_hook.lock().expect("consume hook") = Some(Box::new(move || {
+            actions.set_requested_by_for_test(&confirm_id, "operator");
+        }));
+        let error = owned
+            .adapter
+            .process_intent(&owned.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_LAUNCH_NOT_OWNED)
+        ));
+        let job = owned.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        assert_eq!(
+            owned
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap()
+                .reason,
+            LAUNCH_BLOCK_LAUNCH_NOT_OWNED
+        );
+        owned.server.abort();
+
+        let replayed = harness(true).await;
+        let replay_job = prepare_ready_launch(&replayed).await;
+        let fake = replayed.fake.clone();
+        *replayed.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(replayed
+            .adapter
+            .process_intent(&replayed.intent)
+            .await
+            .is_err());
+        replayed
+            .actions
+            .set_requested_by_for_test(&replay_job, "operator");
+        let replay = replayed
+            .adapter
+            .process_intent(&replayed.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        ));
+        let job = replayed.actions.get(&replay_job).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        replayed.server.abort();
     }
 
     #[tokio::test]
