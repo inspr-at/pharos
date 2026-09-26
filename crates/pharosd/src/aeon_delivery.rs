@@ -1628,43 +1628,6 @@ impl JournalStore {
         Ok(saved)
     }
 
-    fn mark_admit_unresolved(
-        &self,
-        handoff_id: &str,
-        status: StatusCode,
-    ) -> Result<LaunchJournalRecord, AdapterError> {
-        if status != StatusCode::CONFLICT {
-            return Err(AdapterError::Journal);
-        }
-        let mut document = self.document.lock().expect("Aeon delivery journal lock");
-        let existing = document
-            .launches
-            .get(handoff_id)
-            .ok_or(AdapterError::Journal)?
-            .clone();
-        if existing.admission.is_some() || existing.consume_started || existing.receipt.is_some() {
-            return Err(AdapterError::Journal);
-        }
-        if existing.admit_unresolved == Some(status.as_u16()) {
-            return Ok(existing);
-        }
-        if existing.admit_unresolved.is_some() {
-            return Err(AdapterError::Journal);
-        }
-        let mut updated = document.clone();
-        let launch = updated
-            .launches
-            .get_mut(handoff_id)
-            .expect("launch record remains present");
-        launch.admit_unresolved = Some(status.as_u16());
-        let saved = launch.clone();
-        if !saved.valid() {
-            return Err(AdapterError::Journal);
-        }
-        persist_journal(&self.path, &mut document, updated)?;
-        Ok(saved)
-    }
-
     fn acknowledge_consume(
         &self,
         handoff_id: &str,
@@ -2306,6 +2269,14 @@ impl AeonDeliveryAdapter {
                 "Aeon shows the journaled admission consumed; replaying that consume"
             );
         }
+        // A consume that never committed is checked against readiness freshness.
+        // A same-plan refresh is not a contradiction, and an exact replay still
+        // returns the stored receipt.
+        self.refresh_readiness_for_consume(intent).await?;
+        let launch = self
+            .journal
+            .launch(&intent.handoff_id)
+            .ok_or(AdapterError::Journal)?;
         match self.aeon.post_consume(&launch).await {
             Ok(response) => {
                 let receipt = consume_receipt(&response)?;
@@ -2643,6 +2614,44 @@ impl AeonDeliveryAdapter {
         self.journal.clear_launch_block(&intent.handoff_id)
     }
 
+    async fn refresh_readiness_for_consume(
+        &self,
+        intent: &DeliveryIntent,
+    ) -> Result<(), AdapterError> {
+        let Some(existing) = self
+            .journal
+            .evidence_with_kind(&intent.handoff_id, EvidenceKind::LaunchReadiness)
+        else {
+            return Err(AdapterError::Journal);
+        };
+        if existing.receipt.is_none() {
+            self.replay_evidence(intent, &existing).await?;
+        }
+        let current = self
+            .journal
+            .evidence_with_kind(&intent.handoff_id, EvidenceKind::LaunchReadiness)
+            .ok_or(AdapterError::Journal)?;
+        let observed = evidence_string_field(&current.body_json, "observed_at")?;
+        if now_unix().saturating_sub(unix_of(&observed)?) <= READINESS_REFRESH_SECS {
+            return Ok(());
+        }
+        let observed_at = format_timestamp(now_unix())?;
+        let sequence = self.journal.next_sequence(&intent.handoff_id)?;
+        let body = refreshed_readiness_body(&current.body_json, sequence, &observed_at)?;
+        if let Some(reason) = refresh_refusal(&current.body_json, &body)? {
+            return self.block_launch(intent, reason, true);
+        }
+        let record = self.journal.ensure_evidence(EvidenceJournalRecord::new(
+            intent,
+            &self.config.aeon_origin,
+            sequence,
+            EvidenceKind::LaunchReadiness,
+            &body,
+        )?)?;
+        let receipt = self.aeon.post_evidence(&record).await?;
+        self.journal.acknowledge_evidence(&record, receipt)
+    }
+
     async fn send_readiness(
         &self,
         intent: &DeliveryIntent,
@@ -2793,11 +2802,6 @@ impl AeonDeliveryAdapter {
             Ok(admission) => {
                 self.validate_admission(&admission, intent, handoff, reviewed, now_unix())?;
                 self.journal.store_admission(&intent.handoff_id, admission)
-            }
-            Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
-                self.journal
-                    .mark_admit_unresolved(&intent.handoff_id, status)?;
-                Err(AdapterError::LaunchUnresolved)
             }
             Err(error) => Err(error),
         }
@@ -7443,26 +7447,79 @@ mod tests {
                 Some("66666666-6666-4666-8666-666666666666".to_string());
         });
         let replay = other.adapter.process_intent(&other.intent).await;
-        assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
+        assert!(matches!(
+            replay,
+            Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT
+        ));
         assert_eq!(post_count(&other.fake, "/launch/consume"), 0);
         assert_eq!(
             other.actions.get(&other_job).unwrap().state,
             HostActionState::AwaitingConfirmation
         );
-        assert_eq!(
-            other
-                .adapter
-                .journal
-                .launch(DEPLOY_HANDOFF)
-                .unwrap()
-                .admit_unresolved,
-            Some(StatusCode::CONFLICT.as_u16())
-        );
+        assert!(other
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .admit_unresolved
+            .is_none());
         let later = other.adapter.process_intent(&other.intent).await;
-        assert!(matches!(later, Err(AdapterError::LaunchUnresolved)));
-        assert_eq!(post_count(&other.fake, "/launch/admit"), admits_before + 1);
+        assert!(matches!(
+            later,
+            Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT
+        ));
+        assert_eq!(post_count(&other.fake, "/launch/admit"), admits_before + 2);
         assert_eq!(post_count(&other.fake, "/launch/consume"), 0);
         other.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_consume_replay_refreshes_readiness_then_confirms() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let crashed = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(crashed.consume_started);
+        assert!(crashed.receipt.is_none());
+        FrozenNow::set(now + 1000);
+        fixture.fake.update(|inner| inner.now = now + 1000);
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        let readiness = readiness_bodies(&fixture.fake);
+        assert!(readiness.len() >= 2);
+        assert_eq!(
+            readiness[0]["reviewed_plan_digest"],
+            readiness.last().unwrap()["reviewed_plan_digest"]
+        );
+        assert_ne!(
+            readiness[0]["observed_at"],
+            readiness.last().unwrap()["observed_at"]
+        );
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_some());
+        fixture.server.abort();
     }
 
     #[tokio::test]
