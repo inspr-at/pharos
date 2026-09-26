@@ -1859,10 +1859,22 @@ impl Drop for Credentials {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct RequestTrace {
+    method: String,
+    path: String,
+    status: u16,
+    request_id: Option<String>,
+    error_excerpt: Option<String>,
+}
+
 struct AeonClient {
     origin: Url,
     api_key_file: PathBuf,
     client: reqwest::Client,
+    #[cfg(test)]
+    traces: Option<Arc<Mutex<Vec<RequestTrace>>>>,
 }
 
 impl AeonClient {
@@ -1894,7 +1906,45 @@ impl AeonClient {
             origin,
             api_key_file,
             client,
+            #[cfg(test)]
+            traces: None,
         })
+    }
+
+    #[cfg(test)]
+    fn enable_trace(&mut self, traces: Arc<Mutex<Vec<RequestTrace>>>) {
+        self.traces = Some(traces);
+    }
+
+    #[cfg(test)]
+    fn note_exchange(
+        &self,
+        method: &Method,
+        path: &str,
+        status: StatusCode,
+        request_id: Option<String>,
+        body: &[u8],
+    ) {
+        let Some(traces) = &self.traces else {
+            return;
+        };
+        let path = path.split('?').next().unwrap_or(path);
+        let error_excerpt = if status.is_success() {
+            None
+        } else {
+            let end = body.len().min(300);
+            Some(String::from_utf8_lossy(&body[..end]).into_owned())
+        };
+        traces
+            .lock()
+            .expect("Aeon request trace lock")
+            .push(RequestTrace {
+                method: method.as_str().to_string(),
+                path: path.to_string(),
+                status: status.as_u16(),
+                request_id,
+                error_excerpt,
+            });
     }
 
     fn credentials(&self) -> Result<Credentials, AdapterError> {
@@ -2040,6 +2090,8 @@ impl AeonClient {
         idempotency_key: Option<&str>,
         credentials: &Credentials,
     ) -> Result<(StatusCode, Vec<u8>), AdapterError> {
+        #[cfg(test)]
+        let method_name = method.clone();
         let url = self.origin.join(path).map_err(|_| AdapterError::Contract)?;
         let mut authorization = Vec::with_capacity(7 + credentials.api_key.len());
         authorization.extend_from_slice(b"Bearer ");
@@ -2062,13 +2114,30 @@ impl AeonClient {
             builder = builder.header(CONTENT_TYPE, JSON_MEDIA).body(body.to_vec());
         }
         let response = builder.send().await.map_err(|_| AdapterError::Transport)?;
+        let status = response.status();
+        #[cfg(test)]
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         if response.headers().contains_key(CONTENT_ENCODING) {
+            #[cfg(test)]
+            self.note_exchange(&method_name, path, status, request_id, &[]);
             return Err(AdapterError::Contract);
         }
         reject_reflected_headers(response.headers(), credentials)?;
         let media_ok = response_media_json(response.headers());
-        let status = response.status();
-        let bytes = bounded_body(response).await?;
+        let bytes = match bounded_body(response).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                #[cfg(test)]
+                self.note_exchange(&method_name, path, status, request_id, &[]);
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        self.note_exchange(&method_name, path, status, request_id, &bytes);
         reject_reflected_bytes(&bytes, credentials)?;
         if status.is_success() && !media_ok {
             return Err(AdapterError::Contract);
@@ -4337,6 +4406,7 @@ mod tests {
         Response::builder()
             .status(status)
             .header(CONTENT_TYPE.as_str(), JSON_MEDIA)
+            .header("x-request-id", "fake-aeon-request")
             .body(Body::from(serde_json::to_vec(value).unwrap()))
             .unwrap()
     }
@@ -5069,16 +5139,20 @@ mod tests {
     }
 
     fn review_job(store: &HostActionStore, job_id: &str, at: i64) {
+        review_job_for(store, "hsb8", job_id, at);
+    }
+
+    fn review_job_for(store: &HostActionStore, host: &str, job_id: &str, at: i64) {
         let review = store
-            .claim("hsb8", at)
+            .claim(host, at)
             .expect("claim review")
             .expect("review lease");
         store
             .record_agent_result(
                 job_id,
-                "hsb8",
+                host,
                 AgentActionResultRequest {
-                    host: "hsb8".to_string(),
+                    host: host.to_string(),
                     phase: review.phase,
                     outcome: AgentActionOutcome::Succeeded,
                     plan: Some(ready_plan()),
@@ -5112,17 +5186,21 @@ mod tests {
     }
 
     fn finish_apply(store: &HostActionStore, job_id: &str, at: i64) {
+        finish_apply_for(store, "hsb8", job_id, at);
+    }
+
+    fn finish_apply_for(store: &HostActionStore, host: &str, job_id: &str, at: i64) {
         let apply = store
-            .claim("hsb8", at)
+            .claim(host, at)
             .expect("claim apply")
             .expect("apply lease");
         assert_eq!(apply.phase, AgentActionPhase::Apply);
         store
             .record_agent_result(
                 job_id,
-                "hsb8",
+                host,
                 AgentActionResultRequest {
-                    host: "hsb8".to_string(),
+                    host: host.to_string(),
                     phase: apply.phase,
                     outcome: AgentActionOutcome::Succeeded,
                     plan: None,
@@ -5142,10 +5220,18 @@ mod tests {
     }
 
     fn measured(artifact: &ArtifactEvidence, observed_at: i64) -> DeployedArtifactEvidence {
+        measured_for("production-eu1", artifact, observed_at)
+    }
+
+    fn measured_for(
+        environment: &str,
+        artifact: &ArtifactEvidence,
+        observed_at: i64,
+    ) -> DeployedArtifactEvidence {
         DeployedArtifactEvidence {
             schema: DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
             version: DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
-            environment: "production-eu1".to_string(),
+            environment: environment.to_string(),
             version_scheme: artifact.version_scheme,
             artifact_version: artifact.version.clone(),
             release_channel: artifact.release_channel.clone(),
@@ -5164,6 +5250,24 @@ mod tests {
 
     fn record_beacon(store: &Store, observed_at: i64, artifact: &ArtifactEvidence) {
         record_host(store, observed_at, artifact, None);
+    }
+
+    fn record_beacon_for(
+        store: &Store,
+        host: &str,
+        environment: &str,
+        observed_at: i64,
+        artifact: &ArtifactEvidence,
+        backup_success_at: Option<i64>,
+    ) {
+        record_named_host(
+            store,
+            host,
+            environment,
+            observed_at,
+            artifact,
+            backup_success_at,
+        );
     }
 
     fn record_backup(store: &Store, success_at: i64) {
@@ -5200,12 +5304,30 @@ mod tests {
         artifact: &ArtifactEvidence,
         backup_success_at: Option<i64>,
     ) {
+        record_named_host(
+            store,
+            "hsb8",
+            "production-eu1",
+            observed_at,
+            artifact,
+            backup_success_at,
+        );
+    }
+
+    fn record_named_host(
+        store: &Store,
+        host: &str,
+        environment: &str,
+        observed_at: i64,
+        artifact: &ArtifactEvidence,
+        backup_success_at: Option<i64>,
+    ) {
         store
             .record(
                 HostReport {
                     schema: HOST_REPORT_SCHEMA.to_string(),
                     version: HOST_REPORT_VERSION,
-                    name: "hsb8".to_string(),
+                    name: host.to_string(),
                     role: "server".to_string(),
                     is_nix: true,
                     heartbeat_interval_secs: 60,
@@ -5231,7 +5353,7 @@ mod tests {
                     inbound_rtt_ms: None,
                     location: None,
                     preferences: Default::default(),
-                    deployed_artifact: Some(measured(artifact, observed_at)),
+                    deployed_artifact: Some(measured_for(environment, artifact, observed_at)),
                 },
                 observed_at,
             )
@@ -7827,5 +7949,531 @@ mod tests {
             ResultOutcome::Succeeded
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_trace_records_status_and_request_id_only() {
+        let mut fixture = harness(false).await;
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        fixture.adapter.aeon.enable_trace(Arc::clone(&traces));
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let recorded = traces.lock().expect("traces").clone();
+        assert!(recorded.iter().any(|trace| {
+            trace.method == "GET"
+                && trace.path.starts_with("/api/stage-handoffs/")
+                && !trace.path.contains('?')
+                && trace.status == 200
+                && trace.request_id.as_deref() == Some("fake-aeon-request")
+                && trace.error_excerpt.is_none()
+        }));
+        let rendered = format!("{recorded:?}");
+        assert_no_key(rendered.as_bytes());
+        assert!(!rendered.contains("authorization"));
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "live Aeon roundtrip; set PHAROS_AEON_LIVE_ACK=disposable"]
+    async fn live_roundtrip_against_aeon() {
+        let Some(live) = live_roundtrip_env() else {
+            eprintln!("live Aeon roundtrip skipped: PHAROS_AEON_LIVE_ORIGIN is unset");
+            return;
+        };
+        let directory = TestDir::new("live-roundtrip");
+        let journal = directory
+            .path()
+            .join("hosts.json.aeon-delivery-journal.json");
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let actions = Arc::new(HostActionStore::new(None));
+        let mut intents = vec![live.deploy.clone()];
+        if let Some(verify) = &live.verify {
+            intents.push(verify.clone());
+        }
+        let mut adapter = test_adapter(
+            runtime_config(live.origin.clone(), live.key_file.clone(), intents),
+            journal.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        );
+        adapter.aeon.enable_trace(Arc::clone(&traces));
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(90);
+        let now = now_unix();
+        record_beacon_for(
+            &hosts,
+            &live.host,
+            &live.environment,
+            now,
+            &live.artifact,
+            Some(now),
+        );
+        live_step(&adapter, &live.deploy, &traces, &live.report).await;
+        let job_id = actions
+            .list()
+            .into_iter()
+            .find(|job| job.kind == HostActionKind::UpdateRestart)
+            .expect("adapter created the update review")
+            .id;
+        assert_eq!(
+            actions.get(&job_id).unwrap().requested_by,
+            ACTOR,
+            "the adapter must create the job through ensure_update_review_with_id"
+        );
+        review_job_for(&actions, &live.host, &job_id, now_unix());
+        live_until(
+            &adapter,
+            &live.deploy,
+            &traces,
+            &live.report,
+            deadline,
+            || {
+                let launch = adapter.journal.launch(&live.deploy.handoff_id);
+                let readiness = adapter
+                    .journal
+                    .evidence_with_kind(&live.deploy.handoff_id, EvidenceKind::LaunchReadiness);
+                launch.is_some_and(|launch| launch.admission.is_some() && launch.receipt.is_some())
+                    && readiness.is_some_and(|row| row.receipt.is_some())
+                    && actions.get(&job_id).unwrap().confirmed_at.is_some()
+            },
+        )
+        .await;
+        let confirmed = actions.get(&job_id).unwrap();
+        assert_eq!(confirmed.state, HostActionState::QueuedApply);
+        finish_apply_for(
+            &actions,
+            &live.host,
+            &job_id,
+            now_unix().max(confirmed.updated_at),
+        );
+        live_until(
+            &adapter,
+            &live.deploy,
+            &traces,
+            &live.report,
+            deadline,
+            || {
+                let applied = actions.get(&job_id).unwrap();
+                let stamp = now_unix().max(applied.updated_at.saturating_add(1));
+                record_beacon_for(
+                    &hosts,
+                    &live.host,
+                    &live.environment,
+                    stamp,
+                    &live.artifact,
+                    None,
+                );
+                let deployment = adapter
+                    .journal
+                    .evidence_with_kind(&live.deploy.handoff_id, EvidenceKind::Deployment);
+                let result = adapter.journal.result(&live.deploy.handoff_id);
+                deployment.is_some_and(|row| row.receipt.is_some())
+                    && result.is_some_and(|row| {
+                        row.receipt
+                            .is_some_and(|receipt| receipt.outcome == ResultOutcome::Succeeded)
+                    })
+            },
+        )
+        .await;
+        if let Some(verify) = &live.verify {
+            let result = adapter.journal.result(&live.deploy.handoff_id).unwrap();
+            let anchor = unix_of(&result.receipt.unwrap().completed_at).unwrap();
+            record_beacon_for(
+                &hosts,
+                &live.host,
+                &live.environment,
+                now_unix().max(anchor.saturating_add(1)),
+                &live.artifact,
+                None,
+            );
+            live_until(&adapter, verify, &traces, &live.report, deadline, || {
+                let evidence = adapter
+                    .journal
+                    .evidence_with_kind(&verify.handoff_id, EvidenceKind::Verification);
+                let result = adapter.journal.result(&verify.handoff_id);
+                evidence.is_some_and(|row| row.receipt.is_some())
+                    && result.is_some_and(|row| {
+                        row.receipt
+                            .is_some_and(|receipt| receipt.outcome == ResultOutcome::Succeeded)
+                    })
+            })
+            .await;
+        }
+        let mut handoffs = vec![live_handoff_state(&adapter, &live.deploy.handoff_id).await];
+        if let Some(verify) = &live.verify {
+            handoffs.push(live_handoff_state(&adapter, &verify.handoff_id).await);
+        }
+        let report = live_report(&live, &adapter, &journal, &traces, &handoffs, started);
+        std::fs::write(&live.report, serde_json::to_vec_pretty(&report).unwrap())
+            .expect("write live report");
+        let report_bytes = std::fs::read(&live.report).unwrap();
+        let journal_bytes = std::fs::read(&journal).unwrap();
+        assert_no_key(&report_bytes);
+        assert_live_bytes_exclude_key(&report_bytes, &live.key_file);
+        assert_live_bytes_exclude_key(&journal_bytes, &live.key_file);
+        println!("live Aeon roundtrip report: {}", live.report.display());
+    }
+
+    struct LiveRoundtrip {
+        origin: Url,
+        key_file: PathBuf,
+        host: String,
+        environment: String,
+        artifact: ArtifactEvidence,
+        deploy: DeliveryIntent,
+        verify: Option<DeliveryIntent>,
+        report: PathBuf,
+    }
+
+    fn live_roundtrip_env() -> Option<LiveRoundtrip> {
+        let Ok(origin_text) = std::env::var("PHAROS_AEON_LIVE_ORIGIN") else {
+            return None;
+        };
+        if origin_text.trim().is_empty() {
+            return None;
+        }
+        let ack = std::env::var("PHAROS_AEON_LIVE_ACK").unwrap_or_default();
+        if ack != "disposable" {
+            panic!("live Aeon roundtrip refused: set PHAROS_AEON_LIVE_ACK=disposable");
+        }
+        let origin =
+            parse_origin(origin_text.trim()).expect("PHAROS_AEON_LIVE_ORIGIN https origin");
+        let key_file = required_live_path("PHAROS_AEON_LIVE_KEY_FILE");
+        let project = required_live_uuid("PHAROS_AEON_LIVE_PROJECT_NODE_ID");
+        let release = required_live_uuid("PHAROS_AEON_LIVE_RELEASE_NODE_ID");
+        let deploy_handoff = required_live_uuid("PHAROS_AEON_LIVE_DEPLOY_HANDOFF");
+        let verify_handoff = std::env::var("PHAROS_AEON_LIVE_VERIFY_HANDOFF")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let host =
+            std::env::var("PHAROS_AEON_LIVE_HOST").unwrap_or_else(|_| "lab-roundtrip".to_string());
+        let environment =
+            std::env::var("PHAROS_AEON_LIVE_ENVIRONMENT").unwrap_or_else(|_| "lab".to_string());
+        assert!(
+            valid_host(&host),
+            "PHAROS_AEON_LIVE_HOST is not a host name"
+        );
+        assert!(
+            valid_symbol(&environment),
+            "PHAROS_AEON_LIVE_ENVIRONMENT is not a symbol"
+        );
+        let artifact_json = std::env::var("PHAROS_AEON_LIVE_ARTIFACT_JSON").unwrap_or_default();
+        assert!(
+            !artifact_json.trim().is_empty(),
+            "live Aeon roundtrip missing PHAROS_AEON_LIVE_ARTIFACT_JSON"
+        );
+        let artifact: ArtifactEvidence = serde_json::from_str(&artifact_json)
+            .unwrap_or_else(|_| panic!("PHAROS_AEON_LIVE_ARTIFACT_JSON is not ArtifactEvidence"));
+        assert!(artifact.valid(), "live artifact is not valid evidence");
+        assert!(
+            valid_prefixed_sha256(&artifact.digest),
+            "live artifact digest must be sha256-prefixed"
+        );
+        let report = required_live_path("PHAROS_AEON_LIVE_REPORT");
+        let shared = LiveShared {
+            project: &project,
+            release: &release,
+            host: &host,
+            environment: &environment,
+            artifact: &artifact,
+        };
+        let deploy = live_intent(
+            &deploy_handoff,
+            &shared,
+            Operation::Deploy,
+            GuardedWorkflow::DeployProduction,
+            None,
+        );
+        let verify = verify_handoff.map(|handoff| {
+            assert!(
+                valid_uuid(handoff.trim()),
+                "PHAROS_AEON_LIVE_VERIFY_HANDOFF is not a uuid"
+            );
+            assert_ne!(handoff.trim(), deploy_handoff);
+            live_intent(
+                handoff.trim(),
+                &shared,
+                Operation::Verify,
+                GuardedWorkflow::VerifyProduction,
+                Some(deploy_handoff.clone()),
+            )
+        });
+        Some(LiveRoundtrip {
+            origin,
+            key_file,
+            host,
+            environment,
+            artifact,
+            deploy,
+            verify,
+            report,
+        })
+    }
+
+    fn required_live_path(name: &str) -> PathBuf {
+        let value = std::env::var(name).unwrap_or_default();
+        assert!(
+            !value.trim().is_empty(),
+            "live Aeon roundtrip missing {name}"
+        );
+        PathBuf::from(value.trim())
+    }
+
+    fn required_live_uuid(name: &str) -> String {
+        let value = std::env::var(name).unwrap_or_default();
+        let value = value.trim().to_string();
+        assert!(
+            valid_uuid(&value),
+            "live Aeon roundtrip missing or invalid {name}"
+        );
+        value
+    }
+
+    struct LiveShared<'a> {
+        project: &'a str,
+        release: &'a str,
+        host: &'a str,
+        environment: &'a str,
+        artifact: &'a ArtifactEvidence,
+    }
+
+    fn live_intent(
+        handoff_id: &str,
+        shared: &LiveShared<'_>,
+        operation: Operation,
+        workflow: GuardedWorkflow,
+        deployment_handoff_id: Option<String>,
+    ) -> DeliveryIntent {
+        DeliveryIntent {
+            handoff_id: handoff_id.to_string(),
+            project_node_id: shared.project.to_string(),
+            release_node_id: shared.release.to_string(),
+            operation,
+            workflow,
+            environment: shared.environment.to_string(),
+            host: shared.host.to_string(),
+            artifact: shared.artifact.clone(),
+            update_restart_job_id: None,
+            deployment_handoff_id,
+            delegated_launch: matches!(operation, Operation::Deploy).then(|| {
+                DelegatedLaunchSelection {
+                    target_ref: shared.artifact.digest.clone(),
+                }
+            }),
+        }
+    }
+
+    async fn live_step(
+        adapter: &AeonDeliveryAdapter,
+        intent: &DeliveryIntent,
+        traces: &Arc<Mutex<Vec<RequestTrace>>>,
+        report: &Path,
+    ) {
+        if let Err(error) = adapter.process_intent(intent).await {
+            let message = format!("{} ({})", live_failure(traces), error.code());
+            save_live_failure(report, traces, &message);
+            panic!("{message}");
+        }
+    }
+
+    async fn live_until(
+        adapter: &AeonDeliveryAdapter,
+        intent: &DeliveryIntent,
+        traces: &Arc<Mutex<Vec<RequestTrace>>>,
+        report: &Path,
+        deadline: std::time::Instant,
+        mut ready: impl FnMut() -> bool,
+    ) {
+        loop {
+            if std::time::Instant::now() >= deadline {
+                let message = format!("live Aeon roundtrip exceeded 90s: {}", live_failure(traces));
+                save_live_failure(report, traces, &message);
+                panic!("{message}");
+            }
+            live_step(adapter, intent, traces, report).await;
+            if ready() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    fn save_live_failure(report: &Path, traces: &Arc<Mutex<Vec<RequestTrace>>>, message: &str) {
+        let body = json!({
+            "failed": true,
+            "reason": message,
+            "requests": live_trace_rows(traces),
+        });
+        if std::fs::write(report, serde_json::to_vec_pretty(&body).unwrap_or_default()).is_ok() {
+            eprintln!("live Aeon roundtrip report: {}", report.display());
+        }
+    }
+
+    fn live_trace_rows(traces: &Arc<Mutex<Vec<RequestTrace>>>) -> Vec<Value> {
+        traces
+            .lock()
+            .expect("traces")
+            .iter()
+            .map(|trace| {
+                json!({
+                    "method": trace.method,
+                    "path": trace.path,
+                    "status": trace.status,
+                    "request_id": trace.request_id,
+                })
+            })
+            .collect()
+    }
+
+    fn live_failure(traces: &Arc<Mutex<Vec<RequestTrace>>>) -> String {
+        let recorded = traces.lock().expect("traces");
+        let Some(trace) = recorded.iter().rev().find(|trace| trace.status >= 400) else {
+            return "no Aeon error status recorded".to_string();
+        };
+        let (code, reason) = live_error_parts(trace.error_excerpt.as_deref().unwrap_or(""));
+        format!(
+            "Aeon {} {} status {} request_id {} code {} reason {}",
+            trace.method,
+            trace.path,
+            trace.status,
+            trace.request_id.as_deref().unwrap_or(""),
+            code,
+            reason
+        )
+    }
+
+    fn live_error_parts(excerpt: &str) -> (String, String) {
+        let Ok(value) = serde_json::from_str::<Value>(excerpt) else {
+            return (String::new(), excerpt.chars().take(300).collect());
+        };
+        let code = value
+            .get("code")
+            .map(|item| match item {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+        let reason = value
+            .get("reason")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("error").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        (code, reason)
+    }
+
+    async fn live_handoff_state(adapter: &AeonDeliveryAdapter, handoff_id: &str) -> Value {
+        let handoff = match adapter.aeon.get_handoff(handoff_id).await {
+            Ok(handoff) => handoff,
+            Err(error) => panic!(
+                "{} ({})",
+                live_failure(&adapter.aeon.traces.clone().expect("request trace")),
+                error.code()
+            ),
+        };
+        json!({
+            "id": handoff.id,
+            "state": handoff.state.key(),
+        })
+    }
+
+    fn live_report(
+        live: &LiveRoundtrip,
+        adapter: &AeonDeliveryAdapter,
+        journal: &Path,
+        traces: &Arc<Mutex<Vec<RequestTrace>>>,
+        handoffs: &[Value],
+        started: std::time::Instant,
+    ) -> Value {
+        let launch = adapter.journal.launch(&live.deploy.handoff_id).unwrap();
+        let admission = launch.admission.unwrap();
+        let receipt = launch.receipt.unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
+        let mut evidence: Vec<Value> = saved["records"]
+            .as_object()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        evidence.sort_by_key(|row| row["sequence"].as_i64().unwrap_or(0));
+        let mut evidence_cursor = 0usize;
+        let mut results: Vec<Value> = saved["results"]
+            .as_object()
+            .map(|rows| rows.values().cloned().collect())
+            .unwrap_or_default();
+        results.sort_by_key(|row| row["terminal_sequence"].as_i64().unwrap_or(0));
+        let mut result_cursor = 0usize;
+        let requests: Vec<Value> = traces
+            .lock()
+            .expect("traces")
+            .iter()
+            .map(|trace| {
+                let mut item = json!({
+                    "method": trace.method,
+                    "path": trace.path,
+                    "status": trace.status,
+                    "request_id": trace.request_id,
+                });
+                if trace.path.ends_with("/evidence") {
+                    if let Some(row) = evidence.get(evidence_cursor) {
+                        item["sequence"] = row["sequence"].clone();
+                        item["receipt_id"] = json!(format!(
+                            "{}:{}",
+                            row["handoff_id"].as_str().unwrap_or(""),
+                            row["sequence"].as_i64().unwrap_or(0)
+                        ));
+                        evidence_cursor += 1;
+                    }
+                } else if trace.path.ends_with("/launch/admit")
+                    || trace.path.ends_with("/launch/consume")
+                {
+                    item["receipt_id"] = json!(admission.id);
+                } else if trace.path.ends_with("/result") {
+                    if let Some(row) = results.get(result_cursor) {
+                        item["sequence"] = row["terminal_sequence"].clone();
+                        item["receipt_id"] = json!(format!(
+                            "{}:{}",
+                            row["handoff_id"].as_str().unwrap_or(""),
+                            row["terminal_sequence"].as_i64().unwrap_or(0)
+                        ));
+                        result_cursor += 1;
+                    }
+                }
+                item
+            })
+            .collect();
+        json!({
+            "origin": live.origin.as_str(),
+            "host": live.host,
+            "environment": live.environment,
+            "deploy_handoff": live.deploy.handoff_id,
+            "verify_handoff": live.verify.as_ref().map(|intent| intent.handoff_id.clone()),
+            "requests": requests,
+            "handoffs": handoffs,
+            "admission_id": admission.id,
+            "binding_digest": admission.binding_digest_sha256,
+            "consume_receipt": {
+                "handoff_id": receipt.handoff_id,
+                "admission_id": receipt.admission_id,
+                "consumed": receipt.consumed,
+                "consumed_at": receipt.consumed_at,
+            },
+            "timestamps": {
+                "started_at": format_timestamp(now_unix().saturating_sub(started.elapsed().as_secs() as i64)).unwrap(),
+                "finished_at": format_timestamp(now_unix()).unwrap(),
+            },
+        })
+    }
+
+    fn assert_live_bytes_exclude_key(bytes: &[u8], key_file: &Path) {
+        let (mut key, _) = read_private_file(key_file, MAX_API_KEY_BYTES, None).expect("live key");
+        let leaked = !key.is_empty() && contains_slice(bytes, &key);
+        key.fill(0);
+        assert!(!leaked, "live output contains the api key");
     }
 }
