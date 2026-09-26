@@ -19,6 +19,7 @@
 - Withhold a reflected API key from Aeon delivery traces, panic text, and the live roundtrip report (PHAROS-313).
 - Refuse the live Aeon roundtrip unless the journey project key, tenant, and handoff release match the disposable target named in the environment (PHAROS-313).
 - Refuse to confirm a recovered Aeon launch when the handoff is no longer open or its authority no longer matches the journaled admission (PHAROS-313).
+- Recheck the backup success gate before a consume replay refreshes launch readiness (PHAROS-313).
 
 ## 260922141211.0.0 - 2026-09-22
 

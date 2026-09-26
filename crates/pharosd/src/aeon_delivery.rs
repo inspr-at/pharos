@@ -3071,7 +3071,8 @@ impl AeonDeliveryAdapter {
         if now_unix().saturating_sub(unix_of(&observed)?) <= READINESS_REFRESH_SECS {
             return Ok(());
         }
-        let observed_at = format_timestamp(now_unix())?;
+        let now = now_unix();
+        let observed_at = format_timestamp(now)?;
         let sequence = self.journal.next_sequence(&intent.handoff_id)?;
         let launch = self
             .journal
@@ -3082,14 +3083,26 @@ impl AeonDeliveryAdapter {
             .get(&launch.job_id)
             .ok_or(AdapterError::LocalBinding)?;
         let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
+        let host = self.hosts.get(&intent.host);
+        let backup_at = backup_stamp(host.as_ref());
+        let posted_backup = match validated_readiness_backup(plan, backup_at.as_deref(), now) {
+            Ok(stamp) => stamp.to_string(),
+            Err(reason) => return self.block_launch(intent, reason, false),
+        };
         let reviewed = bare_plan_digest(&reviewed_plan_digest(&job).map_err(map_shared)?)?;
-        let body = readiness_refresh_candidate(
+        let mut value: serde_json::Value = decode_strict(&readiness_refresh_candidate(
             &current.body_json,
             sequence,
             &observed_at,
             &reviewed,
             plan,
-        )?;
+        )?)?;
+        value.as_object_mut().ok_or(AdapterError::Contract)?.insert(
+            "backup_observed_at".to_string(),
+            serde_json::Value::String(posted_backup),
+        );
+        let body = serde_json::to_vec(&value).map_err(|_| AdapterError::Contract)?;
+        self.journal.clear_launch_block(&intent.handoff_id)?;
         if let Some(reason) = refresh_refusal(&current.body_json, &body)? {
             return self.block_launch(intent, reason, true);
         }
@@ -8969,6 +8982,58 @@ mod tests {
             .unwrap()
             .receipt
             .is_some());
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consume_replay_does_not_refresh_after_the_backup_success_disappears() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let consumes = post_count(&fixture.fake, "/launch/consume");
+        let readiness = readiness_post_count(&fixture.fake);
+        FrozenNow::set(now + 1000);
+        fixture.fake.update(|inner| inner.now = now + 1000);
+        record_host(&fixture.hosts, now + 1000, &fixture.intent.artifact, None);
+        let replay = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING)
+        ));
+        assert_eq!(post_count(&fixture.fake, "/launch/consume"), consumes);
+        assert_eq!(readiness_post_count(&fixture.fake), readiness);
+        let block = fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .unwrap();
+        assert_eq!(block.reason, LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING);
+        assert!(!block.terminal);
+        assert!(fixture
+            .adapter
+            .journal
+            .launch(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_none());
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
         fixture.server.abort();
     }
 
