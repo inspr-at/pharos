@@ -2729,7 +2729,7 @@ impl AeonDeliveryAdapter {
                 .await
             }
             Ok(None) => Ok(()),
-            Err(_) => {
+            Err(_) if config_measurement_mismatches(host.as_ref(), intent) => {
                 self.write_observation(
                     intent,
                     handoff,
@@ -2739,6 +2739,7 @@ impl AeonDeliveryAdapter {
                 )
                 .await
             }
+            Err(error) => Err(map_shared(error)),
         }
     }
 
@@ -2948,6 +2949,28 @@ fn refreshed_readiness_body(
         serde_json::Value::String(observed_at.to_string()),
     );
     serde_json::to_vec(&value).map_err(|_| AdapterError::Contract)
+}
+
+fn config_measurement_mismatches(
+    host: Option<&pharos_core::Host>,
+    intent: &DeliveryIntent,
+) -> bool {
+    let Some(evidence) = host.and_then(|host| host.deployed_artifact.as_ref()) else {
+        return false;
+    };
+    let artifact = &intent.artifact;
+    evidence.is_config_class_measurement()
+        && !evidence.matches_expected(
+            &intent.environment,
+            artifact.version_scheme,
+            &artifact.version,
+            &artifact.release_channel,
+            artifact.release_sequence,
+            &artifact.digest,
+            &artifact.commit_digest,
+            &artifact.release_manifest_coordinate,
+            &artifact.release_manifest_digest,
+        )
 }
 
 fn handoff_result_matches(result: &HandoffResult, body: &str, handoff_id: &str) -> bool {
@@ -4703,6 +4726,44 @@ mod tests {
             .expect("record host");
     }
 
+    fn record_deployed(store: &Store, observed_at: i64, evidence: DeployedArtifactEvidence) {
+        let artifact = artifact();
+        store
+            .record(
+                HostReport {
+                    schema: HOST_REPORT_SCHEMA.to_string(),
+                    version: HOST_REPORT_VERSION,
+                    name: "hsb8".to_string(),
+                    role: "server".to_string(),
+                    is_nix: true,
+                    heartbeat_interval_secs: 60,
+                    freshness: NixFreshness {
+                        applicable: true,
+                        nixpkgs_channel: Some("nixos-unstable".to_string()),
+                        deployment_evidence: Some(NixDeploymentEvidence {
+                            schema: NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+                            version: NIX_DEPLOYMENT_EVIDENCE_VERSION,
+                            source_revision: artifact.commit_digest.clone(),
+                            flake_lock_sha256: "1".repeat(64),
+                            nixpkgs_revision: "b".repeat(40),
+                            nixpkgs_last_modified: observed_at - 100,
+                            nixpkgs_channel: "nixos-unstable".to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                    kernel: None,
+                    service_observations: vec![],
+                    backup_observations: vec![],
+                    inbound_rtt_ms: None,
+                    location: None,
+                    preferences: Default::default(),
+                    deployed_artifact: Some(evidence),
+                },
+                observed_at,
+            )
+            .expect("record deployed artifact");
+    }
+
     fn fake_now(fake: &FakeAeon) -> i64 {
         fake.update(|inner| inner.now)
     }
@@ -5686,6 +5747,88 @@ mod tests {
             .iter()
             .all(|capture| !capture.path.contains(VERIFY_HANDOFF)));
         sealed.server.abort();
+    }
+
+    fn arm_recorded_deploy(sealed: &SealedDeploy) {
+        let receipt = sealed
+            .adapter
+            .journal
+            .result(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .unwrap();
+        let seal = dependency_digest(DEPLOY_HANDOFF, "deployment", receipt.terminal_sequence);
+        arm_verify_seal(&sealed.fake, &seal, 11);
+    }
+
+    #[tokio::test]
+    async fn verify_mismatch_fails_and_an_unreadable_beacon_is_not_terminal() {
+        let mismatched = sealed_deploy().await;
+        arm_recorded_deploy(&mismatched);
+        let mut evidence = measured(&artifact(), now_unix() + 1);
+        evidence.artifact_version = "9.9.9".to_string();
+        record_deployed(&mismatched.hosts, now_unix() + 1, evidence);
+        mismatched
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        let failed: Value = posts(&mismatched.fake)
+            .into_iter()
+            .find(|capture| {
+                capture.path.contains(VERIFY_HANDOFF) && capture.path.ends_with("/evidence")
+            })
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(failed["outcome"], "failed");
+        let result: Value = posts(&mismatched.fake)
+            .into_iter()
+            .find(|capture| {
+                capture.path.contains(VERIFY_HANDOFF) && capture.path.ends_with("/result")
+            })
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(result["blocker_code"], "dependency_failed");
+        mismatched
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        assert_eq!(
+            posts(&mismatched.fake)
+                .iter()
+                .filter(|capture| {
+                    capture.path.contains(VERIFY_HANDOFF) && capture.path.ends_with("/evidence")
+                })
+                .count(),
+            1
+        );
+        mismatched.server.abort();
+
+        let unreadable = sealed_deploy().await;
+        arm_recorded_deploy(&unreadable);
+        let mut evidence = measured(&artifact(), now_unix() + 1);
+        evidence.digest_class = ArtifactDigestClass::OciManifest;
+        evidence.oci_config_digest = None;
+        evidence.oci_manifest_digest = Some(evidence.digest.clone());
+        record_deployed(&unreadable.hosts, now_unix() + 1, evidence);
+        let error = unreadable
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::LocalBinding));
+        assert!(unreadable
+            .adapter
+            .journal
+            .evidence_with_kind(VERIFY_HANDOFF, EvidenceKind::Verification)
+            .is_none());
+        let again = unreadable.adapter.process_intent(&verify_intent()).await;
+        assert!(matches!(again, Err(AdapterError::LocalBinding)));
+        assert!(posts(&unreadable.fake)
+            .iter()
+            .all(|capture| !capture.path.contains(VERIFY_HANDOFF)));
+        unreadable.server.abort();
     }
 
     #[tokio::test]
