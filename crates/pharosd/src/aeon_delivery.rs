@@ -2425,23 +2425,17 @@ impl AeonDeliveryAdapter {
         intent: &DeliveryIntent,
         error: AdapterError,
     ) -> Result<(), AdapterError> {
-        if matches!(
-            error,
-            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED)
-        ) {
-            self.report_confirmation_not_delegated(intent).await?;
-        }
-        if matches!(
-            error,
-            AdapterError::LaunchBlocked(LAUNCH_BLOCK_ADMISSION_EXPIRED)
-        ) {
-            self.report_admission_expired(intent).await?;
-        }
-        if matches!(
-            error,
-            AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
-        ) {
-            self.report_authority_closed(intent).await?;
+        // Crash recovery returns here before maybe_report. A later poll stops
+        // at reject_terminal_block and lands here again, so this is the post.
+        if let AdapterError::LaunchBlocked(reason) = error {
+            if self
+                .journal
+                .launch_block(&intent.handoff_id)
+                .is_some_and(|block| block.terminal && block.reason == reason)
+            {
+                self.report_terminal_launch_block(intent, reason).await?;
+            }
+            return Err(AdapterError::LaunchBlocked(reason));
         }
         Err(error)
     }
@@ -2557,24 +2551,34 @@ impl AeonDeliveryAdapter {
         self.finish_confirmation(intent, &launch, "")
     }
 
-    async fn report_confirmation_not_delegated(
+    async fn report_terminal_launch_block(
         &self,
         intent: &DeliveryIntent,
+        reason: &'static str,
     ) -> Result<(), AdapterError> {
+        if self
+            .journal
+            .result(&intent.handoff_id)
+            .is_some_and(|record| record.receipt.is_some())
+        {
+            return Ok(());
+        }
         let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
-        if handoff.state.is_open() {
-            handoff.open_for_write()?;
+        if stamp_passed(&handoff.expires_at)? || handoff.result.is_some() {
+            return Ok(());
         }
-        let blocker = aeon_blocker_for_reason(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED)
-            .ok_or(AdapterError::Journal)?;
+        if reason == LAUNCH_BLOCK_ADMISSION_EXPIRED {
+            return self.report_admission_expired(intent).await;
+        }
+        let blocker = aeon_blocker_for_reason(reason).ok_or(AdapterError::Journal)?;
         self.write_observation(
             intent,
             &handoff,
             EvidenceOutcome::Failed,
             now_unix(),
             Some(blocker),
-            Some(LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED),
+            Some(reason),
         )
         .await
     }
@@ -2638,32 +2642,6 @@ impl AeonDeliveryAdapter {
             return Ok(());
         }
         self.block_launch(intent, LAUNCH_BLOCK_AUTHORITY_CLOSED, true)
-    }
-
-    async fn report_authority_closed(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
-        if self
-            .journal
-            .result(&intent.handoff_id)
-            .is_some_and(|record| record.receipt.is_some())
-        {
-            return Ok(());
-        }
-        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
-        handoff.validate(intent)?;
-        if stamp_passed(&handoff.expires_at)? || handoff.result.is_some() {
-            return Ok(());
-        }
-        let blocker =
-            aeon_blocker_for_reason(LAUNCH_BLOCK_AUTHORITY_CLOSED).ok_or(AdapterError::Journal)?;
-        self.write_observation(
-            intent,
-            &handoff,
-            EvidenceOutcome::Failed,
-            now_unix(),
-            Some(blocker),
-            Some(LAUNCH_BLOCK_AUTHORITY_CLOSED),
-        )
-        .await
     }
 
     fn reject_terminal_block(&self, handoff_id: &str) -> Result<(), AdapterError> {
@@ -3459,20 +3437,7 @@ impl AeonDeliveryAdapter {
         if let Some(block) = self.journal.launch_block(&intent.handoff_id) {
             if block.terminal {
                 let reason = launch_block_reason(&block.reason).ok_or(AdapterError::Journal)?;
-                if reason == LAUNCH_BLOCK_ADMISSION_EXPIRED {
-                    return self.report_admission_expired(intent).await;
-                }
-                let blocker = aeon_blocker_for_reason(reason).ok_or(AdapterError::Journal)?;
-                return self
-                    .write_observation(
-                        intent,
-                        handoff,
-                        EvidenceOutcome::Failed,
-                        now_unix(),
-                        Some(blocker),
-                        Some(reason),
-                    )
-                    .await;
+                return self.report_terminal_launch_block(intent, reason).await;
             }
         }
         match job.state {
@@ -3481,6 +3446,10 @@ impl AeonDeliveryAdapter {
                     .journal
                     .launch_block(&intent.handoff_id)
                     .map(|block| block.reason);
+                let blocker = detail
+                    .as_deref()
+                    .and_then(aeon_blocker_for_reason)
+                    .unwrap_or(BlockerCode::DependencyFailed);
                 // Aeon rejects evidence observed more than a minute before the
                 // handoff was created (report.go). The job clock can be older
                 // than that, and a 409 on those bytes would replay forever.
@@ -3489,7 +3458,7 @@ impl AeonDeliveryAdapter {
                     handoff,
                     EvidenceOutcome::Failed,
                     now_unix(),
-                    Some(BlockerCode::DependencyFailed),
+                    Some(blocker),
                     detail.as_deref(),
                 )
                 .await
@@ -9512,6 +9481,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_after_cancelled_consume_posts_dependency_failed() {
+        let fixture = harness(true).await;
+        let job_id = prepare_ready_launch(&fixture).await;
+        let fake = fixture.fake.clone();
+        *fixture.fake.reread_hook.lock().expect("reread hook") = Some(Box::new(move || {
+            fake.update(|inner| inner.fail_next_post = true);
+        }));
+        assert!(fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .is_err());
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(launch.consume_started);
+        assert!(launch.receipt.is_none());
+        let job = fixture.actions.get(&job_id).unwrap();
+        fixture
+            .actions
+            .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
+            .unwrap();
+        let restarted = test_adapter(
+            runtime_config(
+                fixture.adapter.config.aeon_origin.clone(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        );
+        let replay = restarted.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        ));
+        let results = result_posts(&fixture.fake);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "dependency_failed");
+        assert!(results[0].get("detail").is_none());
+        assert_eq!(
+            restarted
+                .journal
+                .result(DEPLOY_HANDOFF)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some("consume_abandoned")
+        );
+        let again = restarted.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(matches!(
+            again,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_CONSUME_ABANDONED)
+        ));
+        assert_eq!(result_posts(&fixture.fake).len(), 1);
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::Cancelled
+        );
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
     async fn consumed_replay_does_not_confirm_an_unconfirmable_job() {
         let fixture = harness(true).await;
         let job_id = prepare_ready_launch(&fixture).await;
@@ -10206,8 +10238,15 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["outcome"], "failed");
         assert!(results[0].get("detail").is_none());
-        let blocker = aeon_blocker_for_reason(reason).unwrap();
-        assert_eq!(results[0]["blocker_code"], blocker_code_wire(blocker));
+        // Literals, so a mapper that returns the wrong variant fails this test.
+        assert_eq!(
+            results[0]["blocker_code"],
+            match reason {
+                LAUNCH_BLOCK_READINESS_PLAN_CHANGED => "policy_refused",
+                LAUNCH_BLOCK_READINESS_FLAG_FALSE => "external_waiting",
+                other => panic!("settled readiness reason {other} has no literal code"),
+            }
+        );
         assert_eq!(
             reloaded
                 .journal

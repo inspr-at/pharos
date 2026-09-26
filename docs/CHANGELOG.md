@@ -19,6 +19,7 @@
 - Compare admission expiry at sub-second precision. A still-valid fraction of the expiry second stays open, and once that instant has passed the block stays local instead of replaying a result Aeon rejects as stale (PHAROS-313).
 - Stamp failed or cancelled deployment evidence at the current time. A job that failed before the handoff existed would otherwise replay evidence Aeon rejects as predating the handoff (PHAROS-313).
 - Link an Aeon retry to the previous review only when that job is review-retryable and still the host's latest update. A cancelled or succeeded predecessor starts a fresh review (PHAROS-313).
+- Post the mapped Aeon blocker when crash recovery records a terminal launch block, including a consume abandoned after the operator cancels the job (PHAROS-313).
 - Withhold a reflected API key from Aeon delivery traces, panic text, and the live roundtrip report (PHAROS-313).
 - Refuse the live Aeon roundtrip unless the journey project key, tenant, and handoff release match the disposable target named in the environment (PHAROS-313).
 - Refuse to confirm a recovered Aeon launch when the handoff is no longer open or its authority no longer matches the journaled admission (PHAROS-313).
