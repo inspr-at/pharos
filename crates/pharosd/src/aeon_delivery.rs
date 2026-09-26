@@ -2744,6 +2744,13 @@ impl AeonDeliveryAdapter {
         let fresh = self.aeon.get_handoff(&intent.handoff_id).await?;
         fresh.validate(intent)?;
         fresh.open_for_write(now_unix())?;
+        let operation = self
+            .journal
+            .operation(&intent.handoff_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        if !operation.matches_handoff(&fresh) {
+            return Err(AdapterError::LocalBinding);
+        }
         let failed_request: ResultRequest = decode_strict(failed.body_json.as_bytes())?;
         if fresh.authority_epoch != failed_request.authority_epoch
             || fresh.prerequisite_seal_sha256 == failed_request.prerequisite_seal_sha256
@@ -3695,6 +3702,7 @@ mod tests {
         drop_accepted_admit: bool,
         drop_accepted_result: bool,
         drift_plan_on_next_get: bool,
+        arm_lineage_drift: bool,
     }
 
     #[derive(Clone)]
@@ -3735,6 +3743,7 @@ mod tests {
                     drop_accepted_admit: false,
                     drop_accepted_result: false,
                     drift_plan_on_next_get: false,
+                    arm_lineage_drift: false,
                 })),
                 captures: Arc::new(Mutex::new(Vec::new())),
                 reread_hook: Arc::new(Mutex::new(None)),
@@ -3944,6 +3953,10 @@ mod tests {
     fn handle_result(inner: &mut FakeInner, id: &str, body: &[u8]) -> Response<Body> {
         if inner.bump_seal_on_result {
             inner.bump_seal_on_result = false;
+            if inner.arm_lineage_drift {
+                inner.arm_lineage_drift = false;
+                inner.drift_plan_on_next_get = true;
+            }
             let Some(handoff) = inner.handoffs.get_mut(id) else {
                 return json_response(StatusCode::NOT_FOUND, &json!({}));
             };
@@ -4720,6 +4733,50 @@ mod tests {
             actions.get(&job_id).unwrap().state,
             HostActionState::Succeeded
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn result_seal_retry_refuses_lineage_drift() {
+        let now = now_unix();
+        let directory = TestDir::new("seal-drift");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now);
+        fake.update(|inner| {
+            inner.bump_seal_on_result = true;
+            inner.arm_lineage_drift = true;
+        });
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let job_id = completed_update(&actions, now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        record_beacon(&hosts, now - 10, &artifact());
+        let mut intent = deploy_intent(false);
+        intent.update_restart_job_id = Some(job_id);
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![intent.clone()]),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            hosts,
+            actions,
+        );
+        let error = adapter.process_intent(&intent).await.unwrap_err();
+        assert!(matches!(error, AdapterError::LocalBinding));
+        assert_eq!(
+            posts(&fake)
+                .iter()
+                .filter(|capture| capture.path.ends_with("/result"))
+                .count(),
+            1
+        );
+        assert!(adapter
+            .journal
+            .result(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .is_none());
         server.abort();
     }
 
