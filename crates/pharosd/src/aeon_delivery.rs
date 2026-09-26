@@ -753,6 +753,8 @@ struct ResultRequest {
     terminal_sequence: i64,
     authority_epoch: i64,
     prerequisite_seal_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocker_code: Option<BlockerCode>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -2020,7 +2022,13 @@ impl AeonDeliveryAdapter {
                 .ok_or(AdapterError::Journal)?;
             let request: ResultRequest = decode_strict(pending.body_json.as_bytes())?;
             return self
-                .finish_result(intent, &handoff, request.terminal_sequence, request.outcome)
+                .finish_result(
+                    intent,
+                    &handoff,
+                    request.terminal_sequence,
+                    request.outcome,
+                    request.blocker_code,
+                )
                 .await;
         }
         let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
@@ -2539,8 +2547,14 @@ impl AeonDeliveryAdapter {
         }
         match job.state {
             HostActionState::Failed | HostActionState::Cancelled => {
-                self.write_observation(intent, handoff, EvidenceOutcome::Failed, job.updated_at)
-                    .await
+                self.write_observation(
+                    intent,
+                    handoff,
+                    EvidenceOutcome::Failed,
+                    job.updated_at,
+                    Some(BlockerCode::DependencyFailed),
+                )
+                .await
             }
             HostActionState::Succeeded => {
                 if job.confirmed_at.is_none() || job.result.is_none() {
@@ -2555,20 +2569,42 @@ impl AeonDeliveryAdapter {
                     return Err(AdapterError::LocalBinding);
                 }
                 let host = self.hosts.get(&intent.host);
+                let now = now_unix();
                 let observed = observed_fresh_config_beacon(
                     host.as_ref(),
                     &intent.environment,
                     &intent.artifact,
                     job.updated_at,
-                    now_unix(),
+                    now,
                     self.config.verification_freshness_secs,
                 )
                 .map_err(map_shared)?;
                 let Some(observed_at) = observed else {
+                    if beacon_window_closed(
+                        job.updated_at,
+                        now,
+                        self.config.verification_freshness_secs,
+                    ) {
+                        return self
+                            .write_observation(
+                                intent,
+                                handoff,
+                                EvidenceOutcome::Failed,
+                                now,
+                                Some(BlockerCode::ReporterStale),
+                            )
+                            .await;
+                    }
                     return Ok(());
                 };
-                self.write_observation(intent, handoff, EvidenceOutcome::Succeeded, observed_at)
-                    .await
+                self.write_observation(
+                    intent,
+                    handoff,
+                    EvidenceOutcome::Succeeded,
+                    observed_at,
+                    None,
+                )
+                .await
             }
             _ => Ok(()),
         }
@@ -2604,22 +2640,48 @@ impl AeonDeliveryAdapter {
             return Err(AdapterError::LocalBinding);
         }
         let host = self.hosts.get(&intent.host);
+        let anchor = unix_of(&receipt.completed_at)?;
+        let now = now_unix();
         match observed_fresh_config_beacon(
             host.as_ref(),
             &intent.environment,
             &intent.artifact,
-            unix_of(&receipt.completed_at)?,
-            now_unix(),
+            anchor,
+            now,
             self.config.verification_freshness_secs,
         ) {
             Ok(Some(observed_at)) => {
-                self.write_observation(intent, handoff, EvidenceOutcome::Succeeded, observed_at)
-                    .await
+                self.write_observation(
+                    intent,
+                    handoff,
+                    EvidenceOutcome::Succeeded,
+                    observed_at,
+                    None,
+                )
+                .await
+            }
+            Ok(None)
+                if beacon_window_closed(anchor, now, self.config.verification_freshness_secs) =>
+            {
+                self.write_observation(
+                    intent,
+                    handoff,
+                    EvidenceOutcome::Failed,
+                    now,
+                    Some(BlockerCode::ReporterStale),
+                )
+                .await
             }
             Ok(None) => Ok(()),
             Err(_) => {
-                self.write_observation(intent, handoff, EvidenceOutcome::Failed, now_unix())
-                    .await
+                self.write_observation(
+                    intent,
+                    handoff,
+                    EvidenceOutcome::Failed,
+                    now,
+                    Some(BlockerCode::DependencyFailed),
+                )
+                .await
             }
         }
     }
@@ -2630,6 +2692,7 @@ impl AeonDeliveryAdapter {
         handoff: &HandoffDocument,
         outcome: EvidenceOutcome,
         observed_at: i64,
+        blocker: Option<BlockerCode>,
     ) -> Result<(), AdapterError> {
         let kind = intent.operation.evidence_kind();
         let record =
@@ -2673,7 +2736,7 @@ impl AeonDeliveryAdapter {
             return Err(AdapterError::LocalBinding);
         }
         let result_outcome = ResultOutcome::from_evidence(outcome)?;
-        self.finish_result(intent, handoff, record.sequence, result_outcome)
+        self.finish_result(intent, handoff, record.sequence, result_outcome, blocker)
             .await
     }
 
@@ -2704,6 +2767,7 @@ impl AeonDeliveryAdapter {
         handoff: &HandoffDocument,
         terminal_sequence: i64,
         outcome: ResultOutcome,
+        blocker: Option<BlockerCode>,
     ) -> Result<(), AdapterError> {
         if self
             .journal
@@ -2712,7 +2776,7 @@ impl AeonDeliveryAdapter {
         {
             return Ok(());
         }
-        let record = self.stage_result(intent, handoff, terminal_sequence, outcome)?;
+        let record = self.stage_result(intent, handoff, terminal_sequence, outcome, blocker)?;
         match self.aeon.post_result(&record).await {
             Ok(receipt) => self.journal.acknowledge_result(&record, receipt),
             Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
@@ -2728,17 +2792,22 @@ impl AeonDeliveryAdapter {
         handoff: &HandoffDocument,
         terminal_sequence: i64,
         outcome: ResultOutcome,
+        blocker: Option<BlockerCode>,
     ) -> Result<ResultJournalRecord, AdapterError> {
         if let Some(existing) = self.journal.result(&intent.handoff_id) {
             // Replay the journaled bytes. A different seal replaces this record
             // only after Aeon rejects those exact bytes.
             return Ok(existing);
         }
+        if (outcome == ResultOutcome::Succeeded) != blocker.is_none() {
+            return Err(AdapterError::Contract);
+        }
         let request = ResultRequest {
             outcome,
             terminal_sequence,
             authority_epoch: handoff.authority_epoch,
             prerequisite_seal_sha256: handoff.prerequisite_seal_sha256.clone(),
+            blocker_code: blocker,
         };
         let body = serde_json::to_vec(&request).map_err(|_| AdapterError::Contract)?;
         let record =
@@ -2772,6 +2841,7 @@ impl AeonDeliveryAdapter {
             terminal_sequence: failed_request.terminal_sequence,
             authority_epoch: fresh.authority_epoch,
             prerequisite_seal_sha256: fresh.prerequisite_seal_sha256,
+            blocker_code: failed_request.blocker_code,
         };
         let body = serde_json::to_vec(&request).map_err(|_| AdapterError::Contract)?;
         let record = ResultJournalRecord::new(
@@ -2807,6 +2877,10 @@ fn consume_receipt(response: &ConsumeResponse, now: i64) -> Result<ConsumeReceip
         consumed: true,
         consumed_at: format_timestamp(now)?,
     })
+}
+
+fn beacon_window_closed(anchor: i64, now: i64, freshness_secs: i64) -> bool {
+    now.saturating_sub(anchor) > freshness_secs
 }
 
 fn backup_observed_at(hosts: &Store, host_name: &str) -> Option<String> {
@@ -4043,6 +4117,22 @@ mod tests {
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
         };
+        let blocker = value["blocker_code"].as_str();
+        let failed_blocker = matches!(
+            blocker,
+            Some(
+                "dependency_pending"
+                    | "dependency_failed"
+                    | "reporter_stale"
+                    | "external_waiting"
+                    | "policy_refused"
+            )
+        );
+        if (value["outcome"] == "failed" && !failed_blocker)
+            || (value["outcome"] == "succeeded" && blocker.is_some())
+        {
+            return json_response(StatusCode::BAD_REQUEST, &json!({}));
+        }
         let last = handoff.evidence.keys().max().copied();
         if value["prerequisite_seal_sha256"].as_str()
             != Some(handoff.prerequisite_seal_sha256.as_str())
@@ -4952,6 +5042,83 @@ mod tests {
             .iter()
             .all(|capture| !capture.path.contains("/launch/")));
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_result_names_a_blocker_and_a_closed_window_is_reporter_stale() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake).await;
+        let status = reqwest::Client::new()
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/result"))
+                    .unwrap(),
+            )
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
+            )
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(
+                serde_json::to_vec(&json!({
+                    "outcome": "failed",
+                    "terminal_sequence": 1,
+                    "authority_epoch": 3,
+                    "prerequisite_seal_sha256": hex_chars('d')
+                }))
+                .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        server.abort();
+
+        let failed = harness(false).await;
+        failed.adapter.process_intent(&failed.intent).await.unwrap();
+        let job_id = failed.actions.list()[0].id.clone();
+        fail_review(&failed.actions, &job_id, now_unix());
+        failed.adapter.process_intent(&failed.intent).await.unwrap();
+        let blocked: Value = posts(&failed.fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/result"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(blocked["outcome"], "failed");
+        assert_eq!(blocked["blocker_code"], "dependency_failed");
+        failed.server.abort();
+
+        let now = now_unix();
+        let directory = TestDir::new("stale-beacon");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let job_id = completed_update(&actions, now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let mut intent = deploy_intent(false);
+        intent.update_restart_job_id = Some(job_id);
+        let mut config = runtime_config(origin, api, vec![intent.clone()]);
+        config.verification_freshness_secs = 10;
+        let adapter = test_adapter(
+            config,
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            hosts,
+            actions,
+        );
+        adapter.process_intent(&intent).await.unwrap();
+        let stale: Value = posts(&fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/result"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(stale["blocker_code"], "reporter_stale");
+        server.abort();
     }
 
     #[tokio::test]
