@@ -770,6 +770,10 @@ struct ConsumeReceipt {
     admission_id: String,
     consumed: bool,
     consumed_at: String,
+    /// Set when the receipt was synthesised from GET because the consume replay
+    /// was refused. The API key and principal id are not stored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reconciled_from_get: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1943,6 +1947,27 @@ impl AeonClient {
         decode_strict(&bytes)
     }
 
+    async fn get_principal(&self) -> Result<String, AdapterError> {
+        let credentials = self.credentials()?;
+        let (status, bytes) = self
+            .exchange(Method::GET, "/api/me", None, None, &credentials)
+            .await?;
+        if status != StatusCode::OK {
+            return Err(status_error(status));
+        }
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| AdapterError::Contract)?;
+        let id = document
+            .get("principal")
+            .and_then(|principal| principal.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or(AdapterError::Contract)?;
+        if !valid_uuid(id) {
+            return Err(AdapterError::Contract);
+        }
+        Ok(id.to_string())
+    }
+
     async fn post_evidence(
         &self,
         record: &EvidenceJournalRecord,
@@ -2121,6 +2146,8 @@ pub(crate) struct AeonDeliveryAdapter {
     aeon: AeonClient,
     hosts: Arc<Store>,
     host_actions: Arc<HostActionStore>,
+    /// Principal id from GET /api/me. Memory only; the API key is never stored.
+    principal_id: Mutex<Option<String>>,
 }
 
 impl AeonDeliveryAdapter {
@@ -2157,6 +2184,7 @@ impl AeonDeliveryAdapter {
             aeon,
             hosts,
             host_actions,
+            principal_id: Mutex::new(None),
         }))
     }
 
@@ -2165,6 +2193,12 @@ impl AeonDeliveryAdapter {
     }
 
     async fn run(self) {
+        if let Err(error) = self.remember_principal().await {
+            tracing::warn!(
+                reason = error.code(),
+                "Aeon principal was not loaded; consume reconciliation will retry"
+            );
+        }
         let mut interval = tokio::time::interval(self.config.poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -2325,9 +2359,7 @@ impl AeonDeliveryAdapter {
                 Ok(true)
             }
             Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
-                self.journal
-                    .mark_consume_unresolved(&intent.handoff_id, status)?;
-                Err(AdapterError::LaunchUnresolved)
+                self.finish_consume_conflict(intent, &launch, true).await
             }
             Err(error) => Err(error),
         }
@@ -2369,12 +2401,82 @@ impl AeonDeliveryAdapter {
                 self.block_launch(intent, reason, true).map(|_| true)
             }
             Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
-                self.journal
-                    .mark_consume_unresolved(&intent.handoff_id, status)?;
-                Err(AdapterError::LaunchUnresolved)
+                self.finish_consume_conflict(intent, launch, false).await
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn remember_principal(&self) -> Result<(), AdapterError> {
+        if self.principal_id.lock().expect("aeon principal").is_some() {
+            return Ok(());
+        }
+        let id = self.aeon.get_principal().await?;
+        *self.principal_id.lock().expect("aeon principal") = Some(id);
+        Ok(())
+    }
+
+    async fn finish_consume_conflict(
+        &self,
+        intent: &DeliveryIntent,
+        launch: &LaunchJournalRecord,
+        confirm: bool,
+    ) -> Result<bool, AdapterError> {
+        let Some(receipt) = self.receipt_reconciled_from_handoff(intent, launch).await? else {
+            self.journal
+                .mark_consume_unresolved(&intent.handoff_id, StatusCode::CONFLICT)?;
+            return Err(AdapterError::LaunchUnresolved);
+        };
+        self.journal
+            .acknowledge_consume(&intent.handoff_id, receipt)?;
+        if !confirm {
+            return self
+                .block_launch(intent, LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB, true)
+                .map(|_| true);
+        }
+        let launch = self
+            .journal
+            .launch(&intent.handoff_id)
+            .ok_or(AdapterError::Journal)?;
+        self.finish_confirmation(intent, &launch)?;
+        Ok(true)
+    }
+
+    async fn receipt_reconciled_from_handoff(
+        &self,
+        intent: &DeliveryIntent,
+        launch: &LaunchJournalRecord,
+    ) -> Result<Option<ConsumeReceipt>, AdapterError> {
+        let observed = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let Some(admission) = observed.admission.as_ref() else {
+            return Ok(None);
+        };
+        let Some(stored) = launch.admission.as_ref() else {
+            return Ok(None);
+        };
+        let Some(consumed_at) = admission.consumed_at.as_deref() else {
+            return Ok(None);
+        };
+        if admission.admission_id != stored.id || parse_timestamp(consumed_at).is_err() {
+            return Ok(None);
+        }
+        self.remember_principal().await?;
+        let principal = self
+            .principal_id
+            .lock()
+            .expect("aeon principal")
+            .clone()
+            .ok_or(AdapterError::Contract)?;
+        if admission.consumed_by_principal_id.as_deref() != Some(principal.as_str()) {
+            return Ok(None);
+        }
+        Ok(Some(ConsumeReceipt {
+            handoff_id: intent.handoff_id.clone(),
+            admission_id: stored.id.clone(),
+            consumed: true,
+            consumed_at: consumed_at.to_string(),
+            reconciled_from_get: true,
+        }))
     }
 
     async fn replay_evidence(
@@ -3343,6 +3445,7 @@ fn consume_receipt(response: &ConsumeResponse) -> Result<ConsumeReceipt, Adapter
         admission_id: response.admission_id.clone(),
         consumed: true,
         consumed_at: response.consumed_at.clone(),
+        reconciled_from_get: false,
     })
 }
 
@@ -4923,6 +5026,26 @@ mod tests {
         principal: &str,
         idempotency: &str,
     ) -> Response<Body> {
+        if method == "GET" && path == "/api/me" {
+            return json_response(
+                StatusCode::OK,
+                &json!({
+                    "principal": {
+                        "id": LAUNCH_PRINCIPAL,
+                        "tenant_id": "55555555-5555-4555-8555-555555555555",
+                        "kind": "agent",
+                        "name": "pharos-delivery",
+                        "roles": []
+                    },
+                    "tenant": {
+                        "id": "55555555-5555-4555-8555-555555555555",
+                        "slug": "lab",
+                        "name": "lab"
+                    },
+                    "identity": null
+                }),
+            );
+        }
         let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
         if parts.len() < 3 || parts[0] != "api" || parts[1] != "stage-handoffs" {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
@@ -5216,6 +5339,7 @@ mod tests {
             aeon,
             hosts,
             host_actions: actions,
+            principal_id: Mutex::new(None),
         }
     }
 
@@ -7225,6 +7349,8 @@ mod tests {
             .is_err());
         fixture.fake.update(|inner| {
             let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.consumed_by_principal_id =
+                Some("88888888-8888-4888-8888-888888888888".to_string());
             for call in handoff.launch_calls.values_mut() {
                 if call.action == "consume" {
                     call.body_digest = "0".repeat(64);
@@ -7372,6 +7498,8 @@ mod tests {
             .is_err());
         unresolved.fake.update(|inner| {
             let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.consumed_by_principal_id =
+                Some("88888888-8888-4888-8888-888888888888".to_string());
             for call in handoff.launch_calls.values_mut() {
                 if call.action == "consume" {
                     call.body_digest = "0".repeat(64);
@@ -7381,6 +7509,10 @@ mod tests {
         let document = fetch_handoff(&unresolved.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
         assert!(document["admission"]["consumed_at"].is_string());
         assert_eq!(document["admission"]["admission_id"], ADMISSION_ID);
+        assert_ne!(
+            document["admission"]["consumed_by_principal_id"],
+            LAUNCH_PRINCIPAL
+        );
         let replay = unresolved.adapter.process_intent(&unresolved.intent).await;
         assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
         let launch = unresolved.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
@@ -7457,12 +7589,26 @@ mod tests {
             }));
         });
         let replay = fixture.adapter.process_intent(&fixture.intent).await;
-        assert!(matches!(replay, Err(AdapterError::LaunchUnresolved)));
+        assert!(replay.is_ok());
+        let launch = fixture.adapter.journal.launch(DEPLOY_HANDOFF).unwrap();
+        assert!(launch.consume_unresolved.is_none());
+        let receipt = launch.receipt.as_ref().unwrap();
+        assert!(receipt.reconciled_from_get);
+        assert!(receipt.consumed);
+        assert_eq!(receipt.admission_id, ADMISSION_ID);
+        let rendered = serde_json::to_string(&launch).unwrap();
+        assert!(!rendered.contains(LAUNCH_PRINCIPAL));
+        assert!(!rendered.contains("AEON_API_KEY_SENTINEL"));
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::QueuedApply);
+        assert!(job.confirmed_at.is_some());
         assert_eq!(
-            fixture.actions.get(&job_id).unwrap().state,
-            HostActionState::AwaitingConfirmation
+            job.events
+                .iter()
+                .filter(|event| event.kind == HostActionEventKind::Confirmed)
+                .count(),
+            1
         );
-        assert!(fixture.actions.get(&job_id).unwrap().confirmed_at.is_none());
         fixture.server.abort();
     }
 
