@@ -73,6 +73,7 @@ const LAUNCH_BLOCK_CONSUME_ABANDONED: &str = "consume_abandoned";
 const LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED: &str = "confirmation_not_delegated";
 const LAUNCH_BLOCK_ADMISSION_EXPIRED: &str = "admission_expired";
 const LAUNCH_BLOCK_AUTHORITY_CLOSED: &str = "handoff_authority_closed";
+const LAUNCH_BLOCK_AUTHORITY_NOT_OPEN: &str = "handoff_authority_not_open";
 const LAUNCH_BLOCK_LAUNCH_NOT_OWNED: &str = "launch_not_owned";
 const LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED: &str = "configured_job_not_owned";
 const LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED: &str = "stage_gate_not_approved";
@@ -88,6 +89,7 @@ const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED,
     LAUNCH_BLOCK_ADMISSION_EXPIRED,
     LAUNCH_BLOCK_AUTHORITY_CLOSED,
+    LAUNCH_BLOCK_AUTHORITY_NOT_OPEN,
     LAUNCH_BLOCK_LAUNCH_NOT_OWNED,
     LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED,
     LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED,
@@ -581,6 +583,12 @@ struct HandoffDocument {
     plugin_id: String,
     attempt: i64,
     authority_epoch: i64,
+    /// Newest successor of this attempt. Absent on an older Aeon.
+    #[serde(default)]
+    superseded_by: Option<String>,
+    /// Whether this attempt can still accept an action. Absent on an older Aeon.
+    #[serde(default)]
+    authority_open: Option<bool>,
     journey_revision: i64,
     state: HandoffState,
     expires_at: String,
@@ -654,6 +662,10 @@ impl HandoffDocument {
             return Err(AdapterError::Contract);
         }
         Ok(())
+    }
+
+    fn explicit_authority_closed(&self) -> bool {
+        self.authority_open == Some(false) || self.superseded_by.is_some()
     }
 }
 
@@ -797,6 +809,10 @@ struct LaunchAdmission {
     expires_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     consumed_at: Option<String>,
+    /// Aeon stamps this on the admit body. Confirmation reads the handoff GET,
+    /// so the projection is dropped before the admission is journaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authority_open: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -811,6 +827,9 @@ struct ConsumeResponse {
     admission_id: String,
     consumed: bool,
     consumed_at: String,
+    /// Refreshed on an exact replay. Confirmation does not use it.
+    #[serde(default)]
+    authority_open: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1361,6 +1380,7 @@ fn aeon_blocker_for_reason(reason: &str) -> Option<BlockerCode> {
         LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
         | LAUNCH_BLOCK_CONSUME_ABANDONED
         | LAUNCH_BLOCK_AUTHORITY_CLOSED => BlockerCode::DependencyFailed,
+        LAUNCH_BLOCK_AUTHORITY_NOT_OPEN => BlockerCode::PolicyRefused,
         _ => return None,
     })
 }
@@ -2328,7 +2348,9 @@ impl AeonClient {
         if status != StatusCode::OK {
             return Err(refusal_from_aeon(status, &bytes));
         }
-        decode_strict(&bytes)
+        let mut admission: LaunchAdmission = decode_strict(&bytes)?;
+        admission.authority_open = None;
+        Ok(admission)
     }
 
     async fn post_consume(
@@ -2834,13 +2856,16 @@ impl AeonDeliveryAdapter {
             .operation(&intent.handoff_id)
             .ok_or(AdapterError::LocalBinding)?;
         let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
-        // GET /api/stage-handoffs/{id} returns this row only. Its attempt and
-        // epoch do not change when a newer attempt is created, and there is no
-        // list route. launchReplay returns the stored consume receipt before
-        // current() (launch.go). Journey stages[].handoff_id is the newest
-        // handoff in the stage by created_at, not this operation's latest
-        // attempt, and it has no attempt or epoch. These fields are the whole
-        // of what that GET can show.
+        // The inferred check existed because GET showed only this row: its
+        // attempt and epoch do not move when a newer attempt is inserted, and
+        // there is no list route. That inference remains the fallback when
+        // authority_open and superseded_by are absent, which is an older Aeon.
+        // A false authority_open, or a superseded_by, is an additional refusal.
+        // It is journaled on its own and never waives the inferred check.
+        // launchReplay still returns the stored receipt before current().
+        // Expiry stays on the admission check below this function: a false
+        // authority_open caused only by an elapsed expires_at must not replace
+        // admission_expired.
         let admission_matches = handoff.admission.as_ref().is_some_and(|embedded| {
             embedded.admission_id == admission.id && embedded.epoch == admission.authority_epoch
         });
@@ -2851,10 +2876,13 @@ impl AeonDeliveryAdapter {
             && handoff.release_node_id == operation.release_node_id
             && handoff.operation == intent.operation
             && handoff.attempt == operation.attempt;
-        if current {
-            return Ok(());
+        if !current {
+            return self.block_launch(intent, LAUNCH_BLOCK_AUTHORITY_CLOSED, true);
         }
-        self.block_launch(intent, LAUNCH_BLOCK_AUTHORITY_CLOSED, true)
+        if handoff.explicit_authority_closed() && !stamp_passed(&handoff.expires_at)? {
+            return self.block_launch(intent, LAUNCH_BLOCK_AUTHORITY_NOT_OPEN, true);
+        }
+        Ok(())
     }
 
     fn reject_terminal_block(&self, handoff_id: &str) -> Result<(), AdapterError> {
@@ -5532,8 +5560,13 @@ mod tests {
         /// stores this as `created_at` and rejects evidence observed more than
         /// a minute earlier.
         created_at: i64,
+        /// Set when a newer attempt exists. GET reports it as `superseded_by`.
+        superseded_by: Option<String>,
+        /// Omit `authority_open` and `superseded_by` so an older Aeon is modeled.
+        omit_supersession_fields: bool,
         /// FakeAeon only. Real `current()` is false when the recomputed plan
-        /// digest or authority epoch differs, and GET does not show that.
+        /// digest or authority epoch differs. GET reports that as
+        /// `authority_open: false`; this flag itself is not a wire field.
         force_stale: bool,
         evidence: BTreeMap<i64, StoredEvidence>,
         admission: Option<Value>,
@@ -5582,6 +5615,8 @@ mod tests {
                 context_digest: hex_chars('c'),
                 prerequisite_seal_sha256: hex_chars('d'),
                 created_at: now,
+                superseded_by: None,
+                omit_supersession_fields: false,
                 force_stale: false,
                 evidence: BTreeMap::new(),
                 admission: None,
@@ -5596,7 +5631,19 @@ mod tests {
             }
         }
 
-        fn json(&self) -> Value {
+        fn authority_is_open(&self, now: i64) -> bool {
+            if self.superseded_by.is_some() || self.result.is_some() || self.force_stale {
+                return false;
+            }
+            if !matches!(self.state.as_str(), "requested" | "active") {
+                return false;
+            }
+            parse_timestamp(&self.expires_at)
+                .map(|time| now <= time.unix_timestamp())
+                .unwrap_or(false)
+        }
+
+        fn json(&self, now: i64) -> Value {
             let mut value = json!({
                 "id": self.id,
                 "project_node_id": self.project_node_id,
@@ -5615,6 +5662,13 @@ mod tests {
                 "context_digest": self.context_digest,
                 "prerequisite_seal_sha256": self.prerequisite_seal_sha256,
             });
+            if !self.omit_supersession_fields {
+                value["superseded_by"] = match &self.superseded_by {
+                    Some(successor) => json!(successor),
+                    None => Value::Null,
+                };
+                value["authority_open"] = json!(self.authority_is_open(now));
+            }
             if let Some(result) = &self.result {
                 value["result"] = result.clone();
             }
@@ -5955,14 +6009,15 @@ mod tests {
                 &json!({"error": "handoff is terminal"}),
             );
         }
-        // current() is false after expiry and when the plan digest or epoch
-        // drifts. report.go returns 409 "handoff is stale" before the stored
-        // replay, so an exact replay is refused as well. force_stale is the
-        // stand-in for the recomputed digest, which GET does not carry.
+        // current() is false after expiry, when a newer attempt supersedes
+        // this one, and when the plan digest or epoch drifts. report.go
+        // returns 409 "handoff is stale" before the stored replay, so an
+        // exact evidence replay is refused as well. force_stale stands in
+        // for the recomputed digest. GET reports that as authority_open.
         let expires_at = parse_timestamp(&handoff.expires_at)
             .map(|time| time.unix_timestamp())
             .unwrap_or(0);
-        if handoff.force_stale || expires_at < now {
+        if handoff.superseded_by.is_some() || handoff.force_stale || expires_at < now {
             return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
         }
         if let Some(stored) = handoff.evidence.get(&sequence) {
@@ -6047,15 +6102,24 @@ mod tests {
         if !same_held_artifact(&value, &handoff.held_artifact) {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
-        if let Some(response) = replay_response(launch_replay(
+        if let Some(response) = finish_launch_replay(
             handoff,
-            "admit",
-            flags.principal,
-            flags.idempotency,
-            body,
             flags.now,
-        )) {
+            launch_replay(
+                handoff,
+                "admit",
+                flags.principal,
+                flags.idempotency,
+                body,
+                flags.now,
+            ),
+        ) {
             return response;
+        }
+        // launch.go checks current() before the gates. A superseded attempt
+        // is 409 "handoff is stale". Exact replay already returned.
+        if handoff.superseded_by.is_some() || handoff.force_stale {
+            return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
         }
         // launch.go checks both gates after an exact replay has already
         // returned. A new admit uses "stage gate is not approved".
@@ -6131,6 +6195,7 @@ mod tests {
             "binding_digest_sha256": binding,
             "artifact_digest_sha256": digest,
             "authority_epoch": handoff.authority_epoch,
+            "authority_open": true,
             "expires_at": expires_at,
         });
         handoff.admission = Some(admission.clone());
@@ -6202,14 +6267,11 @@ mod tests {
         if let Some(response) = rejected_launch_key(idempotency) {
             return response;
         }
-        if let Some(response) = replay_response(launch_replay(
+        if let Some(response) = finish_launch_replay(
             handoff,
-            "consume",
-            principal,
-            idempotency,
-            body,
             now,
-        )) {
+            launch_replay(handoff, "consume", principal, idempotency, body, now),
+        ) {
             return response;
         }
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
@@ -6232,6 +6294,12 @@ mod tests {
             "stage gate is no longer approved",
         ) {
             return response;
+        }
+        // launch.go checks current() after the gates. A new write on a
+        // superseded attempt is 409 "handoff is stale". Exact replay already
+        // returned.
+        if handoff.superseded_by.is_some() || handoff.force_stale {
+            return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
         }
         if handoff.consumed {
             return json_response(StatusCode::CONFLICT, &json!({}));
@@ -6263,6 +6331,7 @@ mod tests {
             "admission_id": admission_id,
             "consumed": true,
             "consumed_at": consumed_at,
+            "authority_open": true,
         });
         handoff.consumed = true;
         handoff.consumed_at = Some(consumed_at);
@@ -6305,6 +6374,9 @@ mod tests {
             } else {
                 json_response(StatusCode::CONFLICT, &json!({}))
             };
+        }
+        if handoff.superseded_by.is_some() || handoff.force_stale {
+            return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
         }
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
@@ -6456,7 +6528,7 @@ mod tests {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         };
         match route {
-            ("GET", None, None) => json_response(StatusCode::OK, &handoff.json()),
+            ("GET", None, None) => json_response(StatusCode::OK, &handoff.json(now)),
             ("POST", Some("evidence"), None) => handle_evidence(handoff, body, now),
             ("POST", Some("launch"), Some("admit")) => {
                 let flags = AdmitFlags {
@@ -6591,6 +6663,27 @@ mod tests {
             return LaunchReplay::Conflict;
         }
         LaunchReplay::Hit(stored.response.clone())
+    }
+
+    fn stamp_authority_open(mut response: Value, open: bool) -> Value {
+        if let Some(object) = response.as_object_mut() {
+            object.insert("authority_open".to_string(), json!(open));
+        }
+        response
+    }
+
+    fn finish_launch_replay(
+        handoff: &FakeHandoff,
+        now: i64,
+        replay: LaunchReplay,
+    ) -> Option<Response<Body>> {
+        match replay {
+            LaunchReplay::Hit(response) => Some(json_response(
+                StatusCode::OK,
+                &stamp_authority_open(response, handoff.authority_is_open(now)),
+            )),
+            other => replay_response(other),
+        }
     }
 
     fn replay_response(replay: LaunchReplay) -> Option<Response<Body>> {
@@ -9706,6 +9799,257 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn superseded_handoff_refuses_confirmation_while_its_state_still_looks_open() {
+        for edit in [
+            |handoff: &mut FakeHandoff| {
+                handoff.superseded_by = Some("22222222-2222-4222-8222-222222222222".to_string());
+            },
+            |handoff: &mut FakeHandoff| {
+                handoff.force_stale = true;
+            },
+        ] {
+            let fixture = harness(true).await;
+            let job_id = dropped_consume(&fixture).await;
+            fixture.fake.update(|inner| {
+                let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+                edit(handoff);
+            });
+            let document = fetch_handoff(&fixture.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+            assert_eq!(document["state"], "requested");
+            assert!(document.get("result").is_none());
+            assert_eq!(document["attempt"], 1);
+            assert_eq!(document["authority_open"], false);
+            assert!(document.get("force_stale").is_none());
+            let replay = fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap_err();
+            // Aeon answers 409 "handoff is stale" for a new write, so the
+            // mapped result is not stored. The terminal block is already
+            // journaled.
+            assert!(
+                matches!(replay, AdapterError::Refused(status) if status == StatusCode::CONFLICT),
+                "{replay:?}"
+            );
+            let job = fixture.actions.get(&job_id).unwrap();
+            assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+            assert!(job.confirmed_at.is_none());
+            let block = fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap();
+            assert_eq!(block.reason, LAUNCH_BLOCK_AUTHORITY_NOT_OPEN);
+            assert!(block.terminal);
+            assert_eq!(expected_blocker_for_reason(&block.reason), "policy_refused");
+            assert!(result_posts(&fixture.fake).is_empty());
+            let later = fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                later,
+                AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_NOT_OPEN)
+            ));
+            assert!(result_posts(&fixture.fake).is_empty());
+            assert_eq!(
+                fixture.actions.get(&job_id).unwrap().state,
+                HostActionState::AwaitingConfirmation
+            );
+            fixture.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_supersession_fields_keep_the_inferred_authority_check() {
+        let open = harness(true).await;
+        let open_job = dropped_consume(&open).await;
+        open.fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .omit_supersession_fields = true;
+        });
+        let document = fetch_handoff(&open.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert!(document.get("authority_open").is_none());
+        assert!(document.get("superseded_by").is_none());
+        assert_eq!(document["attempt"], 1);
+        open.adapter.process_intent(&open.intent).await.unwrap();
+        assert_eq!(
+            open.actions.get(&open_job).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        open.server.abort();
+
+        let closed = harness(true).await;
+        let _closed_job = dropped_consume(&closed).await;
+        closed.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.omit_supersession_fields = true;
+            handoff.state = "failed".to_string();
+        });
+        let replay = closed
+            .adapter
+            .process_intent(&closed.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        ));
+        assert_eq!(
+            result_posts(&closed.fake)[0]["blocker_code"],
+            "dependency_failed"
+        );
+        closed.server.abort();
+    }
+
+    #[tokio::test]
+    async fn superseded_handoff_refuses_a_new_write_and_replays_the_stored_receipt() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let post = |url: String, body: Vec<u8>, key: Option<&str>| {
+            let client = client.clone();
+            let bearer = bearer.clone();
+            let key = key.map(str::to_string);
+            async move {
+                let mut request = client
+                    .post(url)
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA)
+                    .body(body);
+                if let Some(key) = key {
+                    request = request.header("idempotency-key", key);
+                }
+                let response = request.send().await.unwrap();
+                let status = response.status();
+                let value: Value = response.json().await.unwrap_or(json!({}));
+                (status, value)
+            }
+        };
+        let evidence = serde_json::to_vec(&json!({
+            "sequence": 1,
+            "kind": "launch_readiness",
+            "outcome": "satisfied",
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "reviewed_plan_digest": "ab".repeat(32),
+            "host": "hsb8",
+            "all_host_eval_passed": true,
+            "target_build_passed": true,
+            "backup_ready": true,
+            "backup_observed_at": format_timestamp(now).unwrap(),
+            "restart_required": true,
+            "running_kernel": "unknown",
+            "expected_kernel": "unknown"
+        }))
+        .unwrap();
+        let evidence_url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+            .unwrap()
+            .to_string();
+        let (status, _) = post(evidence_url.clone(), evidence.clone(), None).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let admit = serde_json::to_vec(&json!({
+            "version_scheme": "legacy",
+            "version": "1.2.3",
+            "release_channel": "stable",
+            "release_sequence": 123,
+            "digest_sha256": "1".repeat(64),
+            "commit_digest": "a".repeat(40),
+            "manifest_coordinate": "ghcr:inspr-at/pharos/releases/1.2.3",
+            "manifest_digest_sha256": "9".repeat(64)
+        }))
+        .unwrap();
+        let admit_url = origin
+            .join(&format!(
+                "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"
+            ))
+            .unwrap()
+            .to_string();
+        let admit_key = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaad";
+        let (status, admitted) = post(admit_url.clone(), admit.clone(), Some(admit_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(admitted["authority_open"], true);
+        let consume_url = origin
+            .join(&format!(
+                "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/consume"
+            ))
+            .unwrap()
+            .to_string();
+        let consume = serde_json::to_vec(&json!({"admission_id": ADMISSION_ID})).unwrap();
+        let consume_key = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc";
+        let (status, consumed) =
+            post(consume_url.clone(), consume.clone(), Some(consume_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(consumed["authority_open"], true);
+        let successor = "22222222-2222-4222-8222-222222222222";
+        fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .superseded_by = Some(successor.to_string());
+        });
+        let document = fetch_handoff(&origin, DEPLOY_HANDOFF).await;
+        assert_eq!(document["attempt"], 1);
+        assert_eq!(document["state"], "requested");
+        assert_eq!(document["superseded_by"], successor);
+        assert_eq!(document["authority_open"], false);
+        let (status, replayed) =
+            post(consume_url.clone(), consume.clone(), Some(consume_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed["authority_open"], false);
+        assert_eq!(replayed["admission_id"], ADMISSION_ID);
+        let (status, replayed_admit) =
+            post(admit_url.clone(), admit.clone(), Some(admit_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed_admit["authority_open"], false);
+        assert_eq!(replayed_admit["id"], ADMISSION_ID);
+        let (status, value) = post(
+            consume_url,
+            consume,
+            Some("cccccccc-cccc-4ccc-8ccc-cccccccccccd"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        let (status, value) = post(
+            admit_url,
+            admit,
+            Some("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        let (status, value) = post(evidence_url, evidence, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        let result_url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/result"))
+            .unwrap()
+            .to_string();
+        let result = serde_json::to_vec(&json!({
+            "outcome": "failed",
+            "terminal_sequence": 1,
+            "authority_epoch": 3,
+            "prerequisite_seal_sha256": hex_chars('d'),
+            "blocker_code": "policy_refused"
+        }))
+        .unwrap();
+        let (status, value) = post(result_url, result, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        server.abort();
+    }
+
     fn expected_blocker_for_reason(reason: &str) -> &'static str {
         match reason {
             LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING
@@ -9721,6 +10065,7 @@ mod tests {
             LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
             | LAUNCH_BLOCK_CONSUME_ABANDONED
             | LAUNCH_BLOCK_AUTHORITY_CLOSED => "dependency_failed",
+            LAUNCH_BLOCK_AUTHORITY_NOT_OPEN => "policy_refused",
             _ => panic!("reason {reason} has no Aeon blocker code"),
         }
     }

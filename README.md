@@ -570,8 +570,13 @@ and consume are replayed with the journaled Idempotency-Key. An exact replay
 returns the stored admission or receipt, and a conflicting replay stays
 unresolved without changing the host. Confirmation after that replay still
 requires the fetched handoff to be `requested` or `active`, to have no result,
-and to match the journaled admission. A newer attempt of the same operation
-is not visible on that handoff. The bearer token stays in its referenced
+and to match the journaled admission. When that handoff carries
+`authority_open` or `superseded_by`, a false `authority_open` or a set
+`superseded_by` is an additional refusal. It is journaled as
+`handoff_authority_not_open` and maps to `policy_refused`. Those fields are
+optional. An older Aeon that omits them keeps the inferred check, and a true
+`authority_open` does not waive it. A newer attempt of the same operation is
+not visible as a change to this handoff's attempt or epoch. The bearer token stays in its referenced
 file and is not written to the journal. The adapter does nothing until the
 config variable is set.
 
