@@ -2622,8 +2622,7 @@ impl AeonDeliveryAdapter {
         let Some(binding) = self.journal.operation(deploy_id) else {
             return Ok(());
         };
-        if handoff.predecessor_digest != binding.plan_digest
-            || handoff.authority_epoch != binding.authority_epoch
+        if handoff.plan_digest != binding.plan_digest
             || binding.host != intent.host
             || binding.environment != intent.environment
             || binding.artifact != intent.artifact
@@ -2636,7 +2635,10 @@ impl AeonDeliveryAdapter {
         let Some(receipt) = deploy_result.receipt else {
             return Ok(());
         };
-        if receipt.outcome != ResultOutcome::Succeeded {
+        if receipt.outcome != ResultOutcome::Succeeded
+            || handoff.predecessor_digest
+                != dependency_digest(&binding.handoff_id, "deployment", receipt.terminal_sequence)
+        {
             return Err(AdapterError::LocalBinding);
         }
         let host = self.hosts.get(&intent.host);
@@ -3257,6 +3259,10 @@ fn idempotency_key(handoff_id: &str, sequence: i64, request_digest: &str) -> Str
 
 fn hex_digest(bytes: &[u8]) -> String {
     hex_bytes(&Sha256::digest(bytes))
+}
+
+fn dependency_digest(handoff_id: &str, kind: &str, sequence: i64) -> String {
+    hex_digest(format!("{handoff_id}\0{kind}\0{sequence}").as_bytes())
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -5252,31 +5258,121 @@ mod tests {
         server.abort();
     }
 
+    struct SealedDeploy {
+        fake: FakeAeon,
+        server: tokio::task::JoinHandle<()>,
+        adapter: AeonDeliveryAdapter,
+        hosts: Arc<Store>,
+        _directory: TestDir,
+    }
+
+    async fn sealed_deploy() -> SealedDeploy {
+        let now = now_unix();
+        let directory = TestDir::new("verify-lineage");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let job_id = completed_update(&actions, now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        record_beacon(&hosts, now - 10, &artifact());
+        let mut intent = deploy_intent(false);
+        intent.update_restart_job_id = Some(job_id);
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![intent.clone(), verify_intent()]),
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+            Arc::clone(&hosts),
+            actions,
+        );
+        adapter.process_intent(&intent).await.unwrap();
+        SealedDeploy {
+            fake,
+            server,
+            adapter,
+            hosts,
+            _directory: directory,
+        }
+    }
+
+    fn arm_verify_seal(fake: &FakeAeon, predecessor: &str, epoch: i64) {
+        fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(VERIFY_HANDOFF).unwrap();
+            handoff.authority_epoch = epoch;
+            handoff.predecessor_digest = predecessor.to_string();
+            handoff.prerequisite_seal_sha256 = predecessor.to_string();
+        });
+    }
+
     #[tokio::test]
-    async fn verify_lineage_mismatch_is_refused() {
-        let fixture = harness(false).await;
-        fixture
+    async fn verify_lineage_matches_the_deployment_dependency_digest() {
+        let sealed = sealed_deploy().await;
+        let receipt = sealed
             .adapter
-            .process_intent(&fixture.intent)
+            .journal
+            .result(DEPLOY_HANDOFF)
+            .unwrap()
+            .receipt
+            .unwrap();
+        let seal = dependency_digest(DEPLOY_HANDOFF, "deployment", receipt.terminal_sequence);
+        assert_ne!(
+            sealed
+                .fake
+                .update(|inner| inner.handoffs[DEPLOY_HANDOFF].authority_epoch),
+            11
+        );
+        arm_verify_seal(&sealed.fake, &seal, 11);
+        record_beacon(&sealed.hosts, now_unix() + 1, &artifact());
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
             .await
             .unwrap();
-        fixture.fake.update(|inner| {
-            inner
-                .handoffs
-                .get_mut(VERIFY_HANDOFF)
+        let verification: Value = posts(&sealed.fake)
+            .into_iter()
+            .find(|capture| {
+                capture.path.contains(VERIFY_HANDOFF) && capture.path.ends_with("/evidence")
+            })
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(verification["kind"], "verification");
+        assert_eq!(verification["outcome"], "succeeded");
+        assert_eq!(
+            sealed
+                .adapter
+                .journal
+                .result(VERIFY_HANDOFF)
                 .unwrap()
-                .predecessor_digest = hex_chars('e');
-        });
-        let error = fixture
+                .receipt
+                .unwrap()
+                .outcome,
+            ResultOutcome::Succeeded
+        );
+        assert_eq!(
+            sealed
+                .fake
+                .update(|inner| inner.handoffs[VERIFY_HANDOFF].predecessor_digest.clone()),
+            dependency_digest(DEPLOY_HANDOFF, "deployment", receipt.terminal_sequence)
+        );
+        sealed.server.abort();
+    }
+
+    #[tokio::test]
+    async fn verify_lineage_mismatch_is_refused() {
+        let sealed = sealed_deploy().await;
+        arm_verify_seal(&sealed.fake, &hex_chars('e'), 11);
+        let error = sealed
             .adapter
             .process_intent(&verify_intent())
             .await
             .unwrap_err();
         assert!(matches!(error, AdapterError::LocalBinding));
-        assert!(posts(&fixture.fake)
+        assert!(posts(&sealed.fake)
             .iter()
             .all(|capture| !capture.path.contains(VERIFY_HANDOFF)));
-        fixture.server.abort();
+        sealed.server.abort();
     }
 
     #[tokio::test]
