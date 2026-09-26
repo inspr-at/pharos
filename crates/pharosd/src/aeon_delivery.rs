@@ -75,6 +75,7 @@ const LAUNCH_BLOCK_ADMISSION_EXPIRED: &str = "admission_expired";
 const LAUNCH_BLOCK_AUTHORITY_CLOSED: &str = "handoff_authority_closed";
 const LAUNCH_BLOCK_LAUNCH_NOT_OWNED: &str = "launch_not_owned";
 const LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED: &str = "configured_job_not_owned";
+const LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED: &str = "stage_gate_not_approved";
 
 const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING,
@@ -89,6 +90,7 @@ const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_AUTHORITY_CLOSED,
     LAUNCH_BLOCK_LAUNCH_NOT_OWNED,
     LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED,
+    LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED,
 ];
 
 #[derive(Debug)]
@@ -1354,7 +1356,8 @@ fn aeon_blocker_for_reason(reason: &str) -> Option<BlockerCode> {
         | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
         | LAUNCH_BLOCK_LAUNCH_NOT_OWNED
         | LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED
-        | LAUNCH_BLOCK_ADMISSION_EXPIRED => BlockerCode::PolicyRefused,
+        | LAUNCH_BLOCK_ADMISSION_EXPIRED
+        | LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED => BlockerCode::PolicyRefused,
         LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
         | LAUNCH_BLOCK_CONSUME_ABANDONED
         | LAUNCH_BLOCK_AUTHORITY_CLOSED => BlockerCode::DependencyFailed,
@@ -2323,7 +2326,7 @@ impl AeonClient {
             )
             .await?;
         if status != StatusCode::OK {
-            return Err(status_error(status));
+            return Err(refusal_from_aeon(status, &bytes));
         }
         decode_strict(&bytes)
     }
@@ -2351,7 +2354,7 @@ impl AeonClient {
             )
             .await?;
         if status != StatusCode::OK {
-            return Err(status_error(status));
+            return Err(refusal_from_aeon(status, &bytes));
         }
         let response: ConsumeResponse = decode_strict(&bytes)?;
         if !response.consumed
@@ -2379,7 +2382,7 @@ impl AeonClient {
             )
             .await?;
         if status != StatusCode::OK {
-            return Err(status_error(status));
+            return Err(refusal_from_aeon(status, &bytes));
         }
         let response: ResultResponse = decode_strict(&bytes)?;
         let receipt = ResultReceipt::from_response(&response)?;
@@ -2717,6 +2720,11 @@ impl AeonDeliveryAdapter {
             Err(AdapterError::Refused(status)) if status == StatusCode::CONFLICT => {
                 self.finish_consume_conflict(intent, &launch, true).await
             }
+            Err(AdapterError::LaunchBlocked(reason))
+                if reason == LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED =>
+            {
+                self.block_launch(intent, reason, true).map(|_| true)
+            }
             Err(error) => Err(error),
         }
     }
@@ -2758,6 +2766,11 @@ impl AeonDeliveryAdapter {
         }
         if reason == LAUNCH_BLOCK_ADMISSION_EXPIRED {
             return self.report_admission_expired(intent).await;
+        }
+        // close() answers 403 while the candidate or deploy gate is dark, so
+        // a failed result cannot be stored until the gate is approved.
+        if reason == LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED {
+            return Ok(());
         }
         let blocker = aeon_blocker_for_reason(reason).ok_or(AdapterError::Journal)?;
         self.write_observation(
@@ -3585,6 +3598,13 @@ impl AeonDeliveryAdapter {
                 self.validate_admission(&admission, intent, handoff, reviewed)?;
                 self.journal.store_admission(&intent.handoff_id, admission)
             }
+            Err(AdapterError::LaunchBlocked(reason))
+                if reason == LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED =>
+            {
+                Err(self
+                    .block_launch(intent, reason, true)
+                    .expect_err("stage gate refusal is journaled as an error"))
+            }
             Err(error) => Err(error),
         }
     }
@@ -3622,7 +3642,15 @@ impl AeonDeliveryAdapter {
 
     async fn consume_and_confirm(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
         let launch = self.journal.mark_consume_started(&intent.handoff_id)?;
-        let response = self.aeon.post_consume(&launch).await?;
+        let response = match self.aeon.post_consume(&launch).await {
+            Ok(response) => response,
+            Err(AdapterError::LaunchBlocked(reason))
+                if reason == LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED =>
+            {
+                return self.block_launch(intent, reason, true);
+            }
+            Err(error) => return Err(error),
+        };
         let receipt = consume_receipt(&response)?;
         let launch = self
             .journal
@@ -4726,6 +4754,32 @@ fn status_error(status: StatusCode) -> AdapterError {
         401 | 403 => AdapterError::Credential,
         _ => AdapterError::Refused(status),
     }
+}
+
+/// Exact Aeon gate texts. A longer sentence that merely contains one of
+/// these phrases stays a credential failure.
+fn stage_gate_block(status: StatusCode, body: &[u8]) -> Option<&'static str> {
+    if status != StatusCode::FORBIDDEN {
+        return None;
+    }
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return None;
+    };
+    match document.get("error").and_then(serde_json::Value::as_str) {
+        Some(
+            "stage gate is not approved"
+            | "stage gate is no longer approved"
+            | "candidate gate is no longer approved",
+        ) => Some(LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED),
+        _ => None,
+    }
+}
+
+fn refusal_from_aeon(status: StatusCode, body: &[u8]) -> AdapterError {
+    if let Some(reason) = stage_gate_block(status, body) {
+        return AdapterError::LaunchBlocked(reason);
+    }
+    status_error(status)
 }
 
 /// report.go uses the handoff texts once no further row will be stored.
@@ -6003,6 +6057,15 @@ mod tests {
         )) {
             return response;
         }
+        // launch.go checks both gates after an exact replay has already
+        // returned. A new admit uses "stage gate is not approved".
+        if let Some(response) = launch_gate_refusal(
+            flags.candidate_gate_live,
+            flags.deploy_gate_live,
+            "stage gate is not approved",
+        ) {
+            return response;
+        }
         let mut reviewed = None;
         let mut best_sequence = 0;
         let mut saw_stale = false;
@@ -6086,6 +6149,47 @@ mod tests {
         json_response(StatusCode::OK, &admission)
     }
 
+    struct ReleaseGates {
+        candidate_live: bool,
+        deploy_live: bool,
+    }
+
+    fn launch_gate_refusal(
+        candidate_live: bool,
+        deploy_live: bool,
+        message: &'static str,
+    ) -> Option<Response<Body>> {
+        if candidate_live && deploy_live {
+            None
+        } else {
+            Some(json_response(
+                StatusCode::FORBIDDEN,
+                &json!({"error": message}),
+            ))
+        }
+    }
+
+    fn result_gate_refusal(
+        operation: &str,
+        candidate_live: bool,
+        deploy_live: bool,
+    ) -> Option<Response<Body>> {
+        if operation == "deploy" && !candidate_live {
+            return Some(json_response(
+                StatusCode::FORBIDDEN,
+                &json!({"error": "candidate gate is no longer approved"}),
+            ));
+        }
+        // route() uses the deploy gate for both deploy and verify.
+        if matches!(operation, "deploy" | "verify") && !deploy_live {
+            return Some(json_response(
+                StatusCode::FORBIDDEN,
+                &json!({"error": "stage gate is no longer approved"}),
+            ));
+        }
+        None
+    }
+
     fn handle_consume(
         handoff: &mut FakeHandoff,
         body: &[u8],
@@ -6093,6 +6197,7 @@ mod tests {
         idempotency: &str,
         now: i64,
         drop_response: bool,
+        gates: ReleaseGates,
     ) -> Response<Body> {
         if let Some(response) = rejected_launch_key(idempotency) {
             return response;
@@ -6118,6 +6223,15 @@ mod tests {
         };
         if admission["id"] != admission_id {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
+        }
+        // launch.go checks the gates after the admission is loaded and after
+        // an exact consume replay has returned. The text is "no longer".
+        if let Some(response) = launch_gate_refusal(
+            gates.candidate_live,
+            gates.deploy_live,
+            "stage gate is no longer approved",
+        ) {
+            return response;
         }
         if handoff.consumed {
             return json_response(StatusCode::CONFLICT, &json!({}));
@@ -6178,6 +6292,8 @@ mod tests {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
         let now = inner.now;
+        let candidate_gate_live = inner.journey_candidate_gate_live;
+        let deploy_gate_live = inner.journey_deploy_gate_live;
         let drop_result = inner.drop_accepted_result;
         inner.drop_accepted_result = false;
         let Some(handoff) = inner.handoffs.get_mut(id) else {
@@ -6215,6 +6331,13 @@ mod tests {
             || value["terminal_sequence"].as_i64() != last
         {
             return json_response(StatusCode::CONFLICT, &json!({}));
+        }
+        // report.go checks the candidate gate for a deploy result, then the
+        // stage gate from route(). Exact result replay has already returned.
+        if let Some(response) =
+            result_gate_refusal(&handoff.operation, candidate_gate_live, deploy_gate_live)
+        {
+            return response;
         }
         let mut response = json!({
             "outcome": value["outcome"],
@@ -6321,6 +6444,8 @@ mod tests {
             matches!(route, ("POST", Some("launch"), Some("admit"))) && inner.drop_accepted_admit;
         let drop_consume = matches!(route, ("POST", Some("launch"), Some("consume")))
             && inner.drop_accepted_consume;
+        let candidate_gate_live = inner.journey_candidate_gate_live;
+        let deploy_gate_live = inner.journey_deploy_gate_live;
         if drop_admit {
             inner.drop_accepted_admit = false;
         }
@@ -6342,12 +6467,23 @@ mod tests {
                     principal,
                     idempotency,
                     drop_response: drop_admit,
+                    candidate_gate_live,
+                    deploy_gate_live,
                 };
                 handle_admit(&flags, handoff, body)
             }
-            ("POST", Some("launch"), Some("consume")) => {
-                handle_consume(handoff, body, principal, idempotency, now, drop_consume)
-            }
+            ("POST", Some("launch"), Some("consume")) => handle_consume(
+                handoff,
+                body,
+                principal,
+                idempotency,
+                now,
+                drop_consume,
+                ReleaseGates {
+                    candidate_live: candidate_gate_live,
+                    deploy_live: deploy_gate_live,
+                },
+            ),
             _ => json_response(StatusCode::NOT_FOUND, &json!({})),
         }
     }
@@ -6367,6 +6503,8 @@ mod tests {
         principal: &'a str,
         idempotency: &'a str,
         drop_response: bool,
+        candidate_gate_live: bool,
+        deploy_gate_live: bool,
     }
 
     fn canonical_body_digest(body: &[u8]) -> Result<String, ()> {
@@ -9578,7 +9716,8 @@ mod tests {
             | LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED
             | LAUNCH_BLOCK_LAUNCH_NOT_OWNED
             | LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED
-            | LAUNCH_BLOCK_ADMISSION_EXPIRED => "policy_refused",
+            | LAUNCH_BLOCK_ADMISSION_EXPIRED
+            | LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED => "policy_refused",
             LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
             | LAUNCH_BLOCK_CONSUME_ABANDONED
             | LAUNCH_BLOCK_AUTHORITY_CLOSED => "dependency_failed",
@@ -11905,6 +12044,207 @@ mod tests {
             .contains("PHAROS_AEON_LIVE_EXPECT_NODE_KEY"));
         assert!(posts(&other_node.fake).is_empty());
         other_node.server.abort();
+    }
+
+    #[tokio::test]
+    async fn dark_stage_gate_journals_the_admit_refusal_without_touching_the_host() {
+        for darken in [false, true] {
+            let fixture = harness(true).await;
+            let job_id = prepare_ready_launch(&fixture).await;
+            fixture.fake.update(|inner| {
+                if darken {
+                    inner.journey_deploy_gate_live = false;
+                } else {
+                    inner.journey_candidate_gate_live = false;
+                }
+            });
+            let error = fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    AdapterError::LaunchBlocked(LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED)
+                ),
+                "{darken:?} yielded {error}"
+            );
+            let job = fixture.actions.get(&job_id).unwrap();
+            assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+            assert!(job.confirmed_at.is_none());
+            assert_eq!(post_count(&fixture.fake, "/launch/consume"), 0);
+            let block = fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap();
+            assert_eq!(block.reason, LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED);
+            assert!(block.terminal);
+            assert_eq!(expected_blocker_for_reason(&block.reason), "policy_refused");
+            let later = fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                later,
+                AdapterError::LaunchBlocked(LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED)
+            ));
+            assert_eq!(post_count(&fixture.fake, "/launch/admit"), 1);
+            assert_eq!(
+                fixture.actions.get(&job_id).unwrap().state,
+                HostActionState::AwaitingConfirmation
+            );
+            fixture.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn dark_stage_gate_matches_aeon_on_admit_consume_and_result() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let evidence = serde_json::to_vec(&json!({
+            "sequence": 1,
+            "kind": "launch_readiness",
+            "outcome": "satisfied",
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "reviewed_plan_digest": "ab".repeat(32),
+            "host": "hsb8",
+            "all_host_eval_passed": true,
+            "target_build_passed": true,
+            "backup_ready": true,
+            "backup_observed_at": format_timestamp(now).unwrap(),
+            "restart_required": true,
+            "running_kernel": "unknown",
+            "expected_kernel": "unknown"
+        }))
+        .unwrap();
+        let post = |url: String, body: Vec<u8>, key: Option<&str>| {
+            let client = client.clone();
+            let bearer = bearer.clone();
+            let key = key.map(str::to_string);
+            async move {
+                let mut request = client
+                    .post(url)
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA)
+                    .body(body);
+                if let Some(key) = key {
+                    request = request.header("idempotency-key", key);
+                }
+                let response = request.send().await.unwrap();
+                let status = response.status();
+                let value: Value = response.json().await.unwrap_or(json!({}));
+                (status, value)
+            }
+        };
+        let evidence_url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+            .unwrap();
+        let (status, _) = post(evidence_url.to_string(), evidence, None).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let admit = serde_json::to_vec(&json!({
+            "version_scheme": "legacy",
+            "version": "1.2.3",
+            "release_channel": "stable",
+            "release_sequence": 123,
+            "digest_sha256": "1".repeat(64),
+            "commit_digest": "a".repeat(40),
+            "manifest_coordinate": "ghcr:inspr-at/pharos/releases/1.2.3",
+            "manifest_digest_sha256": "9".repeat(64)
+        }))
+        .unwrap();
+        let admit_url = origin
+            .join(&format!(
+                "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"
+            ))
+            .unwrap()
+            .to_string();
+        fake.update(|inner| inner.journey_candidate_gate_live = false);
+        let (status, value) = post(
+            admit_url.clone(),
+            admit.clone(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "stage gate is not approved");
+        fake.update(|inner| {
+            inner.journey_candidate_gate_live = true;
+            inner.journey_deploy_gate_live = false;
+        });
+        let (status, value) = post(
+            admit_url.clone(),
+            admit.clone(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "stage gate is not approved");
+        fake.update(|inner| inner.journey_deploy_gate_live = true);
+        let (status, _) = post(
+            admit_url.clone(),
+            admit.clone(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        fake.update(|inner| inner.journey_deploy_gate_live = false);
+        let (status, replay) = post(
+            admit_url,
+            admit,
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay["id"], ADMISSION_ID);
+        let consume_url = origin
+            .join(&format!(
+                "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/consume"
+            ))
+            .unwrap()
+            .to_string();
+        let consume = serde_json::to_vec(&json!({"admission_id": ADMISSION_ID})).unwrap();
+        let (status, value) = post(
+            consume_url,
+            consume,
+            Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "stage gate is no longer approved");
+        fake.update(|inner| {
+            inner.journey_deploy_gate_live = true;
+            inner.journey_candidate_gate_live = false;
+        });
+        let result_url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/result"))
+            .unwrap()
+            .to_string();
+        let result = serde_json::to_vec(&json!({
+            "outcome": "failed",
+            "terminal_sequence": 1,
+            "authority_epoch": 3,
+            "prerequisite_seal_sha256": hex_chars('d'),
+            "blocker_code": "dependency_failed"
+        }))
+        .unwrap();
+        let (status, value) = post(result_url.clone(), result.clone(), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "candidate gate is no longer approved");
+        fake.update(|inner| {
+            inner.journey_candidate_gate_live = true;
+            inner.journey_deploy_gate_live = false;
+        });
+        let (status, value) = post(result_url, result, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "stage gate is no longer approved");
+        server.abort();
     }
 
     #[tokio::test]

@@ -534,7 +534,10 @@ admission, and only then confirms the same job. Deployment evidence follows a
 fresh config-class beacon, a failed or cancelled job, or a terminal launch
 block while the job is still awaiting confirmation. A failed result uses
 one of Aeon's blocker codes (`dependency_pending`, `dependency_failed`,
-`reporter_stale`, `external_waiting`, `policy_refused`). The precise Pharos
+`reporter_stale`, `external_waiting`, `policy_refused`). A dark candidate or deploy gate is
+`stage_gate_not_approved`, which maps to `policy_refused`; Aeon will not
+store the result while that gate is dark, so the block stays in the
+journal and the host job is not confirmed. The precise Pharos
 reason stays in the journal and is not sent as the code: Aeon rejects any
 other result field. An expired admission journals `admission_expired` and
 posts `policy_refused` while `now` is not strictly after `expires_at`. Aeon
