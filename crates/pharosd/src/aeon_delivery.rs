@@ -9726,6 +9726,60 @@ mod tests {
     }
 
     #[test]
+    fn stage_gate_403_is_not_a_credential_error() {
+        for body in [
+            r#"{"error":"stage gate is not approved"}"#,
+            r#"{"error":"stage gate is no longer approved"}"#,
+            r#"{"error":"candidate gate is no longer approved"}"#,
+        ] {
+            assert!(matches!(
+                refusal_from_aeon(StatusCode::FORBIDDEN, body.as_bytes()),
+                AdapterError::LaunchBlocked(LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED)
+            ));
+        }
+        for body in [
+            r#"{"error":"live agent grant required"}"#,
+            r#"{"error":"Pharos is disabled"}"#,
+            r#"{"error":"stage gate is not approved yet"}"#,
+            r#"{"error":"not approved: stage gate is not approved"}"#,
+            "{}",
+        ] {
+            assert!(matches!(
+                refusal_from_aeon(StatusCode::FORBIDDEN, body.as_bytes()),
+                AdapterError::Credential
+            ));
+        }
+        assert!(matches!(
+            refusal_from_aeon(
+                StatusCode::UNAUTHORIZED,
+                br#"{"error":"stage gate is not approved"}"#
+            ),
+            AdapterError::Credential
+        ));
+    }
+
+    #[tokio::test]
+    async fn forbidden_handoff_read_without_a_gate_reason_stays_a_credential_error() {
+        let fixture = harness(true).await;
+        fixture
+            .fake
+            .update(|inner| inner.get_status = Some(StatusCode::FORBIDDEN));
+        let error = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::Credential));
+        assert!(fixture
+            .adapter
+            .journal
+            .launch_block(DEPLOY_HANDOFF)
+            .is_none());
+        assert!(posts(&fixture.fake).is_empty());
+        fixture.server.abort();
+    }
+
+    #[test]
     fn every_launch_block_reason_maps_to_an_accepted_blocker_code() {
         assert_eq!(
             AEON_BLOCKER_CODES,
@@ -12008,6 +12062,7 @@ mod tests {
         assert!(message.contains("stage gate is not approved"));
         assert!(message.contains("AEON-188"));
         assert!(posts(&dark_gates.fake).is_empty());
+        assert_eq!(readiness_post_count(&dark_gates.fake), 0);
         dark_gates.server.abort();
 
         let deploy_dark = harness(true).await;
@@ -12276,6 +12331,8 @@ mod tests {
         if let Some(verify) = &live.verify {
             handoff_ids.push(verify.handoff_id.as_str());
         }
+        // The gate check is before any evidence post. That post is what
+        // moves a requested handoff to active.
         if let Err(reason) = confirm_live_target(
             &adapter,
             &live.expect_project_key,

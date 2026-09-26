@@ -24,6 +24,7 @@
 - Require the live Aeon roundtrip to name the journey node key and to see every stage gate dark before it writes (PHAROS-313).
 - Require the live Aeon roundtrip's candidate and deploy gates to be live before it writes. A dark gate cannot be admitted. Until Aeon ships an operator-only disposable marker (AEON-188), the operator-supplied project key, node key, and release id remain the guard (PHAROS-313).
 - Refuse an Aeon admit when the candidate or deploy gate is dark, and journal `stage_gate_not_approved` without confirming the host job. Aeon answers 403 `stage gate is not approved` (PHAROS-313).
+- Classify an Aeon 403 as `stage_gate_not_approved` only when its error is exactly a stage-gate refusal. Any other 403 stays a credential failure. The live roundtrip checks the gates before the first evidence post (PHAROS-313).
 - Check every Aeon response header for a reflected bearer token before copying a header into a trace, a panic, or the live report (PHAROS-313).
 - Recheck the backup gate on every consume recovery, including while the posted readiness row is still inside the 600-second refresh window (PHAROS-313).
 - Refuse to confirm a recovered Aeon launch when the fetched handoff already has a result or its admission does not match the journal. A newer attempt is not visible on that handoff (PHAROS-313).
