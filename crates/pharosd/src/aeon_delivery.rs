@@ -1405,17 +1405,26 @@ impl JournalStore {
             return Ok(None);
         }
         let document = self.document.lock().expect("Aeon delivery journal lock");
-        let mut matches = document.operations.values().filter(|binding| {
-            binding.handoff_id != intent.handoff_id
-                && binding.host == intent.host
-                && binding.workflow == intent.workflow.key()
-                && binding.environment == intent.environment
-                && binding.artifact == intent.artifact
-                && binding.release_node_id == intent.release_node_id
-                && binding.plan_digest == handoff.predecessor_digest
-        });
-        let predecessor = matches.next().cloned();
-        if predecessor.is_some() && matches.next().is_some() {
+        let candidates: Vec<_> = document
+            .operations
+            .values()
+            .filter(|binding| {
+                binding.handoff_id != intent.handoff_id
+                    && binding.release_node_id == intent.release_node_id
+                    && binding.workflow == intent.workflow.key()
+                    && binding.host == intent.host
+                    && binding.attempt < handoff.attempt
+            })
+            .cloned()
+            .collect();
+        let Some(best_attempt) = candidates.iter().map(|binding| binding.attempt).max() else {
+            return Ok(None);
+        };
+        let mut chosen = candidates
+            .into_iter()
+            .filter(|binding| binding.attempt == best_attempt);
+        let predecessor = chosen.next();
+        if predecessor.is_some() && chosen.next().is_some() {
             return Err(AdapterError::LocalBinding);
         }
         Ok(predecessor)
@@ -6722,7 +6731,9 @@ mod tests {
             next.id = NEW_HANDOFF.to_string();
             next.attempt = 2;
             next.plan_digest = hex_chars('e');
-            next.predecessor_digest = hex_chars('a');
+            // Aeon sets predecessor_digest to the dependency seal, not the
+            // previous attempt's plan digest.
+            next.predecessor_digest = hex_chars('f');
             inner.handoffs.insert(NEW_HANDOFF.to_string(), next);
         });
         let (origin, server) = serve(fake).await;
@@ -6772,6 +6783,18 @@ mod tests {
         assert_eq!(
             actions.get(&retried).unwrap().retry_of.as_deref(),
             Some(lineage_job.as_str())
+        );
+        assert_ne!(
+            adapter
+                .journal
+                .operation(DEPLOY_HANDOFF)
+                .unwrap()
+                .plan_digest,
+            adapter
+                .journal
+                .operation(NEW_HANDOFF)
+                .unwrap()
+                .predecessor_digest
         );
         assert_eq!(
             adapter
