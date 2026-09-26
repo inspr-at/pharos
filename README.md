@@ -570,8 +570,28 @@ and consume are replayed with the journaled Idempotency-Key. An exact replay
 returns the stored admission or receipt, and a conflicting replay stays
 unresolved without changing the host. Confirmation after that replay still
 requires the fetched handoff to be `requested` or `active`, to have no result,
-and to match the journaled admission. A newer attempt of the same operation
-is not visible on that handoff. The bearer token stays in its referenced
+and to match the journaled admission. When that handoff carries
+`authority_open` or `superseded_by`, a false `authority_open` or a set
+`superseded_by` is an additional refusal while the handoff is still inside
+`expires_at`. It is journaled as `handoff_authority_not_open` and maps to
+`policy_refused`. A handoff already past `expires_at` is journaled as
+`admission_expired` instead, which also maps to `policy_refused`, and no
+result is posted. Those fields are optional. An older Aeon that never sends
+`authority_open` keeps the inferred check. The delivery journal belongs to
+one Aeon origin. A journal with no origin record still starts, and the first
+handoff read records the configured origin. Startup refuses when that
+recorded origin differs from the configured origin; a new origin needs its
+own journal path. Once a handoff read from an origin includes
+`authority_open`, the journal keeps that fact for the origin that sent it,
+and a fact recorded for another origin stays beside it. A later handoff read
+that omits `authority_open`, after that origin has sent it, is journaled as
+`authority_signal_missing`, which maps to `policy_refused`, and the host job
+is not confirmed. A true `authority_open` does not waive the inferred check.
+A newer attempt of the same operation is not visible as a change to this
+handoff's attempt or epoch. Aeon's handoff
+create response now matches GET (AEON-177). This adapter does not create
+handoffs, and GET remains the source of truth for the handoff it confirms.
+The bearer token stays in its referenced
 file and is not written to the journal. The adapter does nothing until the
 config variable is set.
 
@@ -586,10 +606,13 @@ journey `node_key`, refuses `project_key` `PHAROS` and any tenant other than
 `inspr`, and refuses a handoff whose `release_node_id` is not
 `PHAROS_AEON_LIVE_RELEASE_NODE_ID`. Admission answers 403 `stage gate is not
 approved` unless the candidate and deploy gates are live, so the harness
-requires the build stage's `gate_live` and the deploy stage's `gate_live`
-before it writes and says so when the fixture is not ready. Aeon has no
-operator-only disposable marker yet (AEON-188). Until that exists, the
-operator-supplied project key, node key, and release id are the guard.
+finds the stage whose `gate_scope` is `journey.candidate` and the stage whose
+`gate_scope` is `journey.deploy`, and requires `gate_live` on exactly those
+two. A refusal names the scope that is not live. It does not assume stage
+keys. The journey must report `disposable: true` or the harness refuses
+before any write. The project is not marked disposable until an operator
+marks it with Aeon's `aeon journey mark-disposable`. The operator-supplied
+project key, node key, project node, and release id remain required.
 It prints the project key, node key, and
 release number first. A response that reflects the bearer token, in the body or in any header,
 is withheld from the trace and the report. It does not run in CI.

@@ -73,6 +73,10 @@ const LAUNCH_BLOCK_CONSUME_ABANDONED: &str = "consume_abandoned";
 const LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED: &str = "confirmation_not_delegated";
 const LAUNCH_BLOCK_ADMISSION_EXPIRED: &str = "admission_expired";
 const LAUNCH_BLOCK_AUTHORITY_CLOSED: &str = "handoff_authority_closed";
+const LAUNCH_BLOCK_AUTHORITY_NOT_OPEN: &str = "handoff_authority_not_open";
+const LAUNCH_BLOCK_AUTHORITY_SIGNAL_MISSING: &str = "authority_signal_missing";
+const JOURNAL_ORIGIN_MISMATCH: &str =
+    "a delivery journal belongs to one Aeon origin; a new origin needs its own journal path";
 const LAUNCH_BLOCK_LAUNCH_NOT_OWNED: &str = "launch_not_owned";
 const LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED: &str = "configured_job_not_owned";
 const LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED: &str = "stage_gate_not_approved";
@@ -88,6 +92,8 @@ const LAUNCH_BLOCK_REASONS: &[&str] = &[
     LAUNCH_BLOCK_CONFIRMATION_NOT_DELEGATED,
     LAUNCH_BLOCK_ADMISSION_EXPIRED,
     LAUNCH_BLOCK_AUTHORITY_CLOSED,
+    LAUNCH_BLOCK_AUTHORITY_NOT_OPEN,
+    LAUNCH_BLOCK_AUTHORITY_SIGNAL_MISSING,
     LAUNCH_BLOCK_LAUNCH_NOT_OWNED,
     LAUNCH_BLOCK_CONFIGURED_JOB_NOT_OWNED,
     LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED,
@@ -581,6 +587,12 @@ struct HandoffDocument {
     plugin_id: String,
     attempt: i64,
     authority_epoch: i64,
+    /// Newest successor of this attempt. Absent on an older Aeon.
+    #[serde(default)]
+    superseded_by: Option<String>,
+    /// Whether this attempt can still accept an action. Absent on an older Aeon.
+    #[serde(default)]
+    authority_open: Option<bool>,
     journey_revision: i64,
     state: HandoffState,
     expires_at: String,
@@ -654,6 +666,10 @@ impl HandoffDocument {
             return Err(AdapterError::Contract);
         }
         Ok(())
+    }
+
+    fn explicit_authority_closed(&self) -> bool {
+        self.authority_open == Some(false) || self.superseded_by.is_some()
     }
 }
 
@@ -797,6 +813,10 @@ struct LaunchAdmission {
     expires_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     consumed_at: Option<String>,
+    /// Aeon stamps this on the admit body. Confirmation reads the handoff GET,
+    /// so the projection is dropped before the admission is journaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authority_open: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -811,6 +831,9 @@ struct ConsumeResponse {
     admission_id: String,
     consumed: bool,
     consumed_at: String,
+    /// Refreshed on an exact replay. Confirmation does not use it.
+    #[serde(default)]
+    authority_open: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1361,6 +1384,9 @@ fn aeon_blocker_for_reason(reason: &str) -> Option<BlockerCode> {
         LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
         | LAUNCH_BLOCK_CONSUME_ABANDONED
         | LAUNCH_BLOCK_AUTHORITY_CLOSED => BlockerCode::DependencyFailed,
+        LAUNCH_BLOCK_AUTHORITY_NOT_OPEN | LAUNCH_BLOCK_AUTHORITY_SIGNAL_MISSING => {
+            BlockerCode::PolicyRefused
+        }
         _ => return None,
     })
 }
@@ -1379,6 +1405,22 @@ struct JournalDocument {
     results: BTreeMap<String, ResultJournalRecord>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     launch_blocks: BTreeMap<String, LaunchBlock>,
+    /// Origin this journal is bound to. Absent until the first handoff read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound_origin: Option<String>,
+    /// Origins whose handoff reads included `authority_open`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    authority_signals: BTreeMap<String, AuthoritySignalFact>,
+    /// Earlier journals stored one capability origin here. Load folds it into
+    /// `bound_origin` and `authority_signals`, then stops writing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authority_signal_origin: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthoritySignalFact {
+    authority_open_observed: bool,
 }
 
 impl Default for JournalDocument {
@@ -1391,6 +1433,9 @@ impl Default for JournalDocument {
             launches: BTreeMap::new(),
             results: BTreeMap::new(),
             launch_blocks: BTreeMap::new(),
+            bound_origin: None,
+            authority_signals: BTreeMap::new(),
+            authority_signal_origin: None,
         }
     }
 }
@@ -1402,20 +1447,46 @@ struct JournalStore {
 
 impl JournalStore {
     fn new(path: PathBuf) -> Result<Self, AdapterError> {
-        let document = if path.exists() {
+        let mut document = if path.exists() {
             let (bytes, _) = read_private_file(&path, MAX_JOURNAL_BYTES, None)
                 .map_err(|_| AdapterError::Journal)?;
             decode_strict::<JournalDocument>(&bytes).map_err(|_| AdapterError::Journal)?
         } else {
             JournalDocument::default()
         };
+        let migrated = fold_legacy_authority_origin(&mut document)?;
         if !journal_document_valid(&document) {
             return Err(AdapterError::Journal);
         }
-        Ok(Self {
+        let store = Self {
             path,
             document: Mutex::new(document),
-        })
+        };
+        if migrated {
+            let mut document = store.document.lock().expect("Aeon delivery journal lock");
+            let updated = document.clone();
+            persist_journal(&store.path, &mut document, updated)?;
+        }
+        Ok(store)
+    }
+
+    fn require_configured_origin(&self, origin: &Url) -> Result<(), String> {
+        let key = authority_signal_origin(origin);
+        if !valid_authority_signal_origin(&key) {
+            return Err(AdapterError::Configuration.to_string());
+        }
+        let document = self.document.lock().expect("Aeon delivery journal lock");
+        let conflicts = match &document.bound_origin {
+            Some(bound) => bound != &key,
+            None => document
+                .authority_signals
+                .keys()
+                .any(|recorded| recorded != &key),
+        };
+        if conflicts {
+            return Err(JOURNAL_ORIGIN_MISMATCH.to_string());
+        }
+        Ok(())
     }
 
     fn assert_bound(&self, intent: &DeliveryIntent, origin: &Url) -> Result<(), AdapterError> {
@@ -2054,6 +2125,54 @@ impl JournalStore {
             .receipt = Some(receipt);
         persist_journal(&self.path, &mut document, updated)
     }
+
+    fn note_authority_signal(&self, origin: &Url, observed: bool) -> Result<(), AdapterError> {
+        let key = authority_signal_origin(origin);
+        if !valid_authority_signal_origin(&key) {
+            return Err(AdapterError::Contract);
+        }
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        let bind = document.bound_origin.is_none();
+        let record_signal = observed && !document.authority_signals.contains_key(&key);
+        if !bind && !record_signal {
+            return Ok(());
+        }
+        if record_signal && document.authority_signals.len() >= MAX_INTENTS {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        if bind {
+            updated.bound_origin = Some(key.clone());
+        }
+        if record_signal {
+            updated.authority_signals.insert(
+                key,
+                AuthoritySignalFact {
+                    authority_open_observed: true,
+                },
+            );
+        }
+        persist_journal(&self.path, &mut document, updated)
+    }
+
+    fn authority_signal_required(&self, origin: &Url) -> bool {
+        let key = authority_signal_origin(origin);
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .authority_signals
+            .get(&key)
+            .is_some_and(|fact| fact.authority_open_observed)
+    }
+
+    #[cfg(test)]
+    fn bound_origin(&self) -> Option<String> {
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .bound_origin
+            .clone()
+    }
 }
 
 fn journal_document_valid(document: &JournalDocument) -> bool {
@@ -2085,6 +2204,65 @@ fn journal_document_valid(document: &JournalDocument) -> bool {
             .launch_blocks
             .iter()
             .all(|(key, block)| key == &block.handoff_id && block.valid())
+        && document
+            .bound_origin
+            .as_deref()
+            .is_none_or(valid_authority_signal_origin)
+        && document.authority_signal_origin.is_none()
+        && document.authority_signals.len() <= MAX_INTENTS
+        && document.authority_signals.iter().all(|(origin, fact)| {
+            valid_authority_signal_origin(origin) && fact.authority_open_observed
+        })
+}
+
+fn fold_legacy_authority_origin(document: &mut JournalDocument) -> Result<bool, AdapterError> {
+    let Some(legacy) = document.authority_signal_origin.clone() else {
+        return Ok(false);
+    };
+    if !valid_authority_signal_origin(&legacy) {
+        return Err(AdapterError::Journal);
+    }
+    if let Some(bound) = &document.bound_origin {
+        if bound != &legacy {
+            return Err(AdapterError::Journal);
+        }
+    } else {
+        document.bound_origin = Some(legacy.clone());
+    }
+    if let Some(fact) = document.authority_signals.get(&legacy) {
+        if !fact.authority_open_observed {
+            return Err(AdapterError::Journal);
+        }
+    } else if document.authority_signals.len() >= MAX_INTENTS {
+        return Err(AdapterError::Journal);
+    } else {
+        document.authority_signals.insert(
+            legacy,
+            AuthoritySignalFact {
+                authority_open_observed: true,
+            },
+        );
+    }
+    document.authority_signal_origin = None;
+    Ok(true)
+}
+
+fn authority_signal_origin(origin: &Url) -> String {
+    origin.as_str().trim_end_matches('/').to_string()
+}
+
+fn valid_authority_signal_origin(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    matches!(url.scheme(), "https" | "http")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && (url.path().is_empty() || url.path() == "/")
+        && !value.ends_with('/')
 }
 
 fn persist_journal(
@@ -2328,7 +2506,9 @@ impl AeonClient {
         if status != StatusCode::OK {
             return Err(refusal_from_aeon(status, &bytes));
         }
-        decode_strict(&bytes)
+        let mut admission: LaunchAdmission = decode_strict(&bytes)?;
+        admission.authority_open = None;
+        Ok(admission)
     }
 
     async fn post_consume(
@@ -2489,23 +2669,41 @@ impl AeonDeliveryAdapter {
             .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
         refuse_unowned_configured_jobs(&config, &host_actions)
             .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
-        let journal = JournalStore::new(derived_journal_path(host_store_path))
+        let adapter = Self::open(
+            config,
+            derived_journal_path(host_store_path),
+            hosts,
+            host_actions,
+        )?;
+        tracing::info!("Aeon delivery adapter enabled");
+        Ok(Some(adapter))
+    }
+
+    fn open(
+        config: AdapterConfig,
+        journal_path: PathBuf,
+        hosts: Arc<Store>,
+        host_actions: Arc<HostActionStore>,
+    ) -> Result<Self, String> {
+        let journal = JournalStore::new(journal_path)
             .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
+        journal
+            .require_configured_origin(&config.aeon_origin)
+            .map_err(|message| format!("Aeon delivery adapter startup failed: {message}"))?;
         let aeon = AeonClient::new(
             config.aeon_origin.clone(),
             config.api_key_file.clone(),
             &config.aeon_ca_certificates,
         )
         .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
-        tracing::info!("Aeon delivery adapter enabled");
-        Ok(Some(Self {
+        Ok(Self {
             config,
             journal,
             aeon,
             hosts,
             host_actions,
             principal_id: Mutex::new(None),
-        }))
+        })
     }
 
     pub(crate) fn spawn(self) {
@@ -2554,7 +2752,7 @@ impl AeonDeliveryAdapter {
             .result(&intent.handoff_id)
             .is_some_and(|record| record.receipt.is_none())
         {
-            let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+            let handoff = self.read_handoff(&intent.handoff_id).await?;
             handoff.validate(intent)?;
             let pending = self
                 .journal
@@ -2588,7 +2786,7 @@ impl AeonDeliveryAdapter {
         if self.journal.has_stopped_evidence(&intent.handoff_id) {
             return Ok(());
         }
-        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let handoff = self.read_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
         if handoff.state.is_closed() {
             self.log_closed(&handoff);
@@ -2653,7 +2851,7 @@ impl AeonDeliveryAdapter {
             return Err(AdapterError::LocalBinding);
         }
         self.reject_terminal_block(&intent.handoff_id)?;
-        let observed = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let observed = self.read_handoff(&intent.handoff_id).await?;
         observed.validate(intent)?;
         let server_consumed_ours = observed.admission.as_ref().is_some_and(|admission| {
             admission.consumed_at.is_some()
@@ -2759,7 +2957,7 @@ impl AeonDeliveryAdapter {
         {
             return Ok(());
         }
-        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let handoff = self.read_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
         if stamp_passed(&handoff.expires_at)? || handoff.result.is_some() {
             return Ok(());
@@ -2792,7 +2990,7 @@ impl AeonDeliveryAdapter {
         {
             return Ok(());
         }
-        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let handoff = self.read_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
         // Aeon current() is false only once now is strictly after expires_at
         // (store.go). A later result is 409 and must not be journaled. The
@@ -2817,10 +3015,17 @@ impl AeonDeliveryAdapter {
         intent: &DeliveryIntent,
         launch: &LaunchJournalRecord,
     ) -> Result<(), AdapterError> {
-        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let handoff = self.read_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
         self.require_open_authority(intent, launch, &handoff)?;
         self.finish_confirmation(intent, launch, &handoff.expires_at)
+    }
+
+    async fn read_handoff(&self, handoff_id: &str) -> Result<HandoffDocument, AdapterError> {
+        let handoff = self.aeon.get_handoff(handoff_id).await?;
+        self.journal
+            .note_authority_signal(&self.config.aeon_origin, handoff.authority_open.is_some())?;
+        Ok(handoff)
     }
 
     fn require_open_authority(
@@ -2834,13 +3039,21 @@ impl AeonDeliveryAdapter {
             .operation(&intent.handoff_id)
             .ok_or(AdapterError::LocalBinding)?;
         let admission = launch.admission.as_ref().ok_or(AdapterError::Journal)?;
-        // GET /api/stage-handoffs/{id} returns this row only. Its attempt and
-        // epoch do not change when a newer attempt is created, and there is no
-        // list route. launchReplay returns the stored consume receipt before
-        // current() (launch.go). Journey stages[].handoff_id is the newest
-        // handoff in the stage by created_at, not this operation's latest
-        // attempt, and it has no attempt or epoch. These fields are the whole
-        // of what that GET can show.
+        // The inferred check existed because GET showed only this row: its
+        // attempt and epoch do not move when a newer attempt is inserted, and
+        // there is no list route. That inference remains the fallback until
+        // this origin has returned authority_open. That fact is kept per origin.
+        // After that, a handoff read that omits the field is a silent downgrade
+        // and is refused on its own.
+        // A false authority_open, or a superseded_by, is an additional refusal.
+        // It is journaled on its own and never waives the inferred check.
+        // launchReplay still returns the stored receipt before current().
+        // Aeon's handoff create response now matches GET (AEON-177). This
+        // adapter does not create handoffs, and GET remains the source of
+        // truth for the row it confirms.
+        // Expiry stays on the admission check below this function: a false
+        // authority_open caused only by an elapsed expires_at must not replace
+        // admission_expired.
         let admission_matches = handoff.admission.as_ref().is_some_and(|embedded| {
             embedded.admission_id == admission.id && embedded.epoch == admission.authority_epoch
         });
@@ -2851,10 +3064,20 @@ impl AeonDeliveryAdapter {
             && handoff.release_node_id == operation.release_node_id
             && handoff.operation == intent.operation
             && handoff.attempt == operation.attempt;
-        if current {
-            return Ok(());
+        if !current {
+            return self.block_launch(intent, LAUNCH_BLOCK_AUTHORITY_CLOSED, true);
         }
-        self.block_launch(intent, LAUNCH_BLOCK_AUTHORITY_CLOSED, true)
+        if handoff.explicit_authority_closed() && !stamp_passed(&handoff.expires_at)? {
+            return self.block_launch(intent, LAUNCH_BLOCK_AUTHORITY_NOT_OPEN, true);
+        }
+        if handoff.authority_open.is_none()
+            && self
+                .journal
+                .authority_signal_required(&self.config.aeon_origin)
+        {
+            return self.block_launch(intent, LAUNCH_BLOCK_AUTHORITY_SIGNAL_MISSING, true);
+        }
+        Ok(())
     }
 
     fn reject_terminal_block(&self, handoff_id: &str) -> Result<(), AdapterError> {
@@ -2928,7 +3151,7 @@ impl AeonDeliveryAdapter {
         intent: &DeliveryIntent,
         launch: &LaunchJournalRecord,
     ) -> Result<Option<ConsumeReceipt>, AdapterError> {
-        let observed = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let observed = self.read_handoff(&intent.handoff_id).await?;
         let Some(admission) = observed.admission.as_ref() else {
             return Ok(None);
         };
@@ -2971,7 +3194,7 @@ impl AeonDeliveryAdapter {
         if !record.bound_to(intent, &self.config.aeon_origin) || !record.valid() {
             return Err(AdapterError::Journal);
         }
-        let handoff = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let handoff = self.read_handoff(&intent.handoff_id).await?;
         handoff.validate(intent)?;
         // report.go answers 409 "handoff is terminal" when a result is set or
         // the handoff is revoked, and 409 "handoff is stale" once current()
@@ -3241,7 +3464,7 @@ impl AeonDeliveryAdapter {
             return self.block_launch(intent, LAUNCH_BLOCK_ADMISSION_EXPIRED, true);
         }
         self.validate_admission(&admission, intent, handoff, &reviewed)?;
-        let fresh = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let fresh = self.read_handoff(&intent.handoff_id).await?;
         fresh.validate(intent)?;
         fresh.open_for_write()?;
         if fresh.plan_digest != handoff.plan_digest
@@ -4197,7 +4420,7 @@ impl AeonDeliveryAdapter {
         intent: &DeliveryIntent,
         failed: &ResultJournalRecord,
     ) -> Result<(), AdapterError> {
-        let fresh = self.aeon.get_handoff(&intent.handoff_id).await?;
+        let fresh = self.read_handoff(&intent.handoff_id).await?;
         fresh.validate(intent)?;
         fresh.open_for_write()?;
         self.result_retry_binding(intent, &fresh)?;
@@ -5502,6 +5725,57 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn legacy_authority_signal_origin_binds_that_origin() {
+        let directory = TestDir::new("legacy-origin");
+        let path = directory
+            .path()
+            .join("hosts.json.aeon-delivery-journal.json");
+        let origin = "https://aeon.example.test";
+        write_private(
+            &path,
+            format!(
+                r#"{{"schema":"{JOURNAL_SCHEMA}","schema_version":{JOURNAL_SCHEMA_VERSION},"records":{{}},"authority_signal_origin":"{origin}"}}"#
+            )
+            .as_bytes(),
+        );
+        let loaded = JournalStore::new(path.clone()).unwrap();
+        let origin_url = Url::parse(&format!("{origin}/")).unwrap();
+        assert_eq!(loaded.bound_origin().as_deref(), Some(origin));
+        assert!(loaded.authority_signal_required(&origin_url));
+        let rendered = std::fs::read_to_string(&path).unwrap();
+        assert!(!rendered.contains("authority_signal_origin"));
+        assert!(rendered.contains("\"bound_origin\""));
+        assert!(rendered.contains("authority_open_observed"));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let actions = Arc::new(HostActionStore::new(None));
+        let api = directory.path().join("api-key");
+        let mismatch = match AeonDeliveryAdapter::open(
+            runtime_config(
+                Url::parse("https://other.example.test").unwrap(),
+                api.clone(),
+                vec![deploy_intent(true), verify_intent()],
+            ),
+            path.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        ) {
+            Ok(_) => panic!("a different Aeon origin started"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            mismatch,
+            format!("Aeon delivery adapter startup failed: {JOURNAL_ORIGIN_MISMATCH}")
+        );
+        AeonDeliveryAdapter::open(
+            runtime_config(origin_url, api, vec![deploy_intent(true), verify_intent()]),
+            path,
+            hosts,
+            actions,
+        )
+        .expect("the recorded origin still starts");
+    }
+
     fn hex_chars(byte: char) -> String {
         byte.to_string().repeat(64)
     }
@@ -5532,8 +5806,13 @@ mod tests {
         /// stores this as `created_at` and rejects evidence observed more than
         /// a minute earlier.
         created_at: i64,
+        /// Set when a newer attempt exists. GET reports it as `superseded_by`.
+        superseded_by: Option<String>,
+        /// Omit `authority_open` and `superseded_by` so an older Aeon is modeled.
+        omit_supersession_fields: bool,
         /// FakeAeon only. Real `current()` is false when the recomputed plan
-        /// digest or authority epoch differs, and GET does not show that.
+        /// digest or authority epoch differs. GET reports that as
+        /// `authority_open: false`; this flag itself is not a wire field.
         force_stale: bool,
         evidence: BTreeMap<i64, StoredEvidence>,
         admission: Option<Value>,
@@ -5582,6 +5861,8 @@ mod tests {
                 context_digest: hex_chars('c'),
                 prerequisite_seal_sha256: hex_chars('d'),
                 created_at: now,
+                superseded_by: None,
+                omit_supersession_fields: false,
                 force_stale: false,
                 evidence: BTreeMap::new(),
                 admission: None,
@@ -5596,7 +5877,19 @@ mod tests {
             }
         }
 
-        fn json(&self) -> Value {
+        fn authority_is_open(&self, now: i64) -> bool {
+            if self.superseded_by.is_some() || self.result.is_some() || self.force_stale {
+                return false;
+            }
+            if !matches!(self.state.as_str(), "requested" | "active") {
+                return false;
+            }
+            parse_timestamp(&self.expires_at)
+                .map(|time| now <= time.unix_timestamp())
+                .unwrap_or(false)
+        }
+
+        fn json(&self, now: i64) -> Value {
             let mut value = json!({
                 "id": self.id,
                 "project_node_id": self.project_node_id,
@@ -5615,6 +5908,13 @@ mod tests {
                 "context_digest": self.context_digest,
                 "prerequisite_seal_sha256": self.prerequisite_seal_sha256,
             });
+            if !self.omit_supersession_fields {
+                value["superseded_by"] = match &self.superseded_by {
+                    Some(successor) => json!(successor),
+                    None => Value::Null,
+                };
+                value["authority_open"] = json!(self.authority_is_open(now));
+            }
             if let Some(result) = &self.result {
                 value["result"] = result.clone();
             }
@@ -5662,8 +5962,12 @@ mod tests {
         journey_project_key: String,
         journey_node_key: String,
         journey_tenant_slug: String,
-        /// Build stage carries the candidate gate once that gate exists
-        /// (journey derive.go gateIDFor). Admit requires both live.
+        /// None omits the field. Only Some(true) passes the live guard.
+        journey_disposable: Option<bool>,
+        /// Stage keys are labels. gate_scope journey.candidate and
+        /// journey.deploy identify the gates admit requires.
+        journey_candidate_stage_key: String,
+        journey_deploy_stage_key: String,
         journey_candidate_gate_live: bool,
         journey_deploy_gate_live: bool,
     }
@@ -5712,6 +6016,9 @@ mod tests {
                     journey_project_key: "lab".to_string(),
                     journey_node_key: "PRJ-17".to_string(),
                     journey_tenant_slug: "inspr".to_string(),
+                    journey_disposable: Some(true),
+                    journey_candidate_stage_key: "build".to_string(),
+                    journey_deploy_stage_key: "deploy".to_string(),
                     journey_candidate_gate_live: true,
                     journey_deploy_gate_live: true,
                 })),
@@ -5955,14 +6262,15 @@ mod tests {
                 &json!({"error": "handoff is terminal"}),
             );
         }
-        // current() is false after expiry and when the plan digest or epoch
-        // drifts. report.go returns 409 "handoff is stale" before the stored
-        // replay, so an exact replay is refused as well. force_stale is the
-        // stand-in for the recomputed digest, which GET does not carry.
+        // current() is false after expiry, when a newer attempt supersedes
+        // this one, and when the plan digest or epoch drifts. report.go
+        // returns 409 "handoff is stale" before the stored replay, so an
+        // exact evidence replay is refused as well. force_stale stands in
+        // for the recomputed digest. GET reports that as authority_open.
         let expires_at = parse_timestamp(&handoff.expires_at)
             .map(|time| time.unix_timestamp())
             .unwrap_or(0);
-        if handoff.force_stale || expires_at < now {
+        if handoff.superseded_by.is_some() || handoff.force_stale || expires_at < now {
             return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
         }
         if let Some(stored) = handoff.evidence.get(&sequence) {
@@ -6047,18 +6355,36 @@ mod tests {
         if !same_held_artifact(&value, &handoff.held_artifact) {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
-        if let Some(response) = replay_response(launch_replay(
+        if let Some(response) = finish_launch_replay(
             handoff,
-            "admit",
-            flags.principal,
-            flags.idempotency,
-            body,
             flags.now,
-        )) {
+            launch_replay(
+                handoff,
+                "admit",
+                flags.principal,
+                flags.idempotency,
+                body,
+                flags.now,
+            ),
+        ) {
             return response;
         }
-        // launch.go checks both gates after an exact replay has already
-        // returned. A new admit uses "stage gate is not approved".
+        // launch.go refuses a new key once an admission is stored, before
+        // current(). A superseded handoff that already has an admission
+        // answers "launch admission already exists", not "handoff is stale".
+        if handoff.admission.is_some() {
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "launch admission already exists"}),
+            );
+        }
+        // current() is later (launch.go). A superseded attempt with no
+        // admission is 409 "handoff is stale". Exact replay already returned.
+        if handoff.superseded_by.is_some() || handoff.force_stale {
+            return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
+        }
+        // launch.go checks both gates after current(). A new admit uses
+        // "stage gate is not approved".
         if let Some(response) = launch_gate_refusal(
             flags.candidate_gate_live,
             flags.deploy_gate_live,
@@ -6098,9 +6424,6 @@ mod tests {
         if contradicted {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
-        if handoff.admission.is_some() {
-            return json_response(StatusCode::CONFLICT, &json!({}));
-        }
         let binding = if flags.corrupt {
             "0".repeat(64)
         } else {
@@ -6131,6 +6454,7 @@ mod tests {
             "binding_digest_sha256": binding,
             "artifact_digest_sha256": digest,
             "authority_epoch": handoff.authority_epoch,
+            "authority_open": true,
             "expires_at": expires_at,
         });
         handoff.admission = Some(admission.clone());
@@ -6202,14 +6526,11 @@ mod tests {
         if let Some(response) = rejected_launch_key(idempotency) {
             return response;
         }
-        if let Some(response) = replay_response(launch_replay(
+        if let Some(response) = finish_launch_replay(
             handoff,
-            "consume",
-            principal,
-            idempotency,
-            body,
             now,
-        )) {
+            launch_replay(handoff, "consume", principal, idempotency, body, now),
+        ) {
             return response;
         }
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
@@ -6232,6 +6553,12 @@ mod tests {
             "stage gate is no longer approved",
         ) {
             return response;
+        }
+        // launch.go checks current() after the gates. A new write on a
+        // superseded attempt is 409 "handoff is stale". Exact replay already
+        // returned.
+        if handoff.superseded_by.is_some() || handoff.force_stale {
+            return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
         }
         if handoff.consumed {
             return json_response(StatusCode::CONFLICT, &json!({}));
@@ -6263,6 +6590,7 @@ mod tests {
             "admission_id": admission_id,
             "consumed": true,
             "consumed_at": consumed_at,
+            "authority_open": true,
         });
         handoff.consumed = true;
         handoff.consumed_at = Some(consumed_at);
@@ -6305,6 +6633,9 @@ mod tests {
             } else {
                 json_response(StatusCode::CONFLICT, &json!({}))
             };
+        }
+        if handoff.superseded_by.is_some() || handoff.force_stale {
+            return json_response(StatusCode::CONFLICT, &json!({"error": "handoff is stale"}));
         }
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return json_response(StatusCode::BAD_REQUEST, &json!({}));
@@ -6398,24 +6729,27 @@ mod tests {
             && parts[1] == "projects"
             && parts[3] == "journey"
         {
-            return json_response(
-                StatusCode::OK,
-                &json!({
-                    "project_node_id": parts[2],
-                    "project_key": inner.journey_project_key,
-                    "node_key": inner.journey_node_key,
-                    "tenant_slug": inner.journey_tenant_slug,
-                    "stages": [{
-                        "key": "build",
-                        "state": "done",
-                        "gate_live": inner.journey_candidate_gate_live,
-                    }, {
-                        "key": "deploy",
-                        "state": "current",
-                        "gate_live": inner.journey_deploy_gate_live,
-                    }],
-                }),
-            );
+            let mut document = json!({
+                "project_node_id": parts[2],
+                "project_key": inner.journey_project_key,
+                "node_key": inner.journey_node_key,
+                "tenant_slug": inner.journey_tenant_slug,
+                "stages": [{
+                    "key": inner.journey_candidate_stage_key,
+                    "state": "done",
+                    "gate_scope": CANDIDATE_GATE_SCOPE,
+                    "gate_live": inner.journey_candidate_gate_live,
+                }, {
+                    "key": inner.journey_deploy_stage_key,
+                    "state": "current",
+                    "gate_scope": DEPLOY_GATE_SCOPE,
+                    "gate_live": inner.journey_deploy_gate_live,
+                }],
+            });
+            if let Some(disposable) = inner.journey_disposable {
+                document["disposable"] = json!(disposable);
+            }
+            return json_response(StatusCode::OK, &document);
         }
         if parts.len() < 3 || parts[0] != "api" || parts[1] != "stage-handoffs" {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
@@ -6456,7 +6790,7 @@ mod tests {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         };
         match route {
-            ("GET", None, None) => json_response(StatusCode::OK, &handoff.json()),
+            ("GET", None, None) => json_response(StatusCode::OK, &handoff.json(now)),
             ("POST", Some("evidence"), None) => handle_evidence(handoff, body, now),
             ("POST", Some("launch"), Some("admit")) => {
                 let flags = AdmitFlags {
@@ -6593,6 +6927,27 @@ mod tests {
         LaunchReplay::Hit(stored.response.clone())
     }
 
+    fn stamp_authority_open(mut response: Value, open: bool) -> Value {
+        if let Some(object) = response.as_object_mut() {
+            object.insert("authority_open".to_string(), json!(open));
+        }
+        response
+    }
+
+    fn finish_launch_replay(
+        handoff: &FakeHandoff,
+        now: i64,
+        replay: LaunchReplay,
+    ) -> Option<Response<Body>> {
+        match replay {
+            LaunchReplay::Hit(response) => Some(json_response(
+                StatusCode::OK,
+                &stamp_authority_open(response, handoff.authority_is_open(now)),
+            )),
+            other => replay_response(other),
+        }
+    }
+
     fn replay_response(replay: LaunchReplay) -> Option<Response<Body>> {
         match replay {
             LaunchReplay::Miss => None,
@@ -6716,21 +7071,7 @@ mod tests {
         hosts: Arc<Store>,
         actions: Arc<HostActionStore>,
     ) -> AeonDeliveryAdapter {
-        let journal = JournalStore::new(journal_path).expect("test journal");
-        let aeon = AeonClient::new(
-            config.aeon_origin.clone(),
-            config.api_key_file.clone(),
-            &config.aeon_ca_certificates,
-        )
-        .expect("test Aeon client");
-        AeonDeliveryAdapter {
-            config,
-            journal,
-            aeon,
-            hosts,
-            host_actions: actions,
-            principal_id: Mutex::new(None),
-        }
+        AeonDeliveryAdapter::open(config, journal_path, hosts, actions).expect("test adapter")
     }
 
     fn ready_plan() -> HostActionPlan {
@@ -9706,6 +10047,486 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn superseded_handoff_refuses_confirmation_while_its_state_still_looks_open() {
+        for edit in [
+            |handoff: &mut FakeHandoff| {
+                handoff.superseded_by = Some("22222222-2222-4222-8222-222222222222".to_string());
+            },
+            |handoff: &mut FakeHandoff| {
+                handoff.force_stale = true;
+            },
+        ] {
+            let fixture = harness(true).await;
+            let job_id = dropped_consume(&fixture).await;
+            fixture.fake.update(|inner| {
+                let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+                edit(handoff);
+            });
+            let document = fetch_handoff(&fixture.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+            assert_eq!(document["state"], "requested");
+            assert!(document.get("result").is_none());
+            assert_eq!(document["attempt"], 1);
+            assert_eq!(document["authority_open"], false);
+            assert!(document.get("force_stale").is_none());
+            let replay = fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap_err();
+            // Aeon answers 409 "handoff is stale" for a new write, so the
+            // mapped result is not stored. The terminal block is already
+            // journaled.
+            assert!(
+                matches!(replay, AdapterError::Refused(status) if status == StatusCode::CONFLICT),
+                "{replay:?}"
+            );
+            let job = fixture.actions.get(&job_id).unwrap();
+            assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+            assert!(job.confirmed_at.is_none());
+            let block = fixture
+                .adapter
+                .journal
+                .launch_block(DEPLOY_HANDOFF)
+                .unwrap();
+            assert_eq!(block.reason, LAUNCH_BLOCK_AUTHORITY_NOT_OPEN);
+            assert!(block.terminal);
+            assert_eq!(expected_blocker_for_reason(&block.reason), "policy_refused");
+            assert!(result_posts(&fixture.fake).is_empty());
+            let later = fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                later,
+                AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_NOT_OPEN)
+            ));
+            assert!(result_posts(&fixture.fake).is_empty());
+            assert_eq!(
+                fixture.actions.get(&job_id).unwrap().state,
+                HostActionState::AwaitingConfirmation
+            );
+            fixture.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_supersession_fields_keep_the_inferred_authority_check() {
+        let open = harness(true).await;
+        open.fake.update(|inner| {
+            for id in [DEPLOY_HANDOFF, VERIFY_HANDOFF] {
+                inner.handoffs.get_mut(id).unwrap().omit_supersession_fields = true;
+            }
+        });
+        let open_job = dropped_consume(&open).await;
+        let document = fetch_handoff(&open.adapter.config.aeon_origin, DEPLOY_HANDOFF).await;
+        assert!(document.get("authority_open").is_none());
+        assert!(document.get("superseded_by").is_none());
+        assert_eq!(document["attempt"], 1);
+        open.adapter.process_intent(&open.intent).await.unwrap();
+        assert_eq!(
+            open.actions.get(&open_job).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        let saved = JournalStore::new(open.journal.clone()).unwrap();
+        assert!(!saved.authority_signal_required(&open.adapter.config.aeon_origin));
+        assert_eq!(
+            saved.bound_origin().as_deref(),
+            Some(authority_signal_origin(&open.adapter.config.aeon_origin).as_str())
+        );
+        open.server.abort();
+
+        let closed = harness(true).await;
+        let _closed_job = dropped_consume(&closed).await;
+        closed.fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.omit_supersession_fields = true;
+            handoff.state = "failed".to_string();
+        });
+        let replay = closed
+            .adapter
+            .process_intent(&closed.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_CLOSED)
+        ));
+        assert_eq!(
+            result_posts(&closed.fake)[0]["blocker_code"],
+            "dependency_failed"
+        );
+        closed.server.abort();
+    }
+
+    #[tokio::test]
+    async fn omitted_authority_signal_refuses_confirmation_after_a_journal_reload() {
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        assert!(JournalStore::new(fixture.journal.clone())
+            .unwrap()
+            .authority_signal_required(&fixture.adapter.config.aeon_origin));
+        fixture.fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .omit_supersession_fields = true;
+        });
+        let reloaded = test_adapter(
+            runtime_config(
+                fixture.adapter.config.aeon_origin.clone(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        );
+        let error = reloaded.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_SIGNAL_MISSING)
+            ),
+            "{error:?}"
+        );
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        let block = reloaded.journal.launch_block(DEPLOY_HANDOFF).unwrap();
+        assert_eq!(block.reason, LAUNCH_BLOCK_AUTHORITY_SIGNAL_MISSING);
+        assert!(block.terminal);
+        assert_eq!(expected_blocker_for_reason(&block.reason), "policy_refused");
+        assert!(JournalStore::new(fixture.journal.clone())
+            .unwrap()
+            .authority_signal_required(&fixture.adapter.config.aeon_origin));
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn authority_signal_stays_required_after_another_origin_is_recorded() {
+        let fixture = harness(true).await;
+        let job_id = dropped_consume(&fixture).await;
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        let other = Url::parse("https://other.example.test").unwrap();
+        fixture
+            .adapter
+            .journal
+            .note_authority_signal(&other, true)
+            .unwrap();
+        assert_eq!(
+            fixture.adapter.journal.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        assert!(fixture.adapter.journal.authority_signal_required(&origin));
+        assert!(fixture.adapter.journal.authority_signal_required(&other));
+        fixture.fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .omit_supersession_fields = true;
+        });
+        let reloaded = test_adapter(
+            runtime_config(
+                origin.clone(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        );
+        let error = reloaded.process_intent(&fixture.intent).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AdapterError::LaunchBlocked(LAUNCH_BLOCK_AUTHORITY_SIGNAL_MISSING)
+            ),
+            "{error:?}"
+        );
+        let job = fixture.actions.get(&job_id).unwrap();
+        assert_eq!(job.state, HostActionState::AwaitingConfirmation);
+        assert!(job.confirmed_at.is_none());
+        let saved = JournalStore::new(fixture.journal.clone()).unwrap();
+        assert!(saved.authority_signal_required(&origin));
+        assert!(saved.authority_signal_required(&other));
+        assert_eq!(
+            saved.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn journal_recorded_against_one_origin_refuses_a_different_origin_at_startup() {
+        let fixture = harness(true).await;
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        let recorded = JournalStore::new(fixture.journal.clone()).unwrap();
+        assert_eq!(
+            recorded.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        let mismatch = match AeonDeliveryAdapter::open(
+            runtime_config(
+                Url::parse("https://other.example.test").unwrap(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone(), verify_intent()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        ) {
+            Ok(_) => panic!("a different Aeon origin started"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            mismatch,
+            format!("Aeon delivery adapter startup failed: {JOURNAL_ORIGIN_MISMATCH}")
+        );
+        AeonDeliveryAdapter::open(
+            runtime_config(
+                origin,
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone(), verify_intent()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        )
+        .expect("the recorded origin still starts");
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn preexisting_journal_without_an_origin_records_it_on_first_read() {
+        let directory = TestDir::new("prior-journal");
+        let journal = directory
+            .path()
+            .join("hosts.json.aeon-delivery-journal.json");
+        write_private(
+            &journal,
+            format!(
+                r#"{{"schema":"{JOURNAL_SCHEMA}","schema_version":{JOURNAL_SCHEMA_VERSION},"records":{{}}}}"#
+            )
+            .as_bytes(),
+        );
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let fake = FakeAeon::new(now_unix());
+        fake.update(|inner| {
+            for id in [DEPLOY_HANDOFF, VERIFY_HANDOFF] {
+                inner.handoffs.get_mut(id).unwrap().omit_supersession_fields = true;
+            }
+        });
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let intent = deploy_intent(true);
+        let adapter = AeonDeliveryAdapter::open(
+            runtime_config(origin.clone(), api, vec![intent.clone(), verify_intent()]),
+            journal.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        )
+        .expect("a journal with no origin record starts");
+        assert!(adapter.journal.bound_origin().is_none());
+        let fixture = Harness {
+            fake,
+            server,
+            adapter,
+            actions,
+            hosts,
+            journal: journal.clone(),
+            intent,
+            _directory: directory,
+        };
+        let job_id = dropped_consume(&fixture).await;
+        assert_eq!(
+            fixture.adapter.journal.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        assert!(!fixture.adapter.journal.authority_signal_required(&origin));
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        let saved = JournalStore::new(journal).unwrap();
+        assert_eq!(
+            saved.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        assert!(!saved.authority_signal_required(&origin));
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn superseded_handoff_refuses_a_new_write_and_replays_the_stored_receipt() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let post = |url: String, body: Vec<u8>, key: Option<&str>| {
+            let client = client.clone();
+            let bearer = bearer.clone();
+            let key = key.map(str::to_string);
+            async move {
+                let mut request = client
+                    .post(url)
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA)
+                    .body(body);
+                if let Some(key) = key {
+                    request = request.header("idempotency-key", key);
+                }
+                let response = request.send().await.unwrap();
+                let status = response.status();
+                let value: Value = response.json().await.unwrap_or(json!({}));
+                (status, value)
+            }
+        };
+        let evidence = serde_json::to_vec(&json!({
+            "sequence": 1,
+            "kind": "launch_readiness",
+            "outcome": "satisfied",
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "reviewed_plan_digest": "ab".repeat(32),
+            "host": "hsb8",
+            "all_host_eval_passed": true,
+            "target_build_passed": true,
+            "backup_ready": true,
+            "backup_observed_at": format_timestamp(now).unwrap(),
+            "restart_required": true,
+            "running_kernel": "unknown",
+            "expected_kernel": "unknown"
+        }))
+        .unwrap();
+        let evidence_url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+            .unwrap()
+            .to_string();
+        let (status, _) = post(evidence_url.clone(), evidence.clone(), None).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let admit = serde_json::to_vec(&json!({
+            "version_scheme": "legacy",
+            "version": "1.2.3",
+            "release_channel": "stable",
+            "release_sequence": 123,
+            "digest_sha256": "1".repeat(64),
+            "commit_digest": "a".repeat(40),
+            "manifest_coordinate": "ghcr:inspr-at/pharos/releases/1.2.3",
+            "manifest_digest_sha256": "9".repeat(64)
+        }))
+        .unwrap();
+        let admit_url = origin
+            .join(&format!(
+                "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"
+            ))
+            .unwrap()
+            .to_string();
+        let admit_key = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaad";
+        let (status, admitted) = post(admit_url.clone(), admit.clone(), Some(admit_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(admitted["authority_open"], true);
+        let consume_url = origin
+            .join(&format!(
+                "/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/consume"
+            ))
+            .unwrap()
+            .to_string();
+        let consume = serde_json::to_vec(&json!({"admission_id": ADMISSION_ID})).unwrap();
+        let consume_key = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc";
+        let (status, consumed) =
+            post(consume_url.clone(), consume.clone(), Some(consume_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(consumed["authority_open"], true);
+        let successor = "22222222-2222-4222-8222-222222222222";
+        fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .superseded_by = Some(successor.to_string());
+        });
+        let document = fetch_handoff(&origin, DEPLOY_HANDOFF).await;
+        assert_eq!(document["attempt"], 1);
+        assert_eq!(document["state"], "requested");
+        assert_eq!(document["superseded_by"], successor);
+        assert_eq!(document["authority_open"], false);
+        let (status, replayed) =
+            post(consume_url.clone(), consume.clone(), Some(consume_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed["authority_open"], false);
+        assert_eq!(replayed["admission_id"], ADMISSION_ID);
+        let (status, replayed_admit) =
+            post(admit_url.clone(), admit.clone(), Some(admit_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed_admit["authority_open"], false);
+        assert_eq!(replayed_admit["id"], ADMISSION_ID);
+        let (status, value) = post(
+            consume_url,
+            consume,
+            Some("cccccccc-cccc-4ccc-8ccc-cccccccccccd"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        let (status, value) = post(
+            admit_url.clone(),
+            admit.clone(),
+            Some("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "launch admission already exists");
+        fake.update(|inner| {
+            let handoff = inner.handoffs.get_mut(DEPLOY_HANDOFF).unwrap();
+            handoff.admission = None;
+            handoff.launch_calls.clear();
+        });
+        let (status, value) = post(
+            admit_url,
+            admit,
+            Some("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        let (status, value) = post(evidence_url, evidence, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        let result_url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/result"))
+            .unwrap()
+            .to_string();
+        let result = serde_json::to_vec(&json!({
+            "outcome": "failed",
+            "terminal_sequence": 1,
+            "authority_epoch": 3,
+            "prerequisite_seal_sha256": hex_chars('d'),
+            "blocker_code": "policy_refused"
+        }))
+        .unwrap();
+        let (status, value) = post(result_url, result, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "handoff is stale");
+        server.abort();
+    }
+
     fn expected_blocker_for_reason(reason: &str) -> &'static str {
         match reason {
             LAUNCH_BLOCK_BACKUP_SUCCESS_MISSING
@@ -9721,6 +10542,9 @@ mod tests {
             LAUNCH_BLOCK_CONSUMED_WITHOUT_CONFIRMABLE_JOB
             | LAUNCH_BLOCK_CONSUME_ABANDONED
             | LAUNCH_BLOCK_AUTHORITY_CLOSED => "dependency_failed",
+            LAUNCH_BLOCK_AUTHORITY_NOT_OPEN | LAUNCH_BLOCK_AUTHORITY_SIGNAL_MISSING => {
+                "policy_refused"
+            }
             _ => panic!("reason {reason} has no Aeon blocker code"),
         }
     }
@@ -11965,6 +12789,50 @@ mod tests {
         assert!(posts(&allowed.fake).is_empty());
         allowed.server.abort();
 
+        let renamed = harness(true).await;
+        renamed.fake.update(|inner| {
+            inner.journey_candidate_stage_key = "compiled".to_string();
+            inner.journey_deploy_stage_key = "shipped".to_string();
+        });
+        confirm_live_target(
+            &renamed.adapter,
+            "lab",
+            "PRJ-17",
+            &renamed.intent.project_node_id,
+            RELEASE_NODE,
+            renamed.intent.artifact.release_sequence,
+            &[renamed.intent.handoff_id.as_str()],
+        )
+        .await
+        .expect("gate scope, not stage key");
+        assert!(posts(&renamed.fake).is_empty());
+        renamed.server.abort();
+
+        for disposable in [Some(false), None] {
+            let unmarked = harness(true).await;
+            unmarked
+                .fake
+                .update(|inner| inner.journey_disposable = disposable);
+            let refused = confirm_live_target(
+                &unmarked.adapter,
+                "lab",
+                "PRJ-17",
+                &unmarked.intent.project_node_id,
+                RELEASE_NODE,
+                unmarked.intent.artifact.release_sequence,
+                &[unmarked.intent.handoff_id.as_str()],
+            )
+            .await
+            .unwrap_err();
+            assert!(refused.contains("not marked disposable"), "{refused}");
+            assert!(
+                refused.contains("aeon journey mark-disposable"),
+                "{refused}"
+            );
+            assert!(posts(&unmarked.fake).is_empty());
+            unmarked.server.abort();
+        }
+
         let production = harness(true).await;
         production
             .fake
@@ -12058,9 +12926,8 @@ mod tests {
         )
         .await;
         let message = refused.unwrap_err();
-        assert!(message.contains("must be live"));
+        assert!(message.contains("journey.candidate and journey.deploy are not live"));
         assert!(message.contains("stage gate is not approved"));
-        assert!(message.contains("AEON-188"));
         assert!(posts(&dark_gates.fake).is_empty());
         assert_eq!(readiness_post_count(&dark_gates.fake), 0);
         dark_gates.server.abort();
@@ -12079,7 +12946,9 @@ mod tests {
             &[deploy_dark.intent.handoff_id.as_str()],
         )
         .await;
-        assert!(refused.unwrap_err().contains("deploy_live=false"));
+        let message = refused.unwrap_err();
+        assert!(message.contains("journey.deploy is not live"));
+        assert!(!message.contains("journey.candidate is not live"));
         assert!(posts(&deploy_dark.fake).is_empty());
         deploy_dark.server.abort();
 
@@ -12661,15 +13530,27 @@ mod tests {
         release_number: i64,
     }
 
-    fn stage_gate_live(stages: &[Value], key: &str) -> Result<bool, String> {
-        let stage = stages
+    const CANDIDATE_GATE_SCOPE: &str = "journey.candidate";
+    const DEPLOY_GATE_SCOPE: &str = "journey.deploy";
+
+    fn gate_scope_is_live(stages: &[Value], scope: &str) -> bool {
+        let mut matched = stages
             .iter()
-            .find(|stage| stage.get("key").and_then(Value::as_str) == Some(key))
-            .ok_or_else(|| format!("journey stage {key} is missing"))?;
-        stage
-            .get("gate_live")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| format!("journey stage {key} is missing gate_live"))
+            .filter(|stage| stage.get("gate_scope").and_then(Value::as_str) == Some(scope));
+        let Some(stage) = matched.next() else {
+            return false;
+        };
+        if matched.next().is_some() {
+            return false;
+        }
+        stage.get("gate_live").and_then(Value::as_bool) == Some(true)
+    }
+
+    fn dark_gate_scopes(stages: &[Value]) -> Vec<&'static str> {
+        [CANDIDATE_GATE_SCOPE, DEPLOY_GATE_SCOPE]
+            .into_iter()
+            .filter(|scope| !gate_scope_is_live(stages, scope))
+            .collect()
     }
 
     async fn confirm_live_target(
@@ -12734,19 +13615,30 @@ mod tests {
                 "journey node_key differs from PHAROS_AEON_LIVE_EXPECT_NODE_KEY".to_string(),
             );
         }
-        // Admit refuses unless the candidate and deploy gates are live
-        // (launch.go). The build stage carries the candidate gate once that
-        // gate exists (derive.go gateIDFor). Aeon has no disposable-project
-        // field; AEON-188 is the forthcoming operator-only marker.
+        if journey.get("disposable").and_then(Value::as_bool) != Some(true) {
+            return Err(
+                "live Aeon roundtrip refused: the project is not marked disposable. An operator marks it with Aeon's `aeon journey mark-disposable`."
+                    .to_string(),
+            );
+        }
+        // Admit refuses unless journey.candidate and journey.deploy are live
+        // (launch.go). Those are gate_scope values. The build stage reports
+        // the candidate scope (derive.go gateScopeFor); the stage key is not
+        // the identity. disposable true is required in addition to the
+        // operator-supplied project key, node key, project node, and release.
         let stages = journey
             .get("stages")
             .and_then(Value::as_array)
             .ok_or_else(|| "journey stages are missing".to_string())?;
-        let candidate_live = stage_gate_live(stages, "build")?;
-        let deploy_live = stage_gate_live(stages, "deploy")?;
-        if !candidate_live || !deploy_live {
+        let dark = dark_gate_scopes(stages);
+        if !dark.is_empty() {
+            let subject = if dark.len() == 1 {
+                format!("{} is not live", dark[0])
+            } else {
+                format!("{} are not live", dark.join(" and "))
+            };
             return Err(format!(
-                "live Aeon roundtrip refused: the candidate gate (build stage) and the deploy gate must be live before any write, because admission answers 403 \"stage gate is not approved\" until they are. candidate_live={candidate_live} deploy_live={deploy_live}. Aeon has no operator-only disposable marker yet (AEON-188); until then the operator-supplied project key, node key, and release id are the guard."
+                "live Aeon roundtrip refused: {subject}. Admission answers 403 \"stage gate is not approved\" until journey.candidate and journey.deploy are live."
             ));
         }
         if handoff_ids.is_empty() {
@@ -12772,7 +13664,7 @@ mod tests {
             }
         }
         println!(
-            "live Aeon roundtrip target: project_key={project_key} node_key={node_key} release_number={release_number} candidate_gate_live=true deploy_gate_live=true"
+            "live Aeon roundtrip target: project_key={project_key} node_key={node_key} release_number={release_number} journey.candidate=live journey.deploy=live"
         );
         Ok(LiveIdentity {
             project_key: project_key.to_string(),
