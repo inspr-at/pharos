@@ -126,17 +126,20 @@ impl Operation {
         }
     }
 
-    fn ceiling(self) -> EvidenceCeiling {
-        match self {
-            Self::Deploy => EvidenceCeiling::Deployment,
-            Self::Verify => EvidenceCeiling::Verification,
-        }
-    }
-
     fn evidence_kind(self) -> EvidenceKind {
         match self {
             Self::Deploy => EvidenceKind::Deployment,
             Self::Verify => EvidenceKind::Verification,
+        }
+    }
+
+    fn ceilings_allow(self, delegated_launch: bool, ceiling: &[EvidenceCeiling]) -> bool {
+        match self {
+            Self::Deploy => {
+                ceiling.contains(&EvidenceCeiling::Deployment)
+                    && (!delegated_launch || ceiling.contains(&EvidenceCeiling::LaunchReadiness))
+            }
+            Self::Verify => ceiling.contains(&EvidenceCeiling::Verification),
         }
     }
 }
@@ -406,6 +409,7 @@ enum EvidenceCeiling {
     Verification,
     Authorization,
     CredentialHandoff,
+    LaunchReadiness,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -546,7 +550,9 @@ impl HandoffDocument {
             || unique.len() != self.evidence_ceiling.len()
             || self.evidence_ceiling.is_empty()
             || self.evidence_ceiling.len() > 4
-            || !self.evidence_ceiling.contains(&intent.operation.ceiling())
+            || !intent
+                .operation
+                .ceilings_allow(intent.delegated_launch.is_some(), &self.evidence_ceiling)
             || !valid_hex64(&self.plan_digest)
             || !valid_hex64(&self.predecessor_digest)
             || !valid_hex64(&self.context_digest)
@@ -3629,11 +3635,15 @@ mod tests {
 
     impl FakeHandoff {
         fn deploy(now: i64) -> Self {
-            Self::open(DEPLOY_HANDOFF, "deploy", "deployment", now)
+            let mut handoff = Self::open(DEPLOY_HANDOFF, "deploy", "deployment", now);
+            handoff.evidence_ceiling =
+                vec!["deployment".to_string(), "launch_readiness".to_string()];
+            handoff
         }
 
         fn verify(now: i64) -> Self {
             let mut handoff = Self::open(VERIFY_HANDOFF, "verify", "verification", now);
+            handoff.evidence_ceiling = vec!["verification".to_string()];
             handoff.predecessor_digest = hex_chars('b');
             handoff
         }
@@ -4440,6 +4450,26 @@ mod tests {
 
     fn assert_no_key(bytes: &[u8]) {
         assert!(!contains_slice(bytes, API_KEY));
+    }
+
+    #[tokio::test]
+    async fn delegated_deploy_requires_launch_readiness_on_the_ceiling() {
+        let fixture = harness(true).await;
+        fixture.fake.update(|inner| {
+            inner
+                .handoffs
+                .get_mut(DEPLOY_HANDOFF)
+                .unwrap()
+                .evidence_ceiling = vec!["deployment".to_string()];
+        });
+        let error = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::Contract));
+        assert!(fixture.actions.list().is_empty());
+        fixture.server.abort();
     }
 
     #[tokio::test]
