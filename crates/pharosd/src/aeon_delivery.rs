@@ -2317,9 +2317,9 @@ impl AeonDeliveryAdapter {
             .ok_or(AdapterError::LocalBinding)?;
         let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
         let observed_at = format_timestamp(now_unix())?;
-        // The reviewed plan has no backup clock. Use the host's retained
-        // backup success when one exists.
-        let backup_at = backup_observed_at(&self.hosts, &intent.host, &observed_at);
+        // The plan has backup_ready and no clock. Aeon's backup time is
+        // optional, so omit it unless the host store has a success.
+        let backup_at = backup_observed_at(&self.hosts, &intent.host);
         let sequence = self.journal.next_sequence(&intent.handoff_id)?;
         let write = EvidenceWrite {
             sequence,
@@ -2335,7 +2335,7 @@ impl AeonDeliveryAdapter {
             all_host_eval_passed: Some(plan.all_host_eval_passed),
             target_build_passed: Some(plan.target_build_passed),
             backup_ready: Some(plan.backup_ready),
-            backup_observed_at: Some(&backup_at),
+            backup_observed_at: backup_at.as_deref(),
             restart_required: Some(plan.restart_required),
             running_kernel: plan.running_kernel.as_deref(),
             expected_kernel: plan.expected_kernel.as_deref(),
@@ -2799,17 +2799,15 @@ fn consume_receipt(response: &ConsumeResponse, now: i64) -> Result<ConsumeReceip
     })
 }
 
-fn backup_observed_at(hosts: &Store, host_name: &str, observed_at: &str) -> String {
-    let Some(host) = hosts.get(host_name) else {
-        return observed_at.to_string();
-    };
-    host.backup_observations
+fn backup_observed_at(hosts: &Store, host_name: &str) -> Option<String> {
+    let host = hosts.get(host_name)?;
+    let at = host
+        .backup_observations
         .iter()
         .filter_map(|observation| observation.last_success_at)
         .filter(|at| *at > 0)
-        .max()
-        .and_then(|at| format_timestamp(at).ok())
-        .unwrap_or_else(|| observed_at.to_string())
+        .max()?;
+    format_timestamp(at).ok()
 }
 
 fn evidence_string_field(body: &str, key: &str) -> Result<String, AdapterError> {
@@ -3251,10 +3249,11 @@ mod tests {
     use axum::http::{Request, Response};
     use axum::Router;
     use pharos_core::{
-        ArtifactDigestClass, DeployedArtifactEvidence, HostReport, NixDeploymentEvidence,
-        NixFreshness, DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA, DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
-        HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, NIX_DEPLOYMENT_EVIDENCE_SCHEMA,
-        NIX_DEPLOYMENT_EVIDENCE_VERSION,
+        ArtifactDigestClass, BackupConfiguredState, BackupEngine, BackupObservation,
+        BackupPostureState, BackupRunState, DeployedArtifactEvidence, HostReport,
+        NixDeploymentEvidence, NixFreshness, DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA,
+        DEPLOYED_ARTIFACT_EVIDENCE_VERSION, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+        NIX_DEPLOYMENT_EVIDENCE_SCHEMA, NIX_DEPLOYMENT_EVIDENCE_VERSION,
     };
     use serde_json::{json, Value};
 
@@ -3785,6 +3784,14 @@ mod tests {
         value
     }
 
+    fn observation_fresh(stamp: &str, now: i64) -> bool {
+        let Ok(parsed) = parse_timestamp(stamp) else {
+            return false;
+        };
+        let unix = parsed.unix_timestamp();
+        now.saturating_sub(unix) <= 900 && unix <= now + 300
+    }
+
     fn satisfying_readiness(body: &[u8], now: i64) -> Option<String> {
         let value: Value = serde_json::from_slice(body).ok()?;
         if value["kind"] != "launch_readiness" || value["outcome"] != "satisfied" {
@@ -3796,9 +3803,15 @@ mod tests {
         {
             return None;
         }
-        let observed = parse_timestamp(value["observed_at"].as_str()?).ok()?;
-        let observed_unix = observed.unix_timestamp();
-        if now.saturating_sub(observed_unix) > 900 || observed_unix > now + 300 {
+        if !observation_fresh(value["observed_at"].as_str()?, now) {
+            return None;
+        }
+        // A ready backup needs its own fresh success. A missing or stale
+        // backup_observed_at does not satisfy the provider.
+        if !value["backup_observed_at"]
+            .as_str()
+            .is_some_and(|stamp| observation_fresh(stamp, now))
+        {
             return None;
         }
         value["reviewed_plan_digest"].as_str().map(str::to_string)
@@ -4256,6 +4269,43 @@ mod tests {
     }
 
     fn record_beacon(store: &Store, observed_at: i64, artifact: &ArtifactEvidence) {
+        record_host(store, observed_at, artifact, None);
+    }
+
+    fn record_backup(store: &Store, success_at: i64) {
+        record_host(store, success_at, &artifact(), Some(success_at));
+    }
+
+    fn backup_success(success_at: i64) -> BackupObservation {
+        BackupObservation {
+            id: "restic-main".to_string(),
+            label: "Restic main".to_string(),
+            engine: BackupEngine::Restic,
+            state: BackupPostureState::Healthy,
+            configured: BackupConfiguredState::Enabled,
+            summary: "last backup succeeded".to_string(),
+            target_label: None,
+            repository_id: None,
+            schedule: None,
+            next_run_at: None,
+            last_attempt_at: Some(success_at),
+            last_attempt_state: Some(BackupRunState::Succeeded),
+            last_success_at: Some(success_at),
+            snapshot_count: Some(1),
+            total_bytes: None,
+            latest_snapshot_bytes: None,
+            last_check_at: None,
+            last_check_state: None,
+            restore_validation: None,
+        }
+    }
+
+    fn record_host(
+        store: &Store,
+        observed_at: i64,
+        artifact: &ArtifactEvidence,
+        backup_success_at: Option<i64>,
+    ) {
         store
             .record(
                 HostReport {
@@ -4281,7 +4331,9 @@ mod tests {
                     },
                     kernel: None,
                     service_observations: vec![],
-                    backup_observations: vec![],
+                    backup_observations: backup_success_at
+                        .map(|at| vec![backup_success(at)])
+                        .unwrap_or_default(),
                     inbound_rtt_ms: None,
                     location: None,
                     preferences: Default::default(),
@@ -4289,7 +4341,11 @@ mod tests {
                 },
                 observed_at,
             )
-            .expect("record beacon");
+            .expect("record host");
+    }
+
+    fn fake_now(fake: &FakeAeon) -> i64 {
+        fake.update(|inner| inner.now)
     }
 
     fn completed_update(store: &HostActionStore, now: i64) -> String {
@@ -4482,6 +4538,7 @@ mod tests {
         let job_id = fixture.actions.list()[0].id.clone();
         let created = fixture.actions.get(&job_id).unwrap().created_at;
         review_job(&fixture.actions, &job_id, created);
+        record_backup(&fixture.hosts, fake_now(&fixture.fake));
         fixture.fake.update(|inner| inner.fail_next_post = true);
         assert!(fixture
             .adapter
@@ -4629,6 +4686,7 @@ mod tests {
                 &job_id,
                 fixture.actions.get(&job_id).unwrap().created_at,
             );
+            record_backup(&fixture.hosts, fake_now(&fixture.fake));
             fixture.fake.update(|inner| {
                 inner.corrupt_binding = corrupt;
                 inner.expire_admission = !corrupt;
@@ -4871,6 +4929,7 @@ mod tests {
             "all_host_eval_passed": true,
             "target_build_passed": true,
             "backup_ready": true,
+            "backup_observed_at": format_timestamp(now).unwrap(),
             "restart_required": true
         }))
         .unwrap();
@@ -4962,6 +5021,7 @@ mod tests {
             &job_id,
             fixture.actions.get(&job_id).unwrap().created_at,
         );
+        record_backup(&fixture.hosts, fake_now(&fixture.fake));
         fixture
             .fake
             .update(|inner| inner.drop_accepted_consume = true);
@@ -5036,6 +5096,7 @@ mod tests {
             &job_id,
             fixture.actions.get(&job_id).unwrap().created_at,
         );
+        record_backup(&fixture.hosts, fake_now(&fixture.fake));
         job_id
     }
 
@@ -5134,6 +5195,124 @@ mod tests {
         );
         assert!(fixture.actions.get(&job_id).unwrap().confirmed_at.is_none());
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_backup_observation_omits_the_clock_and_refuses_admit() {
+        let missing = harness(true).await;
+        missing
+            .adapter
+            .process_intent(&missing.intent)
+            .await
+            .unwrap();
+        let missing_job = missing.actions.list()[0].id.clone();
+        review_job(
+            &missing.actions,
+            &missing_job,
+            missing.actions.get(&missing_job).unwrap().created_at,
+        );
+        let error = missing
+            .adapter
+            .process_intent(&missing.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::LaunchUnresolved));
+        let readiness: Value = posts(&missing.fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/evidence"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(readiness["kind"], "launch_readiness");
+        assert_eq!(readiness["backup_ready"], true);
+        assert!(readiness.get("backup_observed_at").is_none());
+        assert_eq!(post_count(&missing.fake, "/launch/admit"), 1);
+        assert_eq!(post_count(&missing.fake, "/launch/consume"), 0);
+        assert_eq!(
+            missing
+                .adapter
+                .journal
+                .launch(DEPLOY_HANDOFF)
+                .unwrap()
+                .admit_unresolved,
+            Some(StatusCode::CONFLICT.as_u16())
+        );
+        assert_eq!(
+            missing.actions.get(&missing_job).unwrap().state,
+            HostActionState::AwaitingConfirmation
+        );
+        let later = missing.adapter.process_intent(&missing.intent).await;
+        assert!(matches!(later, Err(AdapterError::LaunchUnresolved)));
+        assert_eq!(post_count(&missing.fake, "/launch/admit"), 1);
+        missing.server.abort();
+
+        let stale = harness(true).await;
+        let stale_at = fake_now(&stale.fake) - 901;
+        record_backup(&stale.hosts, stale_at);
+        stale.adapter.process_intent(&stale.intent).await.unwrap();
+        let stale_job = stale.actions.list()[0].id.clone();
+        review_job(
+            &stale.actions,
+            &stale_job,
+            stale.actions.get(&stale_job).unwrap().created_at,
+        );
+        let stale_error = stale
+            .adapter
+            .process_intent(&stale.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(stale_error, AdapterError::LaunchUnresolved));
+        let stale_body: Value = posts(&stale.fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/evidence"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(
+            stale_body["backup_observed_at"],
+            format_timestamp(stale_at).unwrap()
+        );
+        assert_eq!(post_count(&stale.fake, "/launch/consume"), 0);
+        assert_eq!(
+            stale
+                .adapter
+                .journal
+                .launch(DEPLOY_HANDOFF)
+                .unwrap()
+                .admit_unresolved,
+            Some(StatusCode::CONFLICT.as_u16())
+        );
+        stale.server.abort();
+
+        let present = harness(true).await;
+        let present_job = prepare_ready_launch(&present).await;
+        for _ in 0..4 {
+            present
+                .adapter
+                .process_intent(&present.intent)
+                .await
+                .unwrap();
+            if present.actions.get(&present_job).unwrap().state == HostActionState::QueuedApply {
+                break;
+            }
+        }
+        assert_eq!(
+            present.actions.get(&present_job).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        let admitted: Value = posts(&present.fake)
+            .into_iter()
+            .find(|capture| {
+                capture.path.ends_with("/evidence")
+                    && serde_json::from_slice::<Value>(&capture.body).unwrap()["kind"]
+                        == "launch_readiness"
+            })
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(
+            admitted["backup_observed_at"],
+            format_timestamp(fake_now(&present.fake)).unwrap()
+        );
+        assert_eq!(post_count(&present.fake, "/launch/consume"), 1);
+        present.server.abort();
     }
 
     #[tokio::test]
