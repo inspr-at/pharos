@@ -2313,7 +2313,7 @@ impl AeonDeliveryAdapter {
                 .evidence_with_kind(&intent.handoff_id, EvidenceKind::LaunchReadiness)
                 .ok_or(AdapterError::Journal)?;
             let posted = evidence_string_field(&current.body_json, "reviewed_plan_digest")?;
-            if posted != reviewed {
+            if posted != bare_plan_digest(reviewed)? {
                 return Err(AdapterError::LocalBinding);
             }
             return Ok(());
@@ -2324,9 +2324,12 @@ impl AeonDeliveryAdapter {
             .ok_or(AdapterError::LocalBinding)?;
         let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
         let observed_at = format_timestamp(now_unix())?;
+        let bare_reviewed = bare_plan_digest(reviewed)?;
         // The plan has backup_ready and no clock. Aeon's backup time is
         // optional, so omit it unless the host store has a success.
         let backup_at = backup_observed_at(&self.hosts, &intent.host);
+        let running_kernel = kernel_token(plan.running_kernel.as_deref());
+        let expected_kernel = kernel_token(plan.expected_kernel.as_deref());
         let sequence = self.journal.next_sequence(&intent.handoff_id)?;
         let write = EvidenceWrite {
             sequence,
@@ -2337,15 +2340,15 @@ impl AeonDeliveryAdapter {
             workflow: None,
             environment: None,
             artifact: None,
-            reviewed_plan_digest: Some(reviewed),
+            reviewed_plan_digest: Some(&bare_reviewed),
             host: Some(&intent.host),
             all_host_eval_passed: Some(plan.all_host_eval_passed),
             target_build_passed: Some(plan.target_build_passed),
             backup_ready: Some(plan.backup_ready),
             backup_observed_at: backup_at.as_deref(),
             restart_required: Some(plan.restart_required),
-            running_kernel: plan.running_kernel.as_deref(),
-            expected_kernel: plan.expected_kernel.as_deref(),
+            running_kernel: Some(running_kernel),
+            expected_kernel: Some(expected_kernel),
         };
         self.send_new_evidence(intent, EvidenceKind::LaunchReadiness, &write)
             .await?;
@@ -2910,6 +2913,21 @@ fn artifact_echo_matches(request: &serde_json::Value, artifact: Option<&WireArti
     }
 }
 
+fn bare_plan_digest(value: &str) -> Result<String, AdapterError> {
+    let bare = value.strip_prefix("sha256:").unwrap_or(value);
+    if !valid_hex64(bare) {
+        return Err(AdapterError::Contract);
+    }
+    Ok(bare.to_string())
+}
+
+fn kernel_token(value: Option<&str>) -> &str {
+    value
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .unwrap_or("unknown")
+}
+
 fn launch_binding_digest(
     artifact_digest_sha256: &str,
     authority_epoch: i64,
@@ -2917,12 +2935,11 @@ fn launch_binding_digest(
     release_node_id: &str,
     reviewed_plan_digest: &str,
 ) -> Result<String, AdapterError> {
+    let reviewed_plan_digest = bare_plan_digest(reviewed_plan_digest)?;
     if !valid_hex64(artifact_digest_sha256)
         || authority_epoch < 1
         || !valid_uuid(handoff_id)
         || !valid_uuid(release_node_id)
-        || reviewed_plan_digest.is_empty()
-        || reviewed_plan_digest.contains(['"', '\\'])
     {
         return Err(AdapterError::Contract);
     }
@@ -3570,8 +3587,9 @@ mod tests {
     fn launch_binding_digest_uses_sorted_canonical_json() {
         let digest = "1".repeat(64);
         let reviewed = format!("sha256:{}", "ab".repeat(32));
+        let bare = "ab".repeat(32);
         let canonical = format!(
-            "{{\"artifact_digest_sha256\":\"{digest}\",\"authority_epoch\":3,\"handoff_id\":\"{DEPLOY_HANDOFF}\",\"release_node_id\":\"{RELEASE_NODE}\",\"reviewed_plan_digest\":\"{reviewed}\"}}"
+            "{{\"artifact_digest_sha256\":\"{digest}\",\"authority_epoch\":3,\"handoff_id\":\"{DEPLOY_HANDOFF}\",\"release_node_id\":\"{RELEASE_NODE}\",\"reviewed_plan_digest\":\"{bare}\"}}"
         );
         assert!(!canonical.contains(' '));
         let mut hasher = Sha256::new();
@@ -3798,6 +3816,22 @@ mod tests {
         value
     }
 
+    fn plain_token(value: &str, max: usize) -> bool {
+        !value.is_empty()
+            && value.len() <= max
+            && value.trim() == value
+            && value.chars().all(|ch| !ch.is_control())
+    }
+
+    fn launch_readiness_tokens(value: &Value) -> bool {
+        value["reviewed_plan_digest"]
+            .as_str()
+            .is_some_and(valid_hex64)
+            && plain_token(value["host"].as_str().unwrap_or(""), 256)
+            && plain_token(value["running_kernel"].as_str().unwrap_or(""), 128)
+            && plain_token(value["expected_kernel"].as_str().unwrap_or(""), 128)
+    }
+
     fn observation_fresh(stamp: &str, now: i64) -> bool {
         let Ok(parsed) = parse_timestamp(stamp) else {
             return false;
@@ -3850,6 +3884,9 @@ mod tests {
         }
         if value["authority_epoch"].as_i64() != Some(handoff.authority_epoch) {
             return json_response(StatusCode::CONFLICT, &json!({}));
+        }
+        if value["kind"] == "launch_readiness" && !launch_readiness_tokens(&value) {
+            return json_response(StatusCode::BAD_REQUEST, &json!({}));
         }
         let received_at = format_timestamp(now).unwrap();
         let response = evidence_echo(body, &handoff.id, &received_at);
@@ -4473,6 +4510,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_readiness_posts_bare_digest_and_kernel_tokens() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake).await;
+        let client = reqwest::Client::new();
+        let url = origin
+            .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+            .unwrap();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let send = |body: Value| {
+            let client = client.clone();
+            let url = url.clone();
+            let bearer = bearer.clone();
+            async move {
+                client
+                    .post(url)
+                    .header(AUTHORIZATION, bearer)
+                    .header(CONTENT_TYPE, JSON_MEDIA)
+                    .body(serde_json::to_vec(&body).unwrap())
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        let mut readiness = json!({
+            "sequence": 1,
+            "kind": "launch_readiness",
+            "outcome": "satisfied",
+            "observed_at": format_timestamp(now).unwrap(),
+            "authority_epoch": 3,
+            "reviewed_plan_digest": "ab".repeat(32),
+            "host": "hsb8",
+            "all_host_eval_passed": true,
+            "target_build_passed": true,
+            "backup_ready": true,
+            "backup_observed_at": format_timestamp(now).unwrap(),
+            "restart_required": true,
+            "running_kernel": "6.18.1",
+            "expected_kernel": "6.18.2"
+        });
+        readiness["reviewed_plan_digest"] = json!(format!("sha256:{}", "ab".repeat(32)));
+        assert_eq!(send(readiness.clone()).await, StatusCode::BAD_REQUEST);
+        readiness["reviewed_plan_digest"] = json!("ab".repeat(32));
+        readiness["running_kernel"] = json!("");
+        assert_eq!(send(readiness).await, StatusCode::BAD_REQUEST);
+        server.abort();
+
+        let fixture = harness(true).await;
+        prepare_ready_launch(&fixture).await;
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let posted: Value = posts(&fixture.fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/evidence"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        let digest = posted["reviewed_plan_digest"].as_str().unwrap();
+        assert!(valid_hex64(digest));
+        assert_eq!(posted["running_kernel"], "6.18.1");
+        assert_eq!(posted["expected_kernel"], "6.18.2");
+        fixture.server.abort();
+
+        let missing = harness(true).await;
+        missing
+            .adapter
+            .process_intent(&missing.intent)
+            .await
+            .unwrap();
+        let job_id = missing.actions.list()[0].id.clone();
+        let at = missing.actions.get(&job_id).unwrap().created_at;
+        let review = missing
+            .actions
+            .claim("hsb8", at)
+            .expect("claim")
+            .expect("lease");
+        let mut plan = ready_plan();
+        plan.running_kernel = None;
+        plan.expected_kernel = None;
+        missing
+            .actions
+            .record_agent_result(
+                &job_id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: review.phase,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(plan),
+                    result: None,
+                },
+                at,
+            )
+            .expect("review without kernels");
+        let error = missing
+            .adapter
+            .process_intent(&missing.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::LaunchUnresolved));
+        let omitted: Value = posts(&missing.fake)
+            .into_iter()
+            .find(|capture| capture.path.ends_with("/evidence"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .unwrap();
+        assert_eq!(omitted["running_kernel"], "unknown");
+        assert_eq!(omitted["expected_kernel"], "unknown");
+        assert!(valid_hex64(
+            omitted["reviewed_plan_digest"].as_str().unwrap()
+        ));
+        missing.server.abort();
+    }
+
+    #[tokio::test]
     async fn handoff_validation_refusals_do_not_bind() {
         for label in [
             "project",
@@ -5059,13 +5213,15 @@ mod tests {
             "outcome": "satisfied",
             "observed_at": format_timestamp(now).unwrap(),
             "authority_epoch": 3,
-            "reviewed_plan_digest": format!("sha256:{}", "ab".repeat(32)),
+            "reviewed_plan_digest": "ab".repeat(32),
             "host": "hsb8",
             "all_host_eval_passed": true,
             "target_build_passed": true,
             "backup_ready": true,
             "backup_observed_at": format_timestamp(now).unwrap(),
-            "restart_required": true
+            "restart_required": true,
+            "running_kernel": "unknown",
+            "expected_kernel": "unknown"
         }))
         .unwrap();
         let evidence_status = client
