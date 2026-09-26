@@ -551,7 +551,12 @@ is journaled as exact request bytes before it is sent. An unacknowledged
 evidence row is read from Aeon before it is posted again. The replay stops
 when that handoff is expired, no longer requested or active, or already has
 a result, and when Aeon answers 409 `handoff is stale` or `handoff is terminal`.
-Those bytes stay in the journal and are not posted again. A failed
+Those bytes stay in the journal and are not posted again. A 409
+`evidence predates handoff` stops only that observation. The handoff
+document has no `created_at`, so the refusal is how Pharos learns the
+bound; a later beacon reuses the unstored sequence, and a closed
+verification window reports `reporter_stale` instead of replaying the
+old bytes. A failed
 deployment after a terminal launch block replays any unacknowledged
 evidence first, and allocates the next sequence only after those rows
 are stored. After a crash, admit

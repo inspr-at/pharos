@@ -34,6 +34,7 @@
 - Post a failed Aeon result for a terminal launch block while the host job is still awaiting confirmation (PHAROS-313).
 - Stop replaying unacknowledged Aeon evidence once the handoff is expired, closed, or already has a result, or once Aeon answers 409 `handoff is stale` or `handoff is terminal`. The row stays in the journal and is not posted again (PHAROS-313).
 - Replay unacknowledged Aeon evidence before allocating the next sequence for a terminal launch block, so a failed deployment is not posted above a readiness row Aeon has not stored (PHAROS-313).
+- Stop replaying verification evidence Aeon rejects as predating the handoff. A later beacon reuses that unstored sequence, and a closed window reports `reporter_stale` instead (PHAROS-313).
 
 ## 260922141211.0.0 - 2026-09-22
 

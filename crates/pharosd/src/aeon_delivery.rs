@@ -903,6 +903,15 @@ impl ResultReceipt {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EvidenceReplayStop {
+    /// The handoff will not store another row.
+    Handoff,
+    /// These bytes are older than the handoff. The sequence was not stored.
+    Predates,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct EvidenceJournalRecord {
@@ -919,6 +928,10 @@ struct EvidenceJournalRecord {
     /// unacknowledged and is not replayed.
     #[serde(default, skip_serializing_if = "is_false")]
     replay_stopped: bool,
+    /// Why `replay_stopped` was set. Absent on a handoff-level stop written
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay_stop: Option<EvidenceReplayStop>,
 }
 
 impl EvidenceJournalRecord {
@@ -943,7 +956,18 @@ impl EvidenceJournalRecord {
             body_json: String::from_utf8(body.to_vec()).map_err(|_| AdapterError::Contract)?,
             receipt: None,
             replay_stopped: false,
+            replay_stop: None,
         })
+    }
+
+    fn predates_stopped(&self) -> bool {
+        self.replay_stopped
+            && self.receipt.is_none()
+            && self.replay_stop == Some(EvidenceReplayStop::Predates)
+    }
+
+    fn blocks_new_evidence(&self) -> bool {
+        self.replay_stopped && self.receipt.is_none() && !self.predates_stopped()
     }
 
     fn key(&self) -> String {
@@ -1546,7 +1570,11 @@ impl JournalStore {
         persist_journal(&self.path, &mut document, updated)
     }
 
-    fn stop_evidence_replay(&self, record: &EvidenceJournalRecord) -> Result<(), AdapterError> {
+    fn stop_evidence_replay(
+        &self,
+        record: &EvidenceJournalRecord,
+        stop: EvidenceReplayStop,
+    ) -> Result<(), AdapterError> {
         let mut document = self.document.lock().expect("Aeon delivery journal lock");
         let existing = document
             .records
@@ -1559,16 +1587,46 @@ impl JournalStore {
             return Ok(());
         }
         let mut updated = document.clone();
-        updated
+        let saved = updated
             .records
             .get_mut(&record.key())
-            .expect("evidence record remains present")
-            .replay_stopped = true;
+            .expect("evidence record remains present");
+        saved.replay_stopped = true;
+        saved.replay_stop = Some(stop);
         let saved = updated.records.get(&record.key()).expect("saved").clone();
         if !saved.valid() {
             return Err(AdapterError::Journal);
         }
         persist_journal(&self.path, &mut document, updated)
+    }
+
+    fn replace_predates_evidence(
+        &self,
+        previous: &EvidenceJournalRecord,
+        replacement: EvidenceJournalRecord,
+    ) -> Result<EvidenceJournalRecord, AdapterError> {
+        if !previous.predates_stopped()
+            || !replacement.valid()
+            || replacement.handoff_id != previous.handoff_id
+            || replacement.sequence != previous.sequence
+            || replacement.kind != previous.kind
+        {
+            return Err(AdapterError::Journal);
+        }
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        let existing = document
+            .records
+            .get(&previous.key())
+            .ok_or(AdapterError::Journal)?;
+        if existing.body_json != previous.body_json || !existing.predates_stopped() {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        updated
+            .records
+            .insert(replacement.key(), replacement.clone());
+        persist_journal(&self.path, &mut document, updated)?;
+        Ok(replacement)
     }
 
     fn evidence_sequence(&self, handoff_id: &str, sequence: i64) -> Option<EvidenceJournalRecord> {
@@ -1587,18 +1645,20 @@ impl JournalStore {
             .expect("Aeon delivery journal lock")
             .records
             .values()
-            .any(|record| {
-                record.handoff_id == handoff_id && record.replay_stopped && record.receipt.is_none()
-            })
+            .any(|record| record.handoff_id == handoff_id && record.blocks_new_evidence())
     }
 
-    fn has_unacknowledged_evidence(&self, handoff_id: &str) -> bool {
+    fn has_blocking_unacknowledged(&self, handoff_id: &str) -> bool {
         self.document
             .lock()
             .expect("Aeon delivery journal lock")
             .records
             .values()
-            .any(|record| record.handoff_id == handoff_id && record.receipt.is_none())
+            .any(|record| {
+                record.handoff_id == handoff_id
+                    && record.receipt.is_none()
+                    && !record.predates_stopped()
+            })
     }
 
     fn operation(&self, handoff_id: &str) -> Option<OperationBinding> {
@@ -2907,20 +2967,28 @@ impl AeonDeliveryAdapter {
         // a recorded result are on the GET. Clock skew and a recomputed plan
         // digest are not: those arrive as 409. A contiguous-sequence 409 is
         // not one of these; that row can still be stored after its predecessor.
+        // "evidence predates handoff" stops only those bytes. report.go returns
+        // it before insert, so the sequence was not stored and a later
+        // observation may reuse it. GET does not carry created_at.
         if !handoff.state.is_open()
             || handoff.result.is_some()
             || stamp_passed(&handoff.expires_at)?
         {
-            self.journal.stop_evidence_replay(record)?;
+            self.journal
+                .stop_evidence_replay(record, EvidenceReplayStop::Handoff)?;
             return Ok(());
         }
         match self.aeon.post_evidence_raw(record).await? {
             PostedEvidence::Accepted(receipt) => self.journal.acknowledge_evidence(record, receipt),
-            PostedEvidence::Rejected { status, body } if evidence_replay_refusal(status, &body) => {
-                self.journal.stop_evidence_replay(record)?;
-                Ok(())
+            PostedEvidence::Rejected { status, body } => {
+                match evidence_replay_stop(status, &body) {
+                    Some(stop) => {
+                        self.journal.stop_evidence_replay(record, stop)?;
+                        Ok(())
+                    }
+                    None => Err(status_error(status)),
+                }
             }
-            PostedEvidence::Rejected { status, .. } => Err(status_error(status)),
         }
     }
 
@@ -2940,7 +3008,7 @@ impl AeonDeliveryAdapter {
                 return Ok(false);
             }
         }
-        Ok(!self.journal.has_unacknowledged_evidence(&intent.handoff_id))
+        Ok(!self.journal.has_blocking_unacknowledged(&intent.handoff_id))
     }
 
     fn bind_deployment(
@@ -3761,7 +3829,7 @@ impl AeonDeliveryAdapter {
         let host = self.hosts.get(&intent.host);
         let anchor = unix_of(&receipt.completed_at)?;
         let now = now_unix();
-        match observed_fresh_config_beacon(
+        let fresh = match observed_fresh_config_beacon(
             host.as_ref(),
             &intent.environment,
             &intent.artifact,
@@ -3770,6 +3838,29 @@ impl AeonDeliveryAdapter {
             self.config.verification_freshness_secs,
         ) {
             Ok(Some(observed_at)) => {
+                if self.verification_stamp_is_spent(&intent.handoff_id, observed_at)? {
+                    None
+                } else {
+                    Some(observed_at)
+                }
+            }
+            Ok(None) => None,
+            Err(_) if config_measurement_mismatches(host.as_ref(), intent) => {
+                return self
+                    .write_observation(
+                        intent,
+                        handoff,
+                        EvidenceOutcome::Failed,
+                        now,
+                        Some(BlockerCode::DependencyFailed),
+                        None,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(map_shared(error)),
+        };
+        match fresh {
+            Some(observed_at) => {
                 self.write_observation(
                     intent,
                     handoff,
@@ -3780,9 +3871,7 @@ impl AeonDeliveryAdapter {
                 )
                 .await
             }
-            Ok(None)
-                if beacon_window_closed(anchor, now, self.config.verification_freshness_secs) =>
-            {
+            None if beacon_window_closed(anchor, now, self.config.verification_freshness_secs) => {
                 self.write_observation(
                     intent,
                     handoff,
@@ -3793,20 +3882,26 @@ impl AeonDeliveryAdapter {
                 )
                 .await
             }
-            Ok(None) => Ok(()),
-            Err(_) if config_measurement_mismatches(host.as_ref(), intent) => {
-                self.write_observation(
-                    intent,
-                    handoff,
-                    EvidenceOutcome::Failed,
-                    now,
-                    Some(BlockerCode::DependencyFailed),
-                    None,
-                )
-                .await
-            }
-            Err(error) => Err(map_shared(error)),
+            None => Ok(()),
         }
+    }
+
+    fn verification_stamp_is_spent(
+        &self,
+        handoff_id: &str,
+        observed_at: i64,
+    ) -> Result<bool, AdapterError> {
+        let Some(existing) = self
+            .journal
+            .evidence_with_kind(handoff_id, EvidenceKind::Verification)
+        else {
+            return Ok(false);
+        };
+        if !existing.predates_stopped() {
+            return Ok(false);
+        }
+        let previous = unix_of(&evidence_string_field(&existing.body_json, "observed_at")?)?;
+        Ok(observed_at <= previous)
     }
 
     async fn write_observation(
@@ -3822,6 +3917,22 @@ impl AeonDeliveryAdapter {
             return Ok(());
         }
         let kind = intent.operation.evidence_kind();
+        if self
+            .journal
+            .evidence_with_kind(&intent.handoff_id, kind)
+            .is_some_and(|record| record.predates_stopped())
+        {
+            return self
+                .replace_predates_observation(
+                    intent,
+                    handoff,
+                    outcome,
+                    observed_at,
+                    blocker,
+                    detail,
+                )
+                .await;
+        }
         let record =
             if let Some(existing) = self.journal.evidence_with_kind(&intent.handoff_id, kind) {
                 if existing.receipt.is_none() {
@@ -3838,8 +3949,8 @@ impl AeonDeliveryAdapter {
             } else if self.journal.has_stopped_evidence(&intent.handoff_id) {
                 return Ok(());
             } else {
-                let observed_at = format_timestamp(observed_at)?;
-                if unix_of(&observed_at)? > now_unix().saturating_add(OBSERVED_AT_SKEW_SECS) {
+                let observed_stamp = format_timestamp(observed_at)?;
+                if unix_of(&observed_stamp)? > now_unix().saturating_add(OBSERVED_AT_SKEW_SECS) {
                     return Err(AdapterError::Contract);
                 }
                 let artifact = WireArtifact::from_evidence(&intent.artifact)?;
@@ -3848,7 +3959,7 @@ impl AeonDeliveryAdapter {
                     sequence,
                     kind,
                     outcome,
-                    observed_at: &observed_at,
+                    observed_at: &observed_stamp,
                     authority_epoch: handoff.authority_epoch,
                     workflow: Some(intent.workflow.key()),
                     environment: Some(&intent.environment),
@@ -3895,11 +4006,98 @@ impl AeonDeliveryAdapter {
             kind,
             &body,
         )?)?;
-        let receipt = self.aeon.post_evidence(&record).await?;
-        self.journal.acknowledge_evidence(&record, receipt)?;
-        self.journal
+        self.store_evidence_post(intent, &record).await
+    }
+
+    async fn replace_predates_observation(
+        &self,
+        intent: &DeliveryIntent,
+        handoff: &HandoffDocument,
+        outcome: EvidenceOutcome,
+        observed_at: i64,
+        blocker: Option<BlockerCode>,
+        detail: Option<&str>,
+    ) -> Result<(), AdapterError> {
+        let kind = intent.operation.evidence_kind();
+        let previous = self
+            .journal
             .evidence_with_kind(&intent.handoff_id, kind)
-            .ok_or(AdapterError::Journal)
+            .filter(|record| record.predates_stopped())
+            .ok_or(AdapterError::Journal)?;
+        let previous_at = unix_of(&evidence_string_field(&previous.body_json, "observed_at")?)?;
+        if observed_at <= previous_at {
+            return Ok(());
+        }
+        let observed_stamp = format_timestamp(observed_at)?;
+        if unix_of(&observed_stamp)? > now_unix().saturating_add(OBSERVED_AT_SKEW_SECS) {
+            return Err(AdapterError::Contract);
+        }
+        let artifact = WireArtifact::from_evidence(&intent.artifact)?;
+        let write = EvidenceWrite {
+            sequence: previous.sequence,
+            kind,
+            outcome,
+            observed_at: &observed_stamp,
+            authority_epoch: handoff.authority_epoch,
+            workflow: Some(intent.workflow.key()),
+            environment: Some(&intent.environment),
+            artifact: Some(&artifact),
+            reviewed_plan_digest: None,
+            host: None,
+            all_host_eval_passed: None,
+            target_build_passed: None,
+            backup_ready: None,
+            backup_observed_at: None,
+            restart_required: None,
+            running_kernel: None,
+            expected_kernel: None,
+        };
+        let body = serde_json::to_vec(&write).map_err(|_| AdapterError::Contract)?;
+        let replacement = EvidenceJournalRecord::new(
+            intent,
+            &self.config.aeon_origin,
+            previous.sequence,
+            kind,
+            &body,
+        )?;
+        let record = self
+            .journal
+            .replace_predates_evidence(&previous, replacement)?;
+        let record = self.store_evidence_post(intent, &record).await?;
+        let receipt = record.receipt.as_ref().ok_or(AdapterError::Journal)?;
+        if receipt.outcome != outcome {
+            return Err(AdapterError::LocalBinding);
+        }
+        self.finish_result(
+            intent,
+            handoff,
+            record.sequence,
+            ResultOutcome::from_evidence(outcome)?,
+            blocker,
+            detail,
+        )
+        .await
+    }
+
+    async fn store_evidence_post(
+        &self,
+        intent: &DeliveryIntent,
+        record: &EvidenceJournalRecord,
+    ) -> Result<EvidenceJournalRecord, AdapterError> {
+        match self.aeon.post_evidence_raw(record).await? {
+            PostedEvidence::Accepted(receipt) => {
+                self.journal.acknowledge_evidence(record, receipt)?;
+                self.journal
+                    .evidence_sequence(&intent.handoff_id, record.sequence)
+                    .ok_or(AdapterError::Journal)
+            }
+            PostedEvidence::Rejected { status, body } => {
+                if let Some(stop) = evidence_replay_stop(status, &body) {
+                    self.journal.stop_evidence_replay(record, stop)?;
+                }
+                Err(status_error(status))
+            }
+        }
     }
 
     async fn finish_result(
@@ -4530,19 +4728,21 @@ fn status_error(status: StatusCode) -> AdapterError {
     }
 }
 
-/// report.go uses these two 409 texts once the handoff will not store another
-/// row. A contiguous-sequence 409 is not terminal for this row.
-fn evidence_replay_refusal(status: StatusCode, body: &[u8]) -> bool {
+/// report.go uses the handoff texts once no further row will be stored.
+/// "evidence predates handoff" refuses that observed_at before insert, so
+/// the sequence stays free. A contiguous-sequence 409 stops nothing.
+fn evidence_replay_stop(status: StatusCode, body: &[u8]) -> Option<EvidenceReplayStop> {
     if status != StatusCode::CONFLICT {
-        return false;
+        return None;
     }
     let Ok(document) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
+        return None;
     };
-    matches!(
-        document.get("error").and_then(serde_json::Value::as_str),
-        Some("handoff is stale" | "handoff is terminal")
-    )
+    match document.get("error").and_then(serde_json::Value::as_str) {
+        Some("handoff is stale" | "handoff is terminal") => Some(EvidenceReplayStop::Handoff),
+        Some("evidence predates handoff") => Some(EvidenceReplayStop::Predates),
+        _ => None,
+    }
 }
 
 async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, AdapterError> {
@@ -5664,8 +5864,9 @@ mod tests {
         if value["authority_epoch"].as_i64() != Some(handoff.authority_epoch) {
             return json_response(StatusCode::CONFLICT, &json!({}));
         }
-        // report.go: observed_at before created_at minus one minute is 409.
-        // Before is strict, so the exact one-minute boundary is still accepted.
+        // report.go: observed_at before created_at minus one minute is 409,
+        // for every kind including verification. Before is strict, so the
+        // exact one-minute boundary is still accepted. created_at is not on GET.
         if value["observed_at"].as_str().is_some_and(|stamp| {
             parse_timestamp(stamp)
                 .map(|time| time.unix_timestamp().saturating_add(60) < handoff.created_at)
@@ -7888,6 +8089,168 @@ mod tests {
                 .update(|inner| inner.handoffs[VERIFY_HANDOFF].predecessor_digest.clone()),
             dependency_digest(DEPLOY_HANDOFF, "deployment", receipt.terminal_sequence)
         );
+        sealed.server.abort();
+    }
+
+    fn adapter_verify_evidence(fake: &FakeAeon) -> Vec<Value> {
+        posts(fake)
+            .into_iter()
+            .filter(|capture| {
+                capture.path.contains(VERIFY_HANDOFF)
+                    && capture.path.ends_with("/evidence")
+                    && !capture.idempotency.is_empty()
+            })
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect()
+    }
+
+    async fn post_verify_evidence(origin: &Url, body: &[u8]) -> (StatusCode, Value) {
+        let response = reqwest::Client::new()
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{VERIFY_HANDOFF}/evidence"))
+                    .unwrap(),
+            )
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(API_KEY)),
+            )
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.bytes().await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+        (status, value)
+    }
+
+    fn arm_predating_verify(sealed: &SealedDeploy, created_at: i64) {
+        arm_recorded_deploy(sealed);
+        sealed.fake.update(|inner| {
+            inner.handoffs.get_mut(VERIFY_HANDOFF).unwrap().created_at = created_at;
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_that_predates_the_handoff_waits_for_a_later_beacon() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let sealed = sealed_deploy().await;
+        arm_predating_verify(&sealed, now + 180);
+        let early = now + 30;
+        FrozenNow::set(early);
+        record_beacon(&sealed.hosts, early, &artifact());
+        let refused = sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            AdapterError::Refused(status) if status == StatusCode::CONFLICT
+        ));
+        let stopped = sealed
+            .adapter
+            .journal
+            .evidence_with_kind(VERIFY_HANDOFF, EvidenceKind::Verification)
+            .unwrap();
+        assert!(stopped.predates_stopped());
+        assert!(stopped.receipt.is_none());
+        assert_eq!(stopped.sequence, 1);
+        assert_eq!(adapter_verify_evidence(&sealed.fake).len(), 1);
+        let (status, value) = post_verify_evidence(
+            &sealed.adapter.config.aeon_origin,
+            stopped.body_json.as_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "evidence predates handoff");
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        assert_eq!(adapter_verify_evidence(&sealed.fake).len(), 1);
+
+        let later = now + 200;
+        FrozenNow::set(later);
+        record_beacon(&sealed.hosts, later, &artifact());
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        let evidence = adapter_verify_evidence(&sealed.fake);
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0]["sequence"], 1);
+        assert_eq!(evidence[1]["sequence"], 1);
+        assert_eq!(evidence[1]["outcome"], "succeeded");
+        assert_ne!(evidence[0]["observed_at"], evidence[1]["observed_at"]);
+        assert_eq!(
+            sealed
+                .adapter
+                .journal
+                .result(VERIFY_HANDOFF)
+                .unwrap()
+                .receipt
+                .unwrap()
+                .outcome,
+            ResultOutcome::Succeeded
+        );
+        sealed.server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_that_predates_the_handoff_reports_stale_when_the_window_closes() {
+        let now = now_unix();
+        let _clock = FrozenNow::at(now);
+        let sealed = sealed_deploy().await;
+        arm_predating_verify(&sealed, now + 180);
+        let early = now + 30;
+        FrozenNow::set(early);
+        record_beacon(&sealed.hosts, early, &artifact());
+        assert!(sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .is_err());
+        FrozenNow::set(now + 1_000);
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        let evidence = adapter_verify_evidence(&sealed.fake);
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[1]["sequence"], 1);
+        assert_eq!(evidence[1]["outcome"], "failed");
+        assert_ne!(evidence[0]["observed_at"], evidence[1]["observed_at"]);
+        let result = sealed
+            .adapter
+            .journal
+            .result(VERIFY_HANDOFF)
+            .unwrap()
+            .receipt
+            .unwrap();
+        assert_eq!(result.outcome, ResultOutcome::Failed);
+        let posted: Vec<Value> = posts(&sealed.fake)
+            .into_iter()
+            .filter(|capture| {
+                capture.path.contains(VERIFY_HANDOFF) && capture.path.ends_with("/result")
+            })
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0]["outcome"], "failed");
+        assert_eq!(posted[0]["blocker_code"], "reporter_stale");
+        sealed
+            .adapter
+            .process_intent(&verify_intent())
+            .await
+            .unwrap();
+        assert_eq!(adapter_verify_evidence(&sealed.fake).len(), 2);
         sealed.server.abort();
     }
 
