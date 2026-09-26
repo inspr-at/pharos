@@ -87,7 +87,7 @@ const IDEMPOTENCY_DOMAIN: &[u8] = b"inspr.pharos.paimos-delivery-idempotency.v1\
 const GUARDED_ACTOR: &str = "paimos-delivery";
 
 #[derive(Debug)]
-enum AdapterError {
+pub(crate) enum AdapterError {
     Configuration,
     Credential,
     Trust,
@@ -165,19 +165,19 @@ impl GuardedWorkflow {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct ArtifactEvidence {
-    version_scheme: ArtifactVersionScheme,
-    version: String,
-    release_channel: String,
-    release_sequence: i64,
-    digest: String,
-    commit_digest: String,
-    release_manifest_coordinate: String,
-    release_manifest_digest: String,
+pub(crate) struct ArtifactEvidence {
+    pub(crate) version_scheme: ArtifactVersionScheme,
+    pub(crate) version: String,
+    pub(crate) release_channel: String,
+    pub(crate) release_sequence: i64,
+    pub(crate) digest: String,
+    pub(crate) commit_digest: String,
+    pub(crate) release_manifest_coordinate: String,
+    pub(crate) release_manifest_digest: String,
 }
 
 impl ArtifactEvidence {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         let scheme_ok = match self.version_scheme {
             ArtifactVersionScheme::Legacy => valid_version(&self.version),
             ArtifactVersionScheme::InsprCalendarV1 => valid_inspr_calendar_version(&self.version),
@@ -1590,7 +1590,7 @@ impl Drop for Credentials {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct FileIdentity {
+pub(crate) struct FileIdentity {
     device: u64,
     inode: u64,
 }
@@ -2469,37 +2469,55 @@ impl PaimosDeliveryAdapter {
         strictly_after: i64,
         now: i64,
     ) -> Result<Option<i64>, AdapterError> {
-        let Some(host) = self.hosts.get(&intent.host) else {
-            return Ok(None);
-        };
-        let Some(evidence) = host.deployed_artifact.as_ref() else {
-            return Ok(None);
-        };
-        if !evidence.is_config_class_measurement() {
-            return Err(AdapterError::LocalBinding);
-        }
-        if !evidence.matches_expected(
+        observed_fresh_config_beacon(
+            self.hosts.get(&intent.host).as_ref(),
             &intent.environment,
-            intent.artifact.version_scheme,
-            &intent.artifact.version,
-            &intent.artifact.release_channel,
-            intent.artifact.release_sequence,
-            &intent.artifact.digest,
-            &intent.artifact.commit_digest,
-            &intent.artifact.release_manifest_coordinate,
-            &intent.artifact.release_manifest_digest,
-        ) {
-            return Err(AdapterError::LocalBinding);
-        }
-        let observed_at = evidence.observed_at;
-        if observed_at <= strictly_after
-            || observed_at > now.saturating_add(120)
-            || now.saturating_sub(observed_at) > self.config.verification_freshness_secs
-        {
-            return Ok(None);
-        }
-        Ok(Some(observed_at))
+            &intent.artifact,
+            strictly_after,
+            now,
+            self.config.verification_freshness_secs,
+        )
     }
+}
+
+pub(crate) fn observed_fresh_config_beacon(
+    host: Option<&pharos_core::Host>,
+    environment: &str,
+    artifact: &ArtifactEvidence,
+    strictly_after: i64,
+    now: i64,
+    freshness_secs: i64,
+) -> Result<Option<i64>, AdapterError> {
+    let Some(host) = host else {
+        return Ok(None);
+    };
+    let Some(evidence) = host.deployed_artifact.as_ref() else {
+        return Ok(None);
+    };
+    if !evidence.is_config_class_measurement() {
+        return Err(AdapterError::LocalBinding);
+    }
+    if !evidence.matches_expected(
+        environment,
+        artifact.version_scheme,
+        &artifact.version,
+        &artifact.release_channel,
+        artifact.release_sequence,
+        &artifact.digest,
+        &artifact.commit_digest,
+        &artifact.release_manifest_coordinate,
+        &artifact.release_manifest_digest,
+    ) {
+        return Err(AdapterError::LocalBinding);
+    }
+    let observed_at = evidence.observed_at;
+    if observed_at <= strictly_after
+        || observed_at > now.saturating_add(120)
+        || now.saturating_sub(observed_at) > freshness_secs
+    {
+        return Ok(None);
+    }
+    Ok(Some(observed_at))
 }
 
 fn terminal_report(
@@ -2598,7 +2616,7 @@ fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-fn read_private_file(
+pub(crate) fn read_private_file(
     path: &Path,
     max_bytes: u64,
     exact_bytes: Option<usize>,
@@ -2629,7 +2647,7 @@ fn read_private_file(
     Ok((bytes, before))
 }
 
-fn load_ca_certificates(
+pub(crate) fn load_ca_certificates(
     path: &Path,
 ) -> Result<(Vec<reqwest::Certificate>, FileIdentity), AdapterError> {
     let (mut bytes, identity) =
@@ -2986,7 +3004,7 @@ fn operation_identity(
     Ok(hex_digest(&bytes))
 }
 
-fn reviewed_plan_digest(job: &HostActionJob) -> Result<String, AdapterError> {
+pub(crate) fn reviewed_plan_digest(job: &HostActionJob) -> Result<String, AdapterError> {
     #[derive(Serialize)]
     struct ReviewedPlanBinding<'a> {
         job_id: &'a str,
