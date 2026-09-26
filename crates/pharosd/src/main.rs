@@ -8,6 +8,7 @@
 //! accessible SVG status, the self-host lighthouse); the interactive Leptos UI
 //! is PHAROS-10.
 
+mod aeon_delivery;
 mod agora;
 mod alerting;
 mod alerts;
@@ -5297,7 +5298,20 @@ async fn main() {
     let flow_host = flow_host::FlowHostService::from_env(loopback_dev_mode)
         .unwrap_or_else(|error| panic!("flow host startup failed: {error}"))
         .map(Arc::new);
+    if delivery_config_selected("PHAROS_PAIMOS_DELIVERY_CONFIG_FILE")
+        && delivery_config_selected("PHAROS_AEON_DELIVERY_CONFIG_FILE")
+    {
+        panic!(
+            "PHAROS_PAIMOS_DELIVERY_CONFIG_FILE and PHAROS_AEON_DELIVERY_CONFIG_FILE are both set; one delivery owner per process"
+        );
+    }
     let paimos_delivery = paimos_delivery::PaimosDeliveryAdapter::from_env(
+        host_store_path.as_deref(),
+        Arc::clone(&store),
+        Arc::clone(&host_actions),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let aeon_delivery = aeon_delivery::AeonDeliveryAdapter::from_env(
         host_store_path.as_deref(),
         Arc::clone(&store),
         Arc::clone(&host_actions),
@@ -5343,6 +5357,9 @@ async fn main() {
     if let Some(adapter) = paimos_delivery {
         adapter.spawn();
     }
+    if let Some(adapter) = aeon_delivery {
+        adapter.spawn();
+    }
 
     let app = build_router(state);
 
@@ -5356,6 +5373,13 @@ async fn main() {
         startup.addr
     );
     axum::serve(listener, app).await.expect("serve");
+}
+
+fn delivery_config_selected(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .is_some_and(|value| !value.is_empty())
 }
 
 #[cfg(test)]
