@@ -594,9 +594,10 @@ approved` unless the candidate and deploy gates are live, so the harness
 finds the stage whose `gate_scope` is `journey.candidate` and the stage whose
 `gate_scope` is `journey.deploy`, and requires `gate_live` on exactly those
 two. A refusal names the scope that is not live. It does not assume stage
-keys. Aeon has no
-operator-only disposable marker yet (AEON-188). Until that exists, the
-operator-supplied project key, node key, and release id are the guard.
+keys. The journey must report `disposable: true` or the harness refuses
+before any write. The project is not marked disposable until an operator
+marks it with Aeon's `aeon journey mark-disposable`. The operator-supplied
+project key, node key, project node, and release id remain required.
 It prints the project key, node key, and
 release number first. A response that reflects the bearer token, in the body or in any header,
 is withheld from the trace and the report. It does not run in CI.

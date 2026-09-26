@@ -22,7 +22,7 @@
 - Post the mapped Aeon blocker when crash recovery records a terminal launch block, including a consume abandoned after the operator cancels the job (PHAROS-313).
 - Refuse an Aeon deploy intent that names an `update_restart_job_id` the delivery adapter does not own, at startup and before the job is bound (PHAROS-313).
 - Require the live Aeon roundtrip to name the journey node key and to see every stage gate dark before it writes (PHAROS-313).
-- Require the live Aeon roundtrip's candidate and deploy gates to be live before it writes. A dark gate cannot be admitted. Until Aeon ships an operator-only disposable marker (AEON-188), the operator-supplied project key, node key, and release id remain the guard (PHAROS-313).
+- Require the live Aeon roundtrip's candidate and deploy gates to be live before it writes. A dark gate cannot be admitted (PHAROS-313).
 - Refuse an Aeon admit when the candidate or deploy gate is dark, and journal `stage_gate_not_approved` without confirming the host job. Aeon answers 403 `stage gate is not approved` (PHAROS-313).
 - Classify an Aeon 403 as `stage_gate_not_approved` only when its error is exactly a stage-gate refusal. Any other 403 stays a credential failure. The live roundtrip checks the gates before the first evidence post (PHAROS-313).
 - Check every Aeon response header for a reflected bearer token before copying a header into a trace, a panic, or the live report (PHAROS-313).
@@ -39,6 +39,7 @@
 - Stop replaying verification evidence Aeon rejects as predating the handoff. A later beacon reuses that unstored sequence, and a closed window reports `reporter_stale` instead (PHAROS-313).
 - Refuse to confirm an Aeon launch when the fetched handoff reports `authority_open` false or `superseded_by` is set, and journal that as `handoff_authority_not_open`, which maps to `policy_refused`. When those fields are absent, confirmation still infers an open authority from the handoff state, an empty result, and the journaled admission (PHAROS-321).
 - Select the live Aeon roundtrip's candidate and deploy gates by `gate_scope` (`journey.candidate` and `journey.deploy`). A dark or missing scope is named in the refusal. Stage keys are not that identity (PHAROS-321).
+- Require the live Aeon journey to report `disposable: true` before any write. An operator marks the project with `aeon journey mark-disposable`. The operator-supplied project key, node key, project node, and release id remain required (PHAROS-321).
 
 ## 260922141211.0.0 - 2026-09-22
 

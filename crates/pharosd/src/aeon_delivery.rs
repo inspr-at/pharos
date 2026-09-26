@@ -5716,6 +5716,8 @@ mod tests {
         journey_project_key: String,
         journey_node_key: String,
         journey_tenant_slug: String,
+        /// None omits the field. Only Some(true) passes the live guard.
+        journey_disposable: Option<bool>,
         /// Stage keys are labels. gate_scope journey.candidate and
         /// journey.deploy identify the gates admit requires.
         journey_candidate_stage_key: String,
@@ -5768,6 +5770,7 @@ mod tests {
                     journey_project_key: "lab".to_string(),
                     journey_node_key: "PRJ-17".to_string(),
                     journey_tenant_slug: "inspr".to_string(),
+                    journey_disposable: Some(true),
                     journey_candidate_stage_key: "build".to_string(),
                     journey_deploy_stage_key: "deploy".to_string(),
                     journey_candidate_gate_live: true,
@@ -6474,26 +6477,27 @@ mod tests {
             && parts[1] == "projects"
             && parts[3] == "journey"
         {
-            return json_response(
-                StatusCode::OK,
-                &json!({
-                    "project_node_id": parts[2],
-                    "project_key": inner.journey_project_key,
-                    "node_key": inner.journey_node_key,
-                    "tenant_slug": inner.journey_tenant_slug,
-                    "stages": [{
-                        "key": inner.journey_candidate_stage_key,
-                        "state": "done",
-                        "gate_scope": CANDIDATE_GATE_SCOPE,
-                        "gate_live": inner.journey_candidate_gate_live,
-                    }, {
-                        "key": inner.journey_deploy_stage_key,
-                        "state": "current",
-                        "gate_scope": DEPLOY_GATE_SCOPE,
-                        "gate_live": inner.journey_deploy_gate_live,
-                    }],
-                }),
-            );
+            let mut document = json!({
+                "project_node_id": parts[2],
+                "project_key": inner.journey_project_key,
+                "node_key": inner.journey_node_key,
+                "tenant_slug": inner.journey_tenant_slug,
+                "stages": [{
+                    "key": inner.journey_candidate_stage_key,
+                    "state": "done",
+                    "gate_scope": CANDIDATE_GATE_SCOPE,
+                    "gate_live": inner.journey_candidate_gate_live,
+                }, {
+                    "key": inner.journey_deploy_stage_key,
+                    "state": "current",
+                    "gate_scope": DEPLOY_GATE_SCOPE,
+                    "gate_live": inner.journey_deploy_gate_live,
+                }],
+            });
+            if let Some(disposable) = inner.journey_disposable {
+                document["disposable"] = json!(disposable);
+            }
+            return json_response(StatusCode::OK, &document);
         }
         if parts.len() < 3 || parts[0] != "api" || parts[1] != "stage-handoffs" {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
@@ -12335,6 +12339,31 @@ mod tests {
         assert!(posts(&renamed.fake).is_empty());
         renamed.server.abort();
 
+        for disposable in [Some(false), None] {
+            let unmarked = harness(true).await;
+            unmarked
+                .fake
+                .update(|inner| inner.journey_disposable = disposable);
+            let refused = confirm_live_target(
+                &unmarked.adapter,
+                "lab",
+                "PRJ-17",
+                &unmarked.intent.project_node_id,
+                RELEASE_NODE,
+                unmarked.intent.artifact.release_sequence,
+                &[unmarked.intent.handoff_id.as_str()],
+            )
+            .await
+            .unwrap_err();
+            assert!(refused.contains("not marked disposable"), "{refused}");
+            assert!(
+                refused.contains("aeon journey mark-disposable"),
+                "{refused}"
+            );
+            assert!(posts(&unmarked.fake).is_empty());
+            unmarked.server.abort();
+        }
+
         let production = harness(true).await;
         production
             .fake
@@ -13117,11 +13146,17 @@ mod tests {
                 "journey node_key differs from PHAROS_AEON_LIVE_EXPECT_NODE_KEY".to_string(),
             );
         }
+        if journey.get("disposable").and_then(Value::as_bool) != Some(true) {
+            return Err(
+                "live Aeon roundtrip refused: the project is not marked disposable. An operator marks it with Aeon's `aeon journey mark-disposable`."
+                    .to_string(),
+            );
+        }
         // Admit refuses unless journey.candidate and journey.deploy are live
         // (launch.go). Those are gate_scope values. The build stage reports
         // the candidate scope (derive.go gateScopeFor); the stage key is not
-        // the identity. Aeon has no disposable-project field; AEON-188 is the
-        // forthcoming operator-only marker.
+        // the identity. disposable true is required in addition to the
+        // operator-supplied project key, node key, project node, and release.
         let stages = journey
             .get("stages")
             .and_then(Value::as_array)
