@@ -2284,6 +2284,13 @@ impl AeonDeliveryAdapter {
             self.bind_deployment(intent, &handoff)?;
         }
         if let Err(error) = self.maybe_launch(intent, &handoff).await {
+            if self
+                .journal
+                .launch_block(&intent.handoff_id)
+                .is_some_and(|block| block.terminal)
+            {
+                self.maybe_report(intent, &handoff).await?;
+            }
             return self.finish_blocked_confirmation(intent, error).await;
         }
         self.maybe_report(intent, &handoff).await
@@ -2869,7 +2876,23 @@ impl AeonDeliveryAdapter {
         }
         let observed_at = format_timestamp(now_unix())?;
         let sequence = self.journal.next_sequence(&intent.handoff_id)?;
-        let body = refreshed_readiness_body(&current.body_json, sequence, &observed_at)?;
+        let launch = self
+            .journal
+            .launch(&intent.handoff_id)
+            .ok_or(AdapterError::Journal)?;
+        let job = self
+            .host_actions
+            .get(&launch.job_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
+        let reviewed = bare_plan_digest(&reviewed_plan_digest(&job).map_err(map_shared)?)?;
+        let body = readiness_refresh_candidate(
+            &current.body_json,
+            sequence,
+            &observed_at,
+            &reviewed,
+            plan,
+        )?;
         if let Some(reason) = refresh_refusal(&current.body_json, &body)? {
             return self.block_launch(intent, reason, true);
         }
@@ -2913,7 +2936,18 @@ impl AeonDeliveryAdapter {
             }
             let observed_at = format_timestamp(now_unix())?;
             let sequence = self.journal.next_sequence(&intent.handoff_id)?;
-            let body = refreshed_readiness_body(&current.body_json, sequence, &observed_at)?;
+            let job = self
+                .host_actions
+                .get(job_id)
+                .ok_or(AdapterError::LocalBinding)?;
+            let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
+            let body = readiness_refresh_candidate(
+                &current.body_json,
+                sequence,
+                &observed_at,
+                &bare_plan_digest(reviewed)?,
+                plan,
+            )?;
             if let Some(reason) = refresh_refusal(&current.body_json, &body)? {
                 return self.block_launch(intent, reason, true);
             }
@@ -3557,6 +3591,35 @@ fn consume_receipt(response: &ConsumeResponse) -> Result<ConsumeReceipt, Adapter
         consumed_at: response.consumed_at.clone(),
         reconciled_from_get: false,
     })
+}
+
+fn readiness_refresh_candidate(
+    previous: &str,
+    sequence: i64,
+    observed_at: &str,
+    reviewed_plan_digest: &str,
+    plan: &HostActionPlan,
+) -> Result<Vec<u8>, AdapterError> {
+    let mut value: serde_json::Value =
+        decode_strict(&refreshed_readiness_body(previous, sequence, observed_at)?)?;
+    let object = value.as_object_mut().ok_or(AdapterError::Contract)?;
+    object.insert(
+        "reviewed_plan_digest".to_string(),
+        serde_json::Value::String(reviewed_plan_digest.to_string()),
+    );
+    object.insert(
+        "all_host_eval_passed".to_string(),
+        serde_json::Value::Bool(plan.all_host_eval_passed),
+    );
+    object.insert(
+        "target_build_passed".to_string(),
+        serde_json::Value::Bool(plan.target_build_passed),
+    );
+    object.insert(
+        "backup_ready".to_string(),
+        serde_json::Value::Bool(plan.backup_ready),
+    );
+    serde_json::to_vec(&value).map_err(|_| AdapterError::Contract)
 }
 
 fn refreshed_readiness_body(
@@ -4534,6 +4597,30 @@ mod tests {
         assert_eq!(
             validated_readiness_backup(&unready, Some(&stamp), now).unwrap_err(),
             LAUNCH_BLOCK_BACKUP_NOT_READY
+        );
+    }
+
+    #[test]
+    fn refresh_refusal_compares_the_current_plan_with_the_journaled_row() {
+        let previous = r#"{"sequence":1,"reviewed_plan_digest":"aa","all_host_eval_passed":true,"target_build_passed":true,"backup_ready":true,"observed_at":"2026-01-01T00:00:00Z"}"#;
+        let plan = ready_plan();
+        let same =
+            readiness_refresh_candidate(previous, 2, "2026-01-01T00:10:00Z", "aa", &plan).unwrap();
+        assert!(refresh_refusal(previous, &same).unwrap().is_none());
+        let mut changed = plan.clone();
+        changed.backup_ready = false;
+        let flagged =
+            readiness_refresh_candidate(previous, 2, "2026-01-01T00:10:00Z", "aa", &changed)
+                .unwrap();
+        assert_eq!(
+            refresh_refusal(previous, &flagged).unwrap(),
+            Some(LAUNCH_BLOCK_READINESS_FLAG_FALSE)
+        );
+        let drifted =
+            readiness_refresh_candidate(previous, 2, "2026-01-01T00:10:00Z", "bb", &plan).unwrap();
+        assert_eq!(
+            refresh_refusal(previous, &drifted).unwrap(),
+            Some(LAUNCH_BLOCK_READINESS_PLAN_CHANGED)
         );
     }
 
@@ -8506,6 +8593,80 @@ mod tests {
             HostActionState::AwaitingConfirmation
         );
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_job_reports_a_failed_result_after_a_terminal_launch_block() {
+        let directory = TestDir::new("blocked-cancel");
+        let api = directory.path().join("api-key");
+        write_private(&api, API_KEY);
+        let actions_path = directory.path().join("host-actions.json");
+        let journal = directory
+            .path()
+            .join("hosts.json.aeon-delivery-journal.json");
+        let fake = FakeAeon::new(now_unix());
+        let (origin, server) = serve(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let intent = deploy_intent(true);
+        let adapter = test_adapter(
+            runtime_config(origin, api, vec![intent.clone()]),
+            journal.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        );
+        adapter.process_intent(&intent).await.unwrap();
+        let job_id = actions.list()[0].id.clone();
+        review_job(&actions, &job_id, actions.get(&job_id).unwrap().created_at);
+        record_backup(&hosts, fake_now(&fake));
+        fake.update(|inner| inner.drop_accepted_admit = true);
+        assert!(adapter.process_intent(&intent).await.is_err());
+        let mut saved: Value =
+            serde_json::from_slice(&std::fs::read(&actions_path).expect("saved actions")).unwrap();
+        let plan = saved
+            .as_array_mut()
+            .expect("action list")
+            .iter_mut()
+            .find(|job| job["kind"] == "update_restart")
+            .expect("update job")
+            .get_mut("plan")
+            .expect("reviewed plan")
+            .as_object_mut()
+            .expect("plan object");
+        plan["changed_file_count"] = json!(9);
+        std::fs::write(&actions_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let reloaded_actions = Arc::new(HostActionStore::new(Some(actions_path)));
+        let reloaded = test_adapter(
+            runtime_config(
+                adapter.config.aeon_origin.clone(),
+                adapter.config.api_key_file.clone(),
+                vec![intent.clone()],
+            ),
+            journal,
+            hosts,
+            Arc::clone(&reloaded_actions),
+        );
+        let blocked = reloaded.process_intent(&intent).await.unwrap_err();
+        assert_eq!(blocked.code(), LAUNCH_BLOCK_READINESS_PLAN_CHANGED);
+        let job = reloaded_actions.get(&job_id).unwrap();
+        reloaded_actions
+            .cancel_update_review(&job_id, "hsb8", "operator", now_unix().max(job.updated_at))
+            .unwrap();
+        let reported = reloaded.process_intent(&intent).await.unwrap_err();
+        assert_eq!(reported.code(), LAUNCH_BLOCK_READINESS_PLAN_CHANGED);
+        let results: Vec<Value> = posts(&fake)
+            .into_iter()
+            .filter(|capture| capture.path.ends_with("/result"))
+            .map(|capture| serde_json::from_slice(&capture.body).unwrap())
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["outcome"], "failed");
+        assert_eq!(results[0]["blocker_code"], "dependency_failed");
+        assert_eq!(
+            reloaded_actions.get(&job_id).unwrap().state,
+            HostActionState::Cancelled
+        );
+        server.abort();
     }
 
     #[tokio::test]
