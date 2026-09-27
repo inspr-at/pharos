@@ -143,9 +143,10 @@ enum AdapterError {
         seen: ContractSeen,
     },
     /// This surface sent `Aeon-Contract` before, and this response omitted it.
+    /// `seen` is the last parsed major.minor, when one was recorded.
     ContractDowngrade {
         surface: &'static str,
-        seen: String,
+        seen: Option<(u16, u16)>,
     },
 }
 
@@ -210,10 +211,16 @@ impl fmt::Display for AdapterError {
                 "aeon contract {surface} expected major {expected_major}, saw {}",
                 seen.label()
             ),
-            Self::ContractDowngrade { surface, seen } => write!(
-                formatter,
-                "aeon contract downgrade on {surface}: Aeon-Contract header absent after {seen}"
-            ),
+            Self::ContractDowngrade { surface, seen } => match seen {
+                Some((major, minor)) => write!(
+                    formatter,
+                    "aeon contract downgrade on {surface}: Aeon-Contract header absent after {major}.{minor}"
+                ),
+                None => write!(
+                    formatter,
+                    "aeon contract downgrade on {surface}: Aeon-Contract header absent after a header was seen"
+                ),
+            },
             _ => formatter.write_str(self.code()),
         }
     }
@@ -1491,7 +1498,8 @@ struct JournalDocument {
     /// Origins whose handoff reads included `authority_open`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     authority_signals: BTreeMap<String, AuthoritySignalFact>,
-    /// Last observed `Aeon-Contract` major.minor, per origin, then surface.
+    /// Last parsed `Aeon-Contract` major.minor per origin, then surface.
+    /// A surface entry with no version means a header was seen and could not be parsed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     contract_versions: BTreeMap<String, BTreeMap<String, ObservedContract>>,
     /// Earlier journals stored one capability origin here. Load folds it into
@@ -1509,8 +1517,10 @@ struct AuthoritySignalFact {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ObservedContract {
-    major: u16,
-    minor: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    major: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minor: Option<u16>,
 }
 
 impl Default for JournalDocument {
@@ -2270,7 +2280,65 @@ impl JournalStore {
             .contract_versions
             .get(&key)
             .and_then(|surfaces| surfaces.get(surface))
-            .map(|observed| (observed.major, observed.minor))
+            .and_then(|observed| match (observed.major, observed.minor) {
+                (Some(major), Some(minor)) => Some((major, minor)),
+                _ => None,
+            })
+    }
+
+    fn contract_header_seen(&self, origin: &Url, surface: &str) -> bool {
+        let key = authority_signal_origin(origin);
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .contract_versions
+            .get(&key)
+            .is_some_and(|surfaces| surfaces.contains_key(surface))
+    }
+
+    /// Remember that this surface sent a header whose value could not be used.
+    /// A later parsed version replaces this entry. An existing version stays.
+    fn note_contract_header(&self, origin: &Url, surface: &str) -> Result<(), AdapterError> {
+        let key = authority_signal_origin(origin);
+        if !valid_authority_signal_origin(&key) || expected_contract_major(surface).is_none() {
+            return Err(AdapterError::Contract);
+        }
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        if document
+            .contract_versions
+            .get(&key)
+            .is_some_and(|surfaces| surfaces.contains_key(surface))
+        {
+            return Ok(());
+        }
+        if document
+            .bound_origin
+            .as_ref()
+            .is_some_and(|bound| bound != &key)
+        {
+            return Err(AdapterError::Journal);
+        }
+        let new_origin = !document.contract_versions.contains_key(&key);
+        if new_origin && document.contract_versions.len() >= MAX_INTENTS {
+            return Err(AdapterError::Journal);
+        }
+        let surface_count = document
+            .contract_versions
+            .get(&key)
+            .map(BTreeMap::len)
+            .unwrap_or(0);
+        if surface_count >= EXPECTED_CONTRACT_MAJORS.len() {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        updated.contract_versions.entry(key).or_default().insert(
+            surface.to_string(),
+            ObservedContract {
+                major: None,
+                minor: None,
+            },
+        );
+        persist_journal(&self.path, &mut document, updated)
     }
 
     fn observe_contract(
@@ -2292,7 +2360,7 @@ impl JournalStore {
             .cloned();
         if previous
             .as_ref()
-            .is_some_and(|observed| observed.major == major && observed.minor == minor)
+            .is_some_and(|observed| observed.major == Some(major) && observed.minor == Some(minor))
         {
             return Ok(());
         }
@@ -2322,14 +2390,20 @@ impl JournalStore {
             .contract_versions
             .entry(key.clone())
             .or_default()
-            .insert(surface.to_string(), ObservedContract { major, minor });
+            .insert(
+                surface.to_string(),
+                ObservedContract {
+                    major: Some(major),
+                    minor: Some(minor),
+                },
+            );
         persist_journal(&self.path, &mut document, updated)?;
         // Once per surface per process. A later change stays in the journal.
         if announce_contract_once(surface) {
-            let previous = previous
-                .as_ref()
-                .map(|observed| format!("{}.{}", observed.major, observed.minor))
-                .unwrap_or_default();
+            let previous = match previous.as_ref().map(|item| (item.major, item.minor)) {
+                Some((Some(major), Some(minor))) => format!("{major}.{minor}"),
+                _ => String::new(),
+            };
             let observed = format!("{major}.{minor}");
             tracing::info!(
                 surface,
@@ -2402,9 +2476,13 @@ fn journal_document_valid(document: &JournalDocument) -> bool {
             valid_authority_signal_origin(origin)
                 && !surfaces.is_empty()
                 && surfaces.len() <= EXPECTED_CONTRACT_MAJORS.len()
-                && surfaces
-                    .keys()
-                    .all(|surface| expected_contract_major(surface).is_some())
+                && surfaces.iter().all(|(surface, observed)| {
+                    expected_contract_major(surface).is_some()
+                        && matches!(
+                            (observed.major, observed.minor),
+                            (Some(_), Some(_)) | (None, None)
+                        )
+                })
         })
 }
 
@@ -2594,16 +2672,16 @@ impl AeonClient {
         let raw = match presented_contract(headers) {
             Ok(Some(raw)) => raw,
             Ok(None) => {
-                if let Some((major, minor)) = self.journal.observed_contract(&self.origin, surface)
-                {
+                if self.journal.contract_header_seen(&self.origin, surface) {
                     return Err(AdapterError::ContractDowngrade {
                         surface,
-                        seen: format!("{major}.{minor}"),
+                        seen: self.journal.observed_contract(&self.origin, surface),
                     });
                 }
                 return Ok(());
             }
             Err(()) => {
+                self.journal.note_contract_header(&self.origin, surface)?;
                 return Err(AdapterError::ContractVersion {
                     surface,
                     expected_major,
@@ -2612,6 +2690,7 @@ impl AeonClient {
             }
         };
         let Some(parsed) = parse_contract_header(raw) else {
+            self.journal.note_contract_header(&self.origin, surface)?;
             return Err(AdapterError::ContractVersion {
                 surface,
                 expected_major,
@@ -2619,6 +2698,7 @@ impl AeonClient {
             });
         };
         if parsed.surface != surface {
+            self.journal.note_contract_header(&self.origin, surface)?;
             return Err(AdapterError::ContractVersion {
                 surface,
                 expected_major,
@@ -14315,6 +14395,96 @@ mod tests {
             }
             fixture.server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn unparsable_contract_header_then_a_missing_header_is_a_downgrade() {
+        let fixture = harness(true).await;
+        let sentinel = "sentinelcontractheadersecret";
+        fixture.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Raw(format!("not a contract {sentinel}")),
+        );
+        let first = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        let first_message = first.to_string();
+        assert!(first_message.contains("unparsable"), "{first_message}");
+        assert!(!first_message.contains(sentinel), "{first_message}");
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        assert!(fixture
+            .adapter
+            .journal
+            .contract_header_seen(&origin, SURFACE_STAGE_HANDOFFS));
+        assert!(fixture
+            .adapter
+            .journal
+            .observed_contract(&origin, SURFACE_STAGE_HANDOFFS)
+            .is_none());
+        let reloaded = JournalStore::new(fixture.journal.clone()).unwrap();
+        assert!(reloaded.contract_header_seen(&origin, SURFACE_STAGE_HANDOFFS));
+        assert!(reloaded
+            .observed_contract(&origin, SURFACE_STAGE_HANDOFFS)
+            .is_none());
+        fixture
+            .fake
+            .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Omit);
+        let second = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        let second_message = second.to_string();
+        assert!(
+            matches!(
+                second,
+                AdapterError::ContractDowngrade {
+                    surface: SURFACE_STAGE_HANDOFFS,
+                    seen: None,
+                }
+            ),
+            "{second_message}"
+        );
+        assert!(second_message.contains("downgrade"), "{second_message}");
+        assert!(!second_message.contains(sentinel), "{second_message}");
+        fixture.server.abort();
+
+        let wrong = harness(true).await;
+        wrong.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Raw(format!("{sentinel}/1.0")),
+        );
+        let refused = wrong
+            .adapter
+            .process_intent(&wrong.intent)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("wrong-surface"), "{refused}");
+        assert!(wrong
+            .adapter
+            .journal
+            .contract_header_seen(&wrong.adapter.config.aeon_origin, SURFACE_STAGE_HANDOFFS));
+        wrong
+            .fake
+            .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Omit);
+        let downgraded = wrong
+            .adapter
+            .process_intent(&wrong.intent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                downgraded,
+                AdapterError::ContractDowngrade {
+                    surface: SURFACE_STAGE_HANDOFFS,
+                    seen: None,
+                }
+            ),
+            "{downgraded}"
+        );
+        wrong.server.abort();
     }
 
     #[tokio::test]
