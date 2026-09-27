@@ -2307,14 +2307,22 @@ impl JournalStore {
         if announce_contract_once(surface) {
             let previous = previous
                 .as_ref()
-                .map(|observed| format!("{}.{}", observed.major, observed.minor));
+                .map(|observed| format!("{}.{}", observed.major, observed.minor))
+                .unwrap_or_default();
             let observed = format!("{major}.{minor}");
             tracing::info!(
                 surface,
-                previous = previous.as_deref().unwrap_or(""),
+                previous = %previous,
                 observed = %observed,
                 origin = %key,
                 "Aeon contract version changed"
+            );
+            #[cfg(test)]
+            note_contract_event(
+                surface,
+                format!(
+                    "Aeon contract version changed surface={surface} previous={previous} observed={observed}"
+                ),
             );
         }
         Ok(())
@@ -2386,6 +2394,31 @@ fn announce_contract_once(surface: &str) -> bool {
         .lock()
         .expect("Aeon contract announcement lock")
         .insert(surface.to_string())
+}
+
+#[cfg(test)]
+fn contract_event_log() -> &'static Mutex<Vec<(String, String)>> {
+    static EVENTS: std::sync::OnceLock<Mutex<Vec<(String, String)>>> = std::sync::OnceLock::new();
+    EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn note_contract_event(surface: &str, line: String) {
+    contract_event_log()
+        .lock()
+        .expect("Aeon contract event log")
+        .push((surface.to_string(), line));
+}
+
+#[cfg(test)]
+fn contract_events(surface: &str) -> Vec<String> {
+    contract_event_log()
+        .lock()
+        .expect("Aeon contract event log")
+        .iter()
+        .filter(|(recorded, _)| recorded == surface)
+        .map(|(_, line)| line.clone())
+        .collect()
 }
 
 fn fold_legacy_authority_origin(document: &mut JournalDocument) -> Result<bool, AdapterError> {
@@ -5625,8 +5658,6 @@ mod tests {
         NIX_DEPLOYMENT_EVIDENCE_SCHEMA, NIX_DEPLOYMENT_EVIDENCE_VERSION,
     };
     use serde_json::{json, Value};
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::Layer;
 
     use crate::host_actions::{
         AgentActionOutcome, AgentActionPhase, AgentActionResultRequest, HostActionEventKind,
@@ -13928,34 +13959,6 @@ mod tests {
         })
     }
 
-    #[derive(Clone)]
-    struct ContractTrace {
-        events: Arc<Mutex<Vec<String>>>,
-    }
-
-    struct ContractFields(String);
-
-    impl tracing::field::Visit for ContractFields {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
-            self.0.push_str(&format!(" {}={value:?}", field.name()));
-        }
-    }
-
-    impl<S> Layer<S> for ContractTrace
-    where
-        S: tracing::Subscriber,
-    {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut fields = ContractFields(String::new());
-            event.record(&mut fields);
-            self.events.lock().expect("contract trace").push(fields.0);
-        }
-    }
-
     #[test]
     fn contract_header_parse_is_strict() {
         let parsed = parse_contract_header("me/1.0").unwrap();
@@ -14002,27 +14005,22 @@ mod tests {
         )
         .unwrap();
         let origin = Url::parse("https://aeon.example.test/").unwrap();
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(ContractTrace {
-            events: Arc::clone(&events),
-        });
-        tracing::subscriber::with_default(subscriber, || {
-            store
-                .observe_contract(&origin, SURFACE_APPROVALS, 1, 0)
-                .unwrap();
-            store
-                .observe_contract(&origin, SURFACE_APPROVALS, 1, 3)
-                .unwrap();
-        });
+        let before = contract_events(SURFACE_APPROVALS).len();
+        store
+            .observe_contract(&origin, SURFACE_APPROVALS, 1, 0)
+            .unwrap();
+        store
+            .observe_contract(&origin, SURFACE_APPROVALS, 1, 3)
+            .unwrap();
         assert_eq!(
             store.observed_contract(&origin, SURFACE_APPROVALS),
             Some((1, 3))
         );
-        let recorded = events.lock().expect("contract trace").clone();
-        assert_eq!(recorded.len(), 1, "{recorded:?}");
-        let event = &recorded[0];
-        assert!(event.contains("approvals"), "{event}");
-        assert!(event.contains("1.0"), "{event}");
+        let recorded = contract_events(SURFACE_APPROVALS);
+        assert_eq!(recorded.len(), before + 1, "{recorded:?}");
+        let event = recorded.last().expect("contract event");
+        assert!(event.contains("surface=approvals"), "{event}");
+        assert!(event.contains("observed=1.0"), "{event}");
         assert!(event.contains("Aeon contract version changed"), "{event}");
         let reloaded = JournalStore::new(
             directory
