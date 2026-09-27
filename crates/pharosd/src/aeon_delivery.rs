@@ -2661,18 +2661,23 @@ impl AeonClient {
         })
     }
 
-    /// Additional refusal before the body is parsed. An absent header is still
-    /// accepted until this surface has sent one from this origin.
+    /// Additional refusal before the body is parsed. A missing header is a
+    /// downgrade only when this response's body is interpreted. Auth answers
+    /// and upstream errors carry no header and keep their status.
     fn enforce_contract(
         &self,
         headers: &HeaderMap,
         surface: &'static str,
+        status: StatusCode,
+        body: &[u8],
     ) -> Result<(), AdapterError> {
         let expected_major = expected_contract_major(surface).ok_or(AdapterError::Contract)?;
         let raw = match presented_contract(headers) {
             Ok(Some(raw)) => raw,
             Ok(None) => {
-                if self.journal.contract_header_seen(&self.origin, surface) {
+                if acted_on_contract_body(status, body)
+                    && self.journal.contract_header_seen(&self.origin, surface)
+                {
                     return Err(AdapterError::ContractDowngrade {
                         surface,
                         seen: self.journal.observed_contract(&self.origin, surface),
@@ -3009,7 +3014,7 @@ impl AeonClient {
         #[cfg(test)]
         self.note_exchange(&method_name, path, status, request_id, &bytes, credentials);
         reject_reflected_bytes(&bytes, credentials)?;
-        self.enforce_contract(&response_headers, surface)?;
+        self.enforce_contract(&response_headers, surface, status, &bytes)?;
         if status.is_success() && !media_ok {
             return Err(AdapterError::Contract);
         }
@@ -5394,6 +5399,14 @@ fn refusal_from_aeon(status: StatusCode, body: &[u8]) -> AdapterError {
 /// report.go uses the handoff texts once no further row will be stored.
 /// "evidence predates handoff" refuses that observed_at before insert, so
 /// the sequence stays free. A contiguous-sequence 409 stops nothing.
+/// Successes, stage-gate refusals, and evidence replay stops are the
+/// responses whose body is interpreted. Other statuses keep `status_error`.
+fn acted_on_contract_body(status: StatusCode, body: &[u8]) -> bool {
+    status.is_success()
+        || stage_gate_block(status, body).is_some()
+        || evidence_replay_stop(status, body).is_some()
+}
+
 fn evidence_replay_stop(status: StatusCode, body: &[u8]) -> Option<EvidenceReplayStop> {
     if status != StatusCode::CONFLICT {
         return None;
@@ -14395,6 +14408,69 @@ mod tests {
             }
             fixture.server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn headerless_auth_and_upstream_failures_keep_their_status() {
+        let fixture = harness(true).await;
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .observed_contract(&fixture.adapter.config.aeon_origin, SURFACE_STAGE_HANDOFFS),
+            Some((1, 0))
+        );
+        fixture
+            .fake
+            .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Omit);
+        fixture
+            .fake
+            .update(|inner| inner.get_status = Some(StatusCode::UNAUTHORIZED));
+        let auth = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(auth, AdapterError::Credential),
+            "header-less 401 was {auth}"
+        );
+        fixture
+            .fake
+            .update(|inner| inner.get_status = Some(StatusCode::SERVICE_UNAVAILABLE));
+        let upstream = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                upstream,
+                AdapterError::Refused(status) if status == StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "header-less 503 was {upstream}"
+        );
+        fixture.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Version { major: 2, minor: 0 },
+        );
+        fixture
+            .fake
+            .update(|inner| inner.get_status = Some(StatusCode::UNAUTHORIZED));
+        let bumped = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        let message = bumped.to_string();
+        assert!(message.contains("2.0"), "{message}");
+        assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
+        fixture.server.abort();
     }
 
     #[tokio::test]
