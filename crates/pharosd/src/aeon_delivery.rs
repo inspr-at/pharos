@@ -60,7 +60,7 @@ const EXPECTED_CONTRACT_MAJORS: &[(&str, u16)] = &[
     (SURFACE_BASELINE_BATCHES, 1),
 ];
 const CONTRACT_HEADER: &str = "aeon-contract";
-const CONTRACT_SEEN_MAX: usize = 80;
+const CONTRACT_HEADER_MAX: usize = 80;
 const OPERATION_DOMAIN: &str = "inspr.pharos.aeon-delivery-operation.v1";
 const INTENT_DOMAIN: &str = "inspr.pharos.aeon-delivery-intent.v1";
 const LAUNCH_BINDING_DOMAIN: &[u8] = b"inspr.aeon.launch-binding.v1\0";
@@ -134,11 +134,13 @@ enum AdapterError {
     Refused(StatusCode),
     LaunchUnresolved,
     LaunchBlocked(&'static str),
-    /// The response named a different surface or a different major.
+    /// The response named a different surface, a different major, or a header
+    /// that was not a contract version. `seen` is a fixed category or the
+    /// validated major.minor. It never holds header text.
     ContractVersion {
         surface: &'static str,
         expected_major: u16,
-        seen: String,
+        seen: ContractSeen,
     },
     /// This surface sent `Aeon-Contract` before, and this response omitted it.
     ContractDowngrade {
@@ -177,6 +179,24 @@ impl AdapterError {
     }
 }
 
+/// What a contract refusal may name. Parsed numbers only, or a fixed category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContractSeen {
+    Version { major: u16, minor: u16 },
+    Unparsable,
+    WrongSurface,
+}
+
+impl ContractSeen {
+    fn label(self) -> String {
+        match self {
+            Self::Version { major, minor } => format!("{major}.{minor}"),
+            Self::Unparsable => "unparsable".to_string(),
+            Self::WrongSurface => "wrong-surface".to_string(),
+        }
+    }
+}
+
 impl fmt::Display for AdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -187,7 +207,8 @@ impl fmt::Display for AdapterError {
                 seen,
             } => write!(
                 formatter,
-                "aeon contract {surface} expected major {expected_major}, saw {seen}"
+                "aeon contract {surface} expected major {expected_major}, saw {}",
+                seen.label()
             ),
             Self::ContractDowngrade { surface, seen } => write!(
                 formatter,
@@ -2582,26 +2603,26 @@ impl AeonClient {
                 }
                 return Ok(());
             }
-            Err(seen) => {
+            Err(()) => {
                 return Err(AdapterError::ContractVersion {
                     surface,
                     expected_major,
-                    seen,
+                    seen: ContractSeen::Unparsable,
                 });
             }
         };
-        let Some(parsed) = parse_contract_header(&raw) else {
+        let Some(parsed) = parse_contract_header(raw) else {
             return Err(AdapterError::ContractVersion {
                 surface,
                 expected_major,
-                seen: seen_contract_text(&raw),
+                seen: ContractSeen::Unparsable,
             });
         };
         if parsed.surface != surface {
             return Err(AdapterError::ContractVersion {
                 surface,
                 expected_major,
-                seen: seen_contract_text(&raw),
+                seen: ContractSeen::WrongSurface,
             });
         }
         self.journal
@@ -2610,7 +2631,10 @@ impl AeonClient {
             return Err(AdapterError::ContractVersion {
                 surface,
                 expected_major,
-                seen: format!("{}.{}", parsed.major, parsed.minor),
+                seen: ContractSeen::Version {
+                    major: parsed.major,
+                    minor: parsed.minor,
+                },
             });
         }
         Ok(())
@@ -5359,24 +5383,21 @@ fn expected_contract_major(surface: &str) -> Option<u16> {
 }
 
 /// `Ok(None)` is an absent header. `Err` is a present header that is not one
-/// readable value; the string is what the refusal names.
-fn presented_contract(headers: &HeaderMap) -> Result<Option<String>, String> {
+/// readable value. The borrowed text is for parsing only and is not retained.
+fn presented_contract(headers: &HeaderMap) -> Result<Option<&str>, ()> {
     let mut values = headers.get_all(CONTRACT_HEADER).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err("multiple".to_string());
+        return Err(());
     }
-    match value.to_str() {
-        Ok(text) => Ok(Some(text.to_string())),
-        Err(_) => Err("invalid".to_string()),
-    }
+    value.to_str().map(Some).map_err(|_| ())
 }
 
 fn parse_contract_header(value: &str) -> Option<ParsedContract> {
     if value.is_empty()
-        || value.len() > CONTRACT_SEEN_MAX
+        || value.len() > CONTRACT_HEADER_MAX
         || value
             .chars()
             .any(|ch| ch.is_ascii_whitespace() || ch.is_control())
@@ -5421,25 +5442,6 @@ fn parse_contract_number(value: &str) -> Option<u16> {
         return None;
     }
     value.parse().ok()
-}
-
-fn seen_contract_text(value: &str) -> String {
-    let mut seen = String::new();
-    for ch in value.chars().take(CONTRACT_SEEN_MAX) {
-        if ch.is_control() {
-            seen.push('?');
-        } else {
-            seen.push(ch);
-        }
-    }
-    if value.chars().nth(CONTRACT_SEEN_MAX).is_some() {
-        seen.push_str("...");
-    }
-    if seen.is_empty() {
-        "invalid".to_string()
-    } else {
-        seen
-    }
 }
 
 #[cfg(test)]
@@ -13992,7 +13994,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.append(CONTRACT_HEADER, "me/1.0".parse().unwrap());
         headers.append(CONTRACT_HEADER, "me/1.1".parse().unwrap());
-        assert_eq!(presented_contract(&headers).unwrap_err(), "multiple");
+        assert!(presented_contract(&headers).is_err());
     }
 
     #[test]
@@ -14245,7 +14247,8 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
         assert!(message.contains("expected major 1"), "{message}");
-        assert!(message.contains("journey/1.0"), "{message}");
+        assert!(message.contains("wrong-surface"), "{message}");
+        assert!(!message.contains("journey/1.0"), "{message}");
         assert_eq!(error.code(), "contract_version");
         assert!(fixture.actions.list().is_empty());
         assert!(posts(&fixture.fake).is_empty());
@@ -14255,6 +14258,63 @@ mod tests {
             .observed_contract(&fixture.adapter.config.aeon_origin, SURFACE_STAGE_HANDOFFS)
             .is_none());
         fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn contract_header_text_is_not_copied_into_the_error_or_the_report() {
+        let sentinel = "sentinelcontractheadersecret";
+        for header in [
+            format!("not a contract {sentinel}"),
+            format!("{sentinel}/1.0"),
+        ] {
+            let mut fixture = harness(true).await;
+            let traces = Arc::new(Mutex::new(Vec::new()));
+            fixture.adapter.aeon.enable_trace(Arc::clone(&traces));
+            fixture
+                .fake
+                .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Raw(header));
+            let error = fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap_err();
+            let message = error.to_string();
+            let rendered = format!("{message} {error:?}");
+            assert!(
+                !rendered.contains(sentinel),
+                "header text leaked into the error: {rendered}"
+            );
+            assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
+            assert!(message.contains("expected major 1"), "{message}");
+            assert!(
+                message.contains("unparsable") || message.contains("wrong-surface"),
+                "{message}"
+            );
+            let report = fixture.journal.with_file_name("live-report.json");
+            save_live_failure(
+                &report,
+                &traces,
+                &fixture.adapter.config.api_key_file,
+                &named_error(&error),
+            );
+            let bytes = std::fs::read(&report).unwrap();
+            assert!(
+                !bytes
+                    .windows(sentinel.len())
+                    .any(|window| window == sentinel.as_bytes()),
+                "header text leaked into the report"
+            );
+            if fixture.journal.exists() {
+                let journal = std::fs::read(&fixture.journal).unwrap();
+                assert!(
+                    !journal
+                        .windows(sentinel.len())
+                        .any(|window| window == sentinel.as_bytes()),
+                    "header text leaked into the journal"
+                );
+            }
+            fixture.server.abort();
+        }
     }
 
     #[tokio::test]
