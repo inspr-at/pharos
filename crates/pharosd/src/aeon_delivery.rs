@@ -140,6 +140,11 @@ enum AdapterError {
         expected_major: u16,
         seen: String,
     },
+    /// This surface sent `Aeon-Contract` before, and this response omitted it.
+    ContractDowngrade {
+        surface: &'static str,
+        seen: String,
+    },
 }
 
 impl AdapterError {
@@ -156,6 +161,7 @@ impl AdapterError {
             Self::LaunchUnresolved => "launch_consume_unresolved",
             Self::LaunchBlocked(reason) => reason,
             Self::ContractVersion { .. } => "contract_version",
+            Self::ContractDowngrade { .. } => "contract_downgrade",
         }
     }
 
@@ -163,7 +169,9 @@ impl AdapterError {
     fn posted_blocker(&self) -> Option<BlockerCode> {
         match self {
             Self::LaunchBlocked(reason) => aeon_blocker_for_reason(reason),
-            Self::ContractVersion { .. } => Some(BlockerCode::PolicyRefused),
+            Self::ContractVersion { .. } | Self::ContractDowngrade { .. } => {
+                Some(BlockerCode::PolicyRefused)
+            }
             _ => None,
         }
     }
@@ -180,6 +188,10 @@ impl fmt::Display for AdapterError {
             } => write!(
                 formatter,
                 "aeon contract {surface} expected major {expected_major}, saw {seen}"
+            ),
+            Self::ContractDowngrade { surface, seen } => write!(
+                formatter,
+                "aeon contract downgrade on {surface}: Aeon-Contract header absent after {seen}"
             ),
             _ => formatter.write_str(self.code()),
         }
@@ -1458,6 +1470,9 @@ struct JournalDocument {
     /// Origins whose handoff reads included `authority_open`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     authority_signals: BTreeMap<String, AuthoritySignalFact>,
+    /// Last observed `Aeon-Contract` major.minor, per origin, then surface.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    contract_versions: BTreeMap<String, BTreeMap<String, ObservedContract>>,
     /// Earlier journals stored one capability origin here. Load folds it into
     /// `bound_origin` and `authority_signals`, then stops writing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1468,6 +1483,13 @@ struct JournalDocument {
 #[serde(deny_unknown_fields)]
 struct AuthoritySignalFact {
     authority_open_observed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ObservedContract {
+    major: u16,
+    minor: u16,
 }
 
 impl Default for JournalDocument {
@@ -1482,6 +1504,7 @@ impl Default for JournalDocument {
             launch_blocks: BTreeMap::new(),
             bound_origin: None,
             authority_signals: BTreeMap::new(),
+            contract_versions: BTreeMap::new(),
             authority_signal_origin: None,
         }
     }
@@ -1525,10 +1548,16 @@ impl JournalStore {
         let document = self.document.lock().expect("Aeon delivery journal lock");
         let conflicts = match &document.bound_origin {
             Some(bound) => bound != &key,
-            None => document
-                .authority_signals
-                .keys()
-                .any(|recorded| recorded != &key),
+            None => {
+                document
+                    .authority_signals
+                    .keys()
+                    .any(|recorded| recorded != &key)
+                    || document
+                        .contract_versions
+                        .keys()
+                        .any(|recorded| recorded != &key)
+            }
         };
         if conflicts {
             return Err(JOURNAL_ORIGIN_MISMATCH.to_string());
@@ -2212,6 +2241,85 @@ impl JournalStore {
             .is_some_and(|fact| fact.authority_open_observed)
     }
 
+    fn observed_contract(&self, origin: &Url, surface: &str) -> Option<(u16, u16)> {
+        let key = authority_signal_origin(origin);
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .contract_versions
+            .get(&key)
+            .and_then(|surfaces| surfaces.get(surface))
+            .map(|observed| (observed.major, observed.minor))
+    }
+
+    fn observe_contract(
+        &self,
+        origin: &Url,
+        surface: &str,
+        major: u16,
+        minor: u16,
+    ) -> Result<(), AdapterError> {
+        let key = authority_signal_origin(origin);
+        if !valid_authority_signal_origin(&key) || expected_contract_major(surface).is_none() {
+            return Err(AdapterError::Contract);
+        }
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        let previous = document
+            .contract_versions
+            .get(&key)
+            .and_then(|surfaces| surfaces.get(surface))
+            .cloned();
+        if previous
+            .as_ref()
+            .is_some_and(|observed| observed.major == major && observed.minor == minor)
+        {
+            return Ok(());
+        }
+        if previous.is_none() {
+            let new_origin = !document.contract_versions.contains_key(&key);
+            if new_origin && document.contract_versions.len() >= MAX_INTENTS {
+                return Err(AdapterError::Journal);
+            }
+            let surface_count = document
+                .contract_versions
+                .get(&key)
+                .map(BTreeMap::len)
+                .unwrap_or(0);
+            if surface_count >= EXPECTED_CONTRACT_MAJORS.len() {
+                return Err(AdapterError::Journal);
+            }
+        }
+        if document
+            .bound_origin
+            .as_ref()
+            .is_some_and(|bound| bound != &key)
+        {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        updated
+            .contract_versions
+            .entry(key.clone())
+            .or_default()
+            .insert(surface.to_string(), ObservedContract { major, minor });
+        persist_journal(&self.path, &mut document, updated)?;
+        // Once per surface per process. A later change stays in the journal.
+        if announce_contract_once(surface) {
+            let previous = previous
+                .as_ref()
+                .map(|observed| format!("{}.{}", observed.major, observed.minor));
+            let observed = format!("{major}.{minor}");
+            tracing::info!(
+                surface,
+                previous = previous.as_deref().unwrap_or(""),
+                observed = %observed,
+                origin = %key,
+                "Aeon contract version changed"
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn bound_origin(&self) -> Option<String> {
         self.document
@@ -2260,6 +2368,24 @@ fn journal_document_valid(document: &JournalDocument) -> bool {
         && document.authority_signals.iter().all(|(origin, fact)| {
             valid_authority_signal_origin(origin) && fact.authority_open_observed
         })
+        && document.contract_versions.len() <= MAX_INTENTS
+        && document.contract_versions.iter().all(|(origin, surfaces)| {
+            valid_authority_signal_origin(origin)
+                && !surfaces.is_empty()
+                && surfaces.len() <= EXPECTED_CONTRACT_MAJORS.len()
+                && surfaces
+                    .keys()
+                    .all(|surface| expected_contract_major(surface).is_some())
+        })
+}
+
+fn announce_contract_once(surface: &str) -> bool {
+    static ANNOUNCED: std::sync::OnceLock<Mutex<BTreeSet<String>>> = std::sync::OnceLock::new();
+    ANNOUNCED
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .expect("Aeon contract announcement lock")
+        .insert(surface.to_string())
 }
 
 fn fold_legacy_authority_origin(document: &mut JournalDocument) -> Result<bool, AdapterError> {
@@ -2362,6 +2488,7 @@ struct AeonClient {
     origin: Url,
     api_key_file: PathBuf,
     client: reqwest::Client,
+    journal: Arc<JournalStore>,
     #[cfg(test)]
     traces: Option<Arc<Mutex<Vec<RequestTrace>>>>,
 }
@@ -2371,6 +2498,7 @@ impl AeonClient {
         origin: Url,
         api_key_file: PathBuf,
         root_certificates: &[reqwest::Certificate],
+        journal: Arc<JournalStore>,
     ) -> Result<Self, AdapterError> {
         let has_custom_roots = !root_certificates.is_empty();
         let mut builder = reqwest::Client::builder()
@@ -2395,9 +2523,64 @@ impl AeonClient {
             origin,
             api_key_file,
             client,
+            journal,
             #[cfg(test)]
             traces: None,
         })
+    }
+
+    /// Additional refusal before the body is parsed. An absent header is still
+    /// accepted until this surface has sent one from this origin.
+    fn enforce_contract(
+        &self,
+        headers: &HeaderMap,
+        surface: &'static str,
+    ) -> Result<(), AdapterError> {
+        let expected_major = expected_contract_major(surface).ok_or(AdapterError::Contract)?;
+        let raw = match presented_contract(headers) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                if let Some((major, minor)) = self.journal.observed_contract(&self.origin, surface)
+                {
+                    return Err(AdapterError::ContractDowngrade {
+                        surface,
+                        seen: format!("{major}.{minor}"),
+                    });
+                }
+                return Ok(());
+            }
+            Err(seen) => {
+                return Err(AdapterError::ContractVersion {
+                    surface,
+                    expected_major,
+                    seen,
+                });
+            }
+        };
+        let Some(parsed) = parse_contract_header(&raw) else {
+            return Err(AdapterError::ContractVersion {
+                surface,
+                expected_major,
+                seen: seen_contract_text(&raw),
+            });
+        };
+        if parsed.surface != surface {
+            return Err(AdapterError::ContractVersion {
+                surface,
+                expected_major,
+                seen: seen_contract_text(&raw),
+            });
+        }
+        self.journal
+            .observe_contract(&self.origin, surface, parsed.major, parsed.minor)?;
+        if parsed.major != expected_major {
+            return Err(AdapterError::ContractVersion {
+                surface,
+                expected_major,
+                seen: format!("{}.{}", parsed.major, parsed.minor),
+            });
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2689,7 +2872,7 @@ impl AeonClient {
         #[cfg(test)]
         self.note_exchange(&method_name, path, status, request_id, &bytes, credentials);
         reject_reflected_bytes(&bytes, credentials)?;
-        refuse_unexpected_contract(&response_headers, surface)?;
+        self.enforce_contract(&response_headers, surface)?;
         if status.is_success() && !media_ok {
             return Err(AdapterError::Contract);
         }
@@ -2699,7 +2882,7 @@ impl AeonClient {
 
 pub(crate) struct AeonDeliveryAdapter {
     config: AdapterConfig,
-    journal: JournalStore,
+    journal: Arc<JournalStore>,
     aeon: AeonClient,
     hosts: Arc<Store>,
     host_actions: Arc<HostActionStore>,
@@ -2744,8 +2927,10 @@ impl AeonDeliveryAdapter {
         hosts: Arc<Store>,
         host_actions: Arc<HostActionStore>,
     ) -> Result<Self, String> {
-        let journal = JournalStore::new(journal_path)
-            .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
+        let journal = Arc::new(
+            JournalStore::new(journal_path)
+                .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?,
+        );
         journal
             .require_configured_origin(&config.aeon_origin)
             .map_err(|message| format!("Aeon delivery adapter startup failed: {message}"))?;
@@ -2753,6 +2938,7 @@ impl AeonDeliveryAdapter {
             config.aeon_origin.clone(),
             config.api_key_file.clone(),
             &config.aeon_ca_certificates,
+            Arc::clone(&journal),
         )
         .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
         Ok(Self {
@@ -5221,46 +5407,6 @@ fn seen_contract_text(value: &str) -> String {
     } else {
         seen
     }
-}
-
-/// Additional refusal. An absent header is still accepted: an older Aeon that
-/// has never sent `Aeon-Contract` keeps today's behaviour.
-fn refuse_unexpected_contract(
-    headers: &HeaderMap,
-    surface: &'static str,
-) -> Result<(), AdapterError> {
-    let expected_major = expected_contract_major(surface).ok_or(AdapterError::Contract)?;
-    let raw = match presented_contract(headers) {
-        Ok(Some(raw)) => raw,
-        Ok(None) => return Ok(()),
-        Err(seen) => {
-            return Err(AdapterError::ContractVersion {
-                surface,
-                expected_major,
-                seen,
-            });
-        }
-    };
-    let Some(parsed) = parse_contract_header(&raw) else {
-        return Err(AdapterError::ContractVersion {
-            surface,
-            expected_major,
-            seen: seen_contract_text(&raw),
-        });
-    };
-    if parsed.surface == surface && parsed.major == expected_major {
-        return Ok(());
-    }
-    let seen = if parsed.surface == surface {
-        format!("{}.{}", parsed.major, parsed.minor)
-    } else {
-        seen_contract_text(&raw)
-    };
-    Err(AdapterError::ContractVersion {
-        surface,
-        expected_major,
-        seen,
-    })
 }
 
 #[cfg(test)]
