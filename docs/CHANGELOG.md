@@ -43,6 +43,7 @@
 - Select the live Aeon roundtrip's candidate and deploy gates by `gate_scope` (`journey.candidate` and `journey.deploy`). A dark or missing scope is named in the refusal. Stage keys are not that identity (PHAROS-321).
 - Require the live Aeon journey to report `disposable: true` before any write. An operator marks the project with `aeon journey mark-disposable`. The operator-supplied project key, node key, project node, and release id remain required (PHAROS-321).
 - Note that Aeon's handoff create response now matches GET (AEON-177). The delivery adapter still reads that handoff with GET (PHAROS-321).
+- Pin Aeon-Contract major 1 for each reporter surface in `EXPECTED_CONTRACT_MAJORS`. Any minor of that major is accepted. A different major, or a header that names another surface, is refused by name before the body is parsed, and a result posted for that refusal uses `policy_refused`. The delivery journal records the last observed major.minor per surface per origin. Once a surface has sent the header, a later omission is refused as a downgrade. An origin that has never sent the header keeps the previous behaviour (PHAROS-322).
 
 ## 260922141211.0.0 - 2026-09-22
 

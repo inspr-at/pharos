@@ -587,6 +587,18 @@ and a fact recorded for another origin stays beside it. A later handoff read
 that omits `authority_open`, after that origin has sent it, is journaled as
 `authority_signal_missing`, which maps to `policy_refused`, and the host job
 is not confirmed. A true `authority_open` does not waive the inferred check.
+The adapter pins Aeon-Contract major 1 for `stage-handoffs`,
+`stage-evidence`, `stage-launch`, `stage-result`, `journey`, `me`,
+`approvals`, and `baseline-batches` in `EXPECTED_CONTRACT_MAJORS`. Any minor
+of that major is accepted. A different major, or a header that names another
+surface, is refused by name before the body is parsed: the error names the
+surface, the expected major, and the seen version, and a result posted for
+that refusal uses `policy_refused`. Bump the major in that table when Pharos
+adopts the new contract. A missing header is still accepted until that
+surface has sent one from this origin; a later omission is refused as a
+downgrade. The journal records the last observed major.minor per surface per
+origin.
+
 A newer attempt of the same operation is not visible as a change to this
 handoff's attempt or epoch. Aeon's handoff
 create response now matches GET (AEON-177). This adapter does not create
