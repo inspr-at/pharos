@@ -599,9 +599,17 @@ version, and PHAROS-324. A different major,
 or a header that names another surface, is refused by name before the body
 is parsed. The error names the surface Pharos called and the expected major,
 and it carries the validated major.minor or a fixed category, never the
-header text. A major mismatch posts no result and leaves the handoff open
-until that major is bumped in the table or Aeon serves the expected major.
-A contract that cannot be trusted does not produce evidence. A missing
+header text. The header is checked on the response, so a write already
+sent may have committed on Aeon before Pharos refuses it. Pharos does not
+post a failure result for that refusal, and the refusal is not a rollback.
+The next handoff read acknowledges a stored result when that read is
+accepted and the result matches the journaled request. It does not copy an
+evidence, admit, or consume receipt. Evidence is sent again while the
+handoff is open, and that replay stops without a receipt when the handoff
+is closed, already has a result, or has expired. An admit is sent again. A
+consume the read shows as done is sent again, and the read supplies its
+receipt only when that post returns 409. Until an accepted response for
+a write that is still in flight, the journal can lag the handoff. A missing
 header is still accepted until that surface has sent one from this origin.
 A header that cannot be parsed still counts as sent. A later omission on a
 success, a stage-gate refusal, or an evidence replay stop is refused as a
