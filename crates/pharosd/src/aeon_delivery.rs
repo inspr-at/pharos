@@ -38,6 +38,29 @@ const CONFIG_SCHEMA: &str = "inspr.pharos.aeon-delivery-adapter.v1";
 const CONFIG_SCHEMA_VERSION: u16 = 1;
 const JOURNAL_SCHEMA: &str = "inspr.pharos.aeon-delivery-journal.v1";
 const JOURNAL_SCHEMA_VERSION: u16 = 1;
+/// Reporter surfaces and the `Aeon-Contract` major Pharos accepts. Any minor
+/// of that major is accepted. Bump the major here when Pharos adopts a new
+/// contract for that surface.
+const SURFACE_STAGE_HANDOFFS: &str = "stage-handoffs";
+const SURFACE_STAGE_EVIDENCE: &str = "stage-evidence";
+const SURFACE_STAGE_LAUNCH: &str = "stage-launch";
+const SURFACE_STAGE_RESULT: &str = "stage-result";
+const SURFACE_JOURNEY: &str = "journey";
+const SURFACE_ME: &str = "me";
+const SURFACE_APPROVALS: &str = "approvals";
+const SURFACE_BASELINE_BATCHES: &str = "baseline-batches";
+const EXPECTED_CONTRACT_MAJORS: &[(&str, u16)] = &[
+    (SURFACE_STAGE_HANDOFFS, 1),
+    (SURFACE_STAGE_EVIDENCE, 1),
+    (SURFACE_STAGE_LAUNCH, 1),
+    (SURFACE_STAGE_RESULT, 1),
+    (SURFACE_JOURNEY, 1),
+    (SURFACE_ME, 1),
+    (SURFACE_APPROVALS, 1),
+    (SURFACE_BASELINE_BATCHES, 1),
+];
+const CONTRACT_HEADER: &str = "aeon-contract";
+const CONTRACT_SEEN_MAX: usize = 80;
 const OPERATION_DOMAIN: &str = "inspr.pharos.aeon-delivery-operation.v1";
 const INTENT_DOMAIN: &str = "inspr.pharos.aeon-delivery-intent.v1";
 const LAUNCH_BINDING_DOMAIN: &[u8] = b"inspr.aeon.launch-binding.v1\0";
@@ -111,6 +134,12 @@ enum AdapterError {
     Refused(StatusCode),
     LaunchUnresolved,
     LaunchBlocked(&'static str),
+    /// The response named a different surface or a different major.
+    ContractVersion {
+        surface: &'static str,
+        expected_major: u16,
+        seen: String,
+    },
 }
 
 impl AdapterError {
@@ -126,6 +155,16 @@ impl AdapterError {
             Self::Refused(_) => "aeon_refused",
             Self::LaunchUnresolved => "launch_consume_unresolved",
             Self::LaunchBlocked(reason) => reason,
+            Self::ContractVersion { .. } => "contract_version",
+        }
+    }
+
+    /// Blocker code on a stage result posted because of this error.
+    fn posted_blocker(&self) -> Option<BlockerCode> {
+        match self {
+            Self::LaunchBlocked(reason) => aeon_blocker_for_reason(reason),
+            Self::ContractVersion { .. } => Some(BlockerCode::PolicyRefused),
+            _ => None,
         }
     }
 }
@@ -134,6 +173,14 @@ impl fmt::Display for AdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused(status) => write!(formatter, "{} ({})", self.code(), status.as_u16()),
+            Self::ContractVersion {
+                surface,
+                expected_major,
+                seen,
+            } => write!(
+                formatter,
+                "aeon contract {surface} expected major {expected_major}, saw {seen}"
+            ),
             _ => formatter.write_str(self.code()),
         }
     }
@@ -2408,6 +2455,7 @@ impl AeonClient {
                 None,
                 None,
                 &credentials,
+                SURFACE_STAGE_HANDOFFS,
             )
             .await?;
         if status != StatusCode::OK {
@@ -2417,10 +2465,14 @@ impl AeonClient {
     }
 
     #[cfg(test)]
-    async fn get_json(&self, path: &str) -> Result<serde_json::Value, AdapterError> {
+    async fn get_json(
+        &self,
+        path: &str,
+        surface: &'static str,
+    ) -> Result<serde_json::Value, AdapterError> {
         let credentials = self.credentials()?;
         let (status, bytes) = self
-            .exchange(Method::GET, path, None, None, &credentials)
+            .exchange(Method::GET, path, None, None, &credentials, surface)
             .await?;
         if status != StatusCode::OK {
             return Err(status_error(status));
@@ -2431,7 +2483,7 @@ impl AeonClient {
     async fn get_principal(&self) -> Result<String, AdapterError> {
         let credentials = self.credentials()?;
         let (status, bytes) = self
-            .exchange(Method::GET, "/api/me", None, None, &credentials)
+            .exchange(Method::GET, "/api/me", None, None, &credentials, SURFACE_ME)
             .await?;
         if status != StatusCode::OK {
             return Err(status_error(status));
@@ -2471,6 +2523,7 @@ impl AeonClient {
                 Some(record.body_json.as_bytes()),
                 Some(&record.idempotency_key),
                 &credentials,
+                SURFACE_STAGE_EVIDENCE,
             )
             .await?;
         if status != StatusCode::CREATED {
@@ -2501,6 +2554,7 @@ impl AeonClient {
                 Some(record.admit_body_json.as_bytes()),
                 Some(&record.admit_idempotency_key),
                 &credentials,
+                SURFACE_STAGE_LAUNCH,
             )
             .await?;
         if status != StatusCode::OK {
@@ -2531,6 +2585,7 @@ impl AeonClient {
                 Some(body.as_bytes()),
                 Some(idempotency),
                 &credentials,
+                SURFACE_STAGE_LAUNCH,
             )
             .await?;
         if status != StatusCode::OK {
@@ -2559,6 +2614,7 @@ impl AeonClient {
                 Some(record.body_json.as_bytes()),
                 Some(&record.idempotency_key),
                 &credentials,
+                SURFACE_STAGE_RESULT,
             )
             .await?;
         if status != StatusCode::OK {
@@ -2579,6 +2635,7 @@ impl AeonClient {
         body: Option<&[u8]>,
         idempotency_key: Option<&str>,
         credentials: &Credentials,
+        surface: &'static str,
     ) -> Result<(StatusCode, Vec<u8>), AdapterError> {
         #[cfg(test)]
         let method_name = method.clone();
@@ -2608,6 +2665,7 @@ impl AeonClient {
         // Every header is checked before any header value is copied. A reflected
         // key in x-request-id must not reach a trace, a panic, or the report.
         reject_reflected_headers(response.headers(), credentials)?;
+        let response_headers = response.headers().clone();
         #[cfg(test)]
         let request_id = response
             .headers()
@@ -2631,6 +2689,7 @@ impl AeonClient {
         #[cfg(test)]
         self.note_exchange(&method_name, path, status, request_id, &bytes, credentials);
         reject_reflected_bytes(&bytes, credentials)?;
+        refuse_unexpected_contract(&response_headers, surface)?;
         if status.is_success() && !media_ok {
             return Err(AdapterError::Contract);
         }
@@ -2714,6 +2773,7 @@ impl AeonDeliveryAdapter {
         if let Err(error) = self.remember_principal().await {
             tracing::warn!(
                 reason = error.code(),
+                detail = %error,
                 "Aeon principal was not loaded; consume reconciliation will retry"
             );
         }
@@ -2726,6 +2786,7 @@ impl AeonDeliveryAdapter {
                     tracing::warn!(
                         handoff_id = %intent.handoff_id,
                         reason = error.code(),
+                        detail = %error,
                         "Aeon delivery observation was not reported"
                     );
                 }
@@ -2970,7 +3031,9 @@ impl AeonDeliveryAdapter {
         if reason == LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED {
             return Ok(());
         }
-        let blocker = aeon_blocker_for_reason(reason).ok_or(AdapterError::Journal)?;
+        let blocker = AdapterError::LaunchBlocked(reason)
+            .posted_blocker()
+            .ok_or(AdapterError::Journal)?;
         self.write_observation(
             intent,
             &handoff,
@@ -5060,6 +5123,144 @@ fn reject_reflected_bytes(bytes: &[u8], credentials: &Credentials) -> Result<(),
         return Err(AdapterError::Contract);
     }
     Ok(())
+}
+
+struct ParsedContract {
+    surface: String,
+    major: u16,
+    minor: u16,
+}
+
+fn expected_contract_major(surface: &str) -> Option<u16> {
+    EXPECTED_CONTRACT_MAJORS
+        .iter()
+        .copied()
+        .find(|(name, _)| *name == surface)
+        .map(|(_, major)| major)
+}
+
+/// `Ok(None)` is an absent header. `Err` is a present header that is not one
+/// readable value; the string is what the refusal names.
+fn presented_contract(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let mut values = headers.get_all(CONTRACT_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("multiple".to_string());
+    }
+    match value.to_str() {
+        Ok(text) => Ok(Some(text.to_string())),
+        Err(_) => Err("invalid".to_string()),
+    }
+}
+
+fn parse_contract_header(value: &str) -> Option<ParsedContract> {
+    if value.is_empty()
+        || value.len() > CONTRACT_SEEN_MAX
+        || value
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || ch.is_control())
+    {
+        return None;
+    }
+    let (surface, version) = value.split_once('/')?;
+    if !contract_surface_token(surface) {
+        return None;
+    }
+    let (major, minor) = version.split_once('.')?;
+    if minor.contains('.') {
+        return None;
+    }
+    Some(ParsedContract {
+        surface: surface.to_string(),
+        major: parse_contract_number(major)?,
+        minor: parse_contract_number(minor)?,
+    })
+}
+
+fn contract_surface_token(value: &str) -> bool {
+    let mut parts = value.split('-');
+    match parts.next() {
+        Some(part) if contract_surface_part(part) => parts.all(contract_surface_part),
+        _ => false,
+    }
+}
+
+fn contract_surface_part(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+}
+
+fn parse_contract_number(value: &str) -> Option<u16> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return None;
+    }
+    if !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn seen_contract_text(value: &str) -> String {
+    let mut seen = String::new();
+    for ch in value.chars().take(CONTRACT_SEEN_MAX) {
+        if ch.is_control() {
+            seen.push('?');
+        } else {
+            seen.push(ch);
+        }
+    }
+    if value.chars().nth(CONTRACT_SEEN_MAX).is_some() {
+        seen.push_str("...");
+    }
+    if seen.is_empty() {
+        "invalid".to_string()
+    } else {
+        seen
+    }
+}
+
+/// Additional refusal. An absent header is still accepted: an older Aeon that
+/// has never sent `Aeon-Contract` keeps today's behaviour.
+fn refuse_unexpected_contract(
+    headers: &HeaderMap,
+    surface: &'static str,
+) -> Result<(), AdapterError> {
+    let expected_major = expected_contract_major(surface).ok_or(AdapterError::Contract)?;
+    let raw = match presented_contract(headers) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok(()),
+        Err(seen) => {
+            return Err(AdapterError::ContractVersion {
+                surface,
+                expected_major,
+                seen,
+            });
+        }
+    };
+    let Some(parsed) = parse_contract_header(&raw) else {
+        return Err(AdapterError::ContractVersion {
+            surface,
+            expected_major,
+            seen: seen_contract_text(&raw),
+        });
+    };
+    if parsed.surface == surface && parsed.major == expected_major {
+        return Ok(());
+    }
+    let seen = if parsed.surface == surface {
+        format!("{}.{}", parsed.major, parsed.minor)
+    } else {
+        seen_contract_text(&raw)
+    };
+    Err(AdapterError::ContractVersion {
+        surface,
+        expected_major,
+        seen,
+    })
 }
 
 #[cfg(test)]
@@ -12719,7 +12920,14 @@ mod tests {
         let credentials = adapter.aeon.credentials().expect("test key");
         let long = adapter
             .aeon
-            .exchange(Method::GET, "/long-error", None, None, &credentials)
+            .exchange(
+                Method::GET,
+                "/long-error",
+                None,
+                None,
+                &credentials,
+                SURFACE_ME,
+            )
             .await
             .expect("long error body is not a reflected key");
         drop(credentials);
@@ -12752,7 +12960,14 @@ mod tests {
         let credentials = adapter.aeon.credentials().expect("test key");
         let header_key = adapter
             .aeon
-            .exchange(Method::GET, "/header-key", None, None, &credentials)
+            .exchange(
+                Method::GET,
+                "/header-key",
+                None,
+                None,
+                &credentials,
+                SURFACE_ME,
+            )
             .await;
         drop(credentials);
         assert!(matches!(header_key, Err(AdapterError::Contract)));
@@ -13572,7 +13787,10 @@ mod tests {
         }
         let journey = adapter
             .aeon
-            .get_json(&format!("/api/projects/{project_node_id}/journey"))
+            .get_json(
+                &format!("/api/projects/{project_node_id}/journey"),
+                SURFACE_JOURNEY,
+            )
             .await
             .map_err(|error| format!("live Aeon journey read failed ({})", error.code()))?;
         let project_key = journey
