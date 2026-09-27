@@ -2410,27 +2410,38 @@ impl JournalStore {
                 },
             );
         persist_journal(&self.path, &mut document, updated)?;
-        // Once per surface per process. A later change stays in the journal.
-        if announce_contract_once(surface) {
-            let previous = match previous.as_ref().map(|item| (item.major, item.minor)) {
-                Some((Some(major), Some(minor))) => format!("{major}.{minor}"),
-                _ => String::new(),
-            };
-            let observed = format!("{major}.{minor}");
-            tracing::info!(
+        // The first parsed version is not a change. Each later transition
+        // from a known version is logged once, so a flap cannot repeat it.
+        if let Some(ObservedContract {
+            major: Some(previous_major),
+            minor: Some(previous_minor),
+        }) = previous.as_ref()
+        {
+            if announce_contract_transition(
+                &key,
                 surface,
-                previous = %previous,
-                observed = %observed,
-                origin = %key,
-                "Aeon contract version changed"
-            );
-            #[cfg(test)]
-            note_contract_event(
-                surface,
-                format!(
-                    "Aeon contract version changed surface={surface} previous={previous} observed={observed}"
-                ),
-            );
+                *previous_major,
+                *previous_minor,
+                major,
+                minor,
+            ) {
+                let previous_label = format!("{previous_major}.{previous_minor}");
+                let observed = format!("{major}.{minor}");
+                tracing::info!(
+                    surface,
+                    previous = %previous_label,
+                    observed = %observed,
+                    origin = %key,
+                    "Aeon contract version changed"
+                );
+                #[cfg(test)]
+                note_contract_event(
+                    surface,
+                    format!(
+                        "Aeon contract version changed surface={surface} previous={previous_label} observed={observed}"
+                    ),
+                );
+            }
         }
         Ok(())
     }
@@ -2498,13 +2509,38 @@ fn journal_document_valid(document: &JournalDocument) -> bool {
         })
 }
 
-fn announce_contract_once(surface: &str) -> bool {
-    static ANNOUNCED: std::sync::OnceLock<Mutex<BTreeSet<String>>> = std::sync::OnceLock::new();
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ContractTransition {
+    origin: String,
+    surface: String,
+    previous_major: u16,
+    previous_minor: u16,
+    major: u16,
+    minor: u16,
+}
+
+fn announce_contract_transition(
+    origin: &str,
+    surface: &str,
+    previous_major: u16,
+    previous_minor: u16,
+    major: u16,
+    minor: u16,
+) -> bool {
+    static ANNOUNCED: std::sync::OnceLock<Mutex<BTreeSet<ContractTransition>>> =
+        std::sync::OnceLock::new();
     ANNOUNCED
         .get_or_init(|| Mutex::new(BTreeSet::new()))
         .lock()
         .expect("Aeon contract announcement lock")
-        .insert(surface.to_string())
+        .insert(ContractTransition {
+            origin: origin.to_string(),
+            surface: surface.to_string(),
+            previous_major,
+            previous_minor,
+            major,
+            minor,
+        })
 }
 
 #[cfg(test)]
@@ -14145,7 +14181,7 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_change_is_traced_once_per_surface() {
+    fn contract_version_bump_logs_once_and_the_first_observation_does_not() {
         let directory = TestDir::new("contract-trace");
         let store = JournalStore::new(
             directory
@@ -14158,19 +14194,45 @@ mod tests {
         store
             .observe_contract(&origin, SURFACE_APPROVALS, 1, 0)
             .unwrap();
+        assert_eq!(
+            contract_events(SURFACE_APPROVALS).len(),
+            before,
+            "the first observation is not a change"
+        );
         store
             .observe_contract(&origin, SURFACE_APPROVALS, 1, 3)
             .unwrap();
-        assert_eq!(
-            store.observed_contract(&origin, SURFACE_APPROVALS),
-            Some((1, 3))
-        );
         let recorded = contract_events(SURFACE_APPROVALS);
         assert_eq!(recorded.len(), before + 1, "{recorded:?}");
         let event = recorded.last().expect("contract event");
         assert!(event.contains("surface=approvals"), "{event}");
-        assert!(event.contains("observed=1.0"), "{event}");
+        assert!(event.contains("previous=1.0"), "{event}");
+        assert!(event.contains("observed=1.3"), "{event}");
         assert!(event.contains("Aeon contract version changed"), "{event}");
+        store
+            .observe_contract(&origin, SURFACE_APPROVALS, 1, 0)
+            .unwrap();
+        store
+            .observe_contract(&origin, SURFACE_APPROVALS, 1, 3)
+            .unwrap();
+        let after_flap = contract_events(SURFACE_APPROVALS);
+        assert_eq!(
+            after_flap.len(),
+            before + 2,
+            "a repeated transition is logged once: {after_flap:?}"
+        );
+        assert!(
+            after_flap[before + 1].contains("previous=1.3"),
+            "{after_flap:?}"
+        );
+        assert!(
+            after_flap[before + 1].contains("observed=1.0"),
+            "{after_flap:?}"
+        );
+        assert_eq!(
+            store.observed_contract(&origin, SURFACE_APPROVALS),
+            Some((1, 3))
+        );
         let reloaded = JournalStore::new(
             directory
                 .path()
