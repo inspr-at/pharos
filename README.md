@@ -587,12 +587,16 @@ and a fact recorded for another origin stays beside it. A later handoff read
 that omits `authority_open`, after that origin has sent it, is journaled as
 `authority_signal_missing`, which maps to `policy_refused`, and the host job
 is not confirmed. A true `authority_open` does not waive the inferred check.
+A newer attempt of the same operation is not visible as a change to this
+handoff's attempt or epoch.
 The adapter pins Aeon-Contract major 1 for `stage-handoffs`,
 `stage-evidence`, `stage-launch`, `stage-result`, `journey`, `me`,
 `approvals`, and `baseline-batches` in `EXPECTED_CONTRACT_MAJORS`. The
-header check accepts any minor of that major. The body parsers stay strict,
-so an added field still fails the read. This change makes a version change
-diagnosable. Tolerant body parsing is tracked separately as PHAROS-324.
+header check accepts any minor of that major. Handoff, evidence, launch,
+and result bodies stay strict, so an added field still fails those reads.
+`GET /api/me` is parsed loosely, so an added field there does not. This
+change makes a version change diagnosable. Tolerant body parsing of the
+strict reads is tracked separately as PHAROS-324.
 When strict parsing fails and the observed minor for that surface is above
 `CONTRACT_MINOR_BASELINE`, the error names the surface, the observed
 version, and PHAROS-324. A different major,
@@ -618,8 +622,7 @@ keeps its status. The journal records the last parsed major.minor per
 surface per origin. A contract-version fact does not bind the journal; the
 binding stays absent until the first handoff read.
 
-A newer attempt of the same operation is not visible as a change to this
-handoff's attempt or epoch. Aeon's handoff
+Aeon's handoff
 create response now matches GET (AEON-177). This adapter does not create
 handoffs, and GET remains the source of truth for the handoff it confirms.
 The bearer token stays in its referenced
