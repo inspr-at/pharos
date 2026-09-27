@@ -38,6 +38,32 @@ const CONFIG_SCHEMA: &str = "inspr.pharos.aeon-delivery-adapter.v1";
 const CONFIG_SCHEMA_VERSION: u16 = 1;
 const JOURNAL_SCHEMA: &str = "inspr.pharos.aeon-delivery-journal.v1";
 const JOURNAL_SCHEMA_VERSION: u16 = 1;
+/// Reporter surfaces and the `Aeon-Contract` major Pharos accepts. Any minor
+/// of that major is accepted. Bump the major here when Pharos adopts a new
+/// contract for that surface.
+const SURFACE_STAGE_HANDOFFS: &str = "stage-handoffs";
+const SURFACE_STAGE_EVIDENCE: &str = "stage-evidence";
+const SURFACE_STAGE_LAUNCH: &str = "stage-launch";
+const SURFACE_STAGE_RESULT: &str = "stage-result";
+const SURFACE_JOURNEY: &str = "journey";
+const SURFACE_ME: &str = "me";
+const SURFACE_APPROVALS: &str = "approvals";
+const SURFACE_BASELINE_BATCHES: &str = "baseline-batches";
+const EXPECTED_CONTRACT_MAJORS: &[(&str, u16)] = &[
+    (SURFACE_STAGE_HANDOFFS, 1),
+    (SURFACE_STAGE_EVIDENCE, 1),
+    (SURFACE_STAGE_LAUNCH, 1),
+    (SURFACE_STAGE_RESULT, 1),
+    (SURFACE_JOURNEY, 1),
+    (SURFACE_ME, 1),
+    (SURFACE_APPROVALS, 1),
+    (SURFACE_BASELINE_BATCHES, 1),
+];
+const CONTRACT_HEADER: &str = "aeon-contract";
+const CONTRACT_HEADER_MAX: usize = 80;
+/// Minor the strict body parsers were written against. A higher observed
+/// minor whose body fails to parse is an added field (PHAROS-324).
+const CONTRACT_MINOR_BASELINE: u16 = 0;
 const OPERATION_DOMAIN: &str = "inspr.pharos.aeon-delivery-operation.v1";
 const INTENT_DOMAIN: &str = "inspr.pharos.aeon-delivery-intent.v1";
 const LAUNCH_BINDING_DOMAIN: &[u8] = b"inspr.aeon.launch-binding.v1\0";
@@ -111,6 +137,26 @@ enum AdapterError {
     Refused(StatusCode),
     LaunchUnresolved,
     LaunchBlocked(&'static str),
+    /// The response named a different surface, a different major, or a header
+    /// that was not a contract version. `seen` is a fixed category or the
+    /// validated major.minor. It never holds header text.
+    ContractVersion {
+        surface: &'static str,
+        expected_major: u16,
+        seen: ContractSeen,
+    },
+    /// This surface sent `Aeon-Contract` before, and this response omitted it.
+    /// `seen` is the last parsed major.minor, when one was recorded.
+    ContractDowngrade {
+        surface: &'static str,
+        seen: Option<(u16, u16)>,
+    },
+    /// Strict parsing failed after this surface advertised a minor above the baseline.
+    ContractAdded {
+        surface: &'static str,
+        major: u16,
+        minor: u16,
+    },
 }
 
 impl AdapterError {
@@ -126,6 +172,36 @@ impl AdapterError {
             Self::Refused(_) => "aeon_refused",
             Self::LaunchUnresolved => "launch_consume_unresolved",
             Self::LaunchBlocked(reason) => reason,
+            Self::ContractVersion { .. } => "contract_version",
+            Self::ContractDowngrade { .. } => "contract_downgrade",
+            Self::ContractAdded { .. } => "contract_refused",
+        }
+    }
+
+    /// Blocker code on a stage result posted because of this error.
+    /// A contract refusal posts no result, so it has no blocker.
+    fn posted_blocker(&self) -> Option<BlockerCode> {
+        match self {
+            Self::LaunchBlocked(reason) => aeon_blocker_for_reason(reason),
+            _ => None,
+        }
+    }
+}
+
+/// What a contract refusal may name. Parsed numbers only, or a fixed category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContractSeen {
+    Version { major: u16, minor: u16 },
+    Unparsable,
+    WrongSurface,
+}
+
+impl ContractSeen {
+    fn label(self) -> String {
+        match self {
+            Self::Version { major, minor } => format!("{major}.{minor}"),
+            Self::Unparsable => "unparsable".to_string(),
+            Self::WrongSurface => "wrong-surface".to_string(),
         }
     }
 }
@@ -134,6 +210,33 @@ impl fmt::Display for AdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused(status) => write!(formatter, "{} ({})", self.code(), status.as_u16()),
+            Self::ContractVersion {
+                surface,
+                expected_major,
+                seen,
+            } => write!(
+                formatter,
+                "aeon contract {surface} expected major {expected_major}, saw {}",
+                seen.label()
+            ),
+            Self::ContractAdded {
+                surface,
+                major,
+                minor,
+            } => write!(
+                formatter,
+                "aeon contract {surface} observed {major}.{minor}; Aeon added a field (PHAROS-324)"
+            ),
+            Self::ContractDowngrade { surface, seen } => match seen {
+                Some((major, minor)) => write!(
+                    formatter,
+                    "aeon contract downgrade on {surface}: Aeon-Contract header absent after {major}.{minor}"
+                ),
+                None => write!(
+                    formatter,
+                    "aeon contract downgrade on {surface}: Aeon-Contract header absent after a header was seen"
+                ),
+            },
             _ => formatter.write_str(self.code()),
         }
     }
@@ -1411,6 +1514,10 @@ struct JournalDocument {
     /// Origins whose handoff reads included `authority_open`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     authority_signals: BTreeMap<String, AuthoritySignalFact>,
+    /// Last parsed `Aeon-Contract` major.minor per origin, then surface.
+    /// A surface entry with no version means a header was seen and could not be parsed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    contract_versions: BTreeMap<String, BTreeMap<String, ObservedContract>>,
     /// Earlier journals stored one capability origin here. Load folds it into
     /// `bound_origin` and `authority_signals`, then stops writing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1421,6 +1528,15 @@ struct JournalDocument {
 #[serde(deny_unknown_fields)]
 struct AuthoritySignalFact {
     authority_open_observed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ObservedContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    major: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minor: Option<u16>,
 }
 
 impl Default for JournalDocument {
@@ -1435,6 +1551,7 @@ impl Default for JournalDocument {
             launch_blocks: BTreeMap::new(),
             bound_origin: None,
             authority_signals: BTreeMap::new(),
+            contract_versions: BTreeMap::new(),
             authority_signal_origin: None,
         }
     }
@@ -1478,6 +1595,8 @@ impl JournalStore {
         let document = self.document.lock().expect("Aeon delivery journal lock");
         let conflicts = match &document.bound_origin {
             Some(bound) => bound != &key,
+            // A contract version is keyed by origin and does not bind the
+            // journal. The binding stays absent until the first handoff read.
             None => document
                 .authority_signals
                 .keys()
@@ -2165,6 +2284,168 @@ impl JournalStore {
             .is_some_and(|fact| fact.authority_open_observed)
     }
 
+    fn observed_contract(&self, origin: &Url, surface: &str) -> Option<(u16, u16)> {
+        let key = authority_signal_origin(origin);
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .contract_versions
+            .get(&key)
+            .and_then(|surfaces| surfaces.get(surface))
+            .and_then(|observed| match (observed.major, observed.minor) {
+                (Some(major), Some(minor)) => Some((major, minor)),
+                _ => None,
+            })
+    }
+
+    fn contract_header_seen(&self, origin: &Url, surface: &str) -> bool {
+        let key = authority_signal_origin(origin);
+        self.document
+            .lock()
+            .expect("Aeon delivery journal lock")
+            .contract_versions
+            .get(&key)
+            .is_some_and(|surfaces| surfaces.contains_key(surface))
+    }
+
+    /// Remember that this surface sent a header whose value could not be used.
+    /// A later parsed version replaces this entry. An existing version stays.
+    fn note_contract_header(&self, origin: &Url, surface: &str) -> Result<(), AdapterError> {
+        let key = authority_signal_origin(origin);
+        if !valid_authority_signal_origin(&key) || expected_contract_major(surface).is_none() {
+            return Err(AdapterError::Contract);
+        }
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        if document
+            .contract_versions
+            .get(&key)
+            .is_some_and(|surfaces| surfaces.contains_key(surface))
+        {
+            return Ok(());
+        }
+        if document
+            .bound_origin
+            .as_ref()
+            .is_some_and(|bound| bound != &key)
+        {
+            return Err(AdapterError::Journal);
+        }
+        let new_origin = !document.contract_versions.contains_key(&key);
+        if new_origin && document.contract_versions.len() >= MAX_INTENTS {
+            return Err(AdapterError::Journal);
+        }
+        let surface_count = document
+            .contract_versions
+            .get(&key)
+            .map(BTreeMap::len)
+            .unwrap_or(0);
+        if surface_count >= EXPECTED_CONTRACT_MAJORS.len() {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        updated.contract_versions.entry(key).or_default().insert(
+            surface.to_string(),
+            ObservedContract {
+                major: None,
+                minor: None,
+            },
+        );
+        persist_journal(&self.path, &mut document, updated)
+    }
+
+    fn observe_contract(
+        &self,
+        origin: &Url,
+        surface: &str,
+        major: u16,
+        minor: u16,
+    ) -> Result<(), AdapterError> {
+        let key = authority_signal_origin(origin);
+        if !valid_authority_signal_origin(&key) || expected_contract_major(surface).is_none() {
+            return Err(AdapterError::Contract);
+        }
+        let mut document = self.document.lock().expect("Aeon delivery journal lock");
+        let previous = document
+            .contract_versions
+            .get(&key)
+            .and_then(|surfaces| surfaces.get(surface))
+            .cloned();
+        if previous
+            .as_ref()
+            .is_some_and(|observed| observed.major == Some(major) && observed.minor == Some(minor))
+        {
+            return Ok(());
+        }
+        if previous.is_none() {
+            let new_origin = !document.contract_versions.contains_key(&key);
+            if new_origin && document.contract_versions.len() >= MAX_INTENTS {
+                return Err(AdapterError::Journal);
+            }
+            let surface_count = document
+                .contract_versions
+                .get(&key)
+                .map(BTreeMap::len)
+                .unwrap_or(0);
+            if surface_count >= EXPECTED_CONTRACT_MAJORS.len() {
+                return Err(AdapterError::Journal);
+            }
+        }
+        if document
+            .bound_origin
+            .as_ref()
+            .is_some_and(|bound| bound != &key)
+        {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        updated
+            .contract_versions
+            .entry(key.clone())
+            .or_default()
+            .insert(
+                surface.to_string(),
+                ObservedContract {
+                    major: Some(major),
+                    minor: Some(minor),
+                },
+            );
+        persist_journal(&self.path, &mut document, updated)?;
+        // The first parsed version is not a change. Each later transition
+        // from a known version is logged once, so a flap cannot repeat it.
+        if let Some(ObservedContract {
+            major: Some(previous_major),
+            minor: Some(previous_minor),
+        }) = previous.as_ref()
+        {
+            if announce_contract_transition(
+                &key,
+                surface,
+                *previous_major,
+                *previous_minor,
+                major,
+                minor,
+            ) {
+                let previous_label = format!("{previous_major}.{previous_minor}");
+                let observed = format!("{major}.{minor}");
+                tracing::info!(
+                    surface,
+                    previous = %previous_label,
+                    observed = %observed,
+                    origin = %key,
+                    "Aeon contract version changed"
+                );
+                #[cfg(test)]
+                note_contract_event(
+                    surface,
+                    format!(
+                        "Aeon contract version changed surface={surface} previous={previous_label} observed={observed}"
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn bound_origin(&self) -> Option<String> {
         self.document
@@ -2213,6 +2494,78 @@ fn journal_document_valid(document: &JournalDocument) -> bool {
         && document.authority_signals.iter().all(|(origin, fact)| {
             valid_authority_signal_origin(origin) && fact.authority_open_observed
         })
+        && document.contract_versions.len() <= MAX_INTENTS
+        && document.contract_versions.iter().all(|(origin, surfaces)| {
+            valid_authority_signal_origin(origin)
+                && !surfaces.is_empty()
+                && surfaces.len() <= EXPECTED_CONTRACT_MAJORS.len()
+                && surfaces.iter().all(|(surface, observed)| {
+                    expected_contract_major(surface).is_some()
+                        && matches!(
+                            (observed.major, observed.minor),
+                            (Some(_), Some(_)) | (None, None)
+                        )
+                })
+        })
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ContractTransition {
+    origin: String,
+    surface: String,
+    previous_major: u16,
+    previous_minor: u16,
+    major: u16,
+    minor: u16,
+}
+
+fn announce_contract_transition(
+    origin: &str,
+    surface: &str,
+    previous_major: u16,
+    previous_minor: u16,
+    major: u16,
+    minor: u16,
+) -> bool {
+    static ANNOUNCED: std::sync::OnceLock<Mutex<BTreeSet<ContractTransition>>> =
+        std::sync::OnceLock::new();
+    ANNOUNCED
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .expect("Aeon contract announcement lock")
+        .insert(ContractTransition {
+            origin: origin.to_string(),
+            surface: surface.to_string(),
+            previous_major,
+            previous_minor,
+            major,
+            minor,
+        })
+}
+
+#[cfg(test)]
+fn contract_event_log() -> &'static Mutex<Vec<(String, String)>> {
+    static EVENTS: std::sync::OnceLock<Mutex<Vec<(String, String)>>> = std::sync::OnceLock::new();
+    EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn note_contract_event(surface: &str, line: String) {
+    contract_event_log()
+        .lock()
+        .expect("Aeon contract event log")
+        .push((surface.to_string(), line));
+}
+
+#[cfg(test)]
+fn contract_events(surface: &str) -> Vec<String> {
+    contract_event_log()
+        .lock()
+        .expect("Aeon contract event log")
+        .iter()
+        .filter(|(recorded, _)| recorded == surface)
+        .map(|(_, line)| line.clone())
+        .collect()
 }
 
 fn fold_legacy_authority_origin(document: &mut JournalDocument) -> Result<bool, AdapterError> {
@@ -2315,6 +2668,7 @@ struct AeonClient {
     origin: Url,
     api_key_file: PathBuf,
     client: reqwest::Client,
+    journal: Arc<JournalStore>,
     #[cfg(test)]
     traces: Option<Arc<Mutex<Vec<RequestTrace>>>>,
 }
@@ -2324,6 +2678,7 @@ impl AeonClient {
         origin: Url,
         api_key_file: PathBuf,
         root_certificates: &[reqwest::Certificate],
+        journal: Arc<JournalStore>,
     ) -> Result<Self, AdapterError> {
         let has_custom_roots = !root_certificates.is_empty();
         let mut builder = reqwest::Client::builder()
@@ -2348,9 +2703,74 @@ impl AeonClient {
             origin,
             api_key_file,
             client,
+            journal,
             #[cfg(test)]
             traces: None,
         })
+    }
+
+    /// Additional refusal before the body is parsed. A missing header is a
+    /// downgrade only when this response's body is interpreted. Auth answers
+    /// and upstream errors carry no header and keep their status.
+    fn enforce_contract(
+        &self,
+        headers: &HeaderMap,
+        surface: &'static str,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Result<(), AdapterError> {
+        let expected_major = expected_contract_major(surface).ok_or(AdapterError::Contract)?;
+        let raw = match presented_contract(headers) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                if acted_on_contract_body(status, body)
+                    && self.journal.contract_header_seen(&self.origin, surface)
+                {
+                    return Err(AdapterError::ContractDowngrade {
+                        surface,
+                        seen: self.journal.observed_contract(&self.origin, surface),
+                    });
+                }
+                return Ok(());
+            }
+            Err(()) => {
+                self.journal.note_contract_header(&self.origin, surface)?;
+                return Err(AdapterError::ContractVersion {
+                    surface,
+                    expected_major,
+                    seen: ContractSeen::Unparsable,
+                });
+            }
+        };
+        let Some(parsed) = parse_contract_header(raw) else {
+            self.journal.note_contract_header(&self.origin, surface)?;
+            return Err(AdapterError::ContractVersion {
+                surface,
+                expected_major,
+                seen: ContractSeen::Unparsable,
+            });
+        };
+        if parsed.surface != surface {
+            self.journal.note_contract_header(&self.origin, surface)?;
+            return Err(AdapterError::ContractVersion {
+                surface,
+                expected_major,
+                seen: ContractSeen::WrongSurface,
+            });
+        }
+        self.journal
+            .observe_contract(&self.origin, surface, parsed.major, parsed.minor)?;
+        if parsed.major != expected_major {
+            return Err(AdapterError::ContractVersion {
+                surface,
+                expected_major,
+                seen: ContractSeen::Version {
+                    major: parsed.major,
+                    minor: parsed.minor,
+                },
+            });
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2408,19 +2828,48 @@ impl AeonClient {
                 None,
                 None,
                 &credentials,
+                SURFACE_STAGE_HANDOFFS,
             )
             .await?;
         if status != StatusCode::OK {
             return Err(status_error(status));
         }
-        decode_strict(&bytes)
+        self.decode_response(&bytes, SURFACE_STAGE_HANDOFFS)
+    }
+
+    fn decode_response<T: for<'de> Deserialize<'de>>(
+        &self,
+        bytes: &[u8],
+        surface: &'static str,
+    ) -> Result<T, AdapterError> {
+        decode_strict(bytes).map_err(|_| self.added_field_or_contract(surface))
+    }
+
+    fn added_field_or_contract(&self, surface: &'static str) -> AdapterError {
+        let Some(expected_major) = expected_contract_major(surface) else {
+            return AdapterError::Contract;
+        };
+        match self.journal.observed_contract(&self.origin, surface) {
+            Some((major, minor)) if major == expected_major && minor > CONTRACT_MINOR_BASELINE => {
+                AdapterError::ContractAdded {
+                    surface,
+                    major,
+                    minor,
+                }
+            }
+            _ => AdapterError::Contract,
+        }
     }
 
     #[cfg(test)]
-    async fn get_json(&self, path: &str) -> Result<serde_json::Value, AdapterError> {
+    async fn get_json(
+        &self,
+        path: &str,
+        surface: &'static str,
+    ) -> Result<serde_json::Value, AdapterError> {
         let credentials = self.credentials()?;
         let (status, bytes) = self
-            .exchange(Method::GET, path, None, None, &credentials)
+            .exchange(Method::GET, path, None, None, &credentials, surface)
             .await?;
         if status != StatusCode::OK {
             return Err(status_error(status));
@@ -2431,7 +2880,7 @@ impl AeonClient {
     async fn get_principal(&self) -> Result<String, AdapterError> {
         let credentials = self.credentials()?;
         let (status, bytes) = self
-            .exchange(Method::GET, "/api/me", None, None, &credentials)
+            .exchange(Method::GET, "/api/me", None, None, &credentials, SURFACE_ME)
             .await?;
         if status != StatusCode::OK {
             return Err(status_error(status));
@@ -2471,6 +2920,7 @@ impl AeonClient {
                 Some(record.body_json.as_bytes()),
                 Some(&record.idempotency_key),
                 &credentials,
+                SURFACE_STAGE_EVIDENCE,
             )
             .await?;
         if status != StatusCode::CREATED {
@@ -2479,7 +2929,7 @@ impl AeonClient {
                 body: bytes,
             });
         }
-        let response: EvidenceResponse = decode_strict(&bytes)?;
+        let response: EvidenceResponse = self.decode_response(&bytes, SURFACE_STAGE_EVIDENCE)?;
         let receipt = EvidenceReceipt::from_response(&response)?;
         if !receipt.matches_request(&record.body_json, &record.handoff_id)
             || !evidence_echo_matches(&response, &record.body_json)
@@ -2501,12 +2951,13 @@ impl AeonClient {
                 Some(record.admit_body_json.as_bytes()),
                 Some(&record.admit_idempotency_key),
                 &credentials,
+                SURFACE_STAGE_LAUNCH,
             )
             .await?;
         if status != StatusCode::OK {
             return Err(refusal_from_aeon(status, &bytes));
         }
-        let mut admission: LaunchAdmission = decode_strict(&bytes)?;
+        let mut admission: LaunchAdmission = self.decode_response(&bytes, SURFACE_STAGE_LAUNCH)?;
         admission.authority_open = None;
         Ok(admission)
     }
@@ -2531,12 +2982,13 @@ impl AeonClient {
                 Some(body.as_bytes()),
                 Some(idempotency),
                 &credentials,
+                SURFACE_STAGE_LAUNCH,
             )
             .await?;
         if status != StatusCode::OK {
             return Err(refusal_from_aeon(status, &bytes));
         }
-        let response: ConsumeResponse = decode_strict(&bytes)?;
+        let response: ConsumeResponse = self.decode_response(&bytes, SURFACE_STAGE_LAUNCH)?;
         if !response.consumed
             || response.handoff_id != record.handoff_id
             || response.admission_id != record.admission.as_ref().ok_or(AdapterError::Journal)?.id
@@ -2559,12 +3011,13 @@ impl AeonClient {
                 Some(record.body_json.as_bytes()),
                 Some(&record.idempotency_key),
                 &credentials,
+                SURFACE_STAGE_RESULT,
             )
             .await?;
         if status != StatusCode::OK {
             return Err(refusal_from_aeon(status, &bytes));
         }
-        let response: ResultResponse = decode_strict(&bytes)?;
+        let response: ResultResponse = self.decode_response(&bytes, SURFACE_STAGE_RESULT)?;
         let receipt = ResultReceipt::from_response(&response)?;
         if !receipt.matches_request(&record.body_json, &record.handoff_id) {
             return Err(AdapterError::Contract);
@@ -2579,6 +3032,7 @@ impl AeonClient {
         body: Option<&[u8]>,
         idempotency_key: Option<&str>,
         credentials: &Credentials,
+        surface: &'static str,
     ) -> Result<(StatusCode, Vec<u8>), AdapterError> {
         #[cfg(test)]
         let method_name = method.clone();
@@ -2608,6 +3062,7 @@ impl AeonClient {
         // Every header is checked before any header value is copied. A reflected
         // key in x-request-id must not reach a trace, a panic, or the report.
         reject_reflected_headers(response.headers(), credentials)?;
+        let response_headers = response.headers().clone();
         #[cfg(test)]
         let request_id = response
             .headers()
@@ -2631,6 +3086,7 @@ impl AeonClient {
         #[cfg(test)]
         self.note_exchange(&method_name, path, status, request_id, &bytes, credentials);
         reject_reflected_bytes(&bytes, credentials)?;
+        self.enforce_contract(&response_headers, surface, status, &bytes)?;
         if status.is_success() && !media_ok {
             return Err(AdapterError::Contract);
         }
@@ -2640,7 +3096,7 @@ impl AeonClient {
 
 pub(crate) struct AeonDeliveryAdapter {
     config: AdapterConfig,
-    journal: JournalStore,
+    journal: Arc<JournalStore>,
     aeon: AeonClient,
     hosts: Arc<Store>,
     host_actions: Arc<HostActionStore>,
@@ -2685,8 +3141,10 @@ impl AeonDeliveryAdapter {
         hosts: Arc<Store>,
         host_actions: Arc<HostActionStore>,
     ) -> Result<Self, String> {
-        let journal = JournalStore::new(journal_path)
-            .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
+        let journal = Arc::new(
+            JournalStore::new(journal_path)
+                .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?,
+        );
         journal
             .require_configured_origin(&config.aeon_origin)
             .map_err(|message| format!("Aeon delivery adapter startup failed: {message}"))?;
@@ -2694,6 +3152,7 @@ impl AeonDeliveryAdapter {
             config.aeon_origin.clone(),
             config.api_key_file.clone(),
             &config.aeon_ca_certificates,
+            Arc::clone(&journal),
         )
         .map_err(|error| format!("Aeon delivery adapter startup failed: {error}"))?;
         Ok(Self {
@@ -2714,6 +3173,7 @@ impl AeonDeliveryAdapter {
         if let Err(error) = self.remember_principal().await {
             tracing::warn!(
                 reason = error.code(),
+                detail = %error,
                 "Aeon principal was not loaded; consume reconciliation will retry"
             );
         }
@@ -2726,6 +3186,7 @@ impl AeonDeliveryAdapter {
                     tracing::warn!(
                         handoff_id = %intent.handoff_id,
                         reason = error.code(),
+                        detail = %error,
                         "Aeon delivery observation was not reported"
                     );
                 }
@@ -2970,7 +3431,9 @@ impl AeonDeliveryAdapter {
         if reason == LAUNCH_BLOCK_STAGE_GATE_NOT_APPROVED {
             return Ok(());
         }
-        let blocker = aeon_blocker_for_reason(reason).ok_or(AdapterError::Journal)?;
+        let blocker = AdapterError::LaunchBlocked(reason)
+            .posted_blocker()
+            .ok_or(AdapterError::Journal)?;
         self.write_observation(
             intent,
             &handoff,
@@ -5008,6 +5471,14 @@ fn refusal_from_aeon(status: StatusCode, body: &[u8]) -> AdapterError {
 /// report.go uses the handoff texts once no further row will be stored.
 /// "evidence predates handoff" refuses that observed_at before insert, so
 /// the sequence stays free. A contiguous-sequence 409 stops nothing.
+/// Successes, stage-gate refusals, and evidence replay stops are the
+/// responses whose body is interpreted. Other statuses keep `status_error`.
+fn acted_on_contract_body(status: StatusCode, body: &[u8]) -> bool {
+    status.is_success()
+        || stage_gate_block(status, body).is_some()
+        || evidence_replay_stop(status, body).is_some()
+}
+
 fn evidence_replay_stop(status: StatusCode, body: &[u8]) -> Option<EvidenceReplayStop> {
     if status != StatusCode::CONFLICT {
         return None;
@@ -5060,6 +5531,82 @@ fn reject_reflected_bytes(bytes: &[u8], credentials: &Credentials) -> Result<(),
         return Err(AdapterError::Contract);
     }
     Ok(())
+}
+
+struct ParsedContract {
+    surface: String,
+    major: u16,
+    minor: u16,
+}
+
+fn expected_contract_major(surface: &str) -> Option<u16> {
+    EXPECTED_CONTRACT_MAJORS
+        .iter()
+        .copied()
+        .find(|(name, _)| *name == surface)
+        .map(|(_, major)| major)
+}
+
+/// `Ok(None)` is an absent header. `Err` is a present header that is not one
+/// readable value. The borrowed text is for parsing only and is not retained.
+fn presented_contract(headers: &HeaderMap) -> Result<Option<&str>, ()> {
+    let mut values = headers.get_all(CONTRACT_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    value.to_str().map(Some).map_err(|_| ())
+}
+
+fn parse_contract_header(value: &str) -> Option<ParsedContract> {
+    if value.is_empty()
+        || value.len() > CONTRACT_HEADER_MAX
+        || value
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || ch.is_control())
+    {
+        return None;
+    }
+    let (surface, version) = value.split_once('/')?;
+    if !contract_surface_token(surface) {
+        return None;
+    }
+    let (major, minor) = version.split_once('.')?;
+    if minor.contains('.') {
+        return None;
+    }
+    Some(ParsedContract {
+        surface: surface.to_string(),
+        major: parse_contract_number(major)?,
+        minor: parse_contract_number(minor)?,
+    })
+}
+
+fn contract_surface_token(value: &str) -> bool {
+    let mut parts = value.split('-');
+    match parts.next() {
+        Some(part) if contract_surface_part(part) => parts.all(contract_surface_part),
+        _ => false,
+    }
+}
+
+fn contract_surface_part(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+}
+
+fn parse_contract_number(value: &str) -> Option<u16> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return None;
+    }
+    if !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 #[cfg(test)]
@@ -5268,7 +5815,7 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::extract::State;
-    use axum::http::{Request, Response};
+    use axum::http::{HeaderName, HeaderValue, Request, Response};
     use axum::Router;
     use pharos_core::{
         ArtifactDigestClass, BackupConfiguredState, BackupEngine, BackupObservation,
@@ -5970,6 +6517,17 @@ mod tests {
         journey_deploy_stage_key: String,
         journey_candidate_gate_live: bool,
         journey_deploy_gate_live: bool,
+        /// Missing surface uses major 1 minor 0. `Omit` drops the header.
+        contract_headers: BTreeMap<String, ContractHeaderMode>,
+        /// Adds one unknown field to a handoff GET, which strict parsing refuses.
+        extra_handoff_field: bool,
+    }
+
+    #[derive(Clone, Debug)]
+    enum ContractHeaderMode {
+        Version { major: u16, minor: u16 },
+        Raw(String),
+        Omit,
     }
 
     #[derive(Clone)]
@@ -6021,6 +6579,8 @@ mod tests {
                     journey_deploy_stage_key: "deploy".to_string(),
                     journey_candidate_gate_live: true,
                     journey_deploy_gate_live: true,
+                    contract_headers: BTreeMap::new(),
+                    extra_handoff_field: false,
                 })),
                 captures: Arc::new(Mutex::new(Vec::new())),
                 reread_hook: Arc::new(Mutex::new(None)),
@@ -6032,6 +6592,88 @@ mod tests {
             let mut inner = self.inner.lock().expect("fake lock");
             update(&mut inner)
         }
+
+        fn set_contract(&self, surface: &str, mode: ContractHeaderMode) {
+            self.update(|inner| {
+                inner.contract_headers.insert(surface.to_string(), mode);
+            });
+        }
+
+        fn omit_contract_headers(&self) {
+            self.update(|inner| {
+                for (surface, _) in EXPECTED_CONTRACT_MAJORS {
+                    inner
+                        .contract_headers
+                        .insert((*surface).to_string(), ContractHeaderMode::Omit);
+                }
+            });
+        }
+    }
+
+    impl FakeInner {
+        fn contract_header_value(&self, surface: &str) -> Option<String> {
+            match self.contract_headers.get(surface) {
+                Some(ContractHeaderMode::Omit) => None,
+                Some(ContractHeaderMode::Raw(value)) => Some(value.clone()),
+                Some(ContractHeaderMode::Version { major, minor }) => {
+                    Some(format!("{surface}/{major}.{minor}"))
+                }
+                None => Some(format!("{surface}/1.0")),
+            }
+        }
+    }
+
+    fn contract_surface(method: &str, path: &str) -> Option<&'static str> {
+        if method == "GET" && path == "/api/me" {
+            return Some(SURFACE_ME);
+        }
+        let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        if method == "GET"
+            && parts.len() == 4
+            && parts[0] == "api"
+            && parts[1] == "projects"
+            && parts[3] == "journey"
+        {
+            return Some(SURFACE_JOURNEY);
+        }
+        if parts.len() >= 3 && parts[0] == "api" && parts[1] == "stage-handoffs" {
+            return match (method, parts.get(3).copied(), parts.get(4).copied()) {
+                ("GET", None, None) => Some(SURFACE_STAGE_HANDOFFS),
+                ("POST", Some("evidence"), None) => Some(SURFACE_STAGE_EVIDENCE),
+                ("POST", Some("launch"), Some("admit" | "consume")) => Some(SURFACE_STAGE_LAUNCH),
+                ("POST", Some("result"), None) => Some(SURFACE_STAGE_RESULT),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    fn with_contract_header(
+        inner: &FakeInner,
+        method: &str,
+        path: &str,
+        response: Response<Body>,
+    ) -> Response<Body> {
+        // Auth middleware and injected upstream failures sit outside the route
+        // and carry no Aeon-Contract header. A route-level 404 still does.
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            return response;
+        }
+        let Some(surface) = contract_surface(method, path) else {
+            return response;
+        };
+        let Some(value) = inner.contract_header_value(surface) else {
+            return response;
+        };
+        let (mut parts, body) = response.into_parts();
+        parts.headers.insert(
+            HeaderName::from_static("aeon-contract"),
+            HeaderValue::from_str(&value).expect("contract header value"),
+        );
+        Response::from_parts(parts, body)
     }
 
     fn json_response(status: StatusCode, value: &Value) -> Response<Body> {
@@ -6771,6 +7413,7 @@ mod tests {
             return handle_result(inner, &id, body);
         }
         let now = inner.now;
+        let extra_handoff_field = inner.extra_handoff_field;
         let corrupt = inner.corrupt_binding;
         let expire = inner.expire_admission;
         let admission_lifetime_secs = inner.admission_lifetime_secs;
@@ -6790,7 +7433,13 @@ mod tests {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         };
         match route {
-            ("GET", None, None) => json_response(StatusCode::OK, &handoff.json(now)),
+            ("GET", None, None) => {
+                let mut document = handoff.json(now);
+                if extra_handoff_field {
+                    document["added_field"] = json!(true);
+                }
+                json_response(StatusCode::OK, &document)
+            }
             ("POST", Some("evidence"), None) => handle_evidence(handoff, body, now),
             ("POST", Some("launch"), Some("admit")) => {
                 let flags = AdmitFlags {
@@ -7000,11 +7649,21 @@ mod tests {
         });
         let mut inner = fake.inner.lock().expect("fake lock");
         if !authorized(&inner, &authorization) {
-            return json_response(StatusCode::UNAUTHORIZED, &json!({}));
+            return with_contract_header(
+                &inner,
+                &method,
+                &path,
+                json_response(StatusCode::UNAUTHORIZED, &json!({})),
+            );
         }
         if method == "POST" && inner.fail_next_post {
             inner.fail_next_post = false;
-            return json_response(StatusCode::SERVICE_UNAVAILABLE, &json!({}));
+            return with_contract_header(
+                &inner,
+                &method,
+                &path,
+                json_response(StatusCode::SERVICE_UNAVAILABLE, &json!({})),
+            );
         }
         let fire_reread = method == "GET"
             && inner
@@ -7024,14 +7683,15 @@ mod tests {
         }
         let mut inner = fake.inner.lock().expect("fake lock");
         let idempotency = header_text(&headers, "idempotency-key");
-        dispatch(
+        let response = dispatch(
             &mut inner,
             &method,
             &path,
             &body,
             &authorization,
             &idempotency,
-        )
+        );
+        with_contract_header(&inner, &method, &path, response)
     }
 
     async fn serve(fake: FakeAeon) -> (Url, tokio::task::JoinHandle<()>) {
@@ -12719,7 +13379,14 @@ mod tests {
         let credentials = adapter.aeon.credentials().expect("test key");
         let long = adapter
             .aeon
-            .exchange(Method::GET, "/long-error", None, None, &credentials)
+            .exchange(
+                Method::GET,
+                "/long-error",
+                None,
+                None,
+                &credentials,
+                SURFACE_ME,
+            )
             .await
             .expect("long error body is not a reflected key");
         drop(credentials);
@@ -12752,7 +13419,14 @@ mod tests {
         let credentials = adapter.aeon.credentials().expect("test key");
         let header_key = adapter
             .aeon
-            .exchange(Method::GET, "/header-key", None, None, &credentials)
+            .exchange(
+                Method::GET,
+                "/header-key",
+                None,
+                None,
+                &credentials,
+                SURFACE_ME,
+            )
             .await;
         drop(credentials);
         assert!(matches!(header_key, Err(AdapterError::Contract)));
@@ -13470,6 +14144,842 @@ mod tests {
         })
     }
 
+    #[test]
+    fn contract_header_parse_is_strict() {
+        let parsed = parse_contract_header("me/1.0").unwrap();
+        assert_eq!(parsed.surface, SURFACE_ME);
+        assert_eq!((parsed.major, parsed.minor), (1, 0));
+        let bumped = parse_contract_header("stage-launch/1.15").unwrap();
+        assert_eq!(bumped.minor, 15);
+        for rejected in [
+            "me/01.0",
+            "me/1.00",
+            "me/1",
+            "me/1.0.1",
+            "ME/1.0",
+            "me/1.0 ",
+            " me/1.0",
+            "me/1.0\n",
+            "",
+            "me",
+            "/1.0",
+            "me/",
+            "stage_handoffs/1.0",
+        ] {
+            assert!(parse_contract_header(rejected).is_none(), "{rejected}");
+        }
+        assert_eq!(EXPECTED_CONTRACT_MAJORS.len(), 8);
+        for (surface, major) in EXPECTED_CONTRACT_MAJORS {
+            assert_eq!(expected_contract_major(surface), Some(*major));
+            assert_eq!(*major, 1);
+        }
+        assert!(presented_contract(&HeaderMap::new()).unwrap().is_none());
+        let mut headers = HeaderMap::new();
+        headers.append(CONTRACT_HEADER, "me/1.0".parse().unwrap());
+        headers.append(CONTRACT_HEADER, "me/1.1".parse().unwrap());
+        assert!(presented_contract(&headers).is_err());
+    }
+
+    #[test]
+    fn contract_version_bump_logs_once_and_the_first_observation_does_not() {
+        let directory = TestDir::new("contract-trace");
+        let store = JournalStore::new(
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+        )
+        .unwrap();
+        let origin = Url::parse("https://aeon.example.test/").unwrap();
+        let before = contract_events(SURFACE_APPROVALS).len();
+        store
+            .observe_contract(&origin, SURFACE_APPROVALS, 1, 0)
+            .unwrap();
+        assert_eq!(
+            contract_events(SURFACE_APPROVALS).len(),
+            before,
+            "the first observation is not a change"
+        );
+        store
+            .observe_contract(&origin, SURFACE_APPROVALS, 1, 3)
+            .unwrap();
+        let recorded = contract_events(SURFACE_APPROVALS);
+        assert_eq!(recorded.len(), before + 1, "{recorded:?}");
+        let event = recorded.last().expect("contract event");
+        assert!(event.contains("surface=approvals"), "{event}");
+        assert!(event.contains("previous=1.0"), "{event}");
+        assert!(event.contains("observed=1.3"), "{event}");
+        assert!(event.contains("Aeon contract version changed"), "{event}");
+        store
+            .observe_contract(&origin, SURFACE_APPROVALS, 1, 0)
+            .unwrap();
+        store
+            .observe_contract(&origin, SURFACE_APPROVALS, 1, 3)
+            .unwrap();
+        let after_flap = contract_events(SURFACE_APPROVALS);
+        assert_eq!(
+            after_flap.len(),
+            before + 2,
+            "a repeated transition is logged once: {after_flap:?}"
+        );
+        assert!(
+            after_flap[before + 1].contains("previous=1.3"),
+            "{after_flap:?}"
+        );
+        assert!(
+            after_flap[before + 1].contains("observed=1.0"),
+            "{after_flap:?}"
+        );
+        assert_eq!(
+            store.observed_contract(&origin, SURFACE_APPROVALS),
+            Some((1, 3))
+        );
+        let reloaded = JournalStore::new(
+            directory
+                .path()
+                .join("hosts.json.aeon-delivery-journal.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            reloaded.observed_contract(&origin, SURFACE_APPROVALS),
+            Some((1, 3))
+        );
+    }
+
+    #[test]
+    fn contract_version_alone_does_not_bind_the_journal_origin() {
+        let directory = TestDir::new("contract-origin");
+        let path = directory
+            .path()
+            .join("hosts.json.aeon-delivery-journal.json");
+        let origin = "https://aeon.example.test";
+        let document = json!({
+            "schema": JOURNAL_SCHEMA,
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "records": {},
+            "contract_versions": {
+                origin: {"baseline-batches": {"major": 1, "minor": 2}}
+            }
+        });
+        write_private(&path, &serde_json::to_vec(&document).unwrap());
+        let loaded = JournalStore::new(path.clone()).unwrap();
+        assert_eq!(
+            loaded.observed_contract(&Url::parse(origin).unwrap(), SURFACE_BASELINE_BATCHES),
+            Some((1, 2))
+        );
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let actions = Arc::new(HostActionStore::new(None));
+        AeonDeliveryAdapter::open(
+            runtime_config(
+                Url::parse("https://other.example.test").unwrap(),
+                directory.path().join("api-key"),
+                vec![],
+            ),
+            path.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        )
+        .expect("a contract version does not bind the journal");
+        AeonDeliveryAdapter::open(
+            runtime_config(
+                Url::parse(&format!("{origin}/")).unwrap(),
+                directory.path().join("api-key"),
+                vec![],
+            ),
+            path,
+            hosts,
+            actions,
+        )
+        .expect("the recorded origin still starts");
+    }
+
+    async fn confirm_ready_launch(fixture: &Harness) -> String {
+        let job_id = prepare_ready_launch(fixture).await;
+        for _ in 0..4 {
+            fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap();
+            if fixture.actions.get(&job_id).unwrap().state == HostActionState::QueuedApply {
+                return job_id;
+            }
+        }
+        panic!(
+            "launch did not confirm: {:?}",
+            fixture.actions.get(&job_id).unwrap().state
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_aeon_sends_the_surface_contract_header() {
+        let fake = FakeAeon::new(now_unix());
+        let (origin, server) = serve(fake).await;
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let routes = [
+            ("GET", "/api/me", "me/1.0"),
+            (
+                "GET",
+                &format!("/api/projects/{PROJECT_NODE}/journey"),
+                "journey/1.0",
+            ),
+            (
+                "GET",
+                &format!("/api/stage-handoffs/{DEPLOY_HANDOFF}"),
+                "stage-handoffs/1.0",
+            ),
+            (
+                "POST",
+                &format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"),
+                "stage-evidence/1.0",
+            ),
+            (
+                "POST",
+                &format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/admit"),
+                "stage-launch/1.0",
+            ),
+            (
+                "POST",
+                &format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/launch/consume"),
+                "stage-launch/1.0",
+            ),
+            (
+                "POST",
+                &format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/result"),
+                "stage-result/1.0",
+            ),
+        ];
+        for (method, path, expected) in routes {
+            let url = origin.join(path).unwrap();
+            let request = match method {
+                "GET" => client.get(url),
+                "POST" => client.post(url),
+                _ => unreachable!(),
+            };
+            let response = request
+                .header(AUTHORIZATION, &bearer)
+                .header(CONTENT_TYPE, JSON_MEDIA)
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers().get("aeon-contract").unwrap(),
+                expected,
+                "{method} {path}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn minor_bump_that_fails_strict_parsing_names_the_added_field() {
+        let bumped = harness(true).await;
+        bumped.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Version { major: 1, minor: 3 },
+        );
+        bumped.fake.update(|inner| inner.extra_handoff_field = true);
+        let error = bumped
+            .adapter
+            .process_intent(&bumped.intent)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(
+                error,
+                AdapterError::ContractAdded {
+                    surface: SURFACE_STAGE_HANDOFFS,
+                    major: 1,
+                    minor: 3,
+                }
+            ),
+            "{message}"
+        );
+        assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
+        assert!(message.contains("1.3"), "{message}");
+        assert!(message.contains("Aeon added a field"), "{message}");
+        assert!(message.contains("PHAROS-324"), "{message}");
+        bumped.server.abort();
+
+        let baseline = harness(true).await;
+        baseline
+            .fake
+            .update(|inner| inner.extra_handoff_field = true);
+        let bare = baseline
+            .adapter
+            .process_intent(&baseline.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(bare, AdapterError::Contract), "{bare}");
+        assert!(!bare.to_string().contains("PHAROS-324"), "{bare}");
+        baseline.server.abort();
+    }
+
+    #[tokio::test]
+    async fn minor_contract_bump_is_accepted() {
+        let fixture = harness(true).await;
+        fixture.fake.update(|inner| {
+            for (surface, _) in EXPECTED_CONTRACT_MAJORS {
+                inner.contract_headers.insert(
+                    (*surface).to_string(),
+                    ContractHeaderMode::Version { major: 1, minor: 4 },
+                );
+            }
+        });
+        let job_id = confirm_ready_launch(&fixture).await;
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .observed_contract(&fixture.adapter.config.aeon_origin, SURFACE_STAGE_HANDOFFS),
+            Some((1, 4))
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .observed_contract(&fixture.adapter.config.aeon_origin, SURFACE_STAGE_LAUNCH),
+            Some((1, 4))
+        );
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn major_contract_bump_is_refused_by_name_without_a_host_change() {
+        let fixture = harness(true).await;
+        fixture.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Version { major: 2, minor: 0 },
+        );
+        let error = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
+        assert!(message.contains("expected major 1"), "{message}");
+        assert!(message.contains("2.0"), "{message}");
+        assert_eq!(error.code(), "contract_version");
+        assert!(error.posted_blocker().is_none());
+        assert!(fixture.actions.list().is_empty());
+        assert!(
+            posts(&fixture.fake).is_empty(),
+            "a contract refusal posts no result"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .observed_contract(&fixture.adapter.config.aeon_origin, SURFACE_STAGE_HANDOFFS),
+            Some((2, 0))
+        );
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn mismatched_contract_surface_is_refused_by_name() {
+        let fixture = harness(true).await;
+        fixture.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Raw("journey/1.0".to_string()),
+        );
+        let error = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
+        assert!(message.contains("expected major 1"), "{message}");
+        assert!(message.contains("wrong-surface"), "{message}");
+        assert!(!message.contains("journey/1.0"), "{message}");
+        assert_eq!(error.code(), "contract_version");
+        assert!(fixture.actions.list().is_empty());
+        assert!(posts(&fixture.fake).is_empty());
+        assert!(fixture
+            .adapter
+            .journal
+            .observed_contract(&fixture.adapter.config.aeon_origin, SURFACE_STAGE_HANDOFFS)
+            .is_none());
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn contract_header_text_is_not_copied_into_the_error_or_the_report() {
+        let sentinel = "sentinelcontractheadersecret";
+        for header in [
+            format!("not a contract {sentinel}"),
+            format!("{sentinel}/1.0"),
+        ] {
+            let mut fixture = harness(true).await;
+            let traces = Arc::new(Mutex::new(Vec::new()));
+            fixture.adapter.aeon.enable_trace(Arc::clone(&traces));
+            fixture
+                .fake
+                .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Raw(header));
+            let error = fixture
+                .adapter
+                .process_intent(&fixture.intent)
+                .await
+                .unwrap_err();
+            let message = error.to_string();
+            let rendered = format!("{message} {error:?}");
+            assert!(
+                !rendered.contains(sentinel),
+                "header text leaked into the error: {rendered}"
+            );
+            assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
+            assert!(message.contains("expected major 1"), "{message}");
+            assert!(
+                message.contains("unparsable") || message.contains("wrong-surface"),
+                "{message}"
+            );
+            let report = fixture.journal.with_file_name("live-report.json");
+            save_live_failure(
+                &report,
+                &traces,
+                &fixture.adapter.config.api_key_file,
+                &named_error(&error),
+            );
+            let bytes = std::fs::read(&report).unwrap();
+            assert!(
+                !bytes
+                    .windows(sentinel.len())
+                    .any(|window| window == sentinel.as_bytes()),
+                "header text leaked into the report"
+            );
+            if fixture.journal.exists() {
+                let journal = std::fs::read(&fixture.journal).unwrap();
+                assert!(
+                    !journal
+                        .windows(sentinel.len())
+                        .any(|window| window == sentinel.as_bytes()),
+                    "header text leaked into the journal"
+                );
+            }
+            fixture.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_aeon_omits_the_contract_header_on_auth_and_upstream_failures() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let unauthorized = client
+            .get(origin.join("/api/me").unwrap())
+            .header(AUTHORIZATION, "Bearer not-the-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(unauthorized.headers().get("aeon-contract").is_none());
+        let missing = client
+            .get(
+                origin
+                    .join("/api/stage-handoffs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                    .unwrap(),
+            )
+            .header(AUTHORIZATION, &bearer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing.headers().get("aeon-contract").unwrap(),
+            "stage-handoffs/1.0"
+        );
+        fake.update(|inner| inner.fail_next_post = true);
+        let unavailable = client
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+                    .unwrap(),
+            )
+            .header(AUTHORIZATION, &bearer)
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(unavailable.headers().get("aeon-contract").is_none());
+
+        let fixture = harness(true).await;
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        fixture
+            .fake
+            .update(|inner| inner.get_status = Some(StatusCode::UNAUTHORIZED));
+        let auth = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(auth, AdapterError::Credential),
+            "header-less 401 was {auth}"
+        );
+        fixture.fake.update(|inner| {
+            inner.get_status = None;
+            inner.fail_next_post = true;
+        });
+        review_job(
+            &fixture.actions,
+            &fixture.actions.list()[0].id,
+            fixture.actions.list()[0].created_at,
+        );
+        record_backup(&fixture.hosts, fake_now(&fixture.fake));
+        let upstream = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                upstream,
+                AdapterError::Refused(status) if status == StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "header-less 503 was {upstream}"
+        );
+        fixture.server.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn principal_probe_does_not_bind_the_journal_origin() {
+        let fixture = harness(true).await;
+        fixture.adapter.remember_principal().await.unwrap();
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        assert!(fixture.adapter.journal.bound_origin().is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .observed_contract(&origin, SURFACE_ME),
+            Some((1, 0))
+        );
+        let hosts = Arc::clone(&fixture.hosts);
+        let actions = Arc::clone(&fixture.actions);
+        let other = Url::parse("https://other.example.test").unwrap();
+        AeonDeliveryAdapter::open(
+            runtime_config(
+                other.clone(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone(), verify_intent()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        )
+        .expect("a contract probe does not bind the origin");
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.adapter.journal.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        let refused = match AeonDeliveryAdapter::open(
+            runtime_config(
+                other,
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone(), verify_intent()],
+            ),
+            fixture.journal.clone(),
+            hosts,
+            actions,
+        ) {
+            Ok(_) => panic!("a handoff-bound journal accepted another origin"),
+            Err(error) => error,
+        };
+        assert!(refused.contains(JOURNAL_ORIGIN_MISMATCH), "{refused}");
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn headerless_auth_and_upstream_failures_keep_their_status() {
+        let fixture = harness(true).await;
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .observed_contract(&fixture.adapter.config.aeon_origin, SURFACE_STAGE_HANDOFFS),
+            Some((1, 0))
+        );
+        fixture
+            .fake
+            .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Omit);
+        fixture
+            .fake
+            .update(|inner| inner.get_status = Some(StatusCode::UNAUTHORIZED));
+        let auth = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(auth, AdapterError::Credential),
+            "header-less 401 was {auth}"
+        );
+        fixture
+            .fake
+            .update(|inner| inner.get_status = Some(StatusCode::SERVICE_UNAVAILABLE));
+        let upstream = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                upstream,
+                AdapterError::Refused(status) if status == StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "header-less 503 was {upstream}"
+        );
+        fixture.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Version { major: 2, minor: 0 },
+        );
+        fixture
+            .fake
+            .update(|inner| inner.get_status = Some(StatusCode::NOT_FOUND));
+        let bumped = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        let message = bumped.to_string();
+        assert!(message.contains("2.0"), "{message}");
+        assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn unparsable_contract_header_then_a_missing_header_is_a_downgrade() {
+        let fixture = harness(true).await;
+        let sentinel = "sentinelcontractheadersecret";
+        fixture.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Raw(format!("not a contract {sentinel}")),
+        );
+        let first = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        let first_message = first.to_string();
+        assert!(first_message.contains("unparsable"), "{first_message}");
+        assert!(!first_message.contains(sentinel), "{first_message}");
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        assert!(fixture
+            .adapter
+            .journal
+            .contract_header_seen(&origin, SURFACE_STAGE_HANDOFFS));
+        assert!(fixture
+            .adapter
+            .journal
+            .observed_contract(&origin, SURFACE_STAGE_HANDOFFS)
+            .is_none());
+        let reloaded = JournalStore::new(fixture.journal.clone()).unwrap();
+        assert!(reloaded.contract_header_seen(&origin, SURFACE_STAGE_HANDOFFS));
+        assert!(reloaded
+            .observed_contract(&origin, SURFACE_STAGE_HANDOFFS)
+            .is_none());
+        fixture
+            .fake
+            .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Omit);
+        let second = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        let second_message = second.to_string();
+        assert!(
+            matches!(
+                second,
+                AdapterError::ContractDowngrade {
+                    surface: SURFACE_STAGE_HANDOFFS,
+                    seen: None,
+                }
+            ),
+            "{second_message}"
+        );
+        assert!(second_message.contains("downgrade"), "{second_message}");
+        assert!(!second_message.contains(sentinel), "{second_message}");
+        fixture.server.abort();
+
+        let wrong = harness(true).await;
+        wrong.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Raw(format!("{sentinel}/1.0")),
+        );
+        let refused = wrong
+            .adapter
+            .process_intent(&wrong.intent)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("wrong-surface"), "{refused}");
+        assert!(wrong
+            .adapter
+            .journal
+            .contract_header_seen(&wrong.adapter.config.aeon_origin, SURFACE_STAGE_HANDOFFS));
+        wrong
+            .fake
+            .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Omit);
+        let downgraded = wrong
+            .adapter
+            .process_intent(&wrong.intent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                downgraded,
+                AdapterError::ContractDowngrade {
+                    surface: SURFACE_STAGE_HANDOFFS,
+                    seen: None,
+                }
+            ),
+            "{downgraded}"
+        );
+        wrong.server.abort();
+    }
+
+    #[tokio::test]
+    async fn absent_contract_header_is_accepted_until_one_was_seen() {
+        let fixture = harness(true).await;
+        fixture.fake.omit_contract_headers();
+        let job_id = confirm_ready_launch(&fixture).await;
+        assert_eq!(
+            fixture.actions.get(&job_id).unwrap().state,
+            HostActionState::QueuedApply
+        );
+        assert!(fixture
+            .adapter
+            .journal
+            .observed_contract(&fixture.adapter.config.aeon_origin, SURFACE_STAGE_HANDOFFS)
+            .is_none());
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn absent_contract_header_after_one_was_seen_is_a_downgrade() {
+        let fixture = harness(true).await;
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let job_id = fixture.actions.list()[0].id.clone();
+        let state = fixture.actions.get(&job_id).unwrap().state;
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .observed_contract(&fixture.adapter.config.aeon_origin, SURFACE_STAGE_HANDOFFS),
+            Some((1, 0))
+        );
+        fixture
+            .fake
+            .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Omit);
+        let posted_before = posts(&fixture.fake).len();
+        let error = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("downgrade"), "{message}");
+        assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
+        assert!(message.contains("1.0"), "{message}");
+        assert_eq!(error.code(), "contract_downgrade");
+        assert!(error.posted_blocker().is_none());
+        assert_eq!(posts(&fixture.fake).len(), posted_before);
+        assert_eq!(fixture.actions.get(&job_id).unwrap().state, state);
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn journaled_contract_version_survives_reload_and_still_refuses_a_downgrade() {
+        let fixture = harness(true).await;
+        fixture.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Version { major: 1, minor: 7 },
+        );
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        let job_id = fixture.actions.list()[0].id.clone();
+        let state = fixture.actions.get(&job_id).unwrap().state;
+        let reloaded = JournalStore::new(fixture.journal.clone()).unwrap();
+        assert_eq!(
+            reloaded.observed_contract(&origin, SURFACE_STAGE_HANDOFFS),
+            Some((1, 7))
+        );
+        fixture
+            .fake
+            .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Omit);
+        let reloaded_adapter = test_adapter(
+            runtime_config(
+                origin,
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone(), verify_intent()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&fixture.hosts),
+            Arc::clone(&fixture.actions),
+        );
+        let error = reloaded_adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(
+                error,
+                AdapterError::ContractDowngrade {
+                    surface: SURFACE_STAGE_HANDOFFS,
+                    ..
+                }
+            ),
+            "{message}"
+        );
+        assert!(message.contains("1.7"), "{message}");
+        assert_eq!(fixture.actions.get(&job_id).unwrap().state, state);
+        fixture.server.abort();
+    }
+
+    fn named_error(error: &AdapterError) -> String {
+        match error {
+            AdapterError::ContractVersion { .. }
+            | AdapterError::ContractDowngrade { .. }
+            | AdapterError::ContractAdded { .. } => error.to_string(),
+            _ => error.code().to_string(),
+        }
+    }
+
     fn required_live_path(name: &str) -> PathBuf {
         let value = std::env::var(name).unwrap_or_default();
         assert!(
@@ -13572,9 +15082,12 @@ mod tests {
         }
         let journey = adapter
             .aeon
-            .get_json(&format!("/api/projects/{project_node_id}/journey"))
+            .get_json(
+                &format!("/api/projects/{project_node_id}/journey"),
+                SURFACE_JOURNEY,
+            )
             .await
-            .map_err(|error| format!("live Aeon journey read failed ({})", error.code()))?;
+            .map_err(|error| format!("live Aeon journey read failed ({})", named_error(&error)))?;
         let project_key = journey
             .get("project_key")
             .and_then(Value::as_str)
@@ -13649,7 +15162,9 @@ mod tests {
                 .aeon
                 .get_handoff(handoff_id)
                 .await
-                .map_err(|error| format!("live Aeon handoff read failed ({})", error.code()))?;
+                .map_err(|error| {
+                    format!("live Aeon handoff read failed ({})", named_error(&error))
+                })?;
             if handoff.release_node_id != expected_release_node {
                 return Err(
                     "handoff release_node_id differs from PHAROS_AEON_LIVE_RELEASE_NODE_ID"
@@ -13681,7 +15196,7 @@ mod tests {
         key_file: &Path,
     ) {
         if let Err(error) = adapter.process_intent(intent).await {
-            let message = format!("{} ({})", live_failure(traces), error.code());
+            let message = format!("{} ({})", live_failure(traces), named_error(&error));
             save_live_failure(report, traces, key_file, &message);
             panic!("{message}");
         }
@@ -13843,7 +15358,7 @@ mod tests {
             Err(error) => panic!(
                 "{} ({})",
                 live_failure(&adapter.aeon.traces.clone().expect("request trace")),
-                error.code()
+                named_error(&error)
             ),
         };
         json!({

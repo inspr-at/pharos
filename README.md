@@ -588,7 +588,41 @@ that omits `authority_open`, after that origin has sent it, is journaled as
 `authority_signal_missing`, which maps to `policy_refused`, and the host job
 is not confirmed. A true `authority_open` does not waive the inferred check.
 A newer attempt of the same operation is not visible as a change to this
-handoff's attempt or epoch. Aeon's handoff
+handoff's attempt or epoch.
+The adapter pins Aeon-Contract major 1 for `stage-handoffs`,
+`stage-evidence`, `stage-launch`, `stage-result`, `journey`, `me`,
+`approvals`, and `baseline-batches` in `EXPECTED_CONTRACT_MAJORS`. The
+header check accepts any minor of that major. Handoff, evidence, launch,
+and result bodies stay strict, so an added field still fails those reads.
+`GET /api/me` is parsed loosely, so an added field there does not. This
+change makes a version change diagnosable. Tolerant body parsing of the
+strict reads is tracked separately as PHAROS-324.
+When strict parsing fails and the observed minor for that surface is above
+`CONTRACT_MINOR_BASELINE`, the error names the surface, the observed
+version, and PHAROS-324. A different major,
+or a header that names another surface, is refused by name before the body
+is parsed. The error names the surface Pharos called and the expected major,
+and it carries the validated major.minor or a fixed category, never the
+header text. The header is checked on the response, so a write already
+sent may have committed on Aeon before Pharos refuses it. Pharos does not
+post a failure result for that refusal, and the refusal is not a rollback.
+The next handoff read acknowledges a stored result when that read is
+accepted and the result matches the journaled request. It does not copy an
+evidence, admit, or consume receipt. Evidence is sent again while the
+handoff is open, and that replay stops without a receipt when the handoff
+is closed, already has a result, or has expired. An admit is sent again. A
+consume the read shows as done is sent again, and the read supplies its
+receipt only when that post returns 409. Until an accepted response for
+a write that is still in flight, the journal can lag the handoff. A missing
+header is still accepted until that surface has sent one from this origin.
+A header that cannot be parsed still counts as sent. A later omission on a
+success, a stage-gate refusal, or an evidence replay stop is refused as a
+downgrade. An authentication failure or an upstream error without the header
+keeps its status. The journal records the last parsed major.minor per
+surface per origin. A contract-version fact does not bind the journal; the
+binding stays absent until the first handoff read.
+
+Aeon's handoff
 create response now matches GET (AEON-177). This adapter does not create
 handoffs, and GET remains the source of truth for the handoff it confirms.
 The bearer token stays in its referenced
