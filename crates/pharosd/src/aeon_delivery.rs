@@ -61,6 +61,9 @@ const EXPECTED_CONTRACT_MAJORS: &[(&str, u16)] = &[
 ];
 const CONTRACT_HEADER: &str = "aeon-contract";
 const CONTRACT_HEADER_MAX: usize = 80;
+/// Minor the strict body parsers were written against. A higher observed
+/// minor whose body fails to parse is an added field (PHAROS-324).
+const CONTRACT_MINOR_BASELINE: u16 = 0;
 const OPERATION_DOMAIN: &str = "inspr.pharos.aeon-delivery-operation.v1";
 const INTENT_DOMAIN: &str = "inspr.pharos.aeon-delivery-intent.v1";
 const LAUNCH_BINDING_DOMAIN: &[u8] = b"inspr.aeon.launch-binding.v1\0";
@@ -148,6 +151,12 @@ enum AdapterError {
         surface: &'static str,
         seen: Option<(u16, u16)>,
     },
+    /// Strict parsing failed after this surface advertised a minor above the baseline.
+    ContractAdded {
+        surface: &'static str,
+        major: u16,
+        minor: u16,
+    },
 }
 
 impl AdapterError {
@@ -165,6 +174,7 @@ impl AdapterError {
             Self::LaunchBlocked(reason) => reason,
             Self::ContractVersion { .. } => "contract_version",
             Self::ContractDowngrade { .. } => "contract_downgrade",
+            Self::ContractAdded { .. } => "contract_refused",
         }
     }
 
@@ -210,6 +220,14 @@ impl fmt::Display for AdapterError {
                 formatter,
                 "aeon contract {surface} expected major {expected_major}, saw {}",
                 seen.label()
+            ),
+            Self::ContractAdded {
+                surface,
+                major,
+                minor,
+            } => write!(
+                formatter,
+                "aeon contract {surface} observed {major}.{minor}; Aeon added a field (PHAROS-324)"
             ),
             Self::ContractDowngrade { surface, seen } => match seen {
                 Some((major, minor)) => write!(
@@ -2782,7 +2800,31 @@ impl AeonClient {
         if status != StatusCode::OK {
             return Err(status_error(status));
         }
-        decode_strict(&bytes)
+        self.decode_response(&bytes, SURFACE_STAGE_HANDOFFS)
+    }
+
+    fn decode_response<T: for<'de> Deserialize<'de>>(
+        &self,
+        bytes: &[u8],
+        surface: &'static str,
+    ) -> Result<T, AdapterError> {
+        decode_strict(bytes).map_err(|_| self.added_field_or_contract(surface))
+    }
+
+    fn added_field_or_contract(&self, surface: &'static str) -> AdapterError {
+        let Some(expected_major) = expected_contract_major(surface) else {
+            return AdapterError::Contract;
+        };
+        match self.journal.observed_contract(&self.origin, surface) {
+            Some((major, minor)) if major == expected_major && minor > CONTRACT_MINOR_BASELINE => {
+                AdapterError::ContractAdded {
+                    surface,
+                    major,
+                    minor,
+                }
+            }
+            _ => AdapterError::Contract,
+        }
     }
 
     #[cfg(test)]
@@ -2853,7 +2895,7 @@ impl AeonClient {
                 body: bytes,
             });
         }
-        let response: EvidenceResponse = decode_strict(&bytes)?;
+        let response: EvidenceResponse = self.decode_response(&bytes, SURFACE_STAGE_EVIDENCE)?;
         let receipt = EvidenceReceipt::from_response(&response)?;
         if !receipt.matches_request(&record.body_json, &record.handoff_id)
             || !evidence_echo_matches(&response, &record.body_json)
@@ -2881,7 +2923,7 @@ impl AeonClient {
         if status != StatusCode::OK {
             return Err(refusal_from_aeon(status, &bytes));
         }
-        let mut admission: LaunchAdmission = decode_strict(&bytes)?;
+        let mut admission: LaunchAdmission = self.decode_response(&bytes, SURFACE_STAGE_LAUNCH)?;
         admission.authority_open = None;
         Ok(admission)
     }
@@ -2912,7 +2954,7 @@ impl AeonClient {
         if status != StatusCode::OK {
             return Err(refusal_from_aeon(status, &bytes));
         }
-        let response: ConsumeResponse = decode_strict(&bytes)?;
+        let response: ConsumeResponse = self.decode_response(&bytes, SURFACE_STAGE_LAUNCH)?;
         if !response.consumed
             || response.handoff_id != record.handoff_id
             || response.admission_id != record.admission.as_ref().ok_or(AdapterError::Journal)?.id
@@ -2941,7 +2983,7 @@ impl AeonClient {
         if status != StatusCode::OK {
             return Err(refusal_from_aeon(status, &bytes));
         }
-        let response: ResultResponse = decode_strict(&bytes)?;
+        let response: ResultResponse = self.decode_response(&bytes, SURFACE_STAGE_RESULT)?;
         let receipt = ResultReceipt::from_response(&response)?;
         if !receipt.matches_request(&record.body_json, &record.handoff_id) {
             return Err(AdapterError::Contract);
@@ -6443,6 +6485,8 @@ mod tests {
         journey_deploy_gate_live: bool,
         /// Missing surface uses major 1 minor 0. `Omit` drops the header.
         contract_headers: BTreeMap<String, ContractHeaderMode>,
+        /// Adds one unknown field to a handoff GET, which strict parsing refuses.
+        extra_handoff_field: bool,
     }
 
     #[derive(Clone, Debug)]
@@ -6502,6 +6546,7 @@ mod tests {
                     journey_candidate_gate_live: true,
                     journey_deploy_gate_live: true,
                     contract_headers: BTreeMap::new(),
+                    extra_handoff_field: false,
                 })),
                 captures: Arc::new(Mutex::new(Vec::new())),
                 reread_hook: Arc::new(Mutex::new(None)),
@@ -7334,6 +7379,7 @@ mod tests {
             return handle_result(inner, &id, body);
         }
         let now = inner.now;
+        let extra_handoff_field = inner.extra_handoff_field;
         let corrupt = inner.corrupt_binding;
         let expire = inner.expire_admission;
         let admission_lifetime_secs = inner.admission_lifetime_secs;
@@ -7353,7 +7399,13 @@ mod tests {
             return json_response(StatusCode::NOT_FOUND, &json!({}));
         };
         match route {
-            ("GET", None, None) => json_response(StatusCode::OK, &handoff.json(now)),
+            ("GET", None, None) => {
+                let mut document = handoff.json(now);
+                if extra_handoff_field {
+                    document["added_field"] = json!(true);
+                }
+                json_response(StatusCode::OK, &document)
+            }
             ("POST", Some("evidence"), None) => handle_evidence(handoff, body, now),
             ("POST", Some("launch"), Some("admit")) => {
                 let flags = AdmitFlags {
@@ -14261,6 +14313,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn minor_bump_that_fails_strict_parsing_names_the_added_field() {
+        let bumped = harness(true).await;
+        bumped.fake.set_contract(
+            SURFACE_STAGE_HANDOFFS,
+            ContractHeaderMode::Version { major: 1, minor: 3 },
+        );
+        bumped.fake.update(|inner| inner.extra_handoff_field = true);
+        let error = bumped
+            .adapter
+            .process_intent(&bumped.intent)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(
+                error,
+                AdapterError::ContractAdded {
+                    surface: SURFACE_STAGE_HANDOFFS,
+                    major: 1,
+                    minor: 3,
+                }
+            ),
+            "{message}"
+        );
+        assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
+        assert!(message.contains("1.3"), "{message}");
+        assert!(message.contains("Aeon added a field"), "{message}");
+        assert!(message.contains("PHAROS-324"), "{message}");
+        bumped.server.abort();
+
+        let baseline = harness(true).await;
+        baseline
+            .fake
+            .update(|inner| inner.extra_handoff_field = true);
+        let bare = baseline
+            .adapter
+            .process_intent(&baseline.intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(bare, AdapterError::Contract), "{bare}");
+        assert!(!bare.to_string().contains("PHAROS-324"), "{bare}");
+        baseline.server.abort();
+    }
+
+    #[tokio::test]
     async fn minor_contract_bump_is_accepted() {
         let fixture = harness(true).await;
         fixture.fake.update(|inner| {
@@ -14817,9 +14914,9 @@ mod tests {
 
     fn named_error(error: &AdapterError) -> String {
         match error {
-            AdapterError::ContractVersion { .. } | AdapterError::ContractDowngrade { .. } => {
-                error.to_string()
-            }
+            AdapterError::ContractVersion { .. }
+            | AdapterError::ContractDowngrade { .. }
+            | AdapterError::ContractAdded { .. } => error.to_string(),
             _ => error.code().to_string(),
         }
     }

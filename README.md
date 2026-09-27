@@ -592,7 +592,10 @@ The adapter pins Aeon-Contract major 1 for `stage-handoffs`,
 `approvals`, and `baseline-batches` in `EXPECTED_CONTRACT_MAJORS`. The
 header check accepts any minor of that major. The body parsers stay strict,
 so an added field still fails the read. This change makes a version change
-diagnosable. Tolerant body parsing is tracked separately. A different major,
+diagnosable. Tolerant body parsing is tracked separately as PHAROS-324.
+When strict parsing fails and the observed minor for that surface is above
+`CONTRACT_MINOR_BASELINE`, the error names the surface, the observed
+version, and PHAROS-324. A different major,
 or a header that names another surface, is refused by name before the body
 is parsed. The error names the surface Pharos called and the expected major,
 and it carries the validated major.minor or a fixed category, never the
@@ -600,9 +603,12 @@ header text. A major mismatch posts no result and leaves the handoff open
 until that major is bumped in the table or Aeon serves the expected major.
 A contract that cannot be trusted does not produce evidence. A missing
 header is still accepted until that surface has sent one from this origin.
-A header that cannot be parsed still counts as sent, so a later omission is
-refused as a downgrade. The journal records the last parsed major.minor per
-surface per origin.
+A header that cannot be parsed still counts as sent. A later omission on a
+success, a stage-gate refusal, or an evidence replay stop is refused as a
+downgrade. An authentication failure or an upstream error without the header
+keeps its status. The journal records the last parsed major.minor per
+surface per origin. A contract-version fact does not bind the journal; the
+binding stays absent until the first handoff read.
 
 A newer attempt of the same operation is not visible as a change to this
 handoff's attempt or epoch. Aeon's handoff
