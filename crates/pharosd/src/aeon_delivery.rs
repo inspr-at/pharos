@@ -14702,7 +14702,7 @@ mod tests {
         );
         fixture
             .fake
-            .update(|inner| inner.get_status = Some(StatusCode::UNAUTHORIZED));
+            .update(|inner| inner.get_status = Some(StatusCode::NOT_FOUND));
         let bumped = fixture
             .adapter
             .process_intent(&fixture.intent)
