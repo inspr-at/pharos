@@ -179,12 +179,10 @@ impl AdapterError {
     }
 
     /// Blocker code on a stage result posted because of this error.
+    /// A contract refusal posts no result, so it has no blocker.
     fn posted_blocker(&self) -> Option<BlockerCode> {
         match self {
             Self::LaunchBlocked(reason) => aeon_blocker_for_reason(reason),
-            Self::ContractVersion { .. } | Self::ContractDowngrade { .. } => {
-                Some(BlockerCode::PolicyRefused)
-            }
             _ => None,
         }
     }
@@ -14407,12 +14405,12 @@ mod tests {
         assert!(message.contains("expected major 1"), "{message}");
         assert!(message.contains("2.0"), "{message}");
         assert_eq!(error.code(), "contract_version");
-        assert_eq!(
-            error.posted_blocker().map(blocker_code_wire),
-            Some("policy_refused")
-        );
+        assert!(error.posted_blocker().is_none());
         assert!(fixture.actions.list().is_empty());
-        assert!(posts(&fixture.fake).is_empty());
+        assert!(
+            posts(&fixture.fake).is_empty(),
+            "a contract refusal posts no result"
+        );
         assert_eq!(
             fixture
                 .adapter
@@ -14841,6 +14839,7 @@ mod tests {
         fixture
             .fake
             .set_contract(SURFACE_STAGE_HANDOFFS, ContractHeaderMode::Omit);
+        let posted_before = posts(&fixture.fake).len();
         let error = fixture
             .adapter
             .process_intent(&fixture.intent)
@@ -14851,10 +14850,8 @@ mod tests {
         assert!(message.contains(SURFACE_STAGE_HANDOFFS), "{message}");
         assert!(message.contains("1.0"), "{message}");
         assert_eq!(error.code(), "contract_downgrade");
-        assert_eq!(
-            error.posted_blocker().map(blocker_code_wire),
-            Some("policy_refused")
-        );
+        assert!(error.posted_blocker().is_none());
+        assert_eq!(posts(&fixture.fake).len(), posted_before);
         assert_eq!(fixture.actions.get(&job_id).unwrap().state, state);
         fixture.server.abort();
     }
