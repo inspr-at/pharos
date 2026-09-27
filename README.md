@@ -589,15 +589,20 @@ that omits `authority_open`, after that origin has sent it, is journaled as
 is not confirmed. A true `authority_open` does not waive the inferred check.
 The adapter pins Aeon-Contract major 1 for `stage-handoffs`,
 `stage-evidence`, `stage-launch`, `stage-result`, `journey`, `me`,
-`approvals`, and `baseline-batches` in `EXPECTED_CONTRACT_MAJORS`. Any minor
-of that major is accepted. A different major, or a header that names another
-surface, is refused by name before the body is parsed: the error names the
-surface, the expected major, and the seen version, and a result posted for
-that refusal uses `policy_refused`. Bump the major in that table when Pharos
-adopts the new contract. A missing header is still accepted until that
-surface has sent one from this origin; a later omission is refused as a
-downgrade. The journal records the last observed major.minor per surface per
-origin.
+`approvals`, and `baseline-batches` in `EXPECTED_CONTRACT_MAJORS`. The
+header check accepts any minor of that major. The body parsers stay strict,
+so an added field still fails the read. This change makes a version change
+diagnosable. Tolerant body parsing is tracked separately. A different major,
+or a header that names another surface, is refused by name before the body
+is parsed. The error names the surface Pharos called and the expected major,
+and it carries the validated major.minor or a fixed category, never the
+header text. A major mismatch posts no result and leaves the handoff open
+until that major is bumped in the table or Aeon serves the expected major.
+A contract that cannot be trusted does not produce evidence. A missing
+header is still accepted until that surface has sent one from this origin.
+A header that cannot be parsed still counts as sent, so a later omission is
+refused as a downgrade. The journal records the last parsed major.minor per
+surface per origin.
 
 A newer attempt of the same operation is not visible as a change to this
 handoff's attempt or epoch. Aeon's handoff
