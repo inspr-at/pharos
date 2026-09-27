@@ -6579,6 +6579,14 @@ mod tests {
         path: &str,
         response: Response<Body>,
     ) -> Response<Body> {
+        // Auth middleware and injected upstream failures sit outside the route
+        // and carry no Aeon-Contract header. A route-level 404 still does.
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            return response;
+        }
         let Some(surface) = contract_surface(method, path) else {
             return response;
         };
@@ -14408,6 +14416,96 @@ mod tests {
             }
             fixture.server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn fake_aeon_omits_the_contract_header_on_auth_and_upstream_failures() {
+        let now = now_unix();
+        let fake = FakeAeon::new(now);
+        let (origin, server) = serve(fake.clone()).await;
+        let client = reqwest::Client::new();
+        let bearer = format!("Bearer {}", String::from_utf8_lossy(API_KEY));
+        let unauthorized = client
+            .get(origin.join("/api/me").unwrap())
+            .header(AUTHORIZATION, "Bearer not-the-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(unauthorized.headers().get("aeon-contract").is_none());
+        let missing = client
+            .get(
+                origin
+                    .join("/api/stage-handoffs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                    .unwrap(),
+            )
+            .header(AUTHORIZATION, &bearer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing.headers().get("aeon-contract").unwrap(),
+            "stage-handoffs/1.0"
+        );
+        fake.update(|inner| inner.fail_next_post = true);
+        let unavailable = client
+            .post(
+                origin
+                    .join(&format!("/api/stage-handoffs/{DEPLOY_HANDOFF}/evidence"))
+                    .unwrap(),
+            )
+            .header(AUTHORIZATION, &bearer)
+            .header(CONTENT_TYPE, JSON_MEDIA)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(unavailable.headers().get("aeon-contract").is_none());
+
+        let fixture = harness(true).await;
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        fixture
+            .fake
+            .update(|inner| inner.get_status = Some(StatusCode::UNAUTHORIZED));
+        let auth = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(auth, AdapterError::Credential),
+            "header-less 401 was {auth}"
+        );
+        fixture.fake.update(|inner| {
+            inner.get_status = None;
+            inner.fail_next_post = true;
+        });
+        review_job(
+            &fixture.actions,
+            &fixture.actions.list()[0].id,
+            fixture.actions.list()[0].created_at,
+        );
+        record_backup(&fixture.hosts, fake_now(&fixture.fake));
+        let upstream = fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                upstream,
+                AdapterError::Refused(status) if status == StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "header-less 503 was {upstream}"
+        );
+        fixture.server.abort();
+        server.abort();
     }
 
     #[tokio::test]
