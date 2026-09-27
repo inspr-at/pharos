@@ -1579,16 +1579,12 @@ impl JournalStore {
         let document = self.document.lock().expect("Aeon delivery journal lock");
         let conflicts = match &document.bound_origin {
             Some(bound) => bound != &key,
-            None => {
-                document
-                    .authority_signals
-                    .keys()
-                    .any(|recorded| recorded != &key)
-                    || document
-                        .contract_versions
-                        .keys()
-                        .any(|recorded| recorded != &key)
-            }
+            // A contract version is keyed by origin and does not bind the
+            // journal. The binding stays absent until the first handoff read.
+            None => document
+                .authority_signals
+                .keys()
+                .any(|recorded| recorded != &key),
         };
         if conflicts {
             return Err(JOURNAL_ORIGIN_MISMATCH.to_string());
@@ -14138,7 +14134,7 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_recorded_for_another_origin_refuses_startup() {
+    fn contract_version_alone_does_not_bind_the_journal_origin() {
         let directory = TestDir::new("contract-origin");
         let path = directory
             .path()
@@ -14160,7 +14156,7 @@ mod tests {
         );
         let hosts = Arc::new(Store::new(None).unwrap());
         let actions = Arc::new(HostActionStore::new(None));
-        let mismatch = match AeonDeliveryAdapter::open(
+        AeonDeliveryAdapter::open(
             runtime_config(
                 Url::parse("https://other.example.test").unwrap(),
                 directory.path().join("api-key"),
@@ -14169,11 +14165,8 @@ mod tests {
             path.clone(),
             Arc::clone(&hosts),
             Arc::clone(&actions),
-        ) {
-            Ok(_) => panic!("a different origin started"),
-            Err(error) => error,
-        };
-        assert!(mismatch.contains(JOURNAL_ORIGIN_MISMATCH), "{mismatch}");
+        )
+        .expect("a contract version does not bind the journal");
         AeonDeliveryAdapter::open(
             runtime_config(
                 Url::parse(&format!("{origin}/")).unwrap(),
@@ -14506,6 +14499,59 @@ mod tests {
         );
         fixture.server.abort();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn principal_probe_does_not_bind_the_journal_origin() {
+        let fixture = harness(true).await;
+        fixture.adapter.remember_principal().await.unwrap();
+        let origin = fixture.adapter.config.aeon_origin.clone();
+        assert!(fixture.adapter.journal.bound_origin().is_none());
+        assert_eq!(
+            fixture
+                .adapter
+                .journal
+                .observed_contract(&origin, SURFACE_ME),
+            Some((1, 0))
+        );
+        let hosts = Arc::clone(&fixture.hosts);
+        let actions = Arc::clone(&fixture.actions);
+        let other = Url::parse("https://other.example.test").unwrap();
+        AeonDeliveryAdapter::open(
+            runtime_config(
+                other.clone(),
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone(), verify_intent()],
+            ),
+            fixture.journal.clone(),
+            Arc::clone(&hosts),
+            Arc::clone(&actions),
+        )
+        .expect("a contract probe does not bind the origin");
+        fixture
+            .adapter
+            .process_intent(&fixture.intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.adapter.journal.bound_origin().as_deref(),
+            Some(authority_signal_origin(&origin).as_str())
+        );
+        let refused = match AeonDeliveryAdapter::open(
+            runtime_config(
+                other,
+                fixture.adapter.config.api_key_file.clone(),
+                vec![fixture.intent.clone(), verify_intent()],
+            ),
+            fixture.journal.clone(),
+            hosts,
+            actions,
+        ) {
+            Ok(_) => panic!("a handoff-bound journal accepted another origin"),
+            Err(error) => error,
+        };
+        assert!(refused.contains(JOURNAL_ORIGIN_MISMATCH), "{refused}");
+        fixture.server.abort();
     }
 
     #[tokio::test]
