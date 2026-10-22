@@ -1,15 +1,8 @@
 # Pharos Changelog
 
-## 260925163010.0.0 - 2026-09-25
+## 261022140452.0.0 - 2026-10-22
 
-- Move the host report contract to `inspr.pharos.host-report.v7`, keeping v6, v5 and v4 as accepted predecessors. The backup validation record now retains the last successful selective restore (`last_success_at`) separately from the latest attempt and carries the restored-file count (`restored_files`); a later failed attempt no longer erases the success that drives the 30-day clock, a restore without at least one restored file is not observed as a success, the overdue alert follows that retained success, and older report versions refuse the new fields (PHAROS-304).
-
-## 260922214617.0.0 - 2026-09-22
-
-- Fleet cards, list and quick preview rebuilt on the approved Harbor design: fluid grid that fills the viewport (1 to 5 columns), fixed card regions with one attention line, a two-column protection panel, the moving heartbeat stage and a configuration footer; six-column list; 420px quick preview sheet with exact times and heartbeat history; phone and tablet layouts without horizontal scroll (PHAROS-310).
-
-## Unreleased
-
+- Distrust the compromised eMudhra/emSign chains (PHAROS-334, CVE sweep OPS-424): `webpki-roots` 1.0.10 drops emSign ECC Root CA - G3 like Mozilla and Debian; `rustls-webpki` 0.103.16 rejects paths through distrusted emSign intermediates (RUSTSEC-2026-0382); `rustls` 0.23.46 fixes RUSTSEC-2026-0346 to 0349; the runtime image moves to Debian snapshot 20261022T000000Z with `ca-certificates` 20250419~deb12u2.
 - Add a config-selectable Aeon upstream for the Flow host (`inspr.pharos.flow-host-config.v2`): journey read with strict project node, project key and tenant verification, backwards-revision refusal, `/p/{project_key}?view=journey` navigation with an exact allow-list, and the classic Paimos path left untouched. No production change until the operator switches the config (PHAROS-313).
 - Add an owner-only Aeon delivery adapter selected by `PHAROS_AEON_DELIVERY_CONFIG_FILE`. It reads Aeon stage handoffs, posts typed evidence, consumes one launch admission, and seals the result. The classic Paimos adapter is unchanged. pharosd refuses to start when both delivery configs are set (PHAROS-313).
 - Add an ignored live roundtrip for that adapter. It runs only when `PHAROS_AEON_LIVE_ACK=disposable`, reads the bearer token through the production reader, and writes a value-free request report (PHAROS-313).
@@ -44,6 +37,16 @@
 - Require the live Aeon journey to report `disposable: true` before any write. An operator marks the project with `aeon journey mark-disposable`. The operator-supplied project key, node key, project node, and release id remain required (PHAROS-321).
 - Note that Aeon's handoff create response now matches GET (AEON-177). The delivery adapter still reads that handoff with GET (PHAROS-321).
 - Pin Aeon-Contract major 1 for each reporter surface in `EXPECTED_CONTRACT_MAJORS`. The header check accepts any minor of that major. The handoff, evidence, launch and result body parsers stay strict, so an added field still fails the read, while `GET /api/me` is parsed loosely; this makes a version change diagnosable, and tolerant body parsing is tracked separately as PHAROS-324. When that parse fails and the observed minor for the surface is above `CONTRACT_MINOR_BASELINE`, the error names the surface, the observed version, and PHAROS-324. A different major, or a header that names another surface, is refused by name before the body is parsed. The refusal names the surface Pharos called and carries the validated major.minor or a fixed category, never the header text. The header is checked on the response, so a write already sent may have committed before the refusal. Pharos does not post a failure result for that refusal, and the refusal is not a rollback. The next handoff read acknowledges a stored result when that read is accepted and the result matches the journaled request. It does not copy an evidence, admit, or consume receipt. Evidence is sent again while the handoff is open, and that replay stops without a receipt when the handoff is closed, already has a result, or has expired. An admit is sent again. A consume the read shows as done is sent again, and the read supplies its receipt only when that post returns 409. Until an accepted response for a write that is still in flight, the journal can lag the handoff. The delivery journal records the last parsed major.minor per surface per origin. A contract-version fact does not bind the journal; the binding stays absent until the first handoff read. Once a surface has sent the header, including a header whose value could not be parsed, a later omission on a success, a stage-gate refusal, or an evidence replay stop is refused as a downgrade. An authentication failure or an upstream error without the header keeps its status. An origin that has never sent the header keeps the previous behaviour (PHAROS-322).
+
+## 260925163010.0.0 - 2026-09-25
+
+- Move the host report contract to `inspr.pharos.host-report.v7`, keeping v6, v5 and v4 as accepted predecessors. The backup validation record now retains the last successful selective restore (`last_success_at`) separately from the latest attempt and carries the restored-file count (`restored_files`); a later failed attempt no longer erases the success that drives the 30-day clock, a restore without at least one restored file is not observed as a success, the overdue alert follows that retained success, and older report versions refuse the new fields (PHAROS-304).
+
+## 260922214617.0.0 - 2026-09-22
+
+- Fleet cards, list and quick preview rebuilt on the approved Harbor design: fluid grid that fills the viewport (1 to 5 columns), fixed card regions with one attention line, a two-column protection panel, the moving heartbeat stage and a configuration footer; six-column list; 420px quick preview sheet with exact times and heartbeat history; phone and tablet layouts without horizontal scroll (PHAROS-310).
+
+## Unreleased
 
 ## 260922141211.0.0 - 2026-09-22
 
