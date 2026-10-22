@@ -12,7 +12,7 @@ RUN GIT_COMMIT="${GIT_COMMIT}" cargo build --release --locked -p pharosd -p phar
     && strip target/release/pharosd target/release/pharos-beacon target/release/pharos
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
-ARG DEBIAN_SNAPSHOT=20261022T000000Z
+ARG DEBIAN_SNAPSHOT=20261022T120000Z
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # git: the beacon shells out to it for commits-behind (rev-list HEAD..@{u}).
 # restic: optional PHAROS_BACKUP_MODE=restic collector; no credentials are
@@ -24,7 +24,8 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # separate immutable snapshot; those pins need not share a date.
 # The snapshot follows DLA-4845-1 (2026-10-20). Pin ca-certificates to the
 # release removing emSign ECC Root CA - G3 and Comodo AAA Services root.
-# Keep the explicit PCRE2 pin aligned with the refreshed snapshot. HTTP transport
+# Keep the explicit PCRE2 pin aligned with the refreshed snapshot. libexpat1 is pinned because the
+# base image already ships it and apt would otherwise keep the vulnerable deb12u4 (CVE-2025-59375, CVE-2026-77214). HTTP transport
 # is safe here because apt verifies Debian's signed Release metadata and package
 # hashes.
 RUN printf '%s\n' \
@@ -44,7 +45,7 @@ RUN printf '%s\n' \
       > /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates=20250419~deb12u2 iputils-ping \
-      libpcre2-8-0=10.42-1+deb12u2 openssh-client restic \
+      libpcre2-8-0=10.42-1+deb12u2 libexpat1=2.5.0-1+deb12u5 openssh-client restic \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 pharos
 # /data owned by pharos so a named volume mounted here inherits writable

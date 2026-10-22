@@ -1,7 +1,8 @@
 # Pharos Changelog
 
-## 261022140452.0.0 - 2026-10-22
+## 261022144327.0.0 - 2026-10-22
 
+- Release image: Debian snapshot 20261022T120000Z and `libexpat1` pinned to 2.5.0-1+deb12u5 (CVE-2025-59375, CVE-2026-77214, both HIGH). The release scan refused the 261022140452.0.0 candidate on these; 261022140452.0.0 was never published.
 - Distrust the compromised eMudhra/emSign chains (PHAROS-334, CVE sweep OPS-424): `webpki-roots` 1.0.10 drops emSign ECC Root CA - G3 like Mozilla and Debian; `rustls-webpki` 0.103.16 rejects paths through distrusted emSign intermediates (RUSTSEC-2026-0382); `rustls` 0.23.46 fixes RUSTSEC-2026-0346 to 0349; the runtime image moves to Debian snapshot 20261022T000000Z with `ca-certificates` 20250419~deb12u2.
 - Add a config-selectable Aeon upstream for the Flow host (`inspr.pharos.flow-host-config.v2`): journey read with strict project node, project key and tenant verification, backwards-revision refusal, `/p/{project_key}?view=journey` navigation with an exact allow-list, and the classic Paimos path left untouched. No production change until the operator switches the config (PHAROS-313).
 - Add an owner-only Aeon delivery adapter selected by `PHAROS_AEON_DELIVERY_CONFIG_FILE`. It reads Aeon stage handoffs, posts typed evidence, consumes one launch admission, and seals the result. The classic Paimos adapter is unchanged. pharosd refuses to start when both delivery configs are set (PHAROS-313).
