@@ -11,8 +11,8 @@ COPY . .
 RUN GIT_COMMIT="${GIT_COMMIT}" cargo build --release --locked -p pharosd -p pharos-beacon -p pharos-cli \
     && strip target/release/pharosd target/release/pharos-beacon target/release/pharos
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
-ARG DEBIAN_SNAPSHOT=20260907T180056Z
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+ARG DEBIAN_SNAPSHOT=20261022T000000Z
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # git: the beacon shells out to it for commits-behind (rev-list HEAD..@{u}).
 # restic: optional PHAROS_BACKUP_MODE=restic collector; no credentials are
@@ -22,10 +22,9 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # iputils-ping: the fixed appliance-presence signal used before testing SSH.
 # The runtime base image is pinned by digest. Package indexes are pinned to a
 # separate immutable snapshot; those pins need not share a date.
-# 20260907T180056Z is the debian-security snapshot that indexes
-# libssh2-1 1.10.0-3+deb12u1 and libpcre2-8-0 10.42-1+deb12u1. The runtime
-# base already contains libpcre2-8-0, so request the fixed version explicitly;
-# apt otherwise leaves the vulnerable 10.42-1 package installed. HTTP transport
+# The snapshot follows DLA-4845-1 (2026-10-20). Pin ca-certificates to the
+# release removing emSign ECC Root CA - G3 and Comodo AAA Services root.
+# Keep the explicit PCRE2 pin aligned with the refreshed snapshot. HTTP transport
 # is safe here because apt verifies Debian's signed Release metadata and package
 # hashes.
 RUN printf '%s\n' \
@@ -44,8 +43,8 @@ RUN printf '%s\n' \
       'Check-Valid-Until: no' \
       > /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates iputils-ping \
-      libpcre2-8-0=10.42-1+deb12u1 openssh-client restic \
+    && apt-get install -y --no-install-recommends git ca-certificates=20250419~deb12u2 iputils-ping \
+      libpcre2-8-0=10.42-1+deb12u2 openssh-client restic \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 pharos
 # /data owned by pharos so a named volume mounted here inherits writable
