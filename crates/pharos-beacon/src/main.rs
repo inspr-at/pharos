@@ -2,8 +2,7 @@
 //!
 //! Computes this host's Nix freshness (flake.lock age + commits behind nixcfg)
 //! and reports it to pharosd. With PHAROS_INTERVAL set it loops as a recurring
-//! service; otherwise it reports once and exits. Token auth via Janus is
-//! PHAROS-8; the native (musl) Nix-module deployment is PHAROS-6/7.
+//! service; otherwise it reports once and exits.
 //!
 //! Env: PHAROS_URL (required pharosd base),
 //!      PHAROS_INTERVAL (secs; loop if set), NIXCFG_DIR (flake checkout;
@@ -38,10 +37,10 @@ use pharos_core::{
     resolve_config_digest_from_image_archive, valid_allowlisted_container_ref,
     BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
     DeployedArtifactEvidence, GitRevisionRelation, HostLocation, HostLocationSource,
-    HostPreferences, HostPreferencesRegistry, HostReport, HostReportResponse,
-    ImageConfigDigestCache, ImageIdentityClass, KernelPosture, NixDeploymentEvidence, NixFreshness,
-    NixcfgGitComparison, NixpkgsGitComparison, NixpkgsInputFreshness, NixpkgsRevisionRelation,
-    ServiceObservation, ServiceObservationState, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+    HostPreferences, HostPreferencesRegistry, HostReport, ImageConfigDigestCache,
+    ImageIdentityClass, KernelPosture, NixDeploymentEvidence, NixFreshness, NixcfgGitComparison,
+    NixpkgsGitComparison, NixpkgsInputFreshness, NixpkgsRevisionRelation, ServiceObservation,
+    ServiceObservationState, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
     IMAGE_DESCRIPTOR_DOCKER_FORMAT, MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES,
     MAX_HEARTBEAT_INTERVAL_SECS, MAX_INBOUND_RTT_MS, MAX_SERVICE_OBSERVATIONS,
     MIN_HEARTBEAT_INTERVAL_SECS, RUNNING_CONTAINER_DOCKER_FORMAT,
@@ -49,13 +48,13 @@ use pharos_core::{
 use sha2::{Digest, Sha256};
 use url::Url;
 
-const MAX_REPORT_RESPONSE_BYTES: u64 = 64 * 1024;
 const LOCATION_COMMAND_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const GIT_COMPARISON_TIMEOUT: Duration = Duration::from_secs(12);
 const NIXPKGS_CHANNEL_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_NIXPKGS_REVISION_BYTES: u64 = 128;
 const DEFAULT_NIXPKGS_CHANNEL_BASE_URL: &str = "https://channels.nixos.org/";
 const OFFICIAL_NIXPKGS_GIT_REMOTE: &str = "https://github.com/NixOS/nixpkgs.git";
+const SYSTEM_PROFILES_DIR: &str = "/nix/var/nix/profiles";
 const MAX_DEPLOYMENT_EVIDENCE_BYTES: u64 = 4 * 1024;
 const MAX_FLAKE_LOCK_BYTES: u64 = 8 * 1024 * 1024;
 const BEACON_HEALTH_PATH: &str = "/tmp/pharos-beacon-health-v1";
@@ -310,7 +309,7 @@ impl ReportFailure {
             ReportFailureCode::LocalContract | ReportFailureCode::HttpContract => {
                 "Pharos release owner"
             }
-            ReportFailureCode::HttpAuthentication => "Janus credential owner",
+            ReportFailureCode::HttpAuthentication => "beacon credential owner",
             ReportFailureCode::HttpRetired => "fleet configuration owner",
             ReportFailureCode::Dns
             | ReportFailureCode::Tls
@@ -403,36 +402,6 @@ fn hold_terminal_report_failure(cadence_secs: u64, failure: ReportFailure) -> ! 
     loop {
         thread::sleep(Duration::from_secs(cadence_secs));
         systemd_notify(&format!("WATCHDOG=1\n{status}"));
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreferencesApplyError {
-    InvalidResponse,
-    HostMismatch,
-    NotConfigured,
-    UnsupportedOnNix,
-    WriteFailed,
-}
-
-impl PreferencesApplyError {
-    fn code(self) -> &'static str {
-        match self {
-            Self::InvalidResponse => "invalid_response",
-            Self::HostMismatch => "host_mismatch",
-            Self::NotConfigured => "preferences_file_not_configured",
-            Self::UnsupportedOnNix => "nix_host_uses_declarative_delivery",
-            Self::WriteFailed => "atomic_write_failed",
-        }
-    }
-
-    fn observation(self) -> ServiceObservation {
-        ServiceObservation {
-            id: "host-preferences".to_string(),
-            label: "Host settings".to_string(),
-            state: ServiceObservationState::Warning,
-            summary: format!("settings apply failed: {}", self.code()),
-        }
     }
 }
 
@@ -1322,106 +1291,6 @@ fn read_host_preferences(path: &Path, host: &str) -> Result<HostPreferences, &'s
     parse_host_preferences(&raw, host)
 }
 
-fn atomic_write_host_preferences(
-    path: &Path,
-    registry: &HostPreferencesRegistry,
-) -> Result<(), PreferencesApplyError> {
-    registry
-        .validate_contract()
-        .map_err(|_| PreferencesApplyError::InvalidResponse)?;
-    let parent = path.parent().ok_or(PreferencesApplyError::WriteFailed)?;
-    if !parent.is_dir() {
-        return Err(PreferencesApplyError::WriteFailed);
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or(PreferencesApplyError::WriteFailed)?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| PreferencesApplyError::WriteFailed)?
-        .as_nanos();
-    let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
-    let mut bytes =
-        serde_json::to_vec_pretty(registry).map_err(|_| PreferencesApplyError::InvalidResponse)?;
-    bytes.push(b'\n');
-
-    let write_result = (|| -> std::io::Result<()> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        let _ = File::open(parent).and_then(|directory| directory.sync_all());
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(PreferencesApplyError::WriteFailed);
-    }
-    Ok(())
-}
-
-fn apply_report_response(
-    body: &str,
-    host: &str,
-    is_nix: bool,
-    preferences_path: Option<&Path>,
-) -> Result<Option<HostPreferences>, PreferencesApplyError> {
-    let response = serde_json::from_str::<HostReportResponse>(body)
-        .map_err(|_| PreferencesApplyError::InvalidResponse)?;
-    if response
-        .pending_preferences
-        .as_ref()
-        .is_some_and(|registry| registry.hosts.len() != 1 || !registry.hosts.contains_key(host))
-    {
-        return Err(PreferencesApplyError::HostMismatch);
-    }
-    response
-        .validate_contract_for(host)
-        .map_err(|_| PreferencesApplyError::InvalidResponse)?;
-    let Some(registry) = response.pending_preferences.as_ref() else {
-        return Ok(None);
-    };
-    if is_nix {
-        return Err(PreferencesApplyError::UnsupportedOnNix);
-    }
-    let path = preferences_path.ok_or(PreferencesApplyError::NotConfigured)?;
-    atomic_write_host_preferences(path, registry)?;
-    Ok(registry.preferences_for(host).cloned())
-}
-
-fn apply_report_http_response(
-    response: ureq::http::Response<ureq::Body>,
-    host: &str,
-    is_nix: bool,
-    preferences_path: Option<&Path>,
-) -> Result<Option<HostPreferences>, PreferencesApplyError> {
-    if response.status() == 204 {
-        return Ok(None);
-    }
-    if response.status() != 200 {
-        return Err(PreferencesApplyError::InvalidResponse);
-    }
-    let body = read_bounded_report_response(response.into_body().into_reader())?;
-    apply_report_response(&body, host, is_nix, preferences_path)
-}
-
-fn read_bounded_report_response(reader: impl Read) -> Result<String, PreferencesApplyError> {
-    let mut body = String::new();
-    reader
-        .take(MAX_REPORT_RESPONSE_BYTES + 1)
-        .read_to_string(&mut body)
-        .map_err(|_| PreferencesApplyError::InvalidResponse)?;
-    if body.len() as u64 > MAX_REPORT_RESPONSE_BYTES {
-        return Err(PreferencesApplyError::InvalidResponse);
-    }
-    Ok(body)
-}
-
 /// Locate a flake checkout (one containing flake.lock).
 fn nixcfg_dir() -> Option<String> {
     if let Ok(d) = std::env::var("NIXCFG_DIR") {
@@ -1439,7 +1308,24 @@ fn kernel_running_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/proc/sys/kernel/osrelease"))
 }
 
+/// Where the next boot's kernel is listed, when the system profile is visible.
+///
+/// `nixos-rebuild boot` moves only this profile, so `/run/current-system` misses
+/// a staged kernel. A bind of the resolved modules path is fixed when the
+/// container starts, so seeing later generations takes the profiles directory
+/// and the store, each mounted read-only at its own path. Once the profile is
+/// there it decides: if it no longer resolves the answer is unknown, not an
+/// older directory.
+fn next_boot_modules_dir(profiles: &Path) -> Option<PathBuf> {
+    std::fs::symlink_metadata(profiles.join("system"))
+        .is_ok()
+        .then(|| profiles.join("system/kernel-modules/lib/modules"))
+}
+
 fn kernel_expected_modules_dir() -> PathBuf {
+    if let Some(path) = next_boot_modules_dir(Path::new(SYSTEM_PROFILES_DIR)) {
+        return path;
+    }
     if let Some(path) = env_value("PHAROS_CURRENT_KERNEL_MODULES_DIR") {
         return PathBuf::from(path);
     }
@@ -2865,7 +2751,11 @@ fn collect_backup_status_file() -> Vec<BackupObservation> {
     let Some(path) = env_value("PHAROS_BACKUP_STATUS_FILE") else {
         return Vec::new();
     };
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    backup_status_file_observations(Path::new(&path))
+}
+
+fn backup_status_file_observations(path: &Path) -> Vec<BackupObservation> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
         eprintln!("pharos-beacon: backup status file unavailable");
         return vec![restic_observation_base(
             BackupPostureState::Unknown,
@@ -3760,7 +3650,6 @@ fn main() {
     let preferences_path = env_value("PHAROS_PREFERENCES_FILE").map(std::path::PathBuf::from);
     let mut preferences = HostPreferences::default();
     let mut preferences_error_reported = false;
-    let mut preferences_apply_error: Option<PreferencesApplyError> = None;
 
     // PHAROS_INTERVAL (secs) set => loop forever (recurring service);
     // unset => report once and exit (one-shot / timer-driven).
@@ -3848,9 +3737,6 @@ fn main() {
             NixFreshness::default()
         };
         let mut service_observations = vec![ServiceObservation::nix_freshness(&freshness)];
-        if let Some(error) = preferences_apply_error {
-            service_observations.push(error.observation());
-        }
         let remaining_service_observations =
             MAX_SERVICE_OBSERVATIONS.saturating_sub(service_observations.len());
         service_observations
@@ -3919,23 +3805,6 @@ fn main() {
                         &report.backup_observations
                     )
                 );
-                match apply_report_http_response(resp, &host, is_nix, preferences_path.as_deref()) {
-                    Ok(Some(applied)) => {
-                        preferences = applied;
-                        preferences_apply_error = None;
-                        println!("pharos-beacon: applied pending host settings");
-                    }
-                    Ok(None) => {
-                        preferences_apply_error = None;
-                    }
-                    Err(error) => {
-                        preferences_apply_error = Some(error);
-                        eprintln!(
-                            "pharos-beacon: pending host settings were not applied ({})",
-                            error.code()
-                        );
-                    }
-                }
                 None
             }
             Ok(response) => {
@@ -4147,9 +4016,7 @@ mod tests {
         let root = kernel_fixture("compose-command");
         std::fs::create_dir_all(&root).expect("create command fixture");
         let command = root.join("docker-fixture");
-        std::fs::write(
-            &command,
-            concat!(
+        write_command_fixture(&command, concat!(
                 "#!/bin/sh\n",
                 "test \"$#\" -eq 9 || exit 10\n",
                 "test \"$1\" = --host || exit 11\n",
@@ -4162,11 +4029,7 @@ mod tests {
                 "test \"$8\" = --format || exit 18\n",
                 "test \"$9\" = '{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.Status}}' || exit 19\n",
                 "printf 'alpha\\tweb\\tFalse\\trunning\\tUp 2 minutes (healthy)\\n'\n",
-            ),
-        )
-        .expect("write command fixture");
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
-            .expect("make command fixture executable");
+            ));
 
         let raw = run_compose_command(
             &command.to_string_lossy(),
@@ -4192,13 +4055,10 @@ mod tests {
         );
 
         let failure = root.join("docker-failure");
-        std::fs::write(
+        write_command_fixture(
             &failure,
             "#!/bin/sh\nprintf 'credential-bearing diagnostic' >&2\nexit 1\n",
-        )
-        .expect("write failure fixture");
-        std::fs::set_permissions(&failure, std::fs::Permissions::from_mode(0o700))
-            .expect("make failure fixture executable");
+        );
         assert_eq!(
             run_compose_command(
                 &failure.to_string_lossy(),
@@ -4208,10 +4068,7 @@ mod tests {
         );
 
         let oversized = root.join("docker-oversized");
-        std::fs::write(&oversized, "#!/bin/sh\nhead -c 140000 /dev/zero\n")
-            .expect("write oversized fixture");
-        std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o700))
-            .expect("make oversized fixture executable");
+        write_command_fixture(&oversized, "#!/bin/sh\nhead -c 140000 /dev/zero\n");
         assert_eq!(
             run_compose_command(
                 &oversized.to_string_lossy(),
@@ -4264,7 +4121,7 @@ mod tests {
           "schema": "inspr.pharos.host-preferences.v1",
           "version": 1,
           "hosts": {
-            "gpc0": {
+            "demeter": {
               "accent": "#9868d0",
               "kind": "workstation",
               "alerts": {
@@ -4276,7 +4133,7 @@ mod tests {
           }
         }"##;
 
-        let preferences = parse_host_preferences(raw, "gpc0").expect("preferences parse");
+        let preferences = parse_host_preferences(raw, "demeter").expect("preferences parse");
         assert_eq!(preferences.accent.as_deref(), Some("#9868d0"));
         assert_eq!(preferences.kind, pharos_core::HostKind::Workstation);
         assert!(preferences.alerts.suppress_down);
@@ -4287,19 +4144,19 @@ mod tests {
             .expect("preferences serialize")
             .contains("heartbeat_grace_secs"));
         let mut registry: serde_json::Value = serde_json::from_str(raw).unwrap();
-        registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
-        let overridden = parse_host_preferences(&registry.to_string(), "gpc0").unwrap();
+        registry["hosts"]["demeter"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
+        let overridden = parse_host_preferences(&registry.to_string(), "demeter").unwrap();
         assert_eq!(overridden.alerts.nixpkgs_warn_after_days, Some(7));
-        registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(0);
-        assert!(parse_host_preferences(&registry.to_string(), "gpc0").is_err());
-        registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
-        registry["hosts"]["gpc0"]["alerts"]["heartbeat_grace_secs"] = serde_json::json!(0);
-        let grace = parse_host_preferences(&registry.to_string(), "gpc0").unwrap();
+        registry["hosts"]["demeter"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(0);
+        assert!(parse_host_preferences(&registry.to_string(), "demeter").is_err());
+        registry["hosts"]["demeter"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
+        registry["hosts"]["demeter"]["alerts"]["heartbeat_grace_secs"] = serde_json::json!(0);
+        let grace = parse_host_preferences(&registry.to_string(), "demeter").unwrap();
         assert_eq!(grace.alerts.heartbeat_grace_secs, Some(0));
-        registry["hosts"]["gpc0"]["alerts"]["heartbeat_grace_secs"] = serde_json::json!(3601);
-        assert!(parse_host_preferences(&registry.to_string(), "gpc0").is_err());
-        registry["hosts"]["gpc0"]["alerts"]["heartbeat_grace_secs"] = serde_json::Value::Null;
-        let cleared = parse_host_preferences(&registry.to_string(), "gpc0").unwrap();
+        registry["hosts"]["demeter"]["alerts"]["heartbeat_grace_secs"] = serde_json::json!(3601);
+        assert!(parse_host_preferences(&registry.to_string(), "demeter").is_err());
+        registry["hosts"]["demeter"]["alerts"]["heartbeat_grace_secs"] = serde_json::Value::Null;
+        let cleared = parse_host_preferences(&registry.to_string(), "demeter").unwrap();
         assert_eq!(cleared.alerts.heartbeat_grace_secs, None);
     }
 
@@ -4309,7 +4166,7 @@ mod tests {
           "schema": "inspr.pharos.host-preferences.v1",
           "version": 1,
           "hosts": {
-            "gpc0": {
+            "demeter": {
               "accent": "#9868d0",
               "kind": "workstation",
               "alerts": {
@@ -4323,174 +4180,13 @@ mod tests {
         }"##;
         let previous = HostPreferences::default();
 
-        assert!(parse_host_preferences(extended, "gpc0").is_err());
+        assert!(parse_host_preferences(extended, "demeter").is_err());
         assert!(parse_host_preferences(
             r#"{"schema":"inspr.pharos.host-preferences.v1","version":1,"hosts":{}}"#,
-            "gpc0"
+            "demeter"
         )
         .is_err());
         assert_eq!(previous, HostPreferences::default());
-    }
-
-    #[test]
-    fn pending_preferences_are_atomically_written_as_the_shared_registry() {
-        let root = kernel_fixture("pending-preferences");
-        std::fs::create_dir(&root).expect("create preferences fixture");
-        let path = root.join("host-preferences.json");
-        let preferences = HostPreferences {
-            accent: Some("#48b8a8".to_string()),
-            kind: pharos_core::HostKind::Workstation,
-            alerts: pharos_core::HostAlertPreferences {
-                suppress_down: false,
-                suppress_backup: true,
-                suppress_nix_freshness: false,
-                nixpkgs_warn_after_days: None,
-                heartbeat_grace_secs: None,
-            },
-        };
-        let response = HostReportResponse::pending("gpc0", preferences.clone())
-            .expect("pending response validates");
-        let body = serde_json::to_string(&response).expect("response serializes");
-
-        let applied = apply_report_response(&body, "gpc0", false, Some(&path))
-            .expect("pending preferences apply");
-        assert_eq!(applied, Some(preferences.clone()));
-        assert_eq!(
-            read_host_preferences(&path, "gpc0").expect("written registry parses"),
-            preferences
-        );
-        #[cfg(unix)]
-        assert_eq!(
-            std::fs::metadata(&path)
-                .expect("preferences metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::read_dir(&root)
-                .expect("fixture directory readable")
-                .count(),
-            1,
-            "atomic apply must not leave temporary files behind"
-        );
-        std::fs::remove_dir_all(root).expect("remove preferences fixture");
-    }
-
-    #[test]
-    fn invalid_or_misdirected_pending_preferences_keep_the_previous_file() {
-        let root = kernel_fixture("invalid-pending-preferences");
-        std::fs::create_dir(&root).expect("create preferences fixture");
-        let path = root.join("host-preferences.json");
-        let previous = HostPreferences {
-            accent: Some("#1f7fb5".to_string()),
-            ..Default::default()
-        };
-        let initial = HostReportResponse::pending("gpc0", previous.clone())
-            .expect("initial response validates");
-        apply_report_response(
-            &serde_json::to_string(&initial).expect("initial response serializes"),
-            "gpc0",
-            false,
-            Some(&path),
-        )
-        .expect("initial preferences apply");
-        let previous_bytes = std::fs::read(&path).expect("read previous registry");
-
-        let invalid = r##"{
-          "schema":"inspr.pharos.report-response.v1",
-          "version":1,
-          "pending_preferences":{
-            "schema":"inspr.pharos.host-preferences.v1",
-            "version":1,
-            "hosts":{
-              "gpc0":{
-                "accent":"#48b8a8",
-                "kind":"workstation",
-                "alerts":{},
-                "command":"rebuild"
-              }
-            }
-          }
-        }"##;
-        assert_eq!(
-            apply_report_response(invalid, "gpc0", false, Some(&path)),
-            Err(PreferencesApplyError::InvalidResponse)
-        );
-
-        let wrong_host = HostReportResponse::pending(
-            "athena",
-            HostPreferences {
-                accent: Some("#48b8a8".to_string()),
-                ..Default::default()
-            },
-        )
-        .expect("other host response validates for its host");
-        assert_eq!(
-            apply_report_response(
-                &serde_json::to_string(&wrong_host).expect("response serializes"),
-                "gpc0",
-                false,
-                Some(&path),
-            ),
-            Err(PreferencesApplyError::HostMismatch)
-        );
-        assert_eq!(
-            std::fs::read(&path).expect("previous registry remains"),
-            previous_bytes
-        );
-        std::fs::remove_dir_all(root).expect("remove preferences fixture");
-    }
-
-    #[test]
-    fn pending_preferences_require_a_non_nix_host_and_configured_file() {
-        let response = HostReportResponse::pending(
-            "gpc0",
-            HostPreferences {
-                accent: Some("#48b8a8".to_string()),
-                ..Default::default()
-            },
-        )
-        .expect("pending response validates");
-        let body = serde_json::to_string(&response).expect("response serializes");
-
-        assert_eq!(
-            apply_report_response(&body, "gpc0", false, None),
-            Err(PreferencesApplyError::NotConfigured)
-        );
-        assert_eq!(
-            apply_report_response(
-                &body,
-                "gpc0",
-                true,
-                Some(Path::new("/unused/preferences.json")),
-            ),
-            Err(PreferencesApplyError::UnsupportedOnNix)
-        );
-        let observation = PreferencesApplyError::WriteFailed.observation();
-        assert_eq!(observation.id, "host-preferences");
-        assert_eq!(observation.state, ServiceObservationState::Warning);
-        assert_eq!(
-            observation.summary,
-            "settings apply failed: atomic_write_failed"
-        );
-    }
-
-    #[test]
-    fn pending_preferences_response_body_is_bounded() {
-        let at_limit = vec![b' '; MAX_REPORT_RESPONSE_BYTES as usize];
-        assert_eq!(
-            read_bounded_report_response(std::io::Cursor::new(at_limit))
-                .expect("body at limit is accepted")
-                .len(),
-            MAX_REPORT_RESPONSE_BYTES as usize
-        );
-        let oversized = vec![b' '; MAX_REPORT_RESPONSE_BYTES as usize + 1];
-        assert_eq!(
-            read_bounded_report_response(std::io::Cursor::new(oversized)),
-            Err(PreferencesApplyError::InvalidResponse)
-        );
     }
 
     #[test]
@@ -4524,6 +4220,87 @@ mod tests {
         );
         staged.validate_contract().expect("staged posture valid");
         std::fs::remove_dir_all(staged_root).expect("remove staged fixture");
+    }
+
+    /// A store path holding a system whose `kernel-modules` links to a second
+    /// store path, the way a NixOS generation does.
+    fn write_generation(root: &Path, generation: u32, kernel: &str) {
+        let store = root.join("store");
+        let modules = store.join(format!("modules-{kernel}"));
+        std::fs::create_dir_all(modules.join("lib/modules").join(kernel)).expect("modules");
+        let system = store.join(format!("system-{generation}"));
+        std::fs::create_dir_all(&system).expect("system");
+        std::os::unix::fs::symlink(&modules, system.join("kernel-modules")).expect("link modules");
+        std::os::unix::fs::symlink(
+            &system,
+            root.join("profiles")
+                .join(format!("system-{generation}-link")),
+        )
+        .expect("link generation");
+    }
+
+    /// Moves the profile the way Nix does: a new name, then a rename over it.
+    fn point_system_profile_at(root: &Path, generation: u32) {
+        let profiles = root.join("profiles");
+        let next = profiles.join("system.next");
+        std::os::unix::fs::symlink(format!("system-{generation}-link"), &next).expect("link");
+        std::fs::rename(next, profiles.join("system")).expect("move profile");
+    }
+
+    #[test]
+    fn expected_kernel_follows_the_system_profile_through_a_staged_boot() {
+        let root = kernel_fixture("profile");
+        let profiles = root.join("profiles");
+        std::fs::create_dir_all(&profiles).expect("profiles");
+        let running = root.join("osrelease");
+        std::fs::write(&running, "6.18.26\n").expect("running kernel");
+        write_generation(&root, 1, "6.18.26");
+        point_system_profile_at(&root, 1);
+        let modules = next_boot_modules_dir(&profiles).expect("profile present");
+
+        let before = collect_kernel_posture_at(true, 100, &running, &modules);
+        assert_eq!(before.state, pharos_core::KernelPostureState::Current);
+
+        // `nixos-rebuild boot`: only the profile moves, and the path stays valid.
+        write_generation(&root, 2, "7.0.14");
+        point_system_profile_at(&root, 2);
+        let staged = collect_kernel_posture_at(true, 200, &running, &modules);
+        assert_eq!(
+            staged.state,
+            pharos_core::KernelPostureState::RebootRequired
+        );
+        assert_eq!(staged.running_version.as_deref(), Some("6.18.26"));
+        assert_eq!(staged.expected_version.as_deref(), Some("7.0.14"));
+        staged.validate_contract().expect("staged posture valid");
+
+        // The reboot.
+        std::fs::write(&running, "7.0.14\n").expect("running kernel");
+        let after = collect_kernel_posture_at(true, 300, &running, &modules);
+        assert_eq!(after.state, pharos_core::KernelPostureState::Current);
+
+        std::fs::remove_dir_all(root).expect("remove profile fixture");
+    }
+
+    #[test]
+    fn a_profile_that_no_longer_resolves_is_unknown_and_no_profile_falls_back() {
+        let root = kernel_fixture("profile-gone");
+        let profiles = root.join("profiles");
+        std::fs::create_dir_all(&profiles).expect("profiles");
+        assert_eq!(next_boot_modules_dir(&profiles), None);
+        assert_eq!(next_boot_modules_dir(&root.join("no-mount")), None);
+
+        let running = root.join("osrelease");
+        std::fs::write(&running, "6.18.26\n").expect("running kernel");
+        write_generation(&root, 1, "6.18.26");
+        point_system_profile_at(&root, 1);
+        // The profiles directory is mounted but the store is not.
+        std::fs::remove_dir_all(root.join("store")).expect("remove store");
+        let modules = next_boot_modules_dir(&profiles).expect("the link itself is there");
+        let posture = collect_kernel_posture_at(true, 100, &running, &modules);
+        assert_eq!(posture.state, pharos_core::KernelPostureState::Unknown);
+        assert_eq!(posture.expected_version, None);
+
+        std::fs::remove_dir_all(root).expect("remove profile fixture");
     }
 
     #[test]
@@ -4564,7 +4341,7 @@ mod tests {
     #[test]
     fn success_log_line_keeps_operational_context_without_report_body() {
         let line = success_log_line(
-            "hsb8",
+            "hermes",
             "http://pharos.example/report",
             204,
             &NixFreshness {
@@ -4582,7 +4359,7 @@ mod tests {
             &[],
         );
 
-        assert!(line.contains("hsb8"));
+        assert!(line.contains("hermes"));
         assert!(line.contains("http://pharos.example/report"));
         assert!(line.contains("HTTP 204"));
         assert!(line.contains("generation=unverified"));
@@ -4634,7 +4411,7 @@ mod tests {
     fn restic_backup_options_extract_repository_only() {
         assert_eq!(
             restic_repository_args_from_backup_options(
-                "-r sftp:backup.example.invalid:/ --host csb1 --verbose"
+                "-r sftp:backup.example.invalid:/ --host apollo --verbose"
             ),
             vec![
                 "-r".to_string(),
@@ -4668,7 +4445,7 @@ mod tests {
                 "/run/agenix/restic-repository".to_string()
             ]
         );
-        assert!(restic_repository_args_from_backup_options("--host csb1").is_empty());
+        assert!(restic_repository_args_from_backup_options("--host apollo").is_empty());
     }
 
     #[test]
@@ -4683,7 +4460,7 @@ mod tests {
     fn restic_snapshot_metadata_classifies_healthy_stale_and_missing() {
         let raw = r#"[{
             "time": "2023-11-14T21:13:20Z",
-            "hostname": "csb1",
+            "hostname": "apollo",
             "paths": ["/backup/home"],
             "id": "abcdef"
         }]"#;
@@ -4752,6 +4529,44 @@ mod tests {
             backup_observations_from_json(secret_shaped).expect_err("secret-shaped metadata"),
             "contract"
         );
+    }
+
+    #[test]
+    fn backup_status_file_mode_reports_the_file_and_never_fails_silently() {
+        let path =
+            std::env::temp_dir().join(format!("pharos-backup-status-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"restic-main",
+                "label":"Restic main",
+                "engine":"restic",
+                "state":"warning",
+                "configured":"enabled",
+                "summary":"last backup was late",
+                "schedule":"daily",
+                "last_success_at":1700000000
+            }"#,
+        )
+        .expect("write status file");
+        let observations = backup_status_file_observations(&path);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].id, "restic-main");
+        assert_eq!(observations[0].state, BackupPostureState::Warning);
+        assert_eq!(observations[0].schedule.as_deref(), Some("daily"));
+        assert_eq!(observations[0].last_success_at, Some(1_700_000_000));
+
+        std::fs::write(&path, "not json").expect("write invalid status file");
+        let invalid = backup_status_file_observations(&path);
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].state, BackupPostureState::Unknown);
+        assert_eq!(invalid[0].summary, "backup status file invalid");
+
+        std::fs::remove_file(&path).expect("remove status file");
+        let missing = backup_status_file_observations(&path);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].state, BackupPostureState::Unknown);
+        assert_eq!(missing[0].summary, "backup status file unavailable");
     }
 
     #[test]
@@ -6335,7 +6150,7 @@ mod tests {
         Some((matching_flake_lock(dir.to_str()?, &evidence)?, evidence))
     }
 
-    /// The real csb1 lock shape. The system tracks nixos-unstable and is 21
+    /// The real apollo lock shape. The system tracks nixos-unstable and is 21
     /// days old, while a separate root input sits 218 days stale on an expired
     /// channel and transitive inputs of nixos-hardware are older still.
     /// PHAROS-196: only the system input may drive the reported number.
@@ -6790,6 +6605,69 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Writes an executable fixture and returns once it can run. A child forked by
+    /// a parallel test can hold an inherited write handle on a new file for a moment,
+    /// and Linux refuses to run a file open for writing. Nothing opens this file for
+    /// writing again, so one run that starts means every later one can.
+    fn write_command_fixture(path: &Path, script: &str) {
+        std::fs::write(path, script).expect("write command fixture");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("make command fixture executable");
+        wait_until_runnable(path);
+    }
+
+    fn wait_until_runnable(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Err(error) = run_with_no_arguments(path) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ExecutableFileBusy,
+                "command fixture did not start"
+            );
+            assert!(Instant::now() < deadline, "command fixture stayed busy");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn run_with_no_arguments(path: &Path) -> std::io::Result<std::process::ExitStatus> {
+        Command::new(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    }
+
+    #[test]
+    fn a_command_fixture_waits_out_a_write_handle_someone_else_holds() {
+        let root = kernel_fixture("command-fixture-busy");
+        std::fs::create_dir_all(&root).expect("create fixture directory");
+        let path = root.join("busy");
+        let mut held = std::fs::File::create(&path).expect("create fixture");
+        held.write_all(b"#!/bin/sh\nexit 0\n")
+            .expect("write fixture");
+        held.flush().expect("flush fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("make fixture executable");
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            run_with_no_arguments(&path).map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::ExecutableFileBusy)
+        );
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        wait_until_runnable(&path);
+        // Before the join, so returning early from the wait fails here on Linux.
+        assert!(run_with_no_arguments(&path)
+            .expect("fixture runs")
+            .success());
+        release.join().expect("handle released");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn allowlisted_running_container_measures_config_id_not_metadata_file() {
         let root = kernel_fixture("deployed-artifact-command");
@@ -6804,7 +6682,7 @@ mod tests {
         let command = root.join("docker-fixture");
         let stdout = filtered_container_stdout(&config);
         std::fs::write(command.with_extension("out"), stdout).expect("write filtered stdout");
-        std::fs::write(
+        write_command_fixture(
             &command,
             concat!(
                 "#!/bin/sh\n",
@@ -6836,10 +6714,7 @@ mod tests {
                 "  *) exit 13 ;;\n",
                 "esac\n"
             ),
-        )
-        .expect("write command fixture");
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
-            .expect("make command fixture executable");
+        );
 
         let cache = Mutex::new(ImageConfigDigestCache::new(8));
         let evidence = collect_measured_deployed_artifact_at(
@@ -6867,9 +6742,7 @@ mod tests {
             filtered_container_stdout(&other),
         )
         .expect("write mismatch stdout");
-        std::fs::write(&mismatch, "#!/bin/sh\ncat \"$0.out\"\n").expect("write mismatch fixture");
-        std::fs::set_permissions(&mismatch, std::fs::Permissions::from_mode(0o700))
-            .expect("executable mismatch");
+        write_command_fixture(&mismatch, "#!/bin/sh\ncat \"$0.out\"\n");
         assert!(
             collect_measured_deployed_artifact_at(
                 &mismatch.to_string_lossy(),
@@ -6901,9 +6774,7 @@ mod tests {
             format!("{}\n", stopped_fields.join("\t")),
         )
         .expect("write stopped stdout");
-        std::fs::write(&stopped, "#!/bin/sh\ncat \"$0.out\"\n").expect("write stopped fixture");
-        std::fs::set_permissions(&stopped, std::fs::Permissions::from_mode(0o700))
-            .expect("executable stopped");
+        write_command_fixture(&stopped, "#!/bin/sh\ncat \"$0.out\"\n");
         assert!(collect_measured_deployed_artifact_at(
             &stopped.to_string_lossy(),
             Path::new("/tmp/pharos-docker.sock"),
@@ -6915,13 +6786,10 @@ mod tests {
         .is_none());
 
         let failure = root.join("docker-failure");
-        std::fs::write(
+        write_command_fixture(
             &failure,
             "#!/bin/sh\nprintf 'credential-bearing diagnostic' >&2\nexit 1\n",
-        )
-        .expect("write failure fixture");
-        std::fs::set_permissions(&failure, std::fs::Permissions::from_mode(0o700))
-            .expect("executable failure");
+        );
         assert_eq!(
             run_running_container_command(
                 &failure.to_string_lossy(),
@@ -6932,10 +6800,7 @@ mod tests {
         );
 
         let oversized = root.join("docker-oversized");
-        std::fs::write(&oversized, "#!/bin/sh\nhead -c 5000 /dev/zero\n")
-            .expect("write oversized fixture");
-        std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o700))
-            .expect("executable oversized");
+        write_command_fixture(&oversized, "#!/bin/sh\nhead -c 5000 /dev/zero\n");
         assert_eq!(
             run_running_container_command(
                 &oversized.to_string_lossy(),
@@ -7043,7 +6908,7 @@ mod tests {
         )
         .expect("image descriptor");
         std::fs::write(command.with_extension("tar"), &archive).expect("image archive");
-        std::fs::write(
+        write_command_fixture(
             &command,
             concat!(
                 "#!/bin/sh\n",
@@ -7067,10 +6932,7 @@ mod tests {
                 "  *) exit 13 ;;\n",
                 "esac\n"
             ),
-        )
-        .expect("write docker29 fixture");
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
-            .expect("executable docker29 fixture");
+        );
 
         let cache = Mutex::new(ImageConfigDigestCache::new(8));
         let evidence = collect_measured_deployed_artifact_at(

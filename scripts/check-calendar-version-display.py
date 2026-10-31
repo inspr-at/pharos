@@ -6,17 +6,15 @@ import stat
 import sys
 from pathlib import Path
 
-SOURCE = "317f872bc061576fc0b45d274d3a22f69bcd4c8a"
-CONFIG_SHA256 = "7843f3515ce329277d2d576000bd60ac410d725b241d502a9a3fecb2533d956d"
-MANIFEST_SHA256 = "b1125b92bf8c0bb0a9e14968924230f04503d226b63d0a0aee544efbdaf00af2"
+SOURCE = "bd0a13816f728ad91c36d849f88168bcac4fdc6e"
+CONFIG_SHA256 = "bf6aa144cd73dc97dc941f0f0914138b04ae0a28fbead5123465b15b1f2a2fd9"
+MANIFEST_SHA256 = "a3d2d8d45f4f9c2c1f978225f4737d2248f654595237cb12231e78cff0e2ed6e"
 FILES = {
-    "display.json": (1656, CONFIG_SHA256),
-    "schemes.json": (169, "4c903f9f4dc63ae141f48131b6e5150d86e8381d50ecde89782cf77ad2f4a5b7"),
-    "version.js": (4871, "9a09693e0cef3af586f617ba24cdae96165d95d12f5c447b1d2e67d35a70c9b8"),
-    "presentation.js": (2769, "fd0354837edd05179aeeaa86c271bced25031a3f29e148c448b684116b7dd3ca"),
-    "version-interaction.js": (7671, "cfe539ad84651666d18b192f37659dab7c36aa8e68c43c9bdd42b42e85de2ba1"),
-    "auto-animate.js": (28022, "2fae336f3ed3e814356df4721cfa747a393ff037fee2644d95bbbe1236551753"),
-    "auto-animate-license.js": (1100, "57677685789ebe6233671cef7f78b37f74942936b0d42ef2168d6a2195acf606"),
+    "display.json": (1423, CONFIG_SHA256),
+    "version.js": (6334, "5711296a2f551745073dc416c1cf676c0fa584976ea7680dedff923cf7ac5faf"),
+    "presentation.js": (5275, "37ae4b7757c76bb46960219724f448e4027396a017748d96edb89d25a7c54fe2"),
+    "version-interaction.js": (8317, "37d420e346defff5c01fe849c39c1f7ed93017e62f7e2a8d0b6299e00ede99ff"),
+    "schemes.json": (284, "d88195791de1fe2c8a1fcaa1098c85f1af9c58fc049ef4186c28d6962da0474d"),
     "package.json": (18, "1239d4d885dcad42201a27ed9324f8f0f760b78700d8db9ced39a511cffe7eae"),
 }
 
@@ -46,7 +44,7 @@ def check(root):
         fail("manifest is invalid")
     if (manifest.get("repository") != "inspr-at/inspr" or manifest.get("revision") != SOURCE
             or manifest.get("expectedConfigSha256") != CONFIG_SHA256
-            or manifest.get("schema") != "inspr.calendar-version-display.v2"
+            or manifest.get("schema") != "inspr.calver-display.v3"
             or manifest.get("mode") != "build-time-only"
             or manifest.get("consumers") != [] or manifest.get("runtimeConsumers") is not False):
         fail("manifest provenance drifted")
@@ -68,11 +66,14 @@ def check(root):
         if entry.get("size") != expected_size or entry.get("sha256") != expected_digest:
             fail(f"{name} manifest entry drifted")
     display = json.loads((bundle / "display.json").read_text())
-    if display.get("schema") != "inspr.calendar-version-display.v2" or display.get("scheme") != "inspr-calendar-v2":
+    if display.get("schema") != "inspr.calver-display.v3" or display.get("scheme") != "inspr-calver-3":
         fail("display contract drifted")
-    if display.get("design_revision") != 3 or set(display.get("weights", {})) != {"v","yy","mm","dd","hh","mi","ss","tail"}:
+    if display.get("design_revision") != 4 or display.get("segments") != ["yy", "mm", "dd", "hh", "mi", "ss"]:
         fail("display design drifted")
-    if any(not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1 for value in display["weights"].values()):
+    weights = display.get("weights", {})
+    if set(weights) != set(display["segments"]):
+        fail("display weights drifted")
+    if any(not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1 for value in weights.values()):
         fail("display weights are outside 0-100 percent")
     print(f"calendar-version-display: ok source={SOURCE} manifest=sha256:{MANIFEST_SHA256}")
 

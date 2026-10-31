@@ -1,84 +1,104 @@
-import autoAnimate from './auto-animate.js';
-import './auto-animate-license.js';
+// INSPR-CalVer3 reveal and copy (INSPR-486). Hover, keyboard focus or a tap
+// reveals: every segment shows at 0.7 + 0.3 * rest opacity and zero-width rest
+// segments grow to their natural width. Plain CSS transitions on opacity and
+// max-width carry the shared ~1 s ease-in-out; reduced motion switches at once.
 export const hoverOpacity = weight => .70+.30*(Number.isFinite(weight)?Math.max(0,Math.min(1,weight)):1);
-const duration=1000;
+export const duration=1000;
+// Touch confirmation, after which a tapped version returns to rest.
+export const confirmation=2000;
+const words={copy:'Version kopieren',copied:'Kopiert',failed:'Kopieren nicht verfügbar. Die Version ist markiert: mit ⌘C oder Strg+C kopieren.'};
+const touchLike=type=>type==='touch'||type==='pen';
 
-// AutoAnimate owns FLIP scheduling, Animation playback/cancellation and observers.
-// Its documented plugin receives the new layout. Snapshot current visual bounds
-// before a mutation so interruption starts here, not at its cached old target.
-export function attachVersionInteraction(host,canonical,{animate=autoAnimate,view=globalThis}={}) {
-  const doc=host.ownerDocument||document,originalStyle=host.getAttribute('style'),originalWidth=host.style.width;
-  const attributes=Object.fromEntries(['role','tabindex','aria-label'].map(name=>[name,host.getAttribute(name)]));
-  const sequence=doc.createElement('span');sequence.style.display='inline-block';sequence.style.position='relative';
-  const nodes=[...host.children],carriers=nodes.map(node=>{
-    const carrier=doc.createElement('span');Object.assign(carrier.style,{display:'inline-block',position:'relative',verticalAlign:'baseline'});
-    carrier.append(node);sequence.append(carrier);return {carrier,node,separator:node.className==='separator',opacity:node.style.opacity||'1',color:node.style.color||'',transition:node.style.transition||'',userSelect:node.style.userSelect||''};
-  });host.append(sequence);
-  host.setAttribute('role','button');host.setAttribute('tabindex','0');host.setAttribute('aria-label',`${canonical} — Version kopieren`);
+export function attachVersionInteraction(host,canonical,{view=globalThis,label=canonical,text}={}) {
+  const say={...words,...(text||{})};
+  const doc=host.ownerDocument||document,originalStyle=host.getAttribute('style');
+  const attributes=Object.fromEntries(['role','tabindex','aria-label','title'].map(name=>[name,host.getAttribute(name)]));
+  const items=[...host.children].map(node=>({node,separator:node.className==='separator',collapsed:node.dataset?.collapsed==='true',
+    rest:{opacity:node.style.opacity||'',maxWidth:node.style.maxWidth||'',transition:node.style.transition||'',userSelect:node.style.userSelect||''}}));
+  host.setAttribute('role','button');host.setAttribute('tabindex','0');host.setAttribute('aria-label',`${label} — ${say.copy}`);host.setAttribute('title',label);
   Object.assign(host.style,{display:'inline-block',position:'relative',cursor:'pointer',userSelect:'text',outlineOffset:'4px'});
   const feedback=doc.createElement('span');feedback.setAttribute('role','status');feedback.setAttribute('aria-live','polite');
   Object.assign(feedback.style,{position:'absolute',bottom:'100%',left:'0',fontFamily:'system-ui,sans-serif',fontSize:'12px',fontWeight:'400',lineHeight:'1.5',whiteSpace:'normal',padding:'3px 7px',borderRadius:'4px',background:'#17304a',color:'#fff',pointerEvents:'none',zIndex:'2'});
   feedback.hidden=true;host.append(feedback);
-  let hovered=false,focused=false,down=false,dragged=false,technical=false,disposed=false,controller=null,timer=null,copySerial=0,start=null;
-  let snapshots=new Map();const listeners=[];
+  let hovered=false,focused=false,down=false,held=false,dragged=false,pointer=false,revealed=false,disposed=false,timer=null,copySerial=0,start=null;
+  const listeners=[];
   const media=view.matchMedia?.('(prefers-reduced-motion: reduce)');
   const reduced=()=>media?.matches===true;
   const listen=(target,type,fn)=>{target.addEventListener(type,fn);listeners.push(()=>target.removeEventListener(type,fn));};
   const selected=()=>{const s=doc.getSelection?.();return Boolean(s&&!s.isCollapsed&&(host.contains(s.anchorNode)||host.contains(s.focusNode)));};
-  function plugin(el,_action,oldRect,newRect){
-    const previous=snapshots.get(el)||oldRect,current=el.getBoundingClientRect?.()||newRect||oldRect;
-    // Children include the parent's alignment shift in their viewport snapshots.
-    // Do not animate that same shift a second time on the sequence itself.
-    const dx=el!==sequence&&previous&&current?previous.left-current.left:0,dy=el!==sequence&&previous&&current?previous.top-current.top:0;
-    return new view.KeyframeEffect(el,[{transform:`translate(${dx}px, ${dy}px)`},{transform:'translate(0, 0)'}],{duration:reduced()?0:duration,easing:'ease-in-out'});
-  }
   function motion(target,immediate=false){
     if(disposed)return;
-    if(target===technical){if(immediate)finish();return;}
-    if(!host.style.width){const width=host.getBoundingClientRect?.().width;if(width)host.style.width=`${width}px`;}
-    snapshots=new Map([sequence,...carriers.map(c=>c.carrier)].map(el=>[el,el.getBoundingClientRect?.()]));
-    if(!controller&&!reduced()&&view.KeyframeEffect&&view.ResizeObserver)controller=animate(sequence,plugin);
-    if(immediate||reduced())controller?.disable();else controller?.enable();
-    technical=target;host.dataset.versionView=target?'technical':'pretty';
-    const origin=snapshots.get(sequence);
-    for(const item of carriers){
-      const {carrier,node,separator}=item;
-      node.style.transition=(reduced()||immediate)?'none':`opacity ${duration}ms ease-in-out, color ${duration}ms ease-in-out`;
-      if(separator){
-        node.style.userSelect='none';node.style.opacity=target?'0':'1';
-        if(target){const rect=snapshots.get(carrier);Object.assign(carrier.style,{position:'absolute',left:`${rect&&origin?rect.left-origin.left:0}px`,top:`${rect&&origin?rect.top-origin.top:0}px`});}
-        else Object.assign(carrier.style,{position:'relative',left:'',top:''});
-      }else {node.style.opacity=target?String(hoverOpacity(Number(item.opacity))):item.opacity;node.style.color=target?'currentColor':item.color;}
+    if(target===revealed&&!immediate)return;
+    revealed=target;host.dataset.versionView=target?'revealed':'pretty';
+    const transition=reduced()||immediate?'none':`opacity ${duration}ms ease-in-out, max-width ${duration}ms ease-in-out`;
+    for(const {node,separator,collapsed,rest} of items){
+      node.style.transition=transition;
+      if(separator){node.style.userSelect='none';if(collapsed)node.style.opacity=target?'1':rest.opacity;}
+      else node.style.opacity=target?String(hoverOpacity(rest.opacity===''?1:Number(rest.opacity))):rest.opacity;
+      if(collapsed&&rest.maxWidth){
+        // Grow to the measured natural width so the width change can transition.
+        const width=Number(node.scrollWidth);
+        node.style.maxWidth=target?(width>0?`${width}px`:'none'):rest.maxWidth;
+      }
     }
-    // Move the SAME last digit carrier to trigger childList without disposable
-    // placeholders. All nodes remain connected; AutoAnimate runs remain only.
-    if(carriers.length)sequence.append(carriers.at(-1).carrier);
   }
-  function finish(){for(const el of [sequence,...carriers.flatMap(c=>[c.carrier,c.node])]){for(const animation of el.getAnimations?.()||[])try{animation.finish();}catch{} }if(reduced()||selected())for(const {node} of carriers)node.style.transition='none';}
-  const settle=()=>motion(hovered||focused||down||selected(),selected());
-  listen(host,'pointerenter',e=>{hovered=e.pointerType!=='touch';settle();});listen(host,'pointerleave',()=>{hovered=false;settle();});
-  listen(host,'focus',()=>{focused=!down;host.style.outline='2px solid currentColor';settle();});
+  const settle=()=>motion(hovered||focused||down||held||selected(),selected());
+  function release(){if(!held)return;held=false;settle();}
+  listen(host,'pointerenter',e=>{hovered=!touchLike(e.pointerType);settle();});listen(host,'pointerleave',()=>{hovered=false;settle();});
+  // Only keyboard-visible focus reveals; a tap or click focuses too, after pointerup.
+  const focusVisible=()=>{try{if(typeof host.matches==='function')return host.matches(':focus-visible');}catch{}return !down&&!pointer;};
+  listen(host,'focus',()=>{focused=focusVisible();host.style.outline=focused?'2px solid currentColor':'';settle();});
   listen(host,'blur',()=>{focused=false;host.style.outline='';settle();});
-  listen(host,'pointerdown',e=>{down=true;dragged=false;start={x:e.clientX,y:e.clientY};motion(true);});
+  listen(host,'pointerdown',e=>{down=true;pointer=true;dragged=false;start={x:e.clientX,y:e.clientY};if(touchLike(e.pointerType))held=true;motion(true);});
   listen(host,'pointermove',e=>{if(down&&start&&Math.hypot(e.clientX-start.x,e.clientY-start.y)>4){dragged=true;motion(true,true);}});
-  listen(doc,'pointerup',()=>{down=false;settle();});listen(doc,'pointercancel',()=>{down=false;dragged=true;settle();});
+  listen(doc,'pointerdown',e=>{if(held&&!host.contains(e.target)){view.clearTimeout(timer);release();}});
+  listen(doc,'pointerup',()=>{down=false;if(dragged)held=false;settle();});listen(doc,'pointercancel',()=>{down=false;dragged=true;held=false;settle();});
   listen(doc,'selectionchange',settle);
-  async function copy(){
-    if(disposed||selected()||dragged)return;
-    const serial=++copySerial;view.clearTimeout(timer);feedback.hidden=true;feedback.textContent='';host.dataset.copyState='copying';
-    try{await view.navigator.clipboard.writeText(canonical);if(disposed||serial!==copySerial)return;host.dataset.copyState='copied';feedback.textContent='Kopiert';}
-    catch{if(disposed||serial!==copySerial)return;host.dataset.copyState='error';feedback.textContent='Kopieren nicht verfügbar. Version markieren.';}
-    feedback.hidden=false;timer=view.setTimeout(()=>{feedback.hidden=true;feedback.textContent='';delete host.dataset.copyState;},1800);
+  function clearFeedback(){feedback.hidden=true;feedback.textContent='';feedback.style.pointerEvents='none';}
+  // Fallback for a missing or rejected Clipboard API: a hidden textarea holding
+  // the canonical value, copied with execCommand. Reports whether it worked.
+  function legacyCopy(){
+    const area=doc.createElement('textarea');let ok=false;
+    try{
+      Object.assign(area,{value:canonical,readOnly:true});area.setAttribute('aria-hidden','true');
+      Object.assign(area.style,{position:'fixed',top:'0',left:'0',width:'1px',height:'1px',opacity:'0',pointerEvents:'none'});
+      (doc.body||host).append(area);area.select();ok=doc.execCommand?.('copy')===true;
+    }catch{ok=false;}
+    area.remove();return ok;
   }
-  listen(host,'click',()=>{void copy();});listen(host,'keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();if(!e.repeat){dragged=false;void copy();}}});
-  const preference=()=>{if(reduced())finish();settle();};if(media?.addEventListener)listen(media,'change',preference);
+  // Clicks and keys inside the fallback field must not start another copy.
+  const inFeedback=e=>Boolean(e?.target&&e.target!==host&&feedback.contains?.(e.target));
+  async function copy(){
+    if(disposed)return;
+    if(selected()||dragged){if(held){view.clearTimeout(timer);timer=view.setTimeout(release,confirmation);}return;}
+    const serial=++copySerial;view.clearTimeout(timer);clearFeedback();host.dataset.copyState='copying';
+    let copied=false;
+    try{await view.navigator.clipboard.writeText(canonical);copied=true;}catch{copied=legacyCopy();}
+    if(disposed||serial!==copySerial)return;
+    feedback.hidden=false;
+    if(copied){
+      host.dataset.copyState='copied';feedback.textContent=say.copied;
+      timer=view.setTimeout(()=>{clearFeedback();delete host.dataset.copyState;release();},confirmation);
+      return;
+    }
+    // Last resort: the canonical text, selected, so the user can copy it by hand.
+    // Selecting the Pretty text would lose .0.0, so it is never offered.
+    host.dataset.copyState='error';feedback.textContent=say.failed;feedback.style.pointerEvents='auto';
+    const field=doc.createElement('input');
+    Object.assign(field,{type:'text',readOnly:true,value:canonical});field.setAttribute('aria-label',canonical);field.setAttribute('size',String(canonical.length));
+    Object.assign(field.style,{display:'block',marginTop:'4px',font:'12px ui-monospace,SFMono-Regular,Menlo,monospace',color:'#17304a',background:'#fff',border:'0',borderRadius:'3px',padding:'2px 4px'});
+    field.addEventListener('blur',()=>{if(host.dataset.copyState==='error'){clearFeedback();delete host.dataset.copyState;release();}});
+    feedback.append(field);field.focus();field.select();
+  }
+  listen(host,'click',e=>{if(!inFeedback(e))void copy();});listen(host,'keydown',e=>{if(inFeedback(e))return;pointer=false;if(!focused&&doc.activeElement===host){focused=true;host.style.outline='2px solid currentColor';settle();}if(e.key==='Enter'||e.key===' '){e.preventDefault();if(!e.repeat){dragged=false;void copy();}}});
+  if(media?.addEventListener)listen(media,'change',()=>motion(revealed,true));
   host.dataset.versionView='pretty';
   return {dispose(){
-    if(disposed)return;disposed=true;++copySerial;view.clearTimeout(timer);listeners.forEach(remove=>remove());controller?.destroy?.();
-    for(const item of carriers)Object.assign(item.node.style,{opacity:item.opacity,color:item.color,transition:item.transition,userSelect:item.userSelect});
-    feedback.remove();host.replaceChildren(...nodes);host.style.width=originalWidth;
+    if(disposed)return;disposed=true;++copySerial;view.clearTimeout(timer);listeners.forEach(remove=>remove());
+    for(const {node,rest} of items)Object.assign(node.style,rest);
+    feedback.remove();
     for(const [name,value] of Object.entries(attributes))if(value===null)host.removeAttribute(name);else host.setAttribute(name,value);
     if(originalStyle===null)host.removeAttribute('style');else host.setAttribute('style',originalStyle);
     delete host.dataset.versionView;delete host.dataset.copyState;
-  },technical:()=>technical};
+  },revealed:()=>revealed};
 }

@@ -1,14 +1,11 @@
 # Local-only Pharos topology for development smoke tests.
 #
-# Production compose is owned by nixcfg (hosts/csb1/docker/docker-compose.yml)
-# and uses GHCR images, Traefik, Zitadel OIDC, operator allowlists, tailnet
-# ports, manifests, backups, and eventually strict beacon tokens. Do not copy
-# this file to production.
+# Do not copy this file to production; docker-compose.selfhost.yml is the
+# production template.
 #
-# Secrets are intentionally not committed here. If you need to test strict
-# token behavior locally, prefer read-only files with
-# PHAROS_REGISTRATION_TOKEN_FILE / PHAROS_TOKEN_FILE. Direct values remain a
-# compatibility path for local smoke tests only.
+# Secrets are intentionally not committed here. Every report needs a beacon
+# token: register the host first (see RUNBOOK.md), then pass the token to the
+# beacon profile as PHAROS_TOKEN.
 
 name: pharos-local
 
@@ -24,16 +21,12 @@ services:
       PHAROS_ALLOW_OPEN: "true"
       RUST_LOG: info
       PHAROS_DB: /data/pharos.json
-      # Optional: mount a local manifest directory and set, for example:
-      # PHAROS_MANIFEST_PATHS: /manifests/hsb8.json
       # OIDC/operator policy is intentionally off. Open mode is explicitly
       # limited to the loopback-only published port above.
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - pharos_data:/data
-      # Optional local manifest fixture mount:
-      # - ./manifests:/manifests:ro
 
   pharos-beacon:
     build: .
@@ -49,9 +42,8 @@ services:
       PHAROS_INTERVAL: 60
       PHAROS_HOSTNAME: ${PHAROS_HOSTNAME:-local-dev}
       PHAROS_ROLE: ${PHAROS_ROLE:-local}
-      # Optional for strict-token local tests; leave unset for legacy-mode
-      # local smoke tests. A private override can instead mount a token file
-      # and set PHAROS_TOKEN_FILE to its container path.
+      # Without a token every report gets 401. A private override can instead
+      # mount a token file and set PHAROS_TOKEN_FILE to its container path.
       PHAROS_TOKEN: ${PHAROS_TOKEN:-}
 
 volumes:

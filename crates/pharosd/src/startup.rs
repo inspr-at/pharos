@@ -38,18 +38,6 @@ impl StartupConfig {
             public_base_path,
         })
     }
-
-    pub(super) fn listener_loopback_dev_mode(&self) -> Result<bool, String> {
-        let public_addr = env_nonempty("PHAROS_PUBLIC_ADDR")
-            .map(|value| {
-                value.parse::<SocketAddr>().map_err(|err| {
-                    format!("PHAROS_PUBLIC_ADDR must be a numeric socket address: {err}")
-                })
-            })
-            .transpose()?
-            .unwrap_or(self.addr);
-        Ok(self.addr.ip().is_loopback() && public_addr.ip().is_loopback())
-    }
 }
 
 pub(super) fn container_healthcheck_url(addr: SocketAddr) -> String {

@@ -22,7 +22,7 @@ class CalendarVersionBundleTest(unittest.TestCase):
     def test_exact_bundle_passes(self):
         result = self.run_check(ROOT)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("source=317f872bc061576fc0b45d274d3a22f69bcd4c8a", result.stdout)
+        self.assertIn("source=bd0a13816f728ad91c36d849f88168bcac4fdc6e", result.stdout)
 
     def test_scheme_label_drift_fails(self):
         with tempfile.TemporaryDirectory() as directory:

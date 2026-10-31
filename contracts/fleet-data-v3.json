@@ -1,0 +1,144 @@
+{
+  "schema_version": 3,
+  "title": "Example fleet",
+  "updated_at": "2000-01-03T12:00:00Z",
+  "updated_by": "example-operator",
+  "defaults": {
+    "client": {
+      "offline_warn_days": 30,
+      "offline_red_days": 60
+    }
+  },
+  "cves": [
+    {
+      "id": "CVE-2000-0001",
+      "name": "Example takeover",
+      "severity": "critical",
+      "state": "open",
+      "component": "kernel",
+      "eli10": "A flaw in the kernel lets a local program take over the machine.",
+      "tip": "Update, then reboot.",
+      "fixed_in": ["6.18.56", "7.2.10", "7.3"]
+    },
+    {
+      "id": "CVE-2000-0002",
+      "severity": "high",
+      "state": "mitigated",
+      "component": "example-library",
+      "eli10": "A flaw in a shared library lets a crafted file crash a service.",
+      "tip": "Rebuild the images that include it.",
+      "fixed_in": ["1.2.3"]
+    }
+  ],
+  "handled": [
+    {
+      "ids": ["CVE-1999-0001"],
+      "name": "Example older flaw",
+      "eli10": "An older flaw, patched everywhere.",
+      "hosts": ["demeter", "hermes"],
+      "action": "Updated and rebooted.",
+      "done": "2000-01-02",
+      "ticket": "EXAMPLE-1"
+    }
+  ],
+  "sections": [
+    {
+      "id": "site-one",
+      "name": "Site one",
+      "place": "Example Town",
+      "hosts": [
+        {
+          "name": "demeter",
+          "kind": "nixos",
+          "role": "Server",
+          "os": "NixOS",
+          "version": null,
+          "kernel": null,
+          "tailnet": { "state": "online", "ip": "192.0.2.10" },
+          "lan": "192.0.2.11",
+          "public": "demeter.example.test",
+          "availability": "always_on",
+          "cve": {
+            "CVE-2000-0002": {
+              "state": "fixed",
+              "since": "2000-01-02",
+              "last_verified": "2000-01-02T09:00:00Z"
+            }
+          }
+        },
+        {
+          "name": "hermes",
+          "kind": "mac",
+          "role": "Laptop",
+          "os": "macOS",
+          "version": null,
+          "kernel": null,
+          "tailnet": { "state": "offline", "ip": "192.0.2.20", "note": "Often asleep." },
+          "lan": null,
+          "public": null,
+          "availability": "client",
+          "cve": {
+            "CVE-2000-0002": {
+              "state": "unknown",
+              "note": "Not checked yet.",
+              "last_verified": "2000-01-01T09:00:00Z"
+            }
+          }
+        },
+        {
+          "name": "artemis",
+          "kind": "mac",
+          "role": "Desktop",
+          "os": "macOS",
+          "version": null,
+          "kernel": null,
+          "tailnet": { "state": "none" },
+          "lan": null,
+          "public": null,
+          "availability": "client",
+          "offline_warn_days": 7,
+          "offline_red_days": 14
+        },
+        {
+          "name": "ares",
+          "kind": "pi",
+          "role": "Spare",
+          "os": null,
+          "version": null,
+          "kernel": null,
+          "tailnet": { "state": "none" },
+          "lan": null,
+          "public": null,
+          "availability": "optional",
+          "cve": {
+            "CVE-2000-0002": { "state": "na" }
+          }
+        },
+        {
+          "name": "athena",
+          "kind": "vm",
+          "role": "Server without a beacon",
+          "os": "Debian",
+          "version": "12",
+          "kernel": "6.1.0-1-amd64",
+          "tailnet": { "state": "online", "ip": "192.0.2.30" },
+          "lan": null,
+          "public": "198.51.100.30",
+          "availability": "always_on",
+          "last_verified": "2000-01-03T09:00:00Z",
+          "cve": {
+            "CVE-2000-0001": {
+              "state": "affected",
+              "note": "Declared by hand: this host sends no reports.",
+              "last_verified": "2000-01-03T09:00:00Z"
+            },
+            "CVE-2000-0002": {
+              "state": "affected",
+              "last_verified": "2000-01-03T09:00:00Z"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

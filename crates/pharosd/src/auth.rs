@@ -5,16 +5,16 @@
 //! listener, so a partial or drifted production configuration cannot silently
 //! disable authentication.
 //!
-//! Public client (PKCE, no client secret). The human routes (`/`, `/hosts.json`)
-//! are gated; machine routes (`POST /register`, `POST /report`) use the
-//! PHAROS-8 beacon token flow instead of browser login, while `/healthz` and
-//! `/version` stay open.
+//! Public client (PKCE, no client secret). Every page needs a browser session,
+//! and the data routes take that session or the one read-only operator token.
+//! Machine routes (`POST /register`, `POST /report`) use the PHAROS-8 beacon token
+//! flow instead of browser login, while `/healthz` and `/version` stay open.
 //!
 //! Sessions and in-flight logins are in-memory (single-instance pharosd). A
 //! restart drops them — the dashboard reloads from disk, the user just logs in
 //! again.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::io::Read;
 use std::path::PathBuf;
@@ -40,10 +40,6 @@ use openidconnect::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::janus_projections::{
-    optional_capability_root_from_env, JanusCapability, MachineOperatorPrincipal,
-    MachineOperatorTokenStore, MACHINE_OPERATOR_HASH_DIR_ENV,
-};
 use pharos_core::PublicBasePath;
 
 const SESSION_COOKIE: &str = "__Host-pharos_session";
@@ -58,14 +54,17 @@ const MAX_LOGIN_STARTS_PER_WINDOW: u32 = 120;
 const MAX_SESSION_CREATES_PER_WINDOW: u32 = 120;
 const MAX_RETURN_TO_BYTES: usize = 2_048;
 const ALLOWED_OPERATORS_ENV: &str = "PHAROS_ALLOWED_OPERATORS";
-const ACCESS_POLICY_FILE_ENV: &str = "PHAROS_ACCESS_POLICY_FILE";
+const OPERATOR_TOKEN_HASH_FILE_ENV: &str = "PHAROS_OPERATOR_TOKEN_HASH_FILE";
+const MAX_OPERATOR_TOKEN_HASH_FILE_BYTES: u64 = 128;
+/// A session cookie outlives its session, so a browser coming back can be told
+/// that it ended instead of being asked to sign in as if for the first time.
+const ENDED_SESSION_COOKIE_SECS: i64 = 30 * 24 * 3600;
 const OIDC_CA_FILE_ENV: &str = "PHAROS_OIDC_CA_FILE";
 const MAX_OIDC_CA_FILE_BYTES: u64 = 256 * 1024;
 const MAX_OIDC_CA_CERTIFICATES: usize = 32;
 const ALLOW_OPEN_ENV: &str = "PHAROS_ALLOW_OPEN";
 const OPERATOR_REF_DOMAIN: &str = "pharos:oidc-principal:operator-ref:v2:";
 const VERIFIED_EMAIL_REF_DOMAIN: &str = "pharos:oidc-principal:verified-email-ref:v1:";
-const MANAGED_HUMAN_SESSION_REF_DOMAIN: &str = "inspr.managed-service-human-session.v1";
 
 type OidcClient = CoreClient<
     EndpointSet,
@@ -187,80 +186,7 @@ impl RateWindow {
 
 #[derive(Clone, Debug)]
 pub struct AuthUser {
-    pub operator_ref: String,
-    pub managed_human_session_ref: String,
     pub display_name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AccessGrant {
-    all_hosts: bool,
-    hosts: BTreeSet<String>,
-    agora: bool,
-}
-
-impl AccessGrant {
-    pub fn full() -> Self {
-        Self {
-            all_hosts: true,
-            hosts: BTreeSet::new(),
-            agora: true,
-        }
-    }
-
-    pub fn empty() -> Self {
-        Self {
-            all_hosts: false,
-            hosts: BTreeSet::new(),
-            agora: false,
-        }
-    }
-
-    pub(crate) fn fleet_read() -> Self {
-        Self {
-            all_hosts: true,
-            hosts: BTreeSet::new(),
-            agora: false,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn limited<I, S>(hosts: I, agora: bool) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            all_hosts: false,
-            hosts: hosts.into_iter().map(Into::into).collect(),
-            agora,
-        }
-    }
-
-    pub fn allows_host(&self, host: &str) -> bool {
-        self.all_hosts || self.hosts.contains(host)
-    }
-
-    pub fn can_agora(&self) -> bool {
-        self.agora
-    }
-
-    pub fn can_manage_fleet(&self) -> bool {
-        self.agora && self.all_hosts
-    }
-
-    pub fn is_empty(&self) -> bool {
-        !self.all_hosts && self.hosts.is_empty() && !self.agora
-    }
-
-    pub(crate) fn revision_material(&self) -> String {
-        if self.all_hosts {
-            format!("all:agora={}", self.agora)
-        } else {
-            let hosts: Vec<&str> = self.hosts.iter().map(String::as_str).collect();
-            format!("hosts={}:agora={}", hosts.join(","), self.agora)
-        }
-    }
 }
 
 struct LoginIdentity {
@@ -273,7 +199,6 @@ struct Session {
     #[allow(dead_code)]
     subject: String,
     display_name: String,
-    identifiers: Vec<String>,
     expires: i64,
 }
 
@@ -284,29 +209,25 @@ pub struct Auth {
     http_client: reqwest::Client,
     client: Mutex<OidcClient>,
     operator_policy: OperatorPolicy,
-    access_policy_file: Option<PathBuf>,
     pending: Mutex<HashMap<String, Pending>>,
     sessions: Mutex<HashMap<String, Session>>,
     login_rate: Mutex<RateWindow>,
     session_rate: Mutex<RateWindow>,
 }
 
-/// Human OIDC plus the independent scoped machine-operator verifier.
+/// Human OIDC login state.
 #[derive(Clone, Default)]
 pub struct AuthState {
     human: Option<Arc<Auth>>,
-    machine: Option<MachineOperatorTokenStore>,
     pub(crate) public_base_path: pharos_core::PublicBasePath,
-    #[cfg(test)]
-    fixed_access: Option<AccessGrant>,
-    #[cfg(test)]
-    fixed_user: Option<AuthUser>,
+    /// SHA-256 of the one operator token. It reads data and nothing else.
+    operator_token_hash: Option<[u8; 32]>,
 }
 
 /// Fully validated human-authentication startup configuration.
 pub(crate) struct AuthConfig {
     mode: AuthConfigMode,
-    machine_root: Option<PathBuf>,
+    operator_token_hash: Option<[u8; 32]>,
 }
 
 enum AuthConfigMode {
@@ -319,7 +240,6 @@ struct OidcAuthConfig {
     client_id: ClientId,
     redirect: RedirectUrl,
     operator_policy: OperatorPolicy,
-    access_policy_file: Option<PathBuf>,
     oidc_ca_file: Option<PathBuf>,
 }
 
@@ -342,8 +262,11 @@ impl AuthConfig {
             redirect,
             allow_open,
             operator_policy,
-            access_policy_file_from_env(),
         )?;
+        config.operator_token_hash = env_nonempty(OPERATOR_TOKEN_HASH_FILE_ENV)
+            .map(|path| load_operator_token_hash(std::path::Path::new(&path)))
+            .transpose()
+            .map_err(|error| format!("{OPERATOR_TOKEN_HASH_FILE_ENV}: {error}"))?;
         match (&config.mode, oidc_ca_file.as_ref()) {
             (AuthConfigMode::Oidc(oidc), _) => {
                 crate::public_mount::validate_oidc_redirect_uri(
@@ -360,10 +283,6 @@ impl AuthConfig {
         if let AuthConfigMode::Oidc(oidc) = &mut config.mode {
             oidc.oidc_ca_file = oidc_ca_file;
         }
-        config.machine_root = optional_capability_root_from_env(
-            JanusCapability::PharosMachineOperator,
-            MACHINE_OPERATOR_HASH_DIR_ENV,
-        )?;
         Ok(config)
     }
 
@@ -374,7 +293,6 @@ impl AuthConfig {
         redirect: Option<String>,
         allow_open: bool,
         operator_policy: OperatorPolicy,
-        access_policy_file: Option<PathBuf>,
     ) -> Result<Self, String> {
         let configured = [issuer.is_some(), client_id.is_some(), redirect.is_some()];
 
@@ -400,7 +318,7 @@ impl AuthConfig {
             }
             return Ok(Self {
                 mode: AuthConfigMode::Open,
-                machine_root: None,
+                operator_token_hash: None,
             });
         };
 
@@ -415,9 +333,9 @@ impl AuthConfig {
         let client_id = ClientId::new(client_id);
         let redirect = RedirectUrl::new(redirect)
             .map_err(|err| format!("PHAROS_OIDC_REDIRECT_URI is invalid: {err}"))?;
-        if !listener_is_loopback && !operator_policy.is_enforced() && access_policy_file.is_none() {
+        if !listener_is_loopback && !operator_policy.is_enforced() {
             return Err(format!(
-                "OIDC on a non-loopback listener requires {ALLOWED_OPERATORS_ENV} or {ACCESS_POLICY_FILE_ENV}"
+                "OIDC on a non-loopback listener requires {ALLOWED_OPERATORS_ENV}"
             ));
         }
 
@@ -427,12 +345,42 @@ impl AuthConfig {
                 client_id,
                 redirect,
                 operator_policy,
-                access_policy_file,
                 oidc_ca_file: None,
             })),
-            machine_root: None,
+            operator_token_hash: None,
         })
     }
+}
+
+/// The file holds the token's SHA-256 as 64 lowercase hex digits and nothing else.
+/// Pharos never sees the token until someone presents it.
+fn load_operator_token_hash(path: &std::path::Path) -> Result<[u8; 32], String> {
+    let bytes = crate::probe_support::read_trusted_runtime_file(
+        path,
+        MAX_OPERATOR_TOKEN_HASH_FILE_BYTES,
+        0o022,
+        false,
+    )
+    .ok_or_else(|| {
+        "must be a regular file owned by root or this user, not writable by group or others"
+            .to_string()
+    })?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "is not text".to_string())?;
+    let hex = text.strip_suffix('\n').unwrap_or(text);
+    let digest_error = || "must hold one SHA-256 as 64 lowercase hex digits".to_string();
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(digest_error());
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte =
+            u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| digest_error())?;
+    }
+    Ok(digest)
 }
 
 fn load_oidc_ca_certificates(path: &std::path::Path) -> Result<Vec<reqwest::Certificate>, String> {
@@ -587,23 +535,16 @@ impl Auth {
         config: AuthConfig,
         public_base_path: pharos_core::PublicBasePath,
     ) -> Result<AuthState, String> {
-        let machine = config
-            .machine_root
-            .map(MachineOperatorTokenStore::load)
-            .transpose()
-            .map_err(|error| {
-                format!("machine-operator projection failed startup validation: {error}")
-            })?;
+        let operator_token_hash = config.operator_token_hash;
+        if operator_token_hash.is_some() {
+            tracing::info!("read-only operator token enabled");
+        }
         let AuthConfigMode::Oidc(config) = config.mode else {
             tracing::warn!("human routes are open on an explicitly allowed loopback listener");
             return Ok(AuthState {
                 human: None,
-                machine,
                 public_base_path,
-                #[cfg(test)]
-                fixed_user: None,
-                #[cfg(test)]
-                fixed_access: None,
+                operator_token_hash,
             });
         };
         let OidcAuthConfig {
@@ -611,7 +552,6 @@ impl Auth {
             client_id,
             redirect,
             operator_policy,
-            access_policy_file,
             oidc_ca_file,
         } = *config;
         let http_client = build_oidc_http_client(oidc_ca_file.as_deref())?;
@@ -627,10 +567,7 @@ impl Auth {
         if operator_policy.is_enforced() {
             tracing::info!("Pharos operator authorization enabled");
         }
-        if let Some(path) = &access_policy_file {
-            tracing::info!(path = %path.display(), "Pharos access policy file enabled");
-        }
-        if !operator_policy.is_enforced() && access_policy_file.is_none() {
+        if !operator_policy.is_enforced() {
             tracing::warn!(
                 "OIDC authorization policy is absent on a loopback listener; all authenticated users are allowed"
             );
@@ -643,18 +580,13 @@ impl Auth {
                 http_client,
                 client: Mutex::new(client),
                 operator_policy,
-                access_policy_file,
                 pending: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 login_rate: Mutex::new(RateWindow::default()),
                 session_rate: Mutex::new(RateWindow::default()),
             })),
-            machine,
             public_base_path,
-            #[cfg(test)]
-            fixed_user: None,
-            #[cfg(test)]
-            fixed_access: None,
+            operator_token_hash,
         })
     }
 
@@ -745,173 +677,40 @@ impl Auth {
             .expect("sessions lock")
             .get(&sid)
             .filter(|s| s.expires > now())
-            .map(|session| AuthUser::from_session(session, self.issuer.as_str()))
+            .map(|session| AuthUser {
+                display_name: session.display_name.clone(),
+            })
     }
-
-    pub fn current_access(&self, headers: &HeaderMap) -> AccessGrant {
-        let Some(sid) = cookie(headers, SESSION_COOKIE) else {
-            return AccessGrant::empty();
-        };
-        let identifiers = self
-            .sessions
-            .lock()
-            .expect("sessions lock")
-            .get(&sid)
-            .filter(|s| s.expires > now())
-            .map(|s| s.identifiers.clone());
-        identifiers
-            .as_deref()
-            .map(|identifiers| self.access_for_identifiers(identifiers))
-            .unwrap_or_else(AccessGrant::empty)
-    }
-
-    fn access_for_identifiers(&self, identifiers: &[String]) -> AccessGrant {
-        if !self.operator_policy.is_enforced() && self.access_policy_file.is_none() {
-            return AccessGrant::full();
-        }
-        if self.operator_policy.matches_identifiers(identifiers) {
-            return AccessGrant::full();
-        }
-        let Some(path) = &self.access_policy_file else {
-            return AccessGrant::empty();
-        };
-        match std::fs::read_to_string(path)
-            .map_err(|err| err.to_string())
-            .and_then(|raw| {
-                AccessPolicyDocument::from_json(&raw).map(|policy| policy.grant_for(identifiers))
-            }) {
-            Ok(grant) => grant,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "could not read Pharos access policy; denying non-operator access");
-                AccessGrant::empty()
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum MachineAuthentication {
-    Absent,
-    Authenticated(MachineOperatorPrincipal),
-    Denied,
-    Unavailable,
 }
 
 impl AuthState {
     #[cfg(test)]
-    pub(crate) fn for_test_access(access: AccessGrant) -> Self {
+    pub(crate) fn for_test_operator_token(token: &str) -> Self {
         Self {
-            fixed_access: Some(access),
+            operator_token_hash: Some(secret_hash(token)),
             ..Self::default()
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test_human(access: AccessGrant, user: AuthUser) -> Self {
-        Self {
-            fixed_access: Some(access),
-            fixed_user: Some(user),
-            ..Self::default()
-        }
+    fn operator_token_matches(&self, headers: &HeaderMap) -> bool {
+        let Some(expected) = &self.operator_token_hash else {
+            return false;
+        };
+        crate::bearer_token(headers)
+            .is_some_and(|token| constant_time_equal(&secret_hash(token), expected))
     }
 
     fn human(&self) -> Option<&Arc<Auth>> {
         self.human.as_ref()
     }
 
-    pub(crate) fn human_configured(&self) -> bool {
-        self.human.is_some()
-    }
-
-    pub(crate) fn operator_configured(&self) -> bool {
-        self.human.is_some() || self.machine.is_some()
-    }
-
-    pub(crate) fn is_some(&self) -> bool {
-        self.human_configured()
-    }
-
-    pub(crate) fn machine_readiness(&self) -> Option<bool> {
-        self.machine.as_ref().map(MachineOperatorTokenStore::ready)
-    }
-
-    fn machine_authentication(&self, headers: &HeaderMap) -> MachineAuthentication {
-        let Some(value) = headers.get(header::AUTHORIZATION) else {
-            return MachineAuthentication::Absent;
-        };
-        let Some(token) = value
-            .to_str()
-            .ok()
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return MachineAuthentication::Denied;
-        };
-        let Some(store) = self.machine.as_ref() else {
-            return MachineAuthentication::Denied;
-        };
-        match store.authenticate(token) {
-            Ok(Some(principal)) => MachineAuthentication::Authenticated(principal),
-            Ok(None) => MachineAuthentication::Denied,
-            Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    capability = JanusCapability::PharosMachineOperator.as_str(),
-                    "machine-operator verifier unavailable"
-                );
-                MachineAuthentication::Unavailable
-            }
-        }
-    }
-
-    pub(crate) fn current_user(&self, headers: &HeaderMap) -> Option<AuthUser> {
-        match self.machine_authentication(headers) {
-            MachineAuthentication::Authenticated(principal) => Some(AuthUser {
-                operator_ref: principal.operator_ref,
-                managed_human_session_ref: String::new(),
-                display_name: principal.label,
-            }),
-            MachineAuthentication::Denied | MachineAuthentication::Unavailable => None,
-            MachineAuthentication::Absent => self
-                .human
-                .as_ref()
-                .and_then(|auth| auth.current_user(headers)),
-        }
-    }
-
     pub(crate) fn human_user(&self, headers: &HeaderMap) -> Option<AuthUser> {
         if headers.contains_key(header::AUTHORIZATION) {
             return None;
         }
-        #[cfg(test)]
-        if let Some(user) = &self.fixed_user {
-            return Some(user.clone());
-        }
         self.human
             .as_ref()
             .and_then(|auth| auth.current_user(headers))
-    }
-
-    fn current_access(&self, headers: &HeaderMap) -> AccessGrant {
-        #[cfg(test)]
-        if let Some(access) = &self.fixed_access {
-            return access.clone();
-        }
-        match self.machine_authentication(headers) {
-            MachineAuthentication::Authenticated(principal) if principal.can_write => {
-                AccessGrant::full()
-            }
-            MachineAuthentication::Authenticated(_) => AccessGrant::fleet_read(),
-            MachineAuthentication::Denied | MachineAuthentication::Unavailable => {
-                AccessGrant::empty()
-            }
-            MachineAuthentication::Absent => match &self.human {
-                Some(auth) => auth.current_access(headers),
-                None if self.machine.is_some() => AccessGrant::empty(),
-                None => AccessGrant::full(),
-            },
-        }
     }
 }
 
@@ -950,26 +749,6 @@ where
     }
     entries.insert(key, value);
     Ok(())
-}
-
-impl AuthUser {
-    fn from_session(session: &Session, issuer: &str) -> Self {
-        Self {
-            operator_ref: operator_ref_from_principal(issuer, &session.subject),
-            managed_human_session_ref: managed_human_session_ref(issuer, &session.subject),
-            display_name: session.display_name.clone(),
-        }
-    }
-}
-
-fn managed_human_session_ref(issuer: &str, subject: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(MANAGED_HUMAN_SESSION_REF_DOMAIN.as_bytes());
-    hasher.update([0]);
-    hasher.update(issuer.trim_end_matches('/').as_bytes());
-    hasher.update([0]);
-    hasher.update(subject.as_bytes());
-    format!("hsn_{:x}", hasher.finalize())
 }
 
 fn operator_ref_from_principal(issuer: &str, subject: &str) -> String {
@@ -1018,90 +797,14 @@ impl OperatorPolicy {
         !self.allowed.is_empty()
     }
 
-    fn matches_identifiers(&self, identifiers: &[String]) -> bool {
-        self.is_enforced()
-            && identifiers
+    /// Startup refuses a non-loopback listener without a list, so only a loopback
+    /// development instance ever lets everyone through here.
+    fn allows(&self, identifiers: &[String]) -> bool {
+        !self.is_enforced()
+            || identifiers
                 .iter()
                 .any(|identifier| self.allowed.contains(identifier))
     }
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AccessPolicyDocument {
-    #[serde(default)]
-    grants: Vec<AccessPolicyEntry>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AccessPolicyEntry {
-    #[serde(default, alias = "users")]
-    identifiers: Vec<String>,
-    #[serde(default)]
-    hosts: Vec<String>,
-    #[serde(default)]
-    agora: bool,
-}
-
-impl AccessPolicyDocument {
-    fn from_json(raw: &str) -> Result<Self, String> {
-        let mut document: Self = serde_json::from_str(raw).map_err(|err| err.to_string())?;
-        if document.grants.len() > 4_096 {
-            return Err("access policy has too many grants".to_string());
-        }
-        for grant in &mut document.grants {
-            if grant.identifiers.len() > 128 || grant.hosts.len() > 4_096 {
-                return Err("access policy grant exceeds bounds".to_string());
-            }
-            grant.identifiers = grant
-                .identifiers
-                .iter()
-                .map(|identifier| normalize_policy_identifier(identifier))
-                .collect::<Result<Vec<_>, _>>()?;
-        }
-        Ok(document)
-    }
-
-    fn grant_for(&self, identifiers: &[String]) -> AccessGrant {
-        let mut grant = AccessGrant::empty();
-        for entry in &self.grants {
-            if entry.identifiers.is_empty()
-                || !identifiers
-                    .iter()
-                    .any(|identifier| entry.identifiers.contains(identifier))
-            {
-                continue;
-            }
-            if entry.agora {
-                grant.agora = true;
-            }
-            for host in &entry.hosts {
-                let host = host.trim();
-                if host.is_empty() {
-                    continue;
-                }
-                if host == "*" || host.eq_ignore_ascii_case("all") {
-                    grant.all_hosts = true;
-                } else {
-                    grant.hosts.insert(host.to_string());
-                }
-            }
-        }
-        grant
-    }
-}
-
-fn access_policy_file_from_env() -> Option<PathBuf> {
-    std::env::var(ACCESS_POLICY_FILE_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-pub fn access_for_headers(auth: &AuthState, headers: &HeaderMap) -> AccessGrant {
-    auth.current_access(headers)
 }
 
 impl LoginIdentity {
@@ -1330,6 +1033,15 @@ fn validated_return_to(public_base_path: &PublicBasePath, candidate: Option<&str
         return home;
     }
     let path = uri.path();
+    // A browser resolves %2e as a dot, so a path that looks canonical can climb
+    // out of the mount once it is redirected to.
+    let lower = path.to_ascii_lowercase();
+    if ["%2e", "%2f", "%5c"]
+        .iter()
+        .any(|code| lower.contains(code))
+    {
+        return home;
+    }
     let local = public_base_path
         .strip(path)
         .unwrap_or_else(|| path.to_string());
@@ -1350,6 +1062,21 @@ fn validated_return_to(public_base_path: &PublicBasePath, candidate: Option<&str
         }
         Some(query) => format!("{joined}?{query}"),
         None => joined,
+    }
+}
+
+fn sign_in_location(public_base_path: &PublicBasePath, return_to: &str, ended: bool) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    if return_to != public_base_path.home() {
+        query.append_pair("return_to", return_to);
+    }
+    if ended {
+        query.append_pair("ended", "1");
+    }
+    let page = public_base_path.href("/auth/sign-in");
+    match query.finish() {
+        query if query.is_empty() => page,
+        query => format!("{page}?{query}"),
     }
 }
 
@@ -1474,15 +1201,16 @@ fn login_recovery_response(
 ) -> Response {
     let return_to = validated_return_to(public_base_path, Some(return_to));
     let login = login_location(public_base_path, &return_to);
-    let favicon = public_base_path.href("/favicon.svg");
-    let html = crate::public_mount::localize_document(
+    let html = auth_page(
         public_base_path,
-        &format!(
-            r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign-in recovery · Pharos</title><link rel="icon" type="image/svg+xml" href="{favicon}"><style>:root{{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--accent:#17658f;--sun:#d69b31}}*{{box-sizing:border-box}}body{{min-height:100vh;margin:0;display:grid;place-items:center;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%)}}main{{width:min(440px,calc(100% - 40px));padding:30px;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 18px 42px rgba(45,75,95,.10);text-align:center}}.mark{{display:grid;place-items:center;width:44px;height:44px;margin:0 auto 16px;border:1px solid #f0d49f;border-radius:50%;background:#fff9ef;color:#b87808;font-size:22px}}h1{{margin:0 0 8px;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:500;color:#12304b}}p{{margin:0 0 22px;color:var(--muted)}}a{{display:inline-flex;align-items:center;justify-content:center;min-height:40px;padding:0 17px;border-radius:7px;background:var(--accent);color:white;text-decoration:none;font-weight:650}}a:focus-visible{{outline:3px solid rgba(23,101,143,.28);outline-offset:3px}}</style></head><body><main data-auth-recovery><span class="mark" aria-hidden="true">↻</span><h1>Start sign-in again</h1><p>{}</p><a href="{}">Try signing in again</a></main></body></html>"#,
-            recovery.message(),
-            login,
-            favicon = favicon,
-        ),
+        AuthPage {
+            title: "Sign-in recovery",
+            status: Some(recovery.message()),
+            lead: PHAROS_LEAD,
+            action_href: &login,
+            action: "Sign in again",
+            note: None,
+        },
     );
     let mut headers = HeaderMap::new();
     headers.append(
@@ -1491,7 +1219,93 @@ fn login_recovery_response(
             .parse()
             .expect("flow cookie clearing header"),
     );
-    (recovery.status(), headers, Html(html)).into_response()
+    (recovery.status(), headers, no_store_headers(), Html(html)).into_response()
+}
+
+const PHAROS_LEAD: &str = "Every host, its CVEs and what is due, on one page.";
+const OPERATOR_LIST_NOTE: &str = "For people on the fleet's operator list.";
+
+const fn no_store_headers() -> [(header::HeaderName, &'static str); 3] {
+    [
+        (
+            header::CACHE_CONTROL,
+            "no-store, no-cache, max-age=0, must-revalidate",
+        ),
+        (header::PRAGMA, "no-cache"),
+        (header::EXPIRES, "0"),
+    ]
+}
+
+struct AuthPage<'a> {
+    title: &'a str,
+    status: Option<&'a str>,
+    lead: &'a str,
+    action_href: &'a str,
+    action: &'a str,
+    note: Option<&'a str>,
+}
+
+/// The card around every step of signing in. It says nothing about a host.
+fn auth_page(public_base_path: &PublicBasePath, page: AuthPage<'_>) -> String {
+    use crate::icons::{icon, sprite};
+    use crate::ui::{document_head, html_escape};
+    let status = page
+        .status
+        .map(|text| {
+            format!(
+                r#"<div class="expired" role="status">{}<span>{}</span></div>"#,
+                icon("clock", ""),
+                html_escape(text)
+            )
+        })
+        .unwrap_or_default();
+    let note = page
+        .note
+        .map(|text| format!(r#"<p class="lfor">{}</p>"#, html_escape(text)))
+        .unwrap_or_default();
+    crate::public_mount::localize_document(
+        public_base_path,
+        &format!(
+            r#"{head}<body>{sprite}<div class="login"><span class="login-art" aria-hidden="true"><span class="art-horizon"></span></span><main class="login-main"><div class="lcard">{status}<div class="lbrand"><span class="side-mark">{mark}</span><h1 class="lword">Pharos</h1></div><p class="lead">{lead}</p><a class="btn btn-primary" href="{href}">{action}</a>{note}</div></main></div></body></html>"#,
+            head = document_head(public_base_path, page.title),
+            sprite = sprite(),
+            mark = icon("lighthouse", ""),
+            lead = html_escape(page.lead),
+            href = html_escape(page.action_href),
+            action = html_escape(page.action),
+        ),
+    )
+}
+
+#[derive(Default, serde::Deserialize)]
+pub struct SignInParams {
+    return_to: Option<String>,
+    ended: Option<String>,
+}
+
+/// `GET /auth/sign-in` — the page in front of the identity provider.
+pub async fn sign_in(
+    State(auth): State<AuthState>,
+    Query(params): Query<SignInParams>,
+) -> Response {
+    let public_base_path = &auth.public_base_path;
+    let return_to = validated_return_to(public_base_path, params.return_to.as_deref());
+    let login = login_location(public_base_path, &return_to);
+    let html = auth_page(
+        public_base_path,
+        AuthPage {
+            title: "Sign in",
+            status: params
+                .ended
+                .is_some()
+                .then_some("Your session has ended. Sign in again to see the fleet."),
+            lead: PHAROS_LEAD,
+            action_href: &login,
+            action: "Sign in",
+            note: Some(OPERATOR_LIST_NOTE),
+        },
+    );
+    (no_store_headers(), Html(html)).into_response()
 }
 
 fn rate_limited_response() -> Response {
@@ -1503,20 +1317,13 @@ fn rate_limited_response() -> Response {
         .into_response()
 }
 
-/// Middleware gating operator routes. Browser sessions and scoped machine
-/// bearer credentials share the route group; invalid or unavailable machine
-/// authentication never falls back to a cookie or open mode.
+/// Middleware gating the pages. A bearer credential is never accepted here and
+/// never falls back to a cookie or open mode.
 pub async fn guard(State(auth): State<AuthState>, req: Request, next: Next) -> Response {
-    match auth.machine_authentication(req.headers()) {
-        MachineAuthentication::Authenticated(_) => return next.run(req).await,
-        MachineAuthentication::Denied => return StatusCode::UNAUTHORIZED.into_response(),
-        MachineAuthentication::Unavailable => {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
-        MachineAuthentication::Absent => {}
+    if req.headers().contains_key(header::AUTHORIZATION) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
     match auth.human() {
-        None if auth.machine.is_some() => StatusCode::UNAUTHORIZED.into_response(),
         None => next.run(req).await,
         Some(human) if human.is_authed(req.headers()) => next.run(req).await,
         Some(_) => {
@@ -1528,8 +1335,30 @@ pub async fn guard(State(auth): State<AuthState>, req: Request, next: Next) -> R
             } else {
                 auth.public_base_path.home().to_string()
             };
-            Redirect::to(&login_location(&auth.public_base_path, &return_to)).into_response()
+            let ended = cookie(req.headers(), SESSION_COOKIE).is_some();
+            Redirect::to(&sign_in_location(&auth.public_base_path, &return_to, ended))
+                .into_response()
         }
+    }
+}
+
+/// Middleware gating the data routes, which only read. The operator token opens
+/// them, as does a browser session. Anything else gets a plain 401, never a page.
+pub async fn data_guard(State(auth): State<AuthState>, req: Request, next: Next) -> Response {
+    let allowed = if req.headers().contains_key(header::AUTHORIZATION) {
+        auth.operator_token_matches(req.headers())
+    } else {
+        auth.human()
+            .is_none_or(|human| human.is_authed(req.headers()))
+    };
+    if allowed {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response()
     }
 }
 
@@ -1807,6 +1636,13 @@ pub async fn callback(
         &mut identity,
     )
     .await;
+    if !auth.operator_policy.allows(&identity.identifiers) {
+        tracing::warn!(
+            category = "operator_not_allowed",
+            "sign-in refused: this account is not on the operator list"
+        );
+        return forbidden(&public_base_path);
+    }
     auth.sweep();
     if !auth
         .session_rate
@@ -1839,7 +1675,6 @@ pub async fn callback(
         Session {
             subject: identity.subject.as_str().to_string(),
             display_name: identity.display_name,
-            identifiers: identity.identifiers,
             expires: now() + SESSION_TTL_SECS,
         },
         MAX_SESSIONS,
@@ -1857,9 +1692,15 @@ pub async fn callback(
     let mut headers = HeaderMap::new();
     headers.append(
         header::SET_COOKIE,
-        set_cookie(SESSION_COOKIE, &sid, SESSION_TTL_SECS, true, "Lax")
-            .parse()
-            .expect("cookie header"),
+        set_cookie(
+            SESSION_COOKIE,
+            &sid,
+            SESSION_TTL_SECS + ENDED_SESSION_COOKIE_SECS,
+            true,
+            "Lax",
+        )
+        .parse()
+        .expect("cookie header"),
     );
     headers.append(
         header::SET_COOKIE,
@@ -1892,21 +1733,31 @@ pub async fn recover(State(auth): State<AuthState>, Query(params): Query<LoginPa
     )
 }
 
-#[cfg(test)]
-fn forbidden() -> Response {
+/// Signed in at the provider, but not someone this fleet lets in: no session.
+fn forbidden(public_base_path: &PublicBasePath) -> Response {
+    let html = auth_page(
+        public_base_path,
+        AuthPage {
+            title: "Access denied",
+            status: Some("This account is not on the fleet's operator list."),
+            lead: "Ask the fleet's operator to add it, then sign in again.",
+            action_href: &public_base_path.href("/auth/login"),
+            action: "Sign in again",
+            note: None,
+        },
+    );
+    let mut headers = HeaderMap::new();
+    headers.append(
+        header::SET_COOKIE,
+        set_cookie(FLOW_COOKIE, "", 0, true, "Lax")
+            .parse()
+            .expect("flow cookie clearing header"),
+    );
     (
         StatusCode::FORBIDDEN,
-        [
-            (
-                header::CACHE_CONTROL,
-                "no-store, no-cache, max-age=0, must-revalidate",
-            ),
-            (header::PRAGMA, "no-cache"),
-            (header::EXPIRES, "0"),
-        ],
-        Html(
-            r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Access denied · Pharos</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>:root{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--accent:#1f7fb5}*{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%)}main{width:min(420px,calc(100% - 40px));padding:30px;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 18px 42px rgba(45,75,95,.10);text-align:center}h1{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:500;color:#12304b}p{margin:0 0 20px;color:var(--muted)}a{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:0 16px;border-radius:7px;background:var(--accent);color:white;text-decoration:none;font-weight:650}</style></head><body><main><h1>Access denied</h1><p>Your login succeeded, but this Pharos instance has not granted you operator access.</p><a href="/">Return to Pharos</a></main></body></html>"#,
-        ),
+        headers,
+        no_store_headers(),
+        Html(html),
     )
         .into_response()
 }
@@ -1958,25 +1809,19 @@ pub async fn logout(
 
 /// `GET /auth/logged-out` — neutral landing page after local Pharos logout.
 pub async fn logged_out(State(auth): State<AuthState>) -> impl IntoResponse {
-    (
-        [
-            (
-                header::CACHE_CONTROL,
-                "no-store, no-cache, max-age=0, must-revalidate",
-            ),
-            (header::PRAGMA, "no-cache"),
-            (header::EXPIRES, "0"),
-        ],
-        Html(crate::public_mount::localize_document(
-            &auth.public_base_path,
-            &format!(
-                r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Logged out · Pharos</title><link rel="icon" type="image/svg+xml" href="{favicon}"><style>:root{{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--accent:#1f7fb5;--sun:#d69b31}}*{{box-sizing:border-box}}body{{min-height:100vh;margin:0;display:grid;place-items:center;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%)}}main{{width:min(420px,calc(100% - 40px));padding:30px;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 18px 42px rgba(45,75,95,.10);text-align:center}}h1{{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:500;color:#12304b}}p{{margin:0 0 20px;color:var(--muted)}}a{{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:0 16px;border-radius:7px;background:var(--accent);color:white;text-decoration:none;font-weight:650}}</style></head><body><main><h1>Logged out</h1><p>Your Pharos session has ended.</p><a href="{login}">Sign in</a></main></body></html>"#,
-                favicon = auth.public_base_path.href("/favicon.svg"),
-                login = auth.public_base_path.href("/auth/login"),
-            ),
-        )),
-    )
-        .into_response()
+    let public_base_path = &auth.public_base_path;
+    let html = auth_page(
+        public_base_path,
+        AuthPage {
+            title: "Signed out",
+            status: Some("You have signed out of Pharos."),
+            lead: PHAROS_LEAD,
+            action_href: &public_base_path.href("/auth/login"),
+            action: "Sign in",
+            note: Some(OPERATOR_LIST_NOTE),
+        },
+    );
+    (no_store_headers(), Html(html)).into_response()
 }
 
 #[cfg(test)]
@@ -2177,7 +2022,6 @@ mod tests {
             Some("https://pharos.example.test/auth/callback".to_string()),
             false,
             OperatorPolicy::from_raw(None).unwrap(),
-            None,
         )
         .unwrap();
         let AuthConfigMode::Oidc(oidc) = &mut config.mode else {
@@ -2264,6 +2108,402 @@ mod tests {
         )
     }
 
+    /// What only a signed-in person may read: (route, a path that matches it).
+    const HUMAN_ROUTES: [(&str, &str); 5] = [
+        ("/", "/"),
+        ("/updates", "/updates"),
+        ("/handled", "/handled"),
+        ("/cves/{id}", "/cves/CVE-2000-0001"),
+        ("/hosts/{name}", "/hosts/route-walk-host"),
+    ];
+    /// The same for what a session or the operator token may read.
+    const DATA_ROUTES: [(&str, &str); 2] = [
+        ("/hosts.json", "/hosts.json"),
+        ("/fleet.json", "/fleet.json"),
+    ];
+    /// Open by design: (route, method, a path that matches it). None of them may
+    /// say anything about a host.
+    const OPEN_ROUTES: [(&str, Method, &str); 18] = [
+        ("/auth/sign-in", Method::GET, "/auth/sign-in"),
+        ("/healthz", Method::GET, "/healthz"),
+        ("/readyz", Method::GET, "/readyz"),
+        ("/version", Method::GET, "/version"),
+        ("/register", Method::POST, "/register"),
+        ("/report", Method::POST, "/report"),
+        ("/favicon.svg", Method::GET, "/favicon.svg"),
+        ("/assets/ui/{name}", Method::GET, "/assets/ui/app.css"),
+        (
+            "/assets/calendar-version-bootstrap.mjs",
+            Method::GET,
+            "/assets/calendar-version-bootstrap.mjs",
+        ),
+        (
+            "/assets/vendor/calendar-version-display/{name}",
+            Method::GET,
+            "/assets/vendor/calendar-version-display/version.js",
+        ),
+        ("/auth/login", Method::GET, "/auth/login"),
+        ("/auth/callback", Method::GET, "/auth/callback"),
+        ("/auth/recover", Method::GET, "/auth/recover"),
+        ("/auth/logout", Method::POST, "/auth/logout"),
+        ("/auth/logged-out", Method::GET, "/auth/logged-out"),
+        ("/assets/ui/{name}", Method::GET, "/assets/ui/app.js"),
+        (
+            "/assets/ui/{name}",
+            Method::GET,
+            "/assets/ui/fleet-horizon.webp",
+        ),
+        (
+            "/assets/ui/{name}",
+            Method::GET,
+            "/assets/ui/sidebar-lighthouse.webp",
+        ),
+    ];
+
+    /// Every route written in routes.rs, read from the source so a new one cannot
+    /// be left out of this walk.
+    fn declared_routes() -> std::collections::BTreeSet<String> {
+        include_str!("routes.rs")
+            .split(".route(")
+            .skip(1)
+            .filter_map(|tail| tail.trim_start().strip_prefix('"'))
+            .filter_map(|tail| tail.split('"').next())
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    async fn signed_in_cookie(auth: &AuthState, provider: &MockOidcProvider) -> String {
+        let login_response = login(State(auth.clone()), login_params(None)).await;
+        let parameters = authorization_parameters(&login_response, provider);
+        let state = parameters.get("state").cloned().unwrap();
+        let flow_cookie = response_cookie(&login_response, FLOW_COOKIE).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, flow_cookie.parse().unwrap());
+        let callback_response = callback(
+            State(auth.clone()),
+            headers,
+            callback_params(Some("single-use-code"), Some(state), None),
+        )
+        .await;
+        response_cookie(&callback_response, SESSION_COOKIE).unwrap()
+    }
+
+    #[tokio::test]
+    async fn without_a_login_no_route_says_anything_about_a_host() {
+        let (provider, server) = start_mock_oidc().await;
+        let auth = auth_for_provider(&provider).await;
+
+        let directory =
+            std::env::temp_dir().join(format!("pharos-route-walk-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let store_path = directory.join("hosts.json");
+        std::fs::write(
+            &store_path,
+            serde_json::json!([{
+                "name": "route-walk-host",
+                "role": "Server",
+                "is_nix": true,
+                "last_seen": crate::now_unix(),
+                "heartbeat_interval_secs": 3600,
+                "freshness": {
+                    "applicable": true,
+                    "flake_lock_age_days": 1,
+                    "commits_behind": 0,
+                },
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let data_path = directory.join("fleet.json");
+        std::fs::write(&data_path, crate::fleet_data::CONTRACT).unwrap();
+        let fleet_data = crate::fleet_data::FleetDataRuntime::for_test(data_path);
+        fleet_data.refresh();
+
+        let state = crate::AppState {
+            started_at: crate::now_unix(),
+            store: Arc::new(crate::store::Store::new(Some(store_path)).unwrap()),
+            auth: auth.clone(),
+            beacon_auth: crate::BeaconAuth {
+                registration_token: None,
+            },
+            host_probes: None,
+            fleet_data: Some(fleet_data),
+            public_base_path: PublicBasePath::root(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::routes::build_router(state);
+        let app_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let says_something = |body: &str| {
+            ["route-walk-host", "demeter", "hermes", "CVE-2000-"]
+                .iter()
+                .any(|needle| body.contains(needle))
+        };
+
+        // The walk covers exactly what the router declares.
+        let walked: std::collections::BTreeSet<String> = HUMAN_ROUTES
+            .iter()
+            .chain(DATA_ROUTES.iter())
+            .map(|(route, _)| route.to_string())
+            .chain(OPEN_ROUTES.iter().map(|(route, _, _)| route.to_string()))
+            .collect();
+        assert_eq!(walked, declared_routes());
+
+        for (route, path) in HUMAN_ROUTES {
+            let url = format!("{base}{path}");
+            let anonymous = client.get(&url).send().await.unwrap();
+            assert_eq!(anonymous.status(), StatusCode::SEE_OTHER, "{route}");
+            let location = anonymous.headers()[header::LOCATION.as_str()]
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(location.starts_with("/auth/sign-in"), "{route}: {location}");
+            assert!(!says_something(&anonymous.text().await.unwrap()), "{route}");
+
+            let with_token = client
+                .get(&url)
+                .bearer_auth("not-a-browser-session")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(with_token.status(), StatusCode::UNAUTHORIZED, "{route}");
+            assert!(
+                !says_something(&with_token.text().await.unwrap()),
+                "{route}"
+            );
+        }
+
+        for (route, path) in DATA_ROUTES {
+            let url = format!("{base}{path}");
+            let anonymous = client.get(&url).send().await.unwrap();
+            assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{route}");
+            assert_eq!(
+                anonymous.headers()[header::WWW_AUTHENTICATE.as_str()],
+                "Bearer",
+                "{route}"
+            );
+            assert!(!says_something(&anonymous.text().await.unwrap()), "{route}");
+
+            let wrong_token = client
+                .get(&url)
+                .bearer_auth("not-the-operator-token")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED, "{route}");
+            assert!(
+                !says_something(&wrong_token.text().await.unwrap()),
+                "{route}"
+            );
+        }
+
+        for (route, method, path) in &OPEN_ROUTES {
+            let response = client
+                .request(method.clone(), format!("{base}{path}"))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            assert_ne!(status, StatusCode::NOT_FOUND, "{route}: {path}");
+            assert!(!status.is_server_error(), "{route}: {path}: {status}");
+            let body = response.bytes().await.unwrap();
+            assert!(
+                !says_something(&String::from_utf8_lossy(&body)),
+                "{route}: {path}"
+            );
+        }
+
+        // The same routes do open for a person who signed in, so the walk above
+        // proves the login is what stood in the way.
+        let cookie = signed_in_cookie(&auth, &provider).await;
+        for (route, path) in HUMAN_ROUTES.iter().chain(DATA_ROUTES.iter()) {
+            let response = client
+                .get(format!("{base}{path}"))
+                .header(header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert!(says_something(&response.text().await.unwrap()), "{route}");
+        }
+
+        app_task.abort();
+        drop(server);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    async fn auth_with_policy(provider: &MockOidcProvider, allowed: &str) -> AuthState {
+        let mut config = AuthConfig::from_values(
+            false,
+            Some(provider.issuer.clone()),
+            Some("pharos-oidc-e2e".to_string()),
+            Some("https://pharos.example.test/auth/callback".to_string()),
+            false,
+            OperatorPolicy::from_raw(Some(allowed)).unwrap(),
+        )
+        .unwrap();
+        let AuthConfigMode::Oidc(oidc) = &mut config.mode else {
+            unreachable!("mock OIDC configuration is complete");
+        };
+        oidc.oidc_ca_file = Some(provider.ca_path.clone());
+        Auth::from_config(config, PublicBasePath::root())
+            .await
+            .unwrap()
+    }
+
+    async fn sign_in_through_provider(auth: &AuthState, provider: &MockOidcProvider) -> Response {
+        let login_response = login(State(auth.clone()), login_params(None)).await;
+        let parameters = authorization_parameters(&login_response, provider);
+        let state = parameters.get("state").cloned().unwrap();
+        let flow_cookie = response_cookie(&login_response, FLOW_COOKIE).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, flow_cookie.parse().unwrap());
+        callback(
+            State(auth.clone()),
+            headers,
+            callback_params(Some("single-use-code"), Some(state), None),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_login_allow_list_refuses_anyone_else_with_no_session() {
+        let (provider, server) = start_mock_oidc().await;
+
+        let listed = auth_with_policy(&provider, "email:oidc-e2e@example.invalid").await;
+        let welcome = sign_in_through_provider(&listed, &provider).await;
+        assert_eq!(welcome.status(), StatusCode::SEE_OTHER);
+        assert!(response_cookie(&welcome, SESSION_COOKIE).is_some());
+        // The cookie outlives the session, so a return visit can say it ended.
+        let max_age = welcome
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with(SESSION_COOKIE))
+            .and_then(|value| value.split("Max-Age=").nth(1))
+            .and_then(|tail| tail.split(';').next())
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap();
+        assert!(max_age > SESSION_TTL_SECS, "{max_age}");
+
+        let other = auth_with_policy(&provider, "email:someone-else@example.invalid").await;
+        let refused = sign_in_through_provider(&other, &provider).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert!(response_cookie(&refused, SESSION_COOKIE).is_none());
+        assert_eq!(
+            other.human().unwrap().sessions.lock().unwrap().len(),
+            0,
+            "no session may exist on the server either"
+        );
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page = String::from_utf8_lossy(&body);
+        assert!(page.contains("operator list"), "{page}");
+        assert!(!page.contains("oidc-e2e@example.invalid"), "{page}");
+
+        drop(server);
+    }
+
+    #[test]
+    fn the_operator_token_hash_must_be_a_safe_file_with_one_digest() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("pharos-token-hash-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let digest = "ab".repeat(32);
+        let write = |name: &str, content: &str, mode: u32| {
+            let path = directory.join(name);
+            std::fs::write(&path, content).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+
+        assert_eq!(
+            load_operator_token_hash(&write("good", &digest, 0o600)).unwrap(),
+            [0xab; 32]
+        );
+        assert_eq!(
+            load_operator_token_hash(&write("newline", &format!("{digest}\n"), 0o440)).unwrap(),
+            [0xab; 32]
+        );
+        for (name, content, mode) in [
+            ("short", "abcd".to_string(), 0o600),
+            ("upper", digest.to_uppercase(), 0o600),
+            ("two-lines", format!("{digest}\n\n"), 0o600),
+            ("not-hex", "zz".repeat(32), 0o600),
+            ("empty", String::new(), 0o600),
+            ("group-writable", digest.clone(), 0o620),
+            ("world-writable", digest.clone(), 0o602),
+        ] {
+            assert!(
+                load_operator_token_hash(&write(name, &content, mode)).is_err(),
+                "{name}"
+            );
+        }
+        assert!(load_operator_token_hash(&directory.join("missing")).is_err());
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(directory.join("good"), &link).unwrap();
+        assert!(load_operator_token_hash(&link).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sign_in_says_when_a_session_ended_and_keeps_where_you_were_going() {
+        let auth = AuthState::default();
+        let page = |params: SignInParams| {
+            let auth = auth.clone();
+            async move {
+                let response = sign_in(State(auth), Query(params)).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                String::from_utf8_lossy(&body).to_string()
+            }
+        };
+        let first = page(SignInParams::default()).await;
+        assert!(!first.contains("Your session has ended"), "{first}");
+        assert!(first.contains(r#"href="/auth/login""#), "{first}");
+
+        let ended = page(SignInParams {
+            return_to: Some("/updates".to_string()),
+            ended: Some("1".to_string()),
+        })
+        .await;
+        assert!(ended.contains("Your session has ended"), "{ended}");
+        assert!(ended.contains("return_to=%2Fupdates"), "{ended}");
+
+        let foreign = page(SignInParams {
+            return_to: Some("https://example.invalid/".to_string()),
+            ended: None,
+        })
+        .await;
+        assert!(!foreign.contains("example.invalid"), "{foreign}");
+    }
+
+    #[test]
+    fn a_page_redirect_names_the_sign_in_page_and_stays_on_the_mount() {
+        let root = PublicBasePath::root();
+        assert_eq!(sign_in_location(&root, "/", false), "/auth/sign-in");
+        assert_eq!(
+            sign_in_location(&root, "/updates", true),
+            "/auth/sign-in?return_to=%2Fupdates&ended=1"
+        );
+        let mount = PublicBasePath::parse("/pharos").unwrap();
+        assert_eq!(
+            sign_in_location(&mount, "/pharos", false),
+            "/pharos/auth/sign-in"
+        );
+    }
+
     #[tokio::test]
     async fn oidc_authorization_code_pkce_flow_creates_a_browser_bound_session() {
         let (provider, server) = start_mock_oidc().await;
@@ -2301,10 +2541,9 @@ mod tests {
         let mut session_headers = HeaderMap::new();
         session_headers.insert(header::COOKIE, session_cookie.parse().unwrap());
         let user = auth_state
-            .current_user(&session_headers)
+            .human_user(&session_headers)
             .expect("OIDC callback creates a session");
         assert_eq!(user.display_name, "oidc-e2e-user");
-        assert_eq!(user.operator_ref.len(), 64);
 
         let logout_csrf_cookie = response_cookie(&callback_response, LOGOUT_CSRF_COOKIE).unwrap();
         let logout_csrf = logout_csrf_cookie
@@ -2327,7 +2566,7 @@ mod tests {
         )
         .await;
         assert_eq!(rejected_logout.status(), StatusCode::FORBIDDEN);
-        assert!(auth_state.current_user(&session_headers).is_some());
+        assert!(auth_state.human_user(&session_headers).is_some());
 
         let logout_response = logout(
             State(auth_state.clone()),
@@ -2350,7 +2589,7 @@ mod tests {
                 .count(),
             2
         );
-        assert!(auth_state.current_user(&session_headers).is_none());
+        assert!(auth_state.human_user(&session_headers).is_none());
 
         server.shutdown().await;
     }
@@ -2471,6 +2710,27 @@ mod tests {
             validated_return_to(&mounted, Some("/pharos/auth/callback")),
             "/pharos"
         );
+        // Each of these reads as inside the mount, and a browser resolves it to outside.
+        for escape in [
+            "/pharos/%2e%2e/outside",
+            "/pharos/%2E%2E/outside",
+            "/pharos/.%2e/outside",
+            "/pharos/%2e./outside",
+            "/pharos%2f..%2foutside",
+            "/pharos/%2E%2E%2Foutside",
+            "/pharos/x%5c..%5coutside",
+        ] {
+            assert_eq!(
+                validated_return_to(&mounted, Some(escape)),
+                "/pharos",
+                "{escape}"
+            );
+        }
+        // One encoding deeper is a literal segment: a browser only decodes dots once.
+        assert_eq!(
+            validated_return_to(&mounted, Some("/pharos/%252e%252e/outside")),
+            "/pharos/%252e%252e/outside"
+        );
         assert_eq!(login_location(&mounted, "/pharos"), "/pharos/auth/login");
         assert_eq!(
             login_location(&mounted, "/pharos/services?flow_project=17"),
@@ -2529,8 +2789,8 @@ mod tests {
             .unwrap()
             .ends_with('='));
         let missing_html = response_html(missing_state).await;
-        assert!(missing_html.contains("data-auth-recovery"));
-        assert_eq!(missing_html.matches("<a href=").count(), 1);
+        assert!(missing_html.contains("Sign in again"));
+        assert_eq!(missing_html.matches("<a ").count(), 1);
         assert!(missing_html.contains(r#"href="/auth/login""#));
         assert!(!missing_html.contains("unknown or expired login"));
 
@@ -2552,7 +2812,7 @@ mod tests {
         )
         .await;
         assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
-        assert!(response_html(replay).await.contains("Start sign-in again"));
+        assert!(response_html(replay).await.contains("Sign in again"));
 
         server.shutdown().await;
     }
@@ -2639,7 +2899,19 @@ mod tests {
         assert_eq!(get_response.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             get_response.headers().get(header::LOCATION).unwrap(),
-            "/auth/login?return_to=%2Fservices%3Fview%3Dmanaged"
+            "/auth/sign-in?return_to=%2Fservices%3Fview%3Dmanaged"
+        );
+
+        // A cookie whose session is gone gets told, not just asked to sign in.
+        let ended_response = client
+            .get(format!("http://{address}/services"))
+            .header(header::COOKIE, format!("{SESSION_COOKIE}=gone"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            ended_response.headers().get(header::LOCATION).unwrap(),
+            "/auth/sign-in?return_to=%2Fservices&ended=1"
         );
 
         let post_response = client
@@ -2650,7 +2922,7 @@ mod tests {
         assert_eq!(post_response.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             post_response.headers().get(header::LOCATION).unwrap(),
-            "/auth/login"
+            "/auth/sign-in"
         );
 
         app_server.abort();
@@ -2700,7 +2972,7 @@ mod tests {
             let html = response_html(response).await;
             assert!(html.contains(expected_copy));
             assert!(html.contains(r#"href="/auth/login?return_to=%2Fsettings%2Fproviders""#));
-            assert_eq!(html.matches("<a href=").count(), 1);
+            assert_eq!(html.matches("<a ").count(), 1);
         }
 
         *provider.token_mode.lock().unwrap() = MockTokenMode::Success;
@@ -2840,7 +3112,7 @@ mod tests {
             .text()
             .await
             .unwrap()
-            .contains("<h1>Logged out</h1>"));
+            .contains("You have signed out of Pharos."));
 
         server.abort();
         let _ = server.await;
@@ -2848,14 +3120,12 @@ mod tests {
 
     #[tokio::test]
     async fn auth_pages_link_pharos_favicon() {
-        let denied = forbidden().into_response();
+        let denied = forbidden(&PublicBasePath::root()).into_response();
         let denied_body = axum::body::to_bytes(denied.into_body(), usize::MAX)
             .await
             .expect("denied body");
         let denied_html = std::str::from_utf8(&denied_body).expect("denied html");
-        assert!(
-            denied_html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#)
-        );
+        assert!(denied_html.contains(r#"href="/favicon.svg""#));
 
         let logged_out = logged_out(State(AuthState::default()))
             .await
@@ -2864,8 +3134,7 @@ mod tests {
             .await
             .expect("logged out body");
         let logged_out_html = std::str::from_utf8(&logged_out_body).expect("logged out html");
-        assert!(logged_out_html
-            .contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
+        assert!(logged_out_html.contains(r#"href="/favicon.svg""#));
     }
 
     fn claims(json: &str) -> CoreIdTokenClaims {
@@ -2881,7 +3150,7 @@ mod tests {
     fn display_name_prefers_zitadel_username_claim() {
         let claims = claims(
             r#"{
-                "iss": "https://auth.inspr.at",
+                "iss": "https://issuer.example.test",
                 "sub": "opaque-subject",
                 "aud": "pharos",
                 "exp": 4102444800,
@@ -2902,7 +3171,7 @@ mod tests {
     fn display_name_falls_back_without_username_claim() {
         let claims = claims(
             r#"{
-                "iss": "https://auth.inspr.at",
+                "iss": "https://issuer.example.test",
                 "sub": "opaque-subject",
                 "aud": "pharos",
                 "exp": 4102444800,
@@ -2954,24 +3223,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_user_derives_operator_ref_from_private_session_subject() {
-        let session = Session {
-            subject: "opaque-subject".to_string(),
-            display_name: "Markus".to_string(),
-            identifiers: vec!["markus".to_string()],
-            expires: i64::MAX,
-        };
-
-        let user = AuthUser::from_session(&session, "https://issuer.example.test");
-
-        assert_eq!(
-            user.operator_ref,
-            "6672d3b0e81375008a36d203936aeec654db7566abda3451e7a672be5d36170d"
-        );
-        assert_eq!(user.display_name, "Markus");
-    }
-
-    #[test]
     fn operator_policy_allows_when_not_configured() {
         assert!(!OperatorPolicy::from_raw(None).unwrap().is_enforced());
     }
@@ -2992,17 +3243,17 @@ mod tests {
         assert!(
             OperatorPolicy::from_raw(Some(&format!("operator-ref:{reference}")))
                 .unwrap()
-                .matches_identifiers(&identity.identifiers)
+                .allows(&identity.identifiers)
         );
         assert!(
             OperatorPolicy::from_raw(Some(&format!("verified-email-ref:{email_reference}")))
                 .unwrap()
-                .matches_identifiers(&identity.identifiers)
+                .allows(&identity.identifiers)
         );
         assert!(
             OperatorPolicy::from_raw(Some("email:markus@example.invalid"))
                 .unwrap()
-                .matches_identifiers(&identity.identifiers)
+                .allows(&identity.identifiers)
         );
     }
 
@@ -3013,75 +3264,6 @@ mod tests {
         assert!(OperatorPolicy::from_raw(Some("operator-ref:not-a-hash")).is_err());
         assert!(OperatorPolicy::from_raw(Some("verified-email-ref:not-a-hash")).is_err());
         assert!(OperatorPolicy::from_raw(Some("email:not-an-email")).is_err());
-    }
-
-    #[test]
-    fn managed_human_session_binding_matches_janus_and_normalizes_issuer_slash() {
-        let expected = "hsn_9faf4f59563351db0902dcb553e34717e3d37497b11422efcbd54d9b367c415a";
-        assert_eq!(
-            managed_human_session_ref("https://issuer.example.test", "subject-1"),
-            expected
-        );
-        assert_eq!(
-            managed_human_session_ref("https://issuer.example.test/", "subject-1"),
-            expected
-        );
-        assert_ne!(
-            managed_human_session_ref("https://issuer.example.test", "subject-2"),
-            expected
-        );
-    }
-
-    #[test]
-    fn access_policy_grants_hosts_and_agora_by_identifier() {
-        let policy = AccessPolicyDocument::from_json(
-            r#"{
-                "grants": [
-                    {
-                        "identifiers": ["email:dad@example.invalid"],
-                        "hosts": ["hsb8"],
-                        "agora": false
-                    },
-                    {
-                        "identifiers": ["operator-ref:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
-                        "hosts": ["*"],
-                        "agora": true
-                    }
-                ]
-            }"#,
-        )
-        .expect("policy parses");
-
-        let dad = policy.grant_for(&["email:dad@example.invalid".to_string()]);
-        assert!(dad.allows_host("hsb8"));
-        assert!(!dad.allows_host("csb1"));
-        assert!(!dad.can_agora());
-
-        let markus = policy.grant_for(&[format!("operator-ref:{}", "a".repeat(64))]);
-        assert!(markus.allows_host("csb1"));
-        assert!(markus.allows_host("hsb8"));
-        assert!(markus.can_agora());
-    }
-
-    #[test]
-    fn access_policy_is_deny_by_default_for_unknown_users() {
-        let policy = AccessPolicyDocument::from_json(
-            r#"{
-                "grants": [
-                    {
-                        "identifiers": ["email:markus@example.invalid"],
-                        "hosts": ["*"],
-                        "agora": true
-                    }
-                ]
-            }"#,
-        )
-        .expect("policy parses");
-
-        let unknown = policy.grant_for(&["email:new-user@example.invalid".to_string()]);
-        assert!(unknown.is_empty());
-        assert!(!unknown.allows_host("csb1"));
-        assert!(!unknown.can_agora());
     }
 
     #[test]
@@ -3552,14 +3734,14 @@ mod tests {
     #[test]
     fn open_auth_requires_explicit_loopback_opt_in() {
         let denied_without_opt_in =
-            AuthConfig::from_values(true, None, None, None, false, policy(None), None);
+            AuthConfig::from_values(true, None, None, None, false, policy(None));
         assert!(denied_without_opt_in.is_err());
 
         let denied_non_loopback =
-            AuthConfig::from_values(false, None, None, None, true, policy(None), None);
+            AuthConfig::from_values(false, None, None, None, true, policy(None));
         assert!(denied_non_loopback.is_err());
 
-        let allowed = AuthConfig::from_values(true, None, None, None, true, policy(None), None)
+        let allowed = AuthConfig::from_values(true, None, None, None, true, policy(None))
             .expect("explicit loopback-only open mode is valid");
         assert!(matches!(allowed.mode, AuthConfigMode::Open));
     }
@@ -3573,7 +3755,6 @@ mod tests {
             None,
             false,
             policy(None),
-            None,
         );
         assert!(result.is_err());
     }
@@ -3588,7 +3769,6 @@ mod tests {
             redirect.clone(),
             false,
             policy(None),
-            None,
         );
         assert!(denied.is_err());
 
@@ -3599,7 +3779,6 @@ mod tests {
             redirect,
             false,
             policy(Some("email:operator@example.invalid")),
-            None,
         )
         .expect("operator policy makes non-loopback OIDC fail closed");
         assert!(matches!(allowed.mode, AuthConfigMode::Oidc(_)));
@@ -3608,78 +3787,7 @@ mod tests {
     #[test]
     fn oidc_cannot_be_combined_with_open_mode() {
         let (issuer, client_id, redirect) = oidc_values();
-        let result =
-            AuthConfig::from_values(true, issuer, client_id, redirect, true, policy(None), None);
+        let result = AuthConfig::from_values(true, issuer, client_id, redirect, true, policy(None));
         assert!(result.is_err());
-    }
-
-    fn machine_auth_state(scopes: &[&str]) -> (AuthState, String, PathBuf) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "pharos-auth-machine-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let credential = format!("machine-fixture-{}-{sequence}", std::process::id());
-        let credential_hash = format!("{:x}", Sha256::digest(credential.as_bytes()));
-        crate::janus_projections::write_test_generation(
-            &root,
-            "operator:machine-fixture",
-            "machine fixture",
-            &credential_hash,
-            scopes,
-        );
-        let state = AuthState {
-            human: None,
-            machine: Some(MachineOperatorTokenStore::load(root.clone()).unwrap()),
-            public_base_path: PublicBasePath::root(),
-            fixed_access: None,
-            fixed_user: None,
-        };
-        (state, credential, root)
-    }
-
-    #[test]
-    fn machine_operator_scope_is_independent_and_fail_closed() {
-        let (read_state, credential, read_root) = machine_auth_state(&["fleet:read"]);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {credential}").parse().unwrap(),
-        );
-        let read_access = access_for_headers(&read_state, &headers);
-        assert!(read_access.allows_host("any-host"));
-        assert!(!read_access.can_manage_fleet());
-        assert_eq!(
-            read_state.current_user(&headers).unwrap().operator_ref,
-            "operator:machine-fixture"
-        );
-        assert!(access_for_headers(&read_state, &HeaderMap::new()).is_empty());
-
-        let (write_state, write_credential, write_root) =
-            machine_auth_state(&["fleet:read", "fleet:write"]);
-        headers.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {write_credential}").parse().unwrap(),
-        );
-        assert!(access_for_headers(&write_state, &headers).can_manage_fleet());
-
-        let unconfigured = AuthState::default();
-        assert!(access_for_headers(&unconfigured, &headers).is_empty());
-        assert!(matches!(
-            unconfigured.machine_authentication(&headers),
-            MachineAuthentication::Denied
-        ));
-
-        std::fs::remove_dir_all(read_root).unwrap();
-        std::fs::remove_dir_all(write_root).unwrap();
     }
 }

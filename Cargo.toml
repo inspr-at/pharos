@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/pharos-core", "crates/pharosd", "crates/pharos-beacon", "crates/pharos-cli"]
 
 [workspace.package]
-version = "261022144327.0.0"
+version = "261031155226.0.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["Markus Barta"]
@@ -25,7 +25,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # spin release. Remove this patch when rsa/openidconnect accepts num-bigint-dig
 # 0.9 or newer.
 lazy_static = { path = "vendor/lazy_static" }
-
-# Janus crates (token issuance/rotation) are wired in PHAROS-8, not the scaffold:
-# janus-warden = { git = "https://github.com/inspr-at/janus" }
-# janus-forge  = { git = "https://github.com/inspr-at/janus" }

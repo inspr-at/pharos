@@ -1,7 +1,7 @@
 /// Resolve a UI label from the verified, offline presentation bundle.
 /// This runs during the build; no unknown scheme can reach a running server.
 pub fn scheme_label<'a>(table: &'a serde_json::Value, scheme: &str) -> &'a str {
-    assert_eq!(table["schema"], "inspr.version-scheme-labels.v1");
+    assert_eq!(table["schema"], "inspr.version-scheme-labels.v2");
     let label = table["labels"][scheme]
         .as_str()
         .expect("release scheme must have a doctrine label in schemes.json");
@@ -28,8 +28,9 @@ mod tests {
     #[test]
     fn labels_come_from_the_pinned_doctrine_table() {
         let labels = table();
-        assert_eq!(scheme_label(&labels, "inspr-calendar-v2"), "INSPR-VER2");
-        assert_eq!(scheme_label(&labels, "inspr-calendar-v1"), "INSPR-VER1");
+        assert_eq!(scheme_label(&labels, "inspr-calver-3"), "INSPR-CalVer3");
+        assert_eq!(scheme_label(&labels, "inspr-calendar-v2"), "INSPR-CalVer2");
+        assert_eq!(scheme_label(&labels, "inspr-calendar-v1"), "INSPR-CalVer1");
         assert_eq!(scheme_label(&labels, "legacy"), "Legacy");
     }
 

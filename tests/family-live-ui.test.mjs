@@ -33,7 +33,7 @@ test("every family app is restricted to its Flow mount at both network layers an
     for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
       assert.equal(decideRequest({ method, url: FAMILY_ORIGIN + app.base + "/flow/intents" }, policy).reason, "app-mutation");
     }
-    assert.equal(decideRequest({ method: "GET", url: "https://pharos.barta.cm/pharos/" }, policy).allow, false);
+    assert.equal(decideRequest({ method: "GET", url: "https://pharos.example.test/pharos/" }, policy).allow, false);
     assert.equal(decideRequest({ method: "GET", url: FAMILY_ORIGIN + app.base + "/logout" }, policy).allow, false);
   }
   assert.equal(decideRequest({ method: "GET", url: FAMILY_ORIGIN + "/pharos/" }, { familyApp: "unknown" }).allow, false);
@@ -48,8 +48,8 @@ test("Janus privileged routes are denied and screenshots require its restricted 
 
 test("family keeps issuer login restrictions and secret redaction", () => {
   const policy = { familyApp: "paimos", secrets: ["synthetic-test-password"] };
-  assert.equal(decideRequest({ method: "POST", url: "https://auth.inspr.at/ui/login/password" }, policy).allow, true);
-  for (const target of ["https://auth.inspr.at/ui/login/password/reset", "https://auth.inspr.at/ui/login/mfa/verify", `${FAMILY_ORIGIN}/paimos/api/auth/dev-login`]) {
+  assert.equal(decideRequest({ method: "POST", url: "https://auth.example.test/ui/login/password" }, policy).allow, true);
+  for (const target of ["https://auth.example.test/ui/login/password/reset", "https://auth.example.test/ui/login/mfa/verify", `${FAMILY_ORIGIN}/paimos/api/auth/dev-login`]) {
     assert.equal(decideRequest({ method: "POST", url: target }, policy).allow, false);
   }
   assert.equal(decideRequest({ method: "GET", url: `${FAMILY_ORIGIN}/paimos/?password=synthetic-test-password` }, policy).allow, false);
@@ -71,6 +71,7 @@ test("named routes cannot introduce arbitrary origins or production route suffix
   assert.deepEqual(familyRoutes("paimos", "42"), [{ name: "landing", path: "/paimos/" }, { name: "sandbox", path: "/paimos/projects/42" }]);
   for (const bad of ["../1", "1/issues", "https://foreign.example", "x?project=1"]) assert.throws(() => familyRoutes("paimos", bad));
   assert.throws(() => familyRoutes("janus", "42"));
+  assert.deepEqual(familyRoutes("pharos").map((route) => route.path), ["/pharos/", "/pharos/updates", "/pharos/handled"]);
   assert.equal(familyRoutes("aithema", "project:inspr-uxqa")[1].path, "/aithema/projects/project%3Ainspr-uxqa");
   for (const suffix of ["", "/flow-state"]) {
     assert.equal(decideRequest({ method: "GET", url: `${FAMILY_ORIGIN}/aithema/projects/project%3Ainspr-uxqa${suffix}` }, { familyApp: "aithema" }).allow, true);
@@ -136,7 +137,7 @@ test("family evidence records the two real viewport contracts without auth or mu
 
 test("authentication evidence distinguishes observed submissions from callbacks or unconsumed MFA grants", () => {
   const policy = {};
-  const password = { origin: "https://auth.inspr.at", pathname: "/ui/login/password", method: "POST" };
+  const password = { origin: "https://auth.example.test", pathname: "/ui/login/password", method: "POST" };
   const totp = { ...password, pathname: "/ui/login/mfa/verify" };
   observeFamilyAuthentication(policy, { ...password, method: "GET" });
   observeFamilyAuthentication(policy, { ...password, origin: FAMILY_ORIGIN });

@@ -61,37 +61,37 @@ const FIXTURE_PASSWORD = "fixture-password-not-used";
 const FIXTURE_USER = "person@example.test";
 
 const MUTATIONS = [
-  ["POST", "https://pharos.barta.cm/pharos/host-actions/example/remove"],
-  ["POST", "https://pharos.barta.cm/pharos/host-actions/jobs/1/apply-declared"],
-  ["POST", "https://pharos.barta.cm/pharos/host-actions/jobs/1/confirm"],
-  ["POST", "https://pharos.barta.cm/pharos/host-actions/jobs/1/recover"],
-  ["POST", "https://pharos.barta.cm/pharos/host-actions/system-update"],
-  ["POST", "https://flow.inspr.at/pharos/host-actions/example/remove"],
-  ["POST", "https://pharos.barta.cm/pharos/setup/provisioning-jobs"],
-  ["POST", "https://pharos.barta.cm/pharos/setup/provisioning-jobs/1/create"],
-  ["POST", "https://pharos.barta.cm/pharos/setup/provisioning-jobs/1/confirm"],
-  ["POST", "https://pharos.barta.cm/pharos/setup/provisioning-jobs/1/cleanup"],
-  ["POST", "https://pharos.barta.cm/pharos/settings/fleet.json"],
-  ["POST", "https://pharos.barta.cm/pharos/settings/providers/hetzner-cloud/test"],
-  ["POST", "https://pharos.barta.cm/pharos/settings/providers/hetzner-cloud/preferences"],
-  ["POST", "https://pharos.barta.cm/pharos/settings/providers/hetzner-cloud/disconnect"],
-  ["POST", "https://pharos.barta.cm/pharos/agora/requests/host-preferences.json"],
-  ["POST", "https://pharos.barta.cm/pharos/flow/intents"],
-  ["POST", "https://pharos.barta.cm/pharos/host-need-intents"],
-  ["POST", "https://pharos.barta.cm/pharos/managed-service-setup-intents"],
-  ["POST", "https://pharos.barta.cm/pharos/setup/existing-host/preflight"],
-  ["POST", "https://pharos.barta.cm/pharos/auth/logout"],
-  ["PUT", "https://pharos.barta.cm/pharos/"],
-  ["PATCH", "https://flow.inspr.at/pharos/hosts.json"],
-  ["DELETE", "https://pharos.barta.cm/pharos/hosts/example"],
-  ["POST", "https://pharos.barta.cm/report"],
-  ["POST", "https://pharos.barta.cm/register"],
-  ["POST", "https://pharos.barta.cm/agent/actions/claim"],
-  ["GET", "https://pharos.barta.cm/report"],
-  ["GET", "https://pharos.barta.cm/pharos/report"],
-  ["GET", "https://pharos.barta.cm/pharos/agent/actions/claim"],
-  ["GET", "https://pharos.barta.cm/metrics"],
-  ["GET", "https://flow.inspr.at/pharos/metrics"],
+  ["POST", "https://pharos.example.test/pharos/host-actions/example/remove"],
+  ["POST", "https://pharos.example.test/pharos/host-actions/jobs/1/apply-declared"],
+  ["POST", "https://pharos.example.test/pharos/host-actions/jobs/1/confirm"],
+  ["POST", "https://pharos.example.test/pharos/host-actions/jobs/1/recover"],
+  ["POST", "https://pharos.example.test/pharos/host-actions/system-update"],
+  ["POST", "https://flow.example.test/pharos/host-actions/example/remove"],
+  ["POST", "https://pharos.example.test/pharos/setup/provisioning-jobs"],
+  ["POST", "https://pharos.example.test/pharos/setup/provisioning-jobs/1/create"],
+  ["POST", "https://pharos.example.test/pharos/setup/provisioning-jobs/1/confirm"],
+  ["POST", "https://pharos.example.test/pharos/setup/provisioning-jobs/1/cleanup"],
+  ["POST", "https://pharos.example.test/pharos/settings/fleet.json"],
+  ["POST", "https://pharos.example.test/pharos/settings/providers/hetzner-cloud/test"],
+  ["POST", "https://pharos.example.test/pharos/settings/providers/hetzner-cloud/preferences"],
+  ["POST", "https://pharos.example.test/pharos/settings/providers/hetzner-cloud/disconnect"],
+  ["POST", "https://pharos.example.test/pharos/agora/requests/host-preferences.json"],
+  ["POST", "https://pharos.example.test/pharos/flow/intents"],
+  ["POST", "https://pharos.example.test/pharos/host-need-intents"],
+  ["POST", "https://pharos.example.test/pharos/managed-service-setup-intents"],
+  ["POST", "https://pharos.example.test/pharos/setup/existing-host/preflight"],
+  ["POST", "https://pharos.example.test/pharos/auth/logout"],
+  ["PUT", "https://pharos.example.test/pharos/"],
+  ["PATCH", "https://flow.example.test/pharos/hosts.json"],
+  ["DELETE", "https://pharos.example.test/pharos/hosts/example"],
+  ["POST", "https://pharos.example.test/report"],
+  ["POST", "https://pharos.example.test/register"],
+  ["POST", "https://pharos.example.test/agent/actions/claim"],
+  ["GET", "https://pharos.example.test/report"],
+  ["GET", "https://pharos.example.test/pharos/report"],
+  ["GET", "https://pharos.example.test/pharos/agent/actions/claim"],
+  ["GET", "https://pharos.example.test/metrics"],
+  ["GET", "https://flow.example.test/pharos/metrics"],
 ];
 
 function request(method, url, secrets = []) {
@@ -107,7 +107,7 @@ test("application mutations and machine routes are denied on every personal orig
     assert.equal(Object.hasOwn(result, "url"), false);
     assert.equal(result.path.includes("?"), false);
   }
-  const draft = request("POST", "https://flow.inspr.at/pharos/agora/requests/host-preferences.json");
+  const draft = request("POST", "https://flow.example.test/pharos/agora/requests/host-preferences.json");
   assert.equal(draft.reason, "app-mutation");
 });
 
@@ -135,7 +135,7 @@ test("read-only personal app routes and the login entry are allowed", () => {
 test("callback query values stay out of the guard decision", () => {
   const result = request(
     "GET",
-    "https://pharos.barta.cm/pharos/auth/callback?code=one-time-code&state=opaque-state",
+    "https://pharos.example.test/pharos/auth/callback?code=one-time-code&state=opaque-state",
   );
   assert.equal(result.allow, true);
   assert.equal(result.path, "/pharos/auth/callback");
@@ -148,18 +148,18 @@ test("other origins, prefixes, and schemes are denied", () => {
     "https://pharos.agm.ng/pharos/",
     "https://pharos.agm.ng/pharos/hosts.json",
     "https://fleet.agm.ng/pharos/",
-    "https://flow.inspr.at/paimos/",
-    "https://flow.inspr.at/janus/",
-    "https://flow.inspr.at/aithema/",
-    "https://flow.inspr.at/pharos-extra",
+    "https://flow.example.test/paimos/",
+    "https://flow.example.test/janus/",
+    "https://flow.example.test/aithema/",
+    "https://flow.example.test/pharos-extra",
     "https://tiles.openfreemap.org/styles/positron",
     "https://evil.example/pharos/",
-    "https://pharos.barta.cm.evil.example/pharos/",
-    "https://not-auth.inspr.at/oauth/v2/authorize",
-    "http://pharos.barta.cm/pharos/",
+    "https://pharos.example.test.evil.example/pharos/",
+    "https://not-auth.example.test/oauth/v2/authorize",
+    "http://pharos.example.test/pharos/",
     "https://203.0.113.10/pharos/",
-    "https://pharos.barta.cm/version",
-    "https://pharos.barta.cm/pharos/%2e%2e/paimos",
+    "https://pharos.example.test/version",
+    "https://pharos.example.test/pharos/%2e%2e/paimos",
   ];
   for (const url of denied) {
     const result = request("GET", url);
@@ -170,22 +170,22 @@ test("other origins, prefixes, and schemes are denied", () => {
 });
 
 test("login-provider requests stay on the personal issuer and its login paths", () => {
-  const authorize = request("GET", "https://auth.inspr.at/oauth/v2/authorize?client_id=public");
+  const authorize = request("GET", "https://auth.example.test/oauth/v2/authorize?client_id=public");
   assert.equal(authorize.allow, true);
   assert.equal(authorize.reason, "issuer-read");
   assert.equal(authorize.path, "/oauth/v2/authorize");
   assert.deepEqual(ISSUER_LOGIN_POST_PATHS, ["/ui/login/loginname", "/ui/login/password"]);
-  const loginName = request("POST", "https://auth.inspr.at/ui/login/loginname");
+  const loginName = request("POST", "https://auth.example.test/ui/login/loginname");
   assert.equal(loginName.allow, true);
   assert.equal(loginName.reason, "issuer-login");
-  const loginPost = request("POST", "https://auth.inspr.at/ui/login/password", []);
+  const loginPost = request("POST", "https://auth.example.test/ui/login/password", []);
   assert.equal(loginPost.allow, true);
   assert.equal(loginPost.reason, "issuer-login");
   assert.equal(continuationAllowed(loginPost), true);
   const loginBody = decideRequest(
     {
       method: "POST",
-      url: "https://auth.inspr.at/ui/login/password",
+      url: "https://auth.example.test/ui/login/password",
       postData: "loginName=person%40example.test&password=placeholder",
     },
     {},
@@ -193,12 +193,12 @@ test("login-provider requests stay on the personal issuer and its login paths", 
   assert.equal(loginBody.allow, true);
   assert.equal(JSON.stringify(loginBody).includes("placeholder"), false);
   for (const url of [
-    "https://auth.inspr.at/ui/login/password/reset",
-    "https://auth.inspr.at/ui/login/password/init",
-    "https://auth.inspr.at/oauth/v2/revoke",
-    "https://auth.inspr.at/oauth/v2/token",
-    "https://auth.inspr.at/ui/v2/login/password",
-    "https://auth.inspr.at/ui/login/password/change",
+    "https://auth.example.test/ui/login/password/reset",
+    "https://auth.example.test/ui/login/password/init",
+    "https://auth.example.test/oauth/v2/revoke",
+    "https://auth.example.test/oauth/v2/token",
+    "https://auth.example.test/ui/v2/login/password",
+    "https://auth.example.test/ui/login/password/change",
   ]) {
     const denied = request("POST", url);
     assert.equal(denied.allow, false, url);
@@ -207,7 +207,7 @@ test("login-provider requests stay on the personal issuer and its login paths", 
   const resetBody = decideRequest(
     {
       method: "POST",
-      url: "https://auth.inspr.at/ui/login/password",
+      url: "https://auth.example.test/ui/login/password",
       postData: "reset=1",
     },
     {},
@@ -217,22 +217,22 @@ test("login-provider requests stay on the personal issuer and its login paths", 
   const resetJson = decideRequest(
     {
       method: "POST",
-      url: "https://auth.inspr.at/ui/login/loginname",
+      url: "https://auth.example.test/ui/login/loginname",
       postData: "{\"init\":true}",
     },
     {},
   );
   assert.equal(resetJson.allow, false);
   for (const url of [
-    "https://auth.inspr.at/ui/console",
-    "https://auth.inspr.at/management/v1/users",
-    "https://auth.inspr.at/admin/v1/orgs",
-    "https://auth.inspr.at/v2/users",
+    "https://auth.example.test/ui/console",
+    "https://auth.example.test/management/v1/users",
+    "https://auth.example.test/admin/v1/orgs",
+    "https://auth.example.test/v2/users",
   ]) {
     assert.equal(request("GET", url).allow, false);
     assert.equal(request("POST", url).allow, false);
   }
-  assert.equal(request("POST", "https://auth.inspr.at/ui/v2/assets/app.js").allow, false);
+  assert.equal(request("POST", "https://auth.example.test/ui/v2/assets/app.js").allow, false);
   assert.equal(
     continuationAllowed({ allow: true, reason: "app-mutation", method: "POST", path: "/pharos/" }),
     false,
@@ -242,7 +242,7 @@ test("login-provider requests stay on the personal issuer and its login paths", 
 test("credential material in a URL is denied and stripped from navigation errors", () => {
   const leaked = request(
     "GET",
-    `https://user:${FIXTURE_PASSWORD}@pharos.barta.cm/pharos/?password=${FIXTURE_PASSWORD}`,
+    `https://user:${FIXTURE_PASSWORD}@pharos.example.test/pharos/?password=${FIXTURE_PASSWORD}`,
     [FIXTURE_PASSWORD, FIXTURE_USER],
   );
   assert.equal(leaked.allow, false);
@@ -250,7 +250,7 @@ test("credential material in a URL is denied and stripped from navigation errors
   assert.equal(JSON.stringify(leaked).includes(FIXTURE_PASSWORD), false);
   const sanitized = sanitizeNavigationError(
     new Error(
-      `net::ERR_FAILED at https://auth.inspr.at/oauth/v2/authorize?code=abc&state=xyz ${FIXTURE_USER} ${FIXTURE_PASSWORD}`,
+      `net::ERR_FAILED at https://auth.example.test/oauth/v2/authorize?code=abc&state=xyz ${FIXTURE_USER} ${FIXTURE_PASSWORD}`,
     ),
     [FIXTURE_USER, FIXTURE_PASSWORD],
   );
@@ -258,7 +258,7 @@ test("credential material in a URL is denied and stripped from navigation errors
   assert.equal(sanitized.includes("state="), false);
   assert.equal(sanitized.includes(FIXTURE_PASSWORD), false);
   assert.equal(sanitized.includes(FIXTURE_USER), false);
-  assert.equal(sanitized.includes("https://auth.inspr.at/oauth/v2/authorize"), true);
+  assert.equal(sanitized.includes("https://auth.example.test/oauth/v2/authorize"), true);
 });
 
 function leaks(value, parts) {
@@ -279,21 +279,21 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", asy
   const mixed = percentOdd(secret);
   const encodedUser = encodeURIComponent(FIXTURE_USER);
   const cases = [
-    `https://pharos.barta.cm/pharos/${secret}`,
-    `https://pharos.barta.cm/pharos/${mixed}`,
-    `https://pharos.barta.cm/pharos/${encodedUser}`,
-    `https://pharos.barta.cm/pharos/map#${secret}`,
-    `https://pharos.barta.cm/pharos/map#${short}`,
-    `https://pharos.barta.cm/pharos/${short}`,
-    `https://pharos.barta.cm/pharos/${tiny}`,
-    `https://pharos.barta.cm/pharos/pre-${short}-post`,
-    `https://pharos.barta.cm/pharos/hosts/pres3crpost`,
-    `https://pharos.barta.cm/pharos/hosts/pre-ab1-post`,
-    `https://pharos.barta.cm/pharos/map?x=pre-a%62%31-post`,
-    `https://pharos.barta.cm/pharos/map?pre-a%62%31-post=1`,
-    `https://pharos.barta.cm/pharos/map?${secret}=1`,
-    `https://pharos.barta.cm/pharos/hosts/pre-%2561%2562%2531-post`,
-    `https://user:${short}@pharos.barta.cm/pharos/map`,
+    `https://pharos.example.test/pharos/${secret}`,
+    `https://pharos.example.test/pharos/${mixed}`,
+    `https://pharos.example.test/pharos/${encodedUser}`,
+    `https://pharos.example.test/pharos/map#${secret}`,
+    `https://pharos.example.test/pharos/map#${short}`,
+    `https://pharos.example.test/pharos/${short}`,
+    `https://pharos.example.test/pharos/${tiny}`,
+    `https://pharos.example.test/pharos/pre-${short}-post`,
+    `https://pharos.example.test/pharos/hosts/pres3crpost`,
+    `https://pharos.example.test/pharos/hosts/pre-ab1-post`,
+    `https://pharos.example.test/pharos/map?x=pre-a%62%31-post`,
+    `https://pharos.example.test/pharos/map?pre-a%62%31-post=1`,
+    `https://pharos.example.test/pharos/map?${secret}=1`,
+    `https://pharos.example.test/pharos/hosts/pre-%2561%2562%2531-post`,
+    `https://user:${short}@pharos.example.test/pharos/map`,
   ];
   const secrets = [secret, FIXTURE_USER, short, tiny];
   for (const url of cases) {
@@ -316,7 +316,7 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", asy
   assert.equal(leaks(evidence, secrets), false);
   assert.equal(publicPath(`/pharos/${short}`, [short]), "path-category");
   const punctuated = "Ab!cdEF12";
-  const key = request("GET", `https://pharos.barta.cm/pharos/map?${encodeURIComponent(punctuated)}=1`, [punctuated]);
+  const key = request("GET", `https://pharos.example.test/pharos/map?${encodeURIComponent(punctuated)}=1`, [punctuated]);
   assert.equal(key.allow, false);
   assert.equal(key.reason, "secret-in-url");
   assert.equal(leaks(key, [punctuated]), false);
@@ -324,7 +324,7 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", asy
   assert.equal(
     await settleFetchPause(
       keyedFetch,
-      { requestId: "query-key", request: { method: "GET", url: "https://pharos.barta.cm/pharos/map?pre-a%62%31-post=1" } },
+      { requestId: "query-key", request: { method: "GET", url: "https://pharos.example.test/pharos/map?pre-a%62%31-post=1" } },
       { secrets: ["ab1"] },
     ),
     "failed",
@@ -333,7 +333,7 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", asy
   const main = { id: "main" };
   const routed = primaryFrameDecision(
     {
-      url: () => "https://pharos.barta.cm/pharos/map?pre-a%62%31-post=1",
+      url: () => "https://pharos.example.test/pharos/map?pre-a%62%31-post=1",
       method: () => "GET",
       resourceType: () => "document",
       frame: () => main,
@@ -349,23 +349,23 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", asy
 test("unicode secrets match through percent-decoded paths, keys, and values", async () => {
   const secret = "é!";
   const face = "\u{1F600}";
-  const reviewer = "https://pharos.barta.cm/pharos/map?pre-%25C3%25A9!-post=1";
+  const reviewer = "https://pharos.example.test/pharos/map?pre-%25C3%25A9!-post=1";
   const hidden = [
     reviewer,
-    `https://pharos.barta.cm/pharos/map?${encodeURIComponent(secret)}=1`,
-    `https://pharos.barta.cm/pharos/map?note=${encodeURIComponent(secret)}`,
-    `https://pharos.barta.cm/pharos/map?note=${encodeURIComponent(encodeURIComponent(secret))}`,
-    `https://pharos.barta.cm/pharos/map?pre-${encodeURIComponent(encodeURIComponent(secret))}-post=1`,
-    `https://pharos.barta.cm/pharos/${encodeURIComponent(secret)}`,
-    `https://pharos.barta.cm/pharos/%25C3%25A9!`,
-    `https://pharos.barta.cm/pharos/map#${encodeURIComponent(secret)}`,
-    `https://pharos.barta.cm/pharos/map#${encodeURIComponent(encodeURIComponent(secret))}`,
-    `https://pharos.barta.cm/pharos/map?${encodeURIComponent(face)}=1`,
-    `https://pharos.barta.cm/pharos/map?note=${encodeURIComponent(face)}`,
-    `https://pharos.barta.cm/pharos/map?pre-${encodeURIComponent(encodeURIComponent(face))}-post=1`,
-    `https://pharos.barta.cm/pharos/${encodeURIComponent(face)}`,
-    "https://pharos.barta.cm/pharos/map?x=%ED%A0%BD%ED%B8%80",
-    "https://pharos.barta.cm/pharos/map?x=%E0%83%A9!",
+    `https://pharos.example.test/pharos/map?${encodeURIComponent(secret)}=1`,
+    `https://pharos.example.test/pharos/map?note=${encodeURIComponent(secret)}`,
+    `https://pharos.example.test/pharos/map?note=${encodeURIComponent(encodeURIComponent(secret))}`,
+    `https://pharos.example.test/pharos/map?pre-${encodeURIComponent(encodeURIComponent(secret))}-post=1`,
+    `https://pharos.example.test/pharos/${encodeURIComponent(secret)}`,
+    `https://pharos.example.test/pharos/%25C3%25A9!`,
+    `https://pharos.example.test/pharos/map#${encodeURIComponent(secret)}`,
+    `https://pharos.example.test/pharos/map#${encodeURIComponent(encodeURIComponent(secret))}`,
+    `https://pharos.example.test/pharos/map?${encodeURIComponent(face)}=1`,
+    `https://pharos.example.test/pharos/map?note=${encodeURIComponent(face)}`,
+    `https://pharos.example.test/pharos/map?pre-${encodeURIComponent(encodeURIComponent(face))}-post=1`,
+    `https://pharos.example.test/pharos/${encodeURIComponent(face)}`,
+    "https://pharos.example.test/pharos/map?x=%ED%A0%BD%ED%B8%80",
+    "https://pharos.example.test/pharos/map?x=%E0%83%A9!",
   ];
   for (const url of hidden) {
     const result = request("GET", url, [secret, face]);
@@ -401,50 +401,50 @@ test("unicode secrets match through percent-decoded paths, keys, and values", as
   assert.equal(routed.reason, "secret-in-url");
   assert.equal(leaks(routed, [secret]), false);
   for (const url of [
-    "https://pharos.barta.cm/pharos/map?section=settings",
-    "https://pharos.barta.cm/pharos/map?q=%",
-    "https://pharos.barta.cm/pharos/map?q=%2",
-    "https://pharos.barta.cm/pharos/map?q=%ZZ",
-    "https://pharos.barta.cm/pharos/map?q=%C3%",
-    "https://pharos.barta.cm/pharos/map?q=%ED%A0%80",
-    "https://pharos.barta.cm/pharos/map",
+    "https://pharos.example.test/pharos/map?section=settings",
+    "https://pharos.example.test/pharos/map?q=%",
+    "https://pharos.example.test/pharos/map?q=%2",
+    "https://pharos.example.test/pharos/map?q=%ZZ",
+    "https://pharos.example.test/pharos/map?q=%C3%",
+    "https://pharos.example.test/pharos/map?q=%ED%A0%80",
+    "https://pharos.example.test/pharos/map",
   ]) {
     assert.equal(request("GET", url, [secret, face]).allow, true, url);
   }
   assert.equal(
-    request("GET", "https://pharos.barta.cm/pharos/map?q=%ZZ&pre-%25C3%25A9!-post=1", [secret]).allow,
+    request("GET", "https://pharos.example.test/pharos/map?q=%ZZ&pre-%25C3%25A9!-post=1", [secret]).allow,
     false,
   );
 });
 
 test("issuer reads are allowlisted and incidental channels fail closed", () => {
-  assert.equal(request("GET", "https://auth.inspr.at/ui/v2/assets/app.js").allow, true);
-  assert.equal(request("GET", "https://auth.inspr.at/.well-known/openid-configuration").allow, true);
-  assert.equal(request("GET", "https://auth.inspr.at/v2/sessions").reason, "issuer-read");
-  assert.equal(request("GET", "https://auth.inspr.at/robots.txt").allow, false);
-  assert.equal(request("POST", "https://auth.inspr.at/v2/sessions").allow, false);
+  assert.equal(request("GET", "https://auth.example.test/ui/v2/assets/app.js").allow, true);
+  assert.equal(request("GET", "https://auth.example.test/.well-known/openid-configuration").allow, true);
+  assert.equal(request("GET", "https://auth.example.test/v2/sessions").reason, "issuer-read");
+  assert.equal(request("GET", "https://auth.example.test/robots.txt").allow, false);
+  assert.equal(request("POST", "https://auth.example.test/v2/sessions").allow, false);
   const socket = decideRequest(
-    { method: "GET", url: "https://pharos.barta.cm/pharos/", resourceType: "websocket" },
+    { method: "GET", url: "https://pharos.example.test/pharos/", resourceType: "websocket" },
     {},
   );
   assert.equal(socket.allow, false);
   assert.equal(socket.reason, "websocket");
   assert.equal(continuationAllowed(socket), false);
   const worker = decideRequest(
-    { method: "GET", url: "https://pharos.barta.cm/pharos/assets/app.js", resourceType: "serviceworker" },
+    { method: "GET", url: "https://pharos.example.test/pharos/assets/app.js", resourceType: "serviceworker" },
     {},
   );
   assert.equal(worker.reason, "serviceworker");
   const redirected = decideRedirect({
     method: "POST",
-    url: "https://pharos.barta.cm/pharos/agora/requests/host-preferences.json",
+    url: "https://pharos.example.test/pharos/agora/requests/host-preferences.json",
   });
   assert.equal(redirected.allow, false);
   assert.equal(redirected.reason, "app-mutation");
   assert.equal(decideRedirect({ method: "GET", url: "https://pharos.agm.ng/pharos/" }).allow, false);
   assert.equal(decideIncidental("download").allow, false);
   assert.equal(decideIncidental("popup").reason, "popup");
-  assert.equal(request("GET", "wss://pharos.barta.cm/pharos/socket").allow, false);
+  assert.equal(request("GET", "wss://pharos.example.test/pharos/socket").allow, false);
 });
 
 function matchesSelector(element, selector) {
@@ -711,7 +711,7 @@ test("issuer MFA enrollment is account setup and verification stays MFA", () => 
 });
 
 test("classification separates auth, MFA, policy denial, and broken UI", () => {
-  const app = { origin: "https://pharos.barta.cm", pathname: "/pharos/" };
+  const app = { origin: "https://pharos.example.test", pathname: "/pharos/" };
   const issuer = { origin: PERSONAL_ISSUER_ORIGIN, pathname: "/ui/v2/login/otp" };
   assert.equal(
     classifyObservation({
@@ -731,7 +731,7 @@ test("classification separates auth, MFA, policy denial, and broken UI", () => {
   );
   assert.equal(
     classifyObservation({
-      location: { origin: "https://flow.inspr.at", pathname: "/pharos/auth/login" },
+      location: { origin: "https://flow.example.test", pathname: "/pharos/auth/login" },
       status: 200,
       probe: { appShell: true },
     }),
@@ -771,7 +771,7 @@ test("classification separates auth, MFA, policy denial, and broken UI", () => {
   );
   assert.equal(
     classifyObservation({
-      location: { origin: "https://flow.inspr.at", pathname: "/pharos/version" },
+      location: { origin: "https://flow.example.test", pathname: "/pharos/version" },
       status: 200,
       probe: { appShell: false, managerShell: false },
       managerConfirmed: true,
@@ -817,7 +817,7 @@ test("classification separates auth, MFA, policy denial, and broken UI", () => {
 });
 
 test("screenshots require an authenticated application page without a credential form", () => {
-  const app = { origin: "https://flow.inspr.at", pathname: "/pharos/map" };
+  const app = { origin: "https://flow.example.test", pathname: "/pharos/map" };
   const ready = { appShell: true, managerShell: true, passwordCount: 0, mfa: false, loginForm: false };
   assert.equal(
     screenshotPermitted({ classification: "authenticated", location: app, probe: ready }),
@@ -834,7 +834,7 @@ test("screenshots require an authenticated application page without a credential
   assert.equal(
     screenshotPermitted({
       classification: "authenticated",
-      location: { origin: "https://pharos.barta.cm", pathname: "/pharos/auth/login" },
+      location: { origin: "https://pharos.example.test", pathname: "/pharos/auth/login" },
       probe: ready,
     }),
     false,
@@ -850,7 +850,7 @@ test("screenshots require an authenticated application page without a credential
   assert.equal(
     screenshotPermitted({
       classification: "authenticated",
-      location: { origin: "https://pharos.barta.cm", pathname: "/pharos/version" },
+      location: { origin: "https://pharos.example.test", pathname: "/pharos/version" },
       probe: { appShell: false, managerShell: false, passwordCount: 0 },
     }),
     false,
@@ -885,7 +885,7 @@ test("inventory includes nav, unlinked hosts, and host settings", () => {
     hrefs: [
       "https://pharos.agm.ng/pharos/hosts/company",
       "/pharos/settings/providers/hetzner-cloud",
-      "https://pharos.barta.cm/pharos/services/legacy-host/backup",
+      "https://pharos.example.test/pharos/services/legacy-host/backup",
       "https://tiles.openfreemap.org/styles/positron",
     ],
   });
@@ -914,8 +914,8 @@ test("inventory includes nav, unlinked hosts, and host settings", () => {
 test("credentials are typed only at the personal issuer", () => {
   assert.doesNotThrow(() => assertCredentialEntryOrigin(PERSONAL_ISSUER_ORIGIN));
   for (const origin of [
-    "https://pharos.barta.cm",
-    "https://flow.inspr.at",
+    "https://pharos.example.test",
+    "https://flow.example.test",
     "https://pharos.agm.ng",
     "https://auth.agm.ng",
   ]) {
@@ -1170,7 +1170,7 @@ test("each redirect hop is failed by Fetch before continue, including preserved 
     redirectedRequestId: "login-post",
     request: {
       method: "POST",
-      url: "https://pharos.barta.cm/pharos/agora/requests/host-preferences.json",
+      url: "https://pharos.example.test/pharos/agora/requests/host-preferences.json",
     },
   };
   const mutation = fakeFetchSession();
@@ -1181,7 +1181,7 @@ test("each redirect hop is failed by Fetch before continue, including preserved 
   const allowedHop = {
     requestId: "hop-app",
     redirectedRequestId: "issuer-redirect",
-    request: { method: "GET", url: "https://pharos.barta.cm/pharos/auth/callback" },
+    request: { method: "GET", url: "https://pharos.example.test/pharos/auth/callback" },
   };
   const allowed = fakeFetchSession();
   assert.equal(await settleFetchPause(allowed, allowedHop, {}, () => {}), "continued");
@@ -1190,14 +1190,14 @@ test("each redirect hop is failed by Fetch before continue, including preserved 
   const loginHop = {
     requestId: "hop-login",
     redirectedRequestId: "authorize",
-    request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+    request: { method: "POST", url: "https://auth.example.test/ui/login/password" },
   };
   const login = fakeFetchSession();
   assert.equal(await settleFetchPause(login, loginHop, {}, () => {}), "continued");
   const resetHop = {
     requestId: "hop-reset",
     redirectedRequestId: "authorize",
-    request: { method: "POST", url: "https://auth.inspr.at/ui/login/password/reset" },
+    request: { method: "POST", url: "https://auth.example.test/ui/login/password/reset" },
   };
   const reset = fakeFetchSession();
   assert.equal(await settleFetchPause(reset, resetHop, {}, () => {}), "failed");
@@ -1206,7 +1206,7 @@ test("each redirect hop is failed by Fetch before continue, including preserved 
   const responseStage = {
     requestId: "too-late",
     responseStatusCode: 307,
-    request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+    request: { method: "POST", url: "https://auth.example.test/ui/login/password" },
   };
   const late = fakeFetchSession();
   assert.equal(await settleFetchPause(late, responseStage, {}, () => {}), "failed");
@@ -1238,14 +1238,14 @@ test("fetch guard enables request-stage pauses, cancels auth, and disposes after
   assert.equal(enabled.params.handleAuthRequests, true);
   await session.listeners["Fetch.requestPaused"]({
     requestId: "direct-post",
-    request: { method: "POST", url: "https://pharos.barta.cm/pharos/auth/logout" },
+    request: { method: "POST", url: "https://pharos.example.test/pharos/auth/logout" },
   });
   assert.equal(session.calls.some((call) => call.method === "Fetch.failRequest"), true);
   assert.equal(session.calls.some((call) => call.method === "Fetch.continueRequest"), false);
   session.listeners.close();
   await session.listeners["Fetch.requestPaused"]({
     requestId: "after-close",
-    request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+    request: { method: "POST", url: "https://auth.example.test/ui/login/password" },
   });
   assert.equal(session.calls.some((call) => call.method === "Fetch.continueRequest"), false);
   assert.equal(session.calls.filter((call) => call.method === "Fetch.failRequest").at(-1).params.requestId, "after-close");
@@ -1421,7 +1421,7 @@ test("lost protocol state closes the primary target and stops later continuation
       {
         requestId: "redirected-login",
         redirectedRequestId: "authorize",
-        request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+        request: { method: "POST", url: "https://auth.example.test/ui/login/password" },
       },
       { secrets: ["synthetic-only-secret"], gate: lostGate },
     ),
@@ -1496,7 +1496,7 @@ test("lost protocol state closes the primary target and stops later continuation
       {
         requestId: "after-fetch-close",
         redirectedRequestId: "authorize",
-        request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+        request: { method: "POST", url: "https://auth.example.test/ui/login/password" },
       },
       { secrets: ["synthetic-only-secret"], gate: fetchGate },
     ),
@@ -1695,7 +1695,7 @@ test("only the primary main frame can pass the route, and worker scripts use ord
   const main = { id: "main" };
   const page = { mainFrame: () => main };
   const policy = { secrets: ["synthetic-only-secret"] };
-  const allowed = "https://pharos.barta.cm/pharos/hosts";
+  const allowed = "https://pharos.example.test/pharos/hosts";
   const primaryGet = primaryFrameDecision(frameRequest({ url: allowed, frame: main }), page, policy);
   assert.equal(primaryGet.allow, true);
   assert.equal(primaryGet.reason, "app-read");
@@ -1719,14 +1719,14 @@ test("only the primary main frame can pass the route, and worker scripts use ord
   const unbound = primaryFrameDecision(frameRequest({ url: allowed, frame: main }), null, policy);
   assert.equal(unbound.allow, false);
   const mutation = primaryFrameDecision(
-    frameRequest({ url: "https://pharos.barta.cm/pharos/agora/requests/host-preferences.json", method: "POST", frame: main }),
+    frameRequest({ url: "https://pharos.example.test/pharos/agora/requests/host-preferences.json", method: "POST", frame: main }),
     page,
     policy,
   );
   assert.equal(mutation.allow, false);
   assert.equal(mutation.reason, "app-mutation");
   const leaked = primaryFrameDecision(
-    frameRequest({ url: "https://pharos.barta.cm/pharos/pre-synthetic-only-secret-post", frame: main }),
+    frameRequest({ url: "https://pharos.example.test/pharos/pre-synthetic-only-secret-post", frame: main }),
     page,
     policy,
   );
@@ -1757,7 +1757,7 @@ test("only the primary main frame can pass the route, and worker scripts use ord
   });
   await pageRef.handler({
     request: () => frameRequest({
-      url: "https://pharos.barta.cm/pharos/agora/requests/host-preferences.json",
+      url: "https://pharos.example.test/pharos/agora/requests/host-preferences.json",
       method: "POST",
       frame: main,
     }),

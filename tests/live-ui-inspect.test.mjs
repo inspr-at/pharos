@@ -61,10 +61,10 @@ test("live query mapping keeps list and host sections and drops search text", ()
   assert.equal(publicPath("/pharos/hosts/legacy-host?section=overview"), "/pharos/hosts/legacy-host");
   assert.equal(publicPath("/pharos/hosts/legacy-host?section=settings&section=backups"), "/pharos/hosts/legacy-host");
   assert.equal(publicPath("/pharos/?view=list&q=s3cr", ["s3cr"]), "path-category");
-  assert.equal(publicPathFromUrl("https://pharos.barta.cm/pharos/?view=list&q=hidden-host"), "/pharos/?view=list");
-  assert.equal(searchQueryPresent("https://pharos.barta.cm/pharos/?view=list&q=hidden-host"), true);
+  assert.equal(publicPathFromUrl("https://pharos.example.test/pharos/?view=list&q=hidden-host"), "/pharos/?view=list");
+  assert.equal(searchQueryPresent("https://pharos.example.test/pharos/?view=list&q=hidden-host"), true);
   assert.equal(searchQueryPresent("/pharos/?view=list"), false);
-  assert.equal(JSON.stringify(publicPathFromUrl("https://user:secret@pharos.barta.cm/pharos/?view=list")).includes("secret"), false);
+  assert.equal(JSON.stringify(publicPathFromUrl("https://user:secret@pharos.example.test/pharos/?view=list")).includes("secret"), false);
 });
 
 test("inspection screenshot names stay value-free and distinct", () => {
@@ -196,7 +196,7 @@ test("sealed inspection output keeps only allowlisted evidence", () => {
   const sealed = sealInspection({
     role: "manager",
     productionWindowSwitchReproduced: true,
-    representativeHost: "https://auth.inspr.at/ui/login?password=secret",
+    representativeHost: "https://auth.example.test/ui/login?password=secret",
     searchQueryRetained: false,
     screenshots: ["10-fleet-freshness.png", "../secret.png", "01-home.png", "host-03-backups.png"],
     checks: {
@@ -221,11 +221,11 @@ test("sealed inspection output keeps only allowlisted evidence", () => {
       },
       notes: "<html>password=secret</html>",
     },
-    rawError: "https://auth.inspr.at/ui/login?code=secret",
+    rawError: "https://auth.example.test/ui/login?code=secret",
   });
   const encoded = JSON.stringify(sealed);
   assert.equal(encoded.includes("secret"), false);
-  assert.equal(encoded.includes("auth.inspr.at"), false);
+  assert.equal(encoded.includes("auth.example.test"), false);
   assert.equal(encoded.includes("<html>"), false);
   assert.equal(encoded.includes("person@example"), false);
   assert.equal(encoded.includes("physical-chrome"), false);

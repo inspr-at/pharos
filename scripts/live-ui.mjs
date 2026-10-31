@@ -1,3 +1,4 @@
+import { LiveUiOriginsError, requireLiveUiOrigins } from "./live-ui-origins.mjs";
 import fs from "node:fs";
 import { FAMILY_ORIGIN, familyApp, familyAppLocation, familyAuthPath, classifyFamilyObservation } from "./live-ui-apps.mjs";
 import path from "node:path";
@@ -841,11 +842,12 @@ async function run(command) {
 async function main() {
   let code = 1;
   try {
+    requireLiveUiOrigins();
     const command = assertCommandArgv(process.argv);
     if (SESSION_ORDER[0] !== "install-request-guard") throw new LiveUiError("session-order");
     code = await run(command);
   } catch (error) {
-    const reason = error instanceof LiveUiError ? error.code : "broken-ui";
+    const reason = error instanceof LiveUiError || error instanceof LiveUiOriginsError ? error.code : "broken-ui";
     process.stderr.write(`class=refused reason=${reason}\n`);
     code = 1;
   }

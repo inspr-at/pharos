@@ -55,6 +55,11 @@ V2_HISTORY = (
     ("260922141211.0.0", 23),
     ("260925163010.0.0", 25),
     ("261022140452.0.0", 26),
+    ("261022144327.0.0", 27),
+)
+# Published CalVer3 reservations. The first follows the last v2 in sequence.
+CALVER3_HISTORY = (
+    ("261031155226.0.0", 28),
 )
 
 
@@ -93,10 +98,19 @@ class CalendarVersionTests(unittest.TestCase):
         return document
 
     @classmethod
+    def calver3_release(cls, version, sequence):
+        """A CalVer3 record: the v2 coordinate under the identifier new reservations declare."""
+
+        document = cls.calendar_v2_release(version, sequence)
+        document["version_scheme"] = release_version.CALVER3_SCHEME
+        return document
+
+    @classmethod
     def calendar_v2_release(cls, version, sequence):
         """A v2 release-coordinate record derived from the live document."""
 
         document = copy.deepcopy(cls.release_document())
+        document["version_scheme"] = release_version.CALENDAR_V2_SCHEME
         document["version"] = version
         document["release_sequence"] = sequence
         document["ecosystem_versions"]["cargo_semver"] = version
@@ -256,10 +270,10 @@ class CalendarVersionTests(unittest.TestCase):
             FIRST_CALENDAR_SEQUENCE,
         )
 
-    def test_current_release_is_valid_calendar_v2_successor(self):
+    def test_current_release_is_valid_successor_of_the_v1_era(self):
         current = self.release_document()
         self.assertEqual(current["schema"], release_version.RELEASE_SCHEMA_V2)
-        self.assertEqual(current["version_scheme"], release_version.CALENDAR_V2_SCHEME)
+        self.assertIn(current["version_scheme"], release_version.SHARED_COORDINATE_SCHEMES)
         self.assertGreaterEqual(current["release_sequence"], FIRST_V2_SEQUENCE)
         anchor = current["migration_anchor"]
         self.assertEqual(anchor["first_calendar_version"], FIRST_CALENDAR_VERSION)
@@ -273,7 +287,7 @@ class CalendarVersionTests(unittest.TestCase):
             release_version.CALENDAR_SCHEME, *V1_HISTORY[-1]
         )
         current_identity = release_version.ReleaseIdentity(
-            release_version.CALENDAR_V2_SCHEME, current["version"], current["release_sequence"]
+            current["version_scheme"], current["version"], current["release_sequence"]
         )
         self.assertLess(release_version.compare_releases(last_v1, current_identity), 0)
         recorded = list(self.v1_history())
@@ -284,6 +298,44 @@ class CalendarVersionTests(unittest.TestCase):
             if sequence < current["release_sequence"]
         )
         release_version.validate_reservation_history(current, tuple(recorded), ())
+
+    def test_first_calver3_reservation_follows_the_last_calendar_v2(self):
+        last_version, last_sequence = (
+            release_version.LAST_CALENDAR_V2_VERSION,
+            release_version.LAST_CALENDAR_V2_SEQUENCE,
+        )
+        self.assertEqual(V2_HISTORY[-1], (last_version, last_sequence))
+        self.assertEqual(CALVER3_HISTORY[0][1], last_sequence + 1)
+        self.assertGreater(CALVER3_HISTORY[0][0], last_version)
+        release = self.release_document()
+        self.assertEqual(release["version_scheme"], release_version.CALVER3_SCHEME)
+        self.assertEqual(
+            CALVER3_HISTORY[-1], (release["version"], release["release_sequence"])
+        )
+        first = self.calver3_release("261101120000.0.0", last_sequence + 1)
+        release_version.validate_release(first)
+        recorded = list(self.v1_history())
+        recorded.extend(self.calendar_v2_release(v, s) for v, s in V2_HISTORY)
+        release_version.validate_reservation_history(first, tuple(recorded), ())
+        # Reading back a repository that moved keeps CalVer2 history intact.
+        second = self.calver3_release("261101120001.0.0", last_sequence + 2)
+        release_version.validate_reservation_history(second, tuple([*recorded, first]), ())
+
+    def test_a_new_reservation_cannot_declare_calendar_v2(self):
+        late = self.calendar_v2_release("261101120000.0.0", release_version.LAST_CALENDAR_V2_SEQUENCE + 1)
+        with self.assertRaises(release_version.ReleaseVersionError):
+            release_version.validate_release(late)
+
+    def test_history_cannot_be_redeclared_as_calver3(self):
+        version, sequence = V2_HISTORY[-1]
+        with self.assertRaises(release_version.ReleaseVersionError):
+            release_version.validate_release(self.calver3_release(version, sequence))
+
+    def test_first_calver3_coordinate_must_be_later_than_the_last_calendar_v2(self):
+        sequence = release_version.LAST_CALENDAR_V2_SEQUENCE + 1
+        for version in (release_version.LAST_CALENDAR_V2_VERSION, "260101120000.0.0"):
+            with self.subTest(version=version), self.assertRaises(release_version.ReleaseVersionError):
+                release_version.validate_release(self.calver3_release(version, sequence))
 
     def test_calendar_v2_grammar_is_exact_and_gregorian(self):
         for value in ("260909194540.0.0", "261231235959.0.0", "280229120000.0.0", "100101000000.0.0"):

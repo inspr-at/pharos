@@ -38,8 +38,6 @@ jobs:
           fi
       - name: release consistency
         run: scripts/check-release-consistency.sh
-      - name: pinned Paimos delivery contract
-        run: scripts/check-paimos-delivery-contract.sh
       - name: check the vendored calendar v2 display weights
         run: scripts/check-calendar-version-display.sh
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0 (Node 24)
@@ -244,11 +242,21 @@ jobs:
               and .release_channel == "stable"
               and .release_sequence == $sequence
               and .git_commit == $commit' <<<"${response}" >/dev/null
-          docker run --rm --network host \
+          printed=$(docker run --rm --network host \
             -e PHAROS_URL=http://127.0.0.1:18088 \
             --entrypoint /usr/local/bin/pharos \
-            "${IMAGE}@${DIGEST}" version | jq -e --arg scheme "${SCHEME}" --arg version "${VERSION}" \
-            '.version_scheme == $scheme and .version == $version' >/dev/null
+            "${IMAGE}@${DIGEST}" version)
+          [[ "${printed}" == "pharos ${VERSION}" ]]
+          docker run --rm --cap-drop ALL --security-opt no-new-privileges:true \
+            --entrypoint /usr/bin/ping \
+            "${IMAGE}@${DIGEST}" -c 1 -W 2 127.0.0.1 >/dev/null
+          # The restic collector, and the ssh program its sftp: repositories run.
+          docker run --rm --cap-drop ALL --security-opt no-new-privileges:true \
+            --entrypoint /usr/bin/restic \
+            "${IMAGE}@${DIGEST}" version >/dev/null
+          docker run --rm --cap-drop ALL --security-opt no-new-privileges:true \
+            --entrypoint /usr/bin/ssh \
+            "${IMAGE}@${DIGEST}" -V >/dev/null 2>&1
       - name: scan candidate image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (composite; Node 24 nested actions)
         with:

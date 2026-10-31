@@ -4,6 +4,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 [advisories]
 ignore = [
   { id = "RUSTSEC-2023-0071", reason = "Pharos is an OIDC relying party and uses openidconnect/rsa only for public-key ID-token signature verification; it does not perform RSA private-key operations where the Marvin timing side channel applies." },
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 is pinned by elliptic-curve 0.13, reached only through openidconnect's p256 and p384 for public-key ID-token signature verification; Pharos performs no elliptic-curve private-key operations, so no secret integers reach the affected arithmetic." },
 ]
 
 [licenses]

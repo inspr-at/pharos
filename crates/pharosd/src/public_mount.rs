@@ -103,17 +103,17 @@ mod tests {
     #[test]
     fn localize_injects_routing_context_without_rewriting_quoted_urls() {
         let base = PublicBasePath::parse("/pharos").unwrap();
-        let html = r#"<head></head><a href="/map">Map</a><a href="/paimos/projects/17">Paimos</a><a href="https://github.com/inspr-at/pharos">release</a><script>fetch('/hosts.json')</script><p>content /map stays text</p>"#;
+        let html = r#"<head></head><a href="/map">Map</a><a href="/other/projects/17">Other</a><a href="https://github.com/inspr-at/pharos">release</a><script>fetch('/hosts.json')</script><p>content /map stays text</p>"#;
         let localized = localize_document(&base, html);
         assert!(localized.contains(r#"content="/pharos""#));
         assert!(localized.contains("window.pharosPublicPath=function"));
         assert!(localized.contains(r#"href="/map""#));
-        assert!(localized.contains(r#"href="/paimos/projects/17""#));
+        assert!(localized.contains(r#"href="/other/projects/17""#));
         assert!(localized.contains(r#"href="https://github.com/inspr-at/pharos""#));
         assert!(localized.contains("fetch('/hosts.json')"));
         assert!(localized.contains("content /map stays text"));
         assert!(!localized.contains(r#"href="/pharos/map""#));
-        assert!(!localized.contains("/pharos/paimos"));
+        assert!(!localized.contains("/pharos/other"));
         assert_eq!(base.href("/map"), "/pharos/map");
         assert_eq!(base.href("/"), "/pharos");
     }
@@ -123,7 +123,7 @@ mod tests {
         let base = PublicBasePath::parse("/pharos").unwrap();
         assert!(base.contains_path("/pharos/auth/callback"));
         assert!(!base.contains_path("/pharos-other"));
-        assert!(!base.contains_path("/paimos/projects/17"));
+        assert!(!base.contains_path("/other/projects/17"));
         assert_eq!(base.href("/pharos-other"), "/pharos/pharos-other");
     }
 

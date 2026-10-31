@@ -3,11 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { chromium } from "@playwright/test";
+import { LIVE_UI_ORIGINS, LiveUiOriginsError, requireLiveUiOrigins } from "./live-ui-origins.mjs";
 import { FAMILY_ORIGIN, FAMILY_SCHEMA, FAMILY_VIEWPORTS, familyApp, familyRoutes, classifyFamilyObservation } from "./live-ui-apps.mjs";
 import { LiveUiError, EXIT_CODES, assertRuntimeEnvironment, assertOutputDir, browserContextOptions, openGuardedBrowser, publicLocation, redactEvidence, repoRootFromScripts, shutdownLiveSession, takeAuthenticatedShot, loadUsernameFile, loadPasswordFile } from "./live-ui-guard.mjs";
 import { decodeBase32, loadTotpSecretFile, revokeTotpGrant } from "./live-ui-totp.mjs";
 import { installGuard, signIn, visitRoute, readProbe } from "./live-ui.mjs";
 
+const ISSUER_ORIGIN = LIVE_UI_ORIGINS.issuerOrigin;
 const CREDENTIAL_KEYS = Object.freeze(["INSPR_UXQA_USERNAME", "INSPR_UXQA_PASSWORD", "INSPR_UXQA_TOTP_SECRET"]);
 const PATH_KEYS = Object.freeze(["INSPR_UXQA_USERNAME_FILE", "INSPR_UXQA_PASSWORD_FILE", "INSPR_UXQA_TOTP_SECRET_FILE"]);
 
@@ -77,7 +79,7 @@ export function createFamilyOutput(appName, repoRoot, home = os.homedir(), now =
 }
 
 export function observeFamilyAuthentication(policy, { origin, pathname, method }) {
-  if (origin !== "https://auth.inspr.at" || method !== "POST") return;
+  if (origin !== ISSUER_ORIGIN || method !== "POST") return;
   if (pathname === "/ui/login/password") policy.passwordSubmitted = true;
   if (pathname === "/ui/login/mfa/verify" && policy.totpGrant?.uses?.primary === 1 && policy.totpGrant?.uses?.fetch === 1) policy.totpSubmitted = true;
 }
@@ -92,7 +94,7 @@ export function familyEvidence({ app, started, overall, routes, blocked, callbac
     startedAt: started,
     class: overall,
     appOrigin: FAMILY_ORIGIN,
-    oidc: { issuer: "https://auth.inspr.at", callbackConfirmed: !!callbackConfirmed, method: "browser-oidc", passwordSubmitted: !!passwordSubmitted, totpSubmitted: !!totpSubmitted, credentialMode },
+    oidc: { issuer: ISSUER_ORIGIN, callbackConfirmed: !!callbackConfirmed, method: "browser-oidc", passwordSubmitted: !!passwordSubmitted, totpSubmitted: !!totpSubmitted, credentialMode },
     clientDraft: "none",
     serverMutationAllowlist: [],
     browserState: "memory-only",
@@ -137,7 +139,7 @@ export async function runFamily(appName) {
       // Do not retain URLs (OIDC responses carry single-use codes/state).
       const location = publicLocation(response.url(), secrets);
       observeFamilyAuthentication(policy, { ...location, method: response.request().method() });
-      if (location.origin === "https://auth.inspr.at") policy.issuerObserved = true;
+      if (location.origin === ISSUER_ORIGIN) policy.issuerObserved = true;
       if (policy.issuerObserved && location.origin === FAMILY_ORIGIN && location.pathname === app.callback && response.status() >= 200 && response.status() < 400) policy.callbackConfirmed = true;
     });
     page.on("download", (download) => { download.cancel().catch(() => {}); });
@@ -208,11 +210,12 @@ export async function runFamily(appName) {
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
   try {
+    requireLiveUiOrigins();
     if (process.argv.length !== 3 || !familyApp(process.argv[2])) throw new LiveUiError("family-command");
     process.exitCode = await runFamily(process.argv[2]);
   } catch (error) {
     for (const key of [...CREDENTIAL_KEYS, ...PATH_KEYS]) delete process.env[key];
-    process.stderr.write(`class=refused reason=${error instanceof LiveUiError ? error.code : "family-run-failed"}\n`);
+    process.stderr.write(`class=refused reason=${error instanceof LiveUiError || error instanceof LiveUiOriginsError ? error.code : "family-run-failed"}\n`);
     process.exitCode = 1;
   }
 }
