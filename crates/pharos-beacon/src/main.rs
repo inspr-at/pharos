@@ -1487,38 +1487,26 @@ fn run_docker_text_command(
 ) -> Result<String, &'static str> {
     let mut command = docker_cli(command, socket)?;
     command.args(args);
-    let mut child = command.spawn().map_err(|_error| {
-        #[cfg(test)]
-        eprintln!("docker fixture did not start: {_error}");
-        "deployed artifact command failed"
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|_| "deployed artifact command failed")?;
     let stdout = child
         .stdout
         .take()
         .map(|pipe| drain_bounded(pipe, DEPLOYED_ARTIFACT_COMMAND_OUTPUT_LIMIT_BYTES))
         .ok_or("deployed artifact output unavailable")?;
     let deadline = Instant::now() + DEPLOYED_ARTIFACT_COMMAND_TIMEOUT;
-    let status = wait_for_child(&mut child, deadline).map_err(|reason| {
-        #[cfg(test)]
-        eprintln!("docker fixture wait failed: {reason}");
-        match reason {
-            "timeout" => "deployed artifact command timed out",
-            _ => "deployed artifact command failed",
-        }
+    let status = wait_for_child(&mut child, deadline).map_err(|reason| match reason {
+        "timeout" => "deployed artifact command timed out",
+        _ => "deployed artifact command failed",
     })?;
     let stdout = collect_bounded(&stdout, deadline)
         .and_then(output_string)
-        .map_err(|reason| {
-            #[cfg(test)]
-            eprintln!("docker fixture output failed: {reason}");
-            match reason {
-                "output_limit" => "deployed artifact output exceeded the limit",
-                _ => "deployed artifact output unavailable",
-            }
+        .map_err(|reason| match reason {
+            "output_limit" => "deployed artifact output exceeded the limit",
+            _ => "deployed artifact output unavailable",
         })?;
     if !status.success() {
-        #[cfg(test)]
-        eprintln!("docker fixture exited with {status}: {args:?}");
         return Err("deployed artifact command failed");
     }
     Ok(stdout)
@@ -1622,11 +1610,9 @@ fn resolve_config_from_image_save(
     };
     let mut command = docker_cli(command, socket)?;
     command.args(["save", identity]);
-    let mut child = command.spawn().map_err(|_error| {
-        #[cfg(test)]
-        eprintln!("docker fixture save did not start: {_error}");
-        "deployed artifact command failed"
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|_| "deployed artifact command failed")?;
     let stdout = child
         .stdout
         .take()
@@ -1712,12 +1698,7 @@ fn collect_measured_deployed_artifact_at(
         return None;
     }
     let image_config_digest =
-        measured_image_config_digest(command, socket, &observation.image_identity, cache)
-            .map_err(|_error| {
-                #[cfg(test)]
-                eprintln!("docker fixture image digest failed: {_error}");
-            })
-            .ok()?;
+        measured_image_config_digest(command, socket, &observation.image_identity, cache).ok()?;
     let final_raw = run_running_container_command(command, socket, container).ok()?;
     let final_observation = parse_running_container_format(&final_raw).ok()?;
     if !configured_container_matches_measurement(container, &final_observation.container_id)
@@ -4035,9 +4016,7 @@ mod tests {
         let root = kernel_fixture("compose-command");
         std::fs::create_dir_all(&root).expect("create command fixture");
         let command = root.join("docker-fixture");
-        std::fs::write(
-            &command,
-            concat!(
+        write_command_fixture(&command, concat!(
                 "#!/bin/sh\n",
                 "test \"$#\" -eq 9 || exit 10\n",
                 "test \"$1\" = --host || exit 11\n",
@@ -4050,11 +4029,7 @@ mod tests {
                 "test \"$8\" = --format || exit 18\n",
                 "test \"$9\" = '{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.Status}}' || exit 19\n",
                 "printf 'alpha\\tweb\\tFalse\\trunning\\tUp 2 minutes (healthy)\\n'\n",
-            ),
-        )
-        .expect("write command fixture");
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
-            .expect("make command fixture executable");
+            ));
 
         let raw = run_compose_command(
             &command.to_string_lossy(),
@@ -4080,13 +4055,10 @@ mod tests {
         );
 
         let failure = root.join("docker-failure");
-        std::fs::write(
+        write_command_fixture(
             &failure,
             "#!/bin/sh\nprintf 'credential-bearing diagnostic' >&2\nexit 1\n",
-        )
-        .expect("write failure fixture");
-        std::fs::set_permissions(&failure, std::fs::Permissions::from_mode(0o700))
-            .expect("make failure fixture executable");
+        );
         assert_eq!(
             run_compose_command(
                 &failure.to_string_lossy(),
@@ -4096,10 +4068,7 @@ mod tests {
         );
 
         let oversized = root.join("docker-oversized");
-        std::fs::write(&oversized, "#!/bin/sh\nhead -c 140000 /dev/zero\n")
-            .expect("write oversized fixture");
-        std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o700))
-            .expect("make oversized fixture executable");
+        write_command_fixture(&oversized, "#!/bin/sh\nhead -c 140000 /dev/zero\n");
         assert_eq!(
             run_compose_command(
                 &oversized.to_string_lossy(),
@@ -6636,6 +6605,69 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Writes an executable fixture and returns once it can run. A child forked by
+    /// a parallel test can hold an inherited write handle on a new file for a moment,
+    /// and Linux refuses to run a file open for writing. Nothing opens this file for
+    /// writing again, so one run that starts means every later one can.
+    fn write_command_fixture(path: &Path, script: &str) {
+        std::fs::write(path, script).expect("write command fixture");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("make command fixture executable");
+        wait_until_runnable(path);
+    }
+
+    fn wait_until_runnable(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Err(error) = run_with_no_arguments(path) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ExecutableFileBusy,
+                "command fixture did not start"
+            );
+            assert!(Instant::now() < deadline, "command fixture stayed busy");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn run_with_no_arguments(path: &Path) -> std::io::Result<std::process::ExitStatus> {
+        Command::new(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    }
+
+    #[test]
+    fn a_command_fixture_waits_out_a_write_handle_someone_else_holds() {
+        let root = kernel_fixture("command-fixture-busy");
+        std::fs::create_dir_all(&root).expect("create fixture directory");
+        let path = root.join("busy");
+        let mut held = std::fs::File::create(&path).expect("create fixture");
+        held.write_all(b"#!/bin/sh\nexit 0\n")
+            .expect("write fixture");
+        held.flush().expect("flush fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("make fixture executable");
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            run_with_no_arguments(&path).map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::ExecutableFileBusy)
+        );
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        wait_until_runnable(&path);
+        // Before the join, so returning early from the wait fails here on Linux.
+        assert!(run_with_no_arguments(&path)
+            .expect("fixture runs")
+            .success());
+        release.join().expect("handle released");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn allowlisted_running_container_measures_config_id_not_metadata_file() {
         let root = kernel_fixture("deployed-artifact-command");
@@ -6650,7 +6682,7 @@ mod tests {
         let command = root.join("docker-fixture");
         let stdout = filtered_container_stdout(&config);
         std::fs::write(command.with_extension("out"), stdout).expect("write filtered stdout");
-        std::fs::write(
+        write_command_fixture(
             &command,
             concat!(
                 "#!/bin/sh\n",
@@ -6682,10 +6714,7 @@ mod tests {
                 "  *) exit 13 ;;\n",
                 "esac\n"
             ),
-        )
-        .expect("write command fixture");
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
-            .expect("make command fixture executable");
+        );
 
         let cache = Mutex::new(ImageConfigDigestCache::new(8));
         let evidence = collect_measured_deployed_artifact_at(
@@ -6713,9 +6742,7 @@ mod tests {
             filtered_container_stdout(&other),
         )
         .expect("write mismatch stdout");
-        std::fs::write(&mismatch, "#!/bin/sh\ncat \"$0.out\"\n").expect("write mismatch fixture");
-        std::fs::set_permissions(&mismatch, std::fs::Permissions::from_mode(0o700))
-            .expect("executable mismatch");
+        write_command_fixture(&mismatch, "#!/bin/sh\ncat \"$0.out\"\n");
         assert!(
             collect_measured_deployed_artifact_at(
                 &mismatch.to_string_lossy(),
@@ -6747,9 +6774,7 @@ mod tests {
             format!("{}\n", stopped_fields.join("\t")),
         )
         .expect("write stopped stdout");
-        std::fs::write(&stopped, "#!/bin/sh\ncat \"$0.out\"\n").expect("write stopped fixture");
-        std::fs::set_permissions(&stopped, std::fs::Permissions::from_mode(0o700))
-            .expect("executable stopped");
+        write_command_fixture(&stopped, "#!/bin/sh\ncat \"$0.out\"\n");
         assert!(collect_measured_deployed_artifact_at(
             &stopped.to_string_lossy(),
             Path::new("/tmp/pharos-docker.sock"),
@@ -6761,13 +6786,10 @@ mod tests {
         .is_none());
 
         let failure = root.join("docker-failure");
-        std::fs::write(
+        write_command_fixture(
             &failure,
             "#!/bin/sh\nprintf 'credential-bearing diagnostic' >&2\nexit 1\n",
-        )
-        .expect("write failure fixture");
-        std::fs::set_permissions(&failure, std::fs::Permissions::from_mode(0o700))
-            .expect("executable failure");
+        );
         assert_eq!(
             run_running_container_command(
                 &failure.to_string_lossy(),
@@ -6778,10 +6800,7 @@ mod tests {
         );
 
         let oversized = root.join("docker-oversized");
-        std::fs::write(&oversized, "#!/bin/sh\nhead -c 5000 /dev/zero\n")
-            .expect("write oversized fixture");
-        std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o700))
-            .expect("executable oversized");
+        write_command_fixture(&oversized, "#!/bin/sh\nhead -c 5000 /dev/zero\n");
         assert_eq!(
             run_running_container_command(
                 &oversized.to_string_lossy(),
@@ -6889,7 +6908,7 @@ mod tests {
         )
         .expect("image descriptor");
         std::fs::write(command.with_extension("tar"), &archive).expect("image archive");
-        std::fs::write(
+        write_command_fixture(
             &command,
             concat!(
                 "#!/bin/sh\n",
@@ -6913,10 +6932,7 @@ mod tests {
                 "  *) exit 13 ;;\n",
                 "esac\n"
             ),
-        )
-        .expect("write docker29 fixture");
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
-            .expect("executable docker29 fixture");
+        );
 
         let cache = Mutex::new(ImageConfigDigestCache::new(8));
         let evidence = collect_measured_deployed_artifact_at(
