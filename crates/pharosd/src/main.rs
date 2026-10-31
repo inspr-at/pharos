@@ -836,6 +836,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_schemas_v6_and_v7_pass_on_a_pharos1_store_with_its_tokens() {
+        let path = temp_path("pharos1-store");
+        std::fs::write(&path, include_str!("testdata/pharos1-store.json"))
+            .expect("store fixture written");
+        let state = AppState {
+            store: Arc::new(Store::new(Some(path.clone())).expect("Pharos 1 store loads")),
+            ..report_test_state()
+        };
+        for (schema, version) in [
+            (
+                pharos_core::HOST_REPORT_V6_SCHEMA,
+                pharos_core::HOST_REPORT_V6_VERSION,
+            ),
+            (
+                pharos_core::HOST_REPORT_SCHEMA,
+                pharos_core::HOST_REPORT_VERSION,
+            ),
+        ] {
+            let body: HostReport = serde_json::from_value(serde_json::json!({
+                "schema": schema,
+                "version": version,
+                "name": "demeter",
+                "role": "server",
+                "is_nix": true,
+                "heartbeat_interval_secs": 60,
+                "freshness": {"applicable": true}
+            }))
+            .expect("report parses");
+            let response = report(
+                State(state.clone()),
+                bearer_headers("fixture-token-demeter"),
+                Json(body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{schema}");
+            assert_eq!(
+                state.store.get("demeter").expect("host").report_version,
+                version
+            );
+        }
+
+        let response = report(
+            State(state),
+            bearer_headers("fixture-token-hermes"),
+            Json(test_report("demeter")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        std::fs::remove_file(path).expect("store fixture removed");
+    }
+
+    #[tokio::test]
     async fn report_rejects_reserved_appliance_observation_without_mutating_host() {
         let state = report_test_state();
         register_test_token(&state, "ares", "valid-token");

@@ -1,0 +1,169 @@
+[
+  {
+    "name": "ares",
+    "role": "server",
+    "is_nix": false,
+    "report_version": 7,
+    "token_hash": "26b0238eb29605c007ad7d1114ad78ffbef4bf72cb662204d14bbf730984e56a",
+    "last_seen": null,
+    "heartbeat_log": [],
+    "heartbeat_interval_secs": 60,
+    "freshness": {
+      "applicable": false,
+      "flake_lock_age_days": null,
+      "commits_behind": null
+    },
+    "service_observations": [],
+    "backup_observations": [],
+    "preferences": {
+      "kind": "server",
+      "alerts": {
+        "suppress_down": false,
+        "suppress_backup": false,
+        "suppress_nix_freshness": false
+      }
+    }
+  },
+  {
+    "name": "demeter",
+    "role": "server",
+    "is_nix": true,
+    "report_version": 7,
+    "token_hash": "797c476732a4892c44f8c7cb6b7780ac440379d61fcd109b59bdf8032ec386c1",
+    "last_seen": 1793437662,
+    "heartbeat_log": [
+      1793437662
+    ],
+    "heartbeat_interval_secs": 60,
+    "freshness": {
+      "applicable": true,
+      "flake_lock_age_days": 3,
+      "commits_behind": 40,
+      "nixpkgs_age_days": 3,
+      "nixpkgs_channel": "nixos-unstable",
+      "deployment_evidence": {
+        "schema": "inspr.pharos.nix-deployment-evidence.v1",
+        "version": 1,
+        "source_revision": "abababababababababababababababababababab",
+        "flake_lock_sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "nixpkgs_revision": "efefefefefefefefefefefefefefefefefefefef",
+        "nixpkgs_last_modified": 1793178462,
+        "nixpkgs_channel": "nixos-unstable"
+      },
+      "nixcfg_comparison": {
+        "upstream_revision": "1212121212121212121212121212121212121212",
+        "relation": "behind",
+        "commits_behind": 40
+      }
+    },
+    "service_observations": [
+      {
+        "id": "fixture-service",
+        "label": "Fixture service",
+        "state": "healthy",
+        "summary": "running"
+      }
+    ],
+    "backup_observations": [
+      {
+        "id": "restic-main",
+        "label": "Restic Main",
+        "engine": "restic",
+        "state": "healthy",
+        "configured": "enabled",
+        "summary": "restic-main fixture",
+        "schedule": "daily",
+        "last_success_at": 1793430462
+      },
+      {
+        "id": "restic-offsite",
+        "label": "Restic Offsite",
+        "engine": "restic",
+        "state": "warning",
+        "configured": "enabled",
+        "summary": "restic-offsite fixture",
+        "schedule": "daily",
+        "last_success_at": 1793430462
+      },
+      {
+        "id": "restic-old",
+        "label": "Restic Old",
+        "engine": "restic",
+        "state": "healthy",
+        "configured": "enabled",
+        "summary": "restic-old fixture",
+        "schedule": "daily",
+        "last_success_at": 1792717662
+      }
+    ],
+    "preferences": {
+      "kind": "server",
+      "alerts": {
+        "suppress_down": false,
+        "suppress_backup": false,
+        "suppress_nix_freshness": false
+      }
+    }
+  },
+  {
+    "name": "hermes",
+    "role": "server",
+    "is_nix": false,
+    "report_version": 7,
+    "token_hash": "336f7ca2a6d4c97892552e19e3436a113b6552db9c1f66426b9329da1013af47",
+    "last_seen": 1793437662,
+    "heartbeat_log": [
+      1793437662
+    ],
+    "heartbeat_interval_secs": 60,
+    "freshness": {
+      "applicable": false,
+      "flake_lock_age_days": null,
+      "commits_behind": null
+    },
+    "kernel": {
+      "schema": "inspr.pharos.kernel-posture.v1",
+      "version": 1,
+      "state": "not_applicable",
+      "running_version": "6.8.0-117-generic",
+      "observed_at": 1793437662
+    },
+    "service_observations": [
+      {
+        "id": "nix-freshness",
+        "label": "Nix freshness",
+        "state": "unknown",
+        "summary": "nix: n/a"
+      }
+    ],
+    "backup_observations": [
+      {
+        "id": "restic-status-file",
+        "label": "Restic status file",
+        "engine": "restic",
+        "state": "healthy",
+        "configured": "enabled",
+        "summary": "status file fixture",
+        "schedule": "daily",
+        "last_success_at": 1793434060
+      }
+    ],
+    "preferences": {
+      "kind": "server",
+      "alerts": {
+        "suppress_down": false,
+        "suppress_backup": false,
+        "suppress_nix_freshness": false
+      }
+    },
+    "requested_preferences": {
+      "accent": "#48b8a8",
+      "kind": "workstation",
+      "alerts": {
+        "suppress_down": false,
+        "suppress_backup": false,
+        "suppress_nix_freshness": false
+      }
+    }
+  }
+]

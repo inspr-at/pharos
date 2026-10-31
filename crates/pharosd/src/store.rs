@@ -526,6 +526,206 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("temporary directory removed");
     }
 
+    /// Every host field read from this file by the two jobs outside this
+    /// repository that page from it: the fleet drift check and the fleet backup
+    /// watch. If one of these moves, those jobs go quiet with no error here.
+    const JOB_HOST_FIELDS: &[&str] = &[
+        "/name",
+        "/is_nix",
+        "/last_seen",
+        "/freshness/nixcfg_comparison/relation",
+        "/freshness/nixcfg_comparison/commits_behind",
+        "/freshness/deployment_evidence/source_revision",
+        "/backup_observations",
+    ];
+    /// The same, for each entry of `backup_observations`.
+    const JOB_BACKUP_FIELDS: &[&str] = &[
+        "/id",
+        "/label",
+        "/state",
+        "/configured",
+        "/summary",
+        "/schedule",
+        "/last_success_at",
+    ];
+
+    #[test]
+    fn store_file_keeps_every_field_the_fleet_jobs_read() {
+        let directory = temporary_directory("job-contract");
+        let path = directory.join("pharos.json");
+        let store = Store::new(Some(path.clone())).expect("store starts");
+        store
+            .register(registration("athena"), "hash".to_string())
+            .expect("host registers");
+        let mut report = basic_report("athena");
+        let evidence = NixDeploymentEvidence {
+            schema: pharos_core::NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+            version: pharos_core::NIX_DEPLOYMENT_EVIDENCE_VERSION,
+            source_revision: "1".repeat(40),
+            flake_lock_sha256: "2".repeat(64),
+            nixpkgs_revision: "3".repeat(40),
+            nixpkgs_last_modified: 1_700_000_000,
+            nixpkgs_channel: "nixos-unstable".to_string(),
+        };
+        report.freshness.nixpkgs_channel = Some("nixos-unstable".to_string());
+        report.freshness.deployment_evidence = Some(evidence);
+        report.freshness.commits_behind = Some(40);
+        report.freshness.nixcfg_comparison = Some(NixcfgGitComparison {
+            upstream_revision: "4".repeat(40),
+            relation: GitRevisionRelation::Behind,
+            commits_behind: Some(40),
+        });
+        report.backup_observations = vec![backup_observation(BackupPostureState::Warning)];
+        store
+            .record(report, 1_700_000_100)
+            .expect("report persists");
+
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("store file reads"))
+                .expect("store file parses");
+        let hosts = stored.as_array().expect("the store is a top-level array");
+        let host = &hosts[0];
+        for field in JOB_HOST_FIELDS {
+            assert!(
+                host.pointer(field).is_some_and(|value| !value.is_null()),
+                "{field}"
+            );
+        }
+        let observation = &host["backup_observations"][0];
+        for field in JOB_BACKUP_FIELDS {
+            assert!(
+                observation
+                    .pointer(field)
+                    .is_some_and(|value| !value.is_null()),
+                "{field}"
+            );
+        }
+        assert_eq!(host["name"], "athena");
+        assert_eq!(host["is_nix"], true);
+        assert_eq!(host["last_seen"], 1_700_000_100);
+        assert_eq!(host["freshness"]["nixcfg_comparison"]["relation"], "behind");
+        assert_eq!(host["freshness"]["nixcfg_comparison"]["commits_behind"], 40);
+        assert_eq!(
+            host["freshness"]["deployment_evidence"]["source_revision"],
+            "1".repeat(40)
+        );
+        assert_eq!(observation["state"], "warning");
+        assert_eq!(observation["configured"], "enabled");
+        assert_eq!(observation["schedule"], "hourly");
+        assert_eq!(observation["last_success_at"], 1_700_000_000);
+
+        // The jobs compare these spellings as text.
+        for (relation, text) in [
+            (GitRevisionRelation::Current, "current"),
+            (GitRevisionRelation::Behind, "behind"),
+            (GitRevisionRelation::Ahead, "ahead"),
+            (GitRevisionRelation::Diverged, "diverged"),
+        ] {
+            assert_eq!(serde_json::to_value(relation).unwrap(), text);
+        }
+        for (state, text) in [
+            (BackupPostureState::Healthy, "healthy"),
+            (BackupPostureState::Warning, "warning"),
+            (BackupPostureState::Stale, "stale"),
+            (BackupPostureState::Failed, "failed"),
+            (BackupPostureState::Unknown, "unknown"),
+            (BackupPostureState::Missing, "missing"),
+            (BackupPostureState::NotConfigured, "not-configured"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), text);
+        }
+        assert_eq!(
+            serde_json::to_value(BackupConfiguredState::Disabled).unwrap(),
+            "disabled"
+        );
+        std::fs::remove_dir_all(directory).expect("temporary directory removed");
+    }
+
+    /// Written by the published v261022144327.0.0 image from fictional reports.
+    /// Token hashes are the SHA-256 of `fixture-token-<host>`.
+    const PHAROS1_STORE: &str = include_str!("testdata/pharos1-store.json");
+
+    fn host_named<'a>(hosts: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        hosts
+            .as_array()
+            .expect("the store is a top-level array")
+            .iter()
+            .find(|host| host["name"] == name)
+            .expect("host is in the store")
+    }
+
+    #[test]
+    fn pharos1_store_loads_unchanged_and_leaves_sibling_files_alone() {
+        let now = current_unix();
+        let directory = temporary_directory("pharos1-store");
+        let path = directory.join("pharos.json");
+        // Loading drops heartbeats older than the retention window, so the
+        // fixture's are moved to now to keep the comparison exact.
+        let mut original: serde_json::Value =
+            serde_json::from_str(PHAROS1_STORE).expect("fixture parses");
+        for host in original.as_array_mut().expect("top-level array") {
+            if host["last_seen"].is_number() {
+                host["last_seen"] = now.into();
+                host["heartbeat_log"] = serde_json::json!([now]);
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&original).expect("fixture serializes");
+        std::fs::write(&path, &bytes).expect("store written");
+        let siblings = [
+            "pharos.json.provisioning-jobs.json",
+            "managed-service-operations.json",
+            "managed-setup-intents.json",
+        ];
+        for sibling in siblings {
+            std::fs::write(directory.join(sibling), sibling).expect("sibling written");
+        }
+
+        let store = Store::new(Some(path.clone())).expect("Pharos 1 store loads");
+        assert_eq!(std::fs::read(&path).expect("store reads"), bytes);
+        for name in ["ares", "demeter", "hermes"] {
+            assert_eq!(
+                serde_json::to_value(store.get(name).expect("host loaded")).expect("serializes"),
+                *host_named(&original, name),
+                "{name}"
+            );
+        }
+
+        store
+            .record(basic_report("demeter"), now)
+            .expect("report persists");
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("store reads"))
+                .expect("store parses");
+        for name in ["ares", "hermes"] {
+            assert_eq!(
+                host_named(&rewritten, name),
+                host_named(&original, name),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            host_named(&rewritten, "demeter")["token_hash"],
+            host_named(&original, "demeter")["token_hash"]
+        );
+        assert_eq!(
+            host_named(&rewritten, "hermes")["requested_preferences"]["kind"],
+            "workstation"
+        );
+        for sibling in siblings {
+            assert_eq!(
+                std::fs::read_to_string(directory.join(sibling)).expect("sibling reads"),
+                sibling
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&directory)
+                .expect("directory lists")
+                .count(),
+            siblings.len() + 1
+        );
+        std::fs::remove_dir_all(directory).expect("temporary directory removed");
+    }
+
     #[test]
     fn concurrent_mutations_persist_in_lock_order_without_lost_hosts() {
         let directory = temporary_directory("concurrency");
