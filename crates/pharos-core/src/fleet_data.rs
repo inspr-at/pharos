@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
 
+use crate::cve_status::plain_kernel_version;
 use crate::{looks_like_secret_material, valid_canonical_hostname};
 
 pub const FLEET_DATA_SCHEMA_VERSION: u64 = 3;
@@ -232,6 +233,14 @@ impl FleetHost {
 }
 
 impl FleetData {
+    /// The handled history, newest first. A day's entries keep the file's order.
+    pub fn handled_newest_first(&self) -> Vec<&HandledCves> {
+        let mut handled: Vec<&HandledCves> = self.handled.iter().collect();
+        // Validation guarantees YYYY-MM-DD, which sorts as text.
+        handled.sort_by(|left, right| right.done.cmp(&left.done));
+        handled
+    }
+
     /// Parse and validate one file. Nothing is accepted partly: any problem
     /// refuses the whole file, so a caller keeps its last good data.
     pub fn parse(raw: &str) -> Result<Self, FleetDataError> {
@@ -538,9 +547,7 @@ fn valid_slug(value: &str) -> bool {
 }
 
 fn valid_version_line(value: &str) -> bool {
-    value
-        .split('.')
-        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    plain_kernel_version(value).is_some()
 }
 
 /// CVE-YYYY-NNNN with four to seven id digits.
@@ -580,6 +587,10 @@ fn verified_at(value: &str, path: &str, updated: OffsetDateTime) -> Result<(), F
 fn calendar_date(value: &str, path: &str) -> Result<Date, FleetDataError> {
     let format = time::format_description::parse_borrowed::<2>("[year]-[month]-[day]")
         .expect("the date format is valid");
+    // The parser also takes a signed year, which would not sort as text.
+    if value.len() != "YYYY-MM-DD".len() {
+        return invalid(path.to_string(), "expected YYYY-MM-DD");
+    }
     Date::parse(value, &format).or_else(|_| invalid(path.to_string(), "expected YYYY-MM-DD"))
 }
 
@@ -612,6 +623,39 @@ mod tests {
             "the types must carry every field of the contract"
         );
         assert!(data.updated_at_unix().is_some());
+    }
+
+    #[test]
+    fn handled_history_is_newest_first_and_a_day_keeps_the_file_order() {
+        let mut value = contract();
+        let entry = value["handled"][0].clone();
+        let dated = |done: &str, id: &str| {
+            let mut entry = entry.clone();
+            entry["done"] = done.into();
+            entry["ids"][0] = id.into();
+            entry
+        };
+        value["handled"] = serde_json::json!([
+            dated("1999-12-31", "CVE-1999-0001"),
+            dated("2000-01-02", "CVE-1999-0002"),
+            dated("1999-02-01", "CVE-1999-0003"),
+            dated("2000-01-02", "CVE-1999-0004"),
+        ]);
+        let data = FleetData::parse(&value.to_string()).expect("valid");
+        let order: Vec<&str> = data
+            .handled_newest_first()
+            .iter()
+            .map(|entry| entry.ids[0].as_str())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "CVE-1999-0002",
+                "CVE-1999-0004",
+                "CVE-1999-0001",
+                "CVE-1999-0003"
+            ]
+        );
     }
 
     #[test]
@@ -864,6 +908,26 @@ mod tests {
             (
                 "a kernel fix line must be dotted numbers",
                 Box::new(|value| value["cves"][0]["fixed_in"][0] = "6.18.x".into()),
+            ),
+            (
+                "a kernel fix line must be dotted numbers",
+                Box::new(|value| value["cves"][0]["fixed_in"][0] = "6".into()),
+            ),
+            (
+                "a kernel fix line must be dotted numbers",
+                Box::new(|value| value["cves"][0]["fixed_in"][0] = "6.18.56.1".into()),
+            ),
+            (
+                "a kernel fix line must be dotted numbers",
+                Box::new(|value| value["cves"][0]["fixed_in"][0] = "7.3-rc1".into()),
+            ),
+            (
+                "expected YYYY-MM-DD",
+                Box::new(|value| value["handled"][0]["done"] = "+2000-01-02".into()),
+            ),
+            (
+                "expected YYYY-MM-DD",
+                Box::new(|value| value["handled"][0]["done"] = "-2000-01-02".into()),
             ),
             (
                 "must match the name its beacon reports",
