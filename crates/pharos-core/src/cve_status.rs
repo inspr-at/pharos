@@ -59,16 +59,23 @@ pub struct KernelReport<'a> {
 impl<'a> KernelReport<'a> {
     /// `None` when the host has no comparable kernel to report. Off NixOS the
     /// posture is not applicable: vendor kernels backport fixes without changing
-    /// the version, so the number says nothing either way.
+    /// the version, so the number says nothing either way. A report that should
+    /// have named a kernel and didn't is still a report: it answers unknown, and
+    /// can't hand the answer back to an older hand-written status.
     pub fn from_host(host: &'a Host, now: UnixSeconds) -> Option<Self> {
-        let posture = host.kernel.as_ref()?;
-        if posture.state == KernelPostureState::NotApplicable {
+        let reported_at = host.last_seen?;
+        let posture = host.kernel.as_ref();
+        let no_kernel_to_report = match posture {
+            Some(posture) => posture.state == KernelPostureState::NotApplicable,
+            None => !host.freshness.applicable,
+        };
+        if no_kernel_to_report {
             return None;
         }
         Some(Self {
-            running_version: posture.running_version.as_deref(),
-            next_boot_version: posture.expected_version.as_deref(),
-            reported_at: host.last_seen?,
+            running_version: posture.and_then(|posture| posture.running_version.as_deref()),
+            next_boot_version: posture.and_then(|posture| posture.expected_version.as_deref()),
+            reported_at,
             fresh: liveness(host.last_seen, host.heartbeat_interval_secs, now) == Liveness::Live,
         })
     }
@@ -664,7 +671,68 @@ mod tests {
 
         let mut no_kernel = host;
         no_kernel.kernel = None;
+        no_kernel.freshness.applicable = true;
+        assert_eq!(
+            KernelReport::from_host(&no_kernel, NOW),
+            Some(KernelReport {
+                running_version: None,
+                next_boot_version: None,
+                reported_at: NOW - 30,
+                fresh: true
+            })
+        );
+        no_kernel.freshness.applicable = false;
         assert_eq!(KernelReport::from_host(&no_kernel, NOW), None);
+    }
+
+    #[test]
+    fn a_report_that_omits_its_kernel_never_brings_back_an_older_declared_status() {
+        let cve = serde_json::from_value::<FleetCve>(serde_json::json!({
+            "id": "CVE-2000-0001",
+            "severity": "high",
+            "state": "open",
+            "component": KERNEL_COMPONENT,
+            "eli10": "A kernel flaw.",
+            "tip": "Update.",
+            "fixed_in": ["6.18.56"],
+        }))
+        .unwrap();
+        let declared = |state: &str, verified: &str| {
+            serde_json::from_value::<DeclaredCveStatus>(serde_json::json!({
+                "state": state, "last_verified": verified,
+            }))
+            .unwrap()
+        };
+        let status_of = |age: i64, applicable: bool, row: &DeclaredCveStatus| {
+            let mut host = host_with(
+                KernelPostureState::Current,
+                Some("6.18.52"),
+                Some("6.18.52"),
+                Some(NOW - age),
+                Some(60),
+            );
+            host.kernel = None;
+            host.freshness.applicable = applicable;
+            host_cve_status(&cve, Some(row), KernelReport::from_host(&host, NOW), NOW).status
+        };
+        // An hour before NOW.
+        const AN_HOUR_AGO: &str = "2000-02-29T23:00:00Z";
+
+        // Fresh, so it decides, and it can't say.
+        let earlier = declared("fixed", YESTERDAY);
+        assert_eq!(status_of(30, true, &earlier), CveStatus::Unknown);
+        // Stale and newer than the check: still the newer evidence.
+        assert_eq!(status_of(3_600, true, &earlier), CveStatus::Unknown);
+        // Stale and older than the check: the check is the newer evidence.
+        let later = declared("fixed", AN_HOUR_AGO);
+        assert_eq!(status_of(86_400, true, &later), CveStatus::Fixed);
+        // Not applicable stays, and a host with no kernel to report keeps its file.
+        let not_applicable = declared("na", YESTERDAY);
+        assert_eq!(
+            status_of(30, true, &not_applicable),
+            CveStatus::NotApplicable
+        );
+        assert_eq!(status_of(30, false, &earlier), CveStatus::Fixed);
     }
 
     #[test]

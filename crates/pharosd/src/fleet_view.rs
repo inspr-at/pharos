@@ -187,7 +187,8 @@ impl HostRow {
     }
 
     /// A report that decides speaks first. Not every report names a release, and
-    /// the file's value is then all there is.
+    /// the file's value is then all there is. A report the file has replaced says
+    /// nothing any more.
     pub(crate) fn os_version(&self) -> Option<&str> {
         let declared = self
             .declared
@@ -196,7 +197,7 @@ impl HostRow {
         if self.report_decides() {
             self.nixpkgs_channel().or(declared)
         } else {
-            declared.or_else(|| self.nixpkgs_channel())
+            declared
         }
     }
 

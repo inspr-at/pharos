@@ -3507,6 +3507,23 @@ mod tests {
         // A check after a stale report replaces what that report said.
         let view = view_with(Some("nixos-25.11"), NOW - 2 * 86_400, NEW_CHECK);
         assert_eq!(view.rows[0].os_version(), Some("24.05"));
+
+        // Even a check that names only a kernel: the old release doesn't carry over.
+        let mut declared = listed("ares", serde_json::json!({}));
+        declared["os"] = "Example OS".into();
+        declared["kernel"] = "6.18.56".into();
+        declared["last_verified"] = NEW_CHECK.into();
+        let mut host = old_report("6.18.52", "6.18.52");
+        host.freshness.nixpkgs_channel = Some("nixos-25.05".to_string());
+        let view = view_of(
+            Some(data(serde_json::json!([]), serde_json::json!([declared]))),
+            None,
+            vec![host],
+        );
+        assert_eq!(view.rows[0].os_version(), None);
+        for page in [fleet_page(&view), host_page(&view)] {
+            assert!(!page.contains("25.05"), "{page}");
+        }
     }
 
     #[test]
