@@ -17,9 +17,10 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # git: the beacon shells out to it for commits-behind (rev-list HEAD..@{u}).
 # restic: optional PHAROS_BACKUP_MODE=restic collector; no credentials are
 # baked into the image.
-# openssh-client: pharosd can run read-only existing-host preflight and
-# convergence-marker probes when the runtime has non-interactive SSH access.
-# iputils-ping: the fixed appliance-presence signal used before testing SSH.
+# iputils-ping: the fixed presence signal for beaconless host probes. Debian ships
+# it with cap_net_raw=ep, and the kernel refuses to exec that under cap_drop: ALL,
+# so the capability is removed. Ping then uses an unprivileged ICMP socket, which
+# Docker's ping_group_range allows on a bridge network.
 # The runtime base image is pinned by digest. Package indexes are pinned to a
 # separate immutable snapshot; those pins need not share a date.
 # The snapshot follows DLA-4845-1 (2026-10-20). Pin ca-certificates to the
@@ -45,7 +46,8 @@ RUN printf '%s\n' \
       > /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates=20250419~deb12u2 iputils-ping \
-      libpcre2-8-0=10.42-1+deb12u2 libexpat1=2.5.0-1+deb12u5 openssh-client restic \
+      libpcre2-8-0=10.42-1+deb12u2 libexpat1=2.5.0-1+deb12u5 restic \
+    && setcap -r /usr/bin/ping \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 pharos
 # /data owned by pharos so a named volume mounted here inherits writable

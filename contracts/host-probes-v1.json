@@ -1,0 +1,9 @@
+{
+  "schema": "inspr.pharos.host-probes.v1",
+  "version": 1,
+  "probe_interval_secs": 60,
+  "hosts": [
+    { "host": "hermes", "target": "hermes.example.test" },
+    { "host": "artemis", "target": "192.0.2.40", "tcp_port": 2222 }
+  ]
+}

@@ -112,10 +112,8 @@ routes answer both there and at the origin root.
 | `PHAROS_REQUIRE_BEACON_TOKEN`                                  | Optional; tokens are always required, and `false` refuses startup               |
 | `PHAROS_BEACON_TOKEN_MODE`                                     | Optional; only `local` is valid, and anything else refuses startup              |
 | `PHAROS_MANIFEST_PATHS`                                        | Read-only declared-host manifests                                               |
-| `PHAROS_HOST_PREFERENCES_PATH`                                 | Read-only declared host preference registry                                     |
 | `PHAROS_HTTP_PROBES_PATH`                                      | Optional `inspr.pharos.http-probes.v1` registry                                 |
-| `PHAROS_APPLIANCE_PROBES_PATH`                                 | Optional `inspr.pharos.appliance-probes.v1` registry; requires `PHAROS_DB`      |
-| `PHAROS_EXISTING_HOST_IDENTITY_FILE`, `_KNOWN_HOSTS_FILE`      | Optional SSH identity for the appliance marker read                             |
+| `PHAROS_HOST_PROBES_PATH`                                      | Optional `inspr.pharos.host-probes.v1` registry; requires `PHAROS_DB`           |
 
 Startup fails closed: partial OIDC settings or open mode on a non-loopback
 address stop the server.
@@ -167,10 +165,15 @@ validation, and a missing observation stays unknown.
 Hosts without a beacon can still report reachability. `PHAROS_HTTP_PROBES_PATH`
 binds a manifest service to a credential-free URL with an expected status and
 optional body marker; `contracts/http-probes-v1.json` shows the shape.
-`PHAROS_APPLIANCE_PROBES_PATH` runs one ICMP check and one TCP connection to the
-declared SSH port; `contracts/appliance-probes-v1.json` shows the shape. Probes
-return reachability and coarse results, never response bodies or raw SSH output,
-and targets are never returned in the API.
+`PHAROS_HOST_PROBES_PATH` runs one ICMP check and one TCP connection per host, with
+no credential; `contracts/host-probes-v1.json` shows the shape. The last time a host
+answered is kept in `<PHAROS_DB>.host-probes.json` and survives a restart. A
+configured registry that is missing, invalid, a symlink, or writable by group or
+others refuses startup. Probes return reachability and coarse results, never
+response bodies, and targets are never returned in the API. Ping needs no capability
+in the image: on a bridge network Docker allows it, and on a host network the host's
+`net.ipv4.ping_group_range` decides. A check that cannot run says nothing about the
+host.
 
 ## Development
 

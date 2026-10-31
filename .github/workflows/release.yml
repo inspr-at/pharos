@@ -247,6 +247,9 @@ jobs:
             --entrypoint /usr/local/bin/pharos \
             "${IMAGE}@${DIGEST}" version | jq -e --arg scheme "${SCHEME}" --arg version "${VERSION}" \
             '.version_scheme == $scheme and .version == $version' >/dev/null
+          docker run --rm --cap-drop ALL --security-opt no-new-privileges:true \
+            --entrypoint /usr/bin/ping \
+            "${IMAGE}@${DIGEST}" -c 1 -W 2 127.0.0.1 >/dev/null
       - name: scan candidate image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (composite; Node 24 nested actions)
         with:

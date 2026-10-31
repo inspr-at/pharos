@@ -3,13 +3,13 @@
 //! Machine routes take beacon registrations and reports; the Fleet page and
 //! its data sit behind login. Hosts live in one JSON store (`PHAROS_DB`).
 
-mod appliance_probes;
 mod auth;
 #[cfg(test)]
 #[path = "../build_support.rs"]
 mod build_support;
 mod durable_file;
 mod fleet_data;
+mod host_probes;
 mod http_probes;
 mod manifests;
 mod probe_support;
@@ -19,7 +19,6 @@ mod startup;
 mod store;
 mod ui;
 
-use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -40,12 +39,11 @@ use pharos_core::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::appliance_probes::{spawn_appliance_probe_loop, ApplianceProbeRuntime};
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState, AuthUser};
 use crate::fleet_data::{spawn_fleet_data_loop, FleetDataRuntime, FleetDataView};
+use crate::host_probes::{spawn_host_probe_loop, HostProbeRuntime};
 use crate::http_probes::{spawn_http_probe_loops, HttpProbeRuntime};
 use crate::manifests::ManifestRegistry;
-use crate::probe_support::ProbeSshConfig;
 use crate::routes::build_router;
 use crate::startup::*;
 use crate::store::Store;
@@ -58,6 +56,7 @@ struct AppState {
     auth: AuthState,
     beacon_auth: BeaconAuth,
     http_probes: Option<Arc<HttpProbeRuntime>>,
+    host_probes: Option<Arc<HostProbeRuntime>>,
     fleet_data: Option<Arc<FleetDataRuntime>>,
     public_base_path: PublicBasePath,
 }
@@ -271,14 +270,6 @@ async fn report(
         tracing::warn!(error = %error, "report rejected: invalid report contract");
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if rep
-        .service_observations
-        .iter()
-        .any(appliance_probes::is_appliance_observation)
-    {
-        tracing::warn!(host = %rep.name, "report rejected: reserved server observation");
-        return StatusCode::BAD_REQUEST.into_response();
-    }
     let Some(token) = bearer_token(&headers) else {
         tracing::warn!(host = %rep.name, "report rejected: missing bearer token");
         return StatusCode::UNAUTHORIZED.into_response();
@@ -406,12 +397,19 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
         .map(|runtime| runtime.snapshot(now))
         .unwrap_or_default();
     server_probes.retain(|host, _| access.allows_host(host));
+    let mut host_probes = state
+        .host_probes
+        .as_deref()
+        .map(|runtime| runtime.snapshot(now))
+        .unwrap_or_default();
+    host_probes.retain(|host, _| access.allows_host(host));
     (
         no_store_headers(),
         Json(json!({
             "as_of": now,
             "hosts": hosts,
             "server_probes": server_probes,
+            "host_probes": host_probes,
             "fleet_data": fleet_data_payload(state.fleet_data.as_deref(), now),
         })),
     )
@@ -613,27 +611,20 @@ async fn main() {
     let auth = Auth::from_config(startup.auth, startup.public_base_path.clone())
         .await
         .unwrap_or_else(|err| panic!("Pharos authentication startup failed: {err}"));
-    let appliance_probes =
-        ApplianceProbeRuntime::from_env(host_store_path.as_deref(), ProbeSshConfig::from_env())
-            .unwrap_or_else(|error| panic!("appliance probe startup failed: {error}"));
-    if let Some(runtime) = appliance_probes.as_ref() {
-        runtime
-            .validate_host_records(&store, &manifests)
-            .unwrap_or_else(|error| panic!("appliance probe startup failed: {error}"));
-    }
-    store
-        .replace_server_observations(appliance_probes::APPLIANCE_OBSERVATION_ID, &BTreeMap::new())
-        .unwrap_or_else(|error| panic!("stale appliance observation cleanup failed: {error}"));
+    let host_probes = HostProbeRuntime::from_env(host_store_path.as_deref())
+        .unwrap_or_else(|error| panic!("host probe startup failed: {error}"))
+        .map(Arc::new);
     let state = AppState {
         store,
         auth,
         beacon_auth: startup.beacon_auth,
         http_probes: http_probes.clone(),
+        host_probes: host_probes.clone(),
         fleet_data: FleetDataRuntime::from_env(),
         public_base_path: startup.public_base_path.clone(),
     };
-    if let Some(runtime) = appliance_probes {
-        spawn_appliance_probe_loop(Arc::new(runtime), Arc::clone(&state.store));
+    if let Some(runtime) = host_probes {
+        spawn_host_probe_loop(runtime);
     }
     if let Some(runtime) = http_probes {
         spawn_http_probe_loops(runtime);
@@ -659,7 +650,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pharos_core::{HostRegistrationResponse as RegistrationReply, ServiceObservation};
+    use pharos_core::HostRegistrationResponse as RegistrationReply;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -694,6 +685,7 @@ mod tests {
             auth: AuthState::default(),
             beacon_auth,
             http_probes: None,
+            host_probes: None,
             fleet_data: None,
             public_base_path: PublicBasePath::root(),
         }
@@ -910,30 +902,6 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         std::fs::remove_file(path).expect("store fixture removed");
-    }
-
-    #[tokio::test]
-    async fn report_rejects_reserved_appliance_observation_without_mutating_host() {
-        let state = report_test_state();
-        register_test_token(&state, "ares", "valid-token");
-        let before = state.store.get("ares").expect("registered host exists");
-        let mut spoofed = test_report("ares");
-        spoofed.service_observations = vec![ServiceObservation {
-            id: appliance_probes::APPLIANCE_OBSERVATION_ID.to_string(),
-            label: "Appliance convergence".to_string(),
-            state: pharos_core::ServiceObservationState::Healthy,
-            summary: "powered off as expected".to_string(),
-        }];
-
-        let response = report(
-            State(state.clone()),
-            bearer_headers("valid-token"),
-            Json(spoofed),
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(state.store.get("ares"), Some(before));
     }
 
     #[tokio::test]
@@ -1361,6 +1329,35 @@ mod tests {
         // The file's contents stay off this API until the page needs them.
         assert_eq!(hosts["fleet_data"].get("sections"), None);
         std::fs::remove_file(path).expect("file removed");
+    }
+
+    #[tokio::test]
+    async fn host_probes_are_on_the_api_without_their_targets() {
+        let (runtime, _directory) = host_probes::runtime_for_test(&["hermes", "artemis"]);
+        runtime.record_reachable_for_test("hermes", now_unix());
+        let mut state = report_test_state();
+        state.host_probes = Some(runtime);
+        let hosts_json = |state: AppState| async move {
+            let base = serve_test_app(state).await;
+            reqwest::get(format!("{base}/hosts.json"))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+
+        let hosts = hosts_json(state).await;
+        assert_eq!(hosts["host_probes"]["hermes"]["reachable"], true);
+        assert!(hosts["host_probes"]["hermes"]["last_reachable_at"].is_i64());
+        assert_eq!(
+            hosts["host_probes"]["artemis"]["reachable"],
+            serde_json::Value::Null
+        );
+        assert!(!hosts.to_string().contains("example.test"));
+
+        let unconfigured = hosts_json(report_test_state()).await;
+        assert_eq!(unconfigured["host_probes"], serde_json::json!({}));
     }
 
     #[tokio::test]
