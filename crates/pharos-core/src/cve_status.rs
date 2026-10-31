@@ -174,7 +174,7 @@ pub fn kernel_cve_status(fixed_in: &[String], report: KernelReport<'_>) -> CveSt
         .and_then(plain_kernel_version)
         .map(|version| verdict(version, &lines));
     match (next_boot, running) {
-        (Some(Verdict::Fixed), _) => CveStatus::RebootDue,
+        (Some(Verdict::Fixed), Verdict::Affected) => CveStatus::RebootDue,
         (_, Verdict::Affected) => CveStatus::Affected,
         _ => CveStatus::Unknown,
     }
@@ -338,8 +338,9 @@ mod tests {
             (Some("6.18.55"), Some("6.18.56"), RebootDue),
             (Some("6.18.55"), Some("7.3.1"), RebootDue),
             (Some("6.18.55"), Some("8.0.0"), RebootDue),
-            // A running kernel no line covers is not fixed, but the reboot fixes it.
-            (Some("7.1.5"), Some("7.2.10"), RebootDue),
+            // Nothing says a kernel no line covers is affected. Updates due still
+            // shows the reboot.
+            (Some("7.1.5"), Some("7.2.10"), Unknown),
             // The next boot does not fix it.
             (Some("6.18.55"), Some("6.18.55"), Affected),
             (Some("6.18.54"), Some("6.18.55"), Affected),

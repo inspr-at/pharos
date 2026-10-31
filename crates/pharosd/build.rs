@@ -95,6 +95,8 @@ fn verify_calendar_bundle(manifest_dir: &Path) {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     println!("cargo:rerun-if-changed={}", manifest_path.display());
+    // The directory too, or a file added later would never be seen.
+    println!("cargo:rerun-if-changed={}", bundle.display());
 }
 
 fn main() {

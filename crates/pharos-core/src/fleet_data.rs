@@ -14,7 +14,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
 
 use crate::cve_status::plain_kernel_version;
-use crate::{looks_like_secret_material, valid_canonical_hostname};
+use crate::{has_url_credentials, looks_like_secret_material, valid_canonical_hostname};
 
 pub const FLEET_DATA_SCHEMA_VERSION: u64 = 3;
 pub const MAX_FLEET_DATA_BYTES: u64 = 1024 * 1024;
@@ -593,14 +593,6 @@ fn optional_short_text(value: Option<&str>, path: &str) -> Result<(), FleetDataE
 
 fn long_text(value: &str, path: &str) -> Result<(), FleetDataError> {
     text(value, path, MAX_LONG_TEXT_BYTES)
-}
-
-fn has_url_credentials(value: &str) -> bool {
-    value.split("//").skip(1).any(|rest| {
-        rest.split(|c: char| c == '/' || c.is_whitespace())
-            .next()
-            .is_some_and(|authority| authority.contains('@'))
-    })
 }
 
 fn valid_slug(value: &str) -> bool {

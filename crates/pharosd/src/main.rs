@@ -27,7 +27,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{DefaultBodyLimit, FromRef, Path as AxumPath, RawQuery, State};
+use axum::extract::{
+    DefaultBodyLimit, FromRef, FromRequest, Path as AxumPath, RawQuery, Request, State,
+};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -38,6 +40,7 @@ use pharos_core::{
     liveness, Host, HostRegistration, HostRegistrationResponse, HostReport, PublicBasePath,
     MAX_HOST_REGISTRATION_BYTES, MAX_HOST_REPORT_BYTES,
 };
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -261,11 +264,33 @@ async fn version() -> Json<serde_json::Value> {
     }))
 }
 
+/// `Json`, except that a refused body gets its status and nothing else: the
+/// default rejection quotes the value it could not read.
+struct MachineBody<T>(T);
+
+impl<S, T> FromRequest<S> for MachineBody<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = StatusCode;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, StatusCode> {
+        match Json::<T>::from_request(request, state).await {
+            Ok(Json(body)) => Ok(Self(body)),
+            Err(rejection) => {
+                tracing::warn!(status = %rejection.status(), "request body refused");
+                Err(rejection.status())
+            }
+        }
+    }
+}
+
 /// Beacon ingestion (PHAROS-9): upsert the host, stamping server receive time.
 async fn report(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(rep): Json<HostReport>,
+    MachineBody(rep): MachineBody<HostReport>,
 ) -> Response {
     if let Err(error) = rep.validate_contract() {
         tracing::warn!(error = %error, "report rejected: invalid report contract");
@@ -294,7 +319,7 @@ async fn report(
 async fn register(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(registration): Json<HostRegistration>,
+    MachineBody(registration): MachineBody<HostRegistration>,
 ) -> Response {
     if let Err(error) = registration.validate_contract() {
         tracing::warn!(error = %error, "registration rejected: invalid contract");
@@ -861,7 +886,7 @@ mod tests {
             let response = report(
                 State(state.clone()),
                 bearer_headers("fixture-token-demeter"),
-                Json(body),
+                MachineBody(body),
             )
             .await;
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{schema}");
@@ -874,11 +899,60 @@ mod tests {
         let response = report(
             State(state),
             bearer_headers("fixture-token-hermes"),
-            Json(test_report("demeter")),
+            MachineBody(test_report("demeter")),
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         std::fs::remove_file(path).expect("store fixture removed");
+    }
+
+    #[tokio::test]
+    async fn a_refused_body_answers_with_its_status_and_quotes_nothing() {
+        let secret = "https://example-user:example-pass@example.test";
+        let app = crate::routes::build_router(report_test_state());
+        for (path, content_type, body, status) in [
+            (
+                "/report",
+                "application/json",
+                format!(r#"{{"schema":"{secret}"}}"#),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/report",
+                "application/json",
+                format!(r#"{{"name":{secret}}}"#),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/register",
+                "application/json",
+                format!(r#"{{"version":"{secret}"}}"#),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/report",
+                "text/plain",
+                secret.to_string(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ] {
+            let response = tower::ServiceExt::oneshot(
+                app.clone(),
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), status, "{path} {content_type}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(bytes.is_empty(), "{}", String::from_utf8_lossy(&bytes));
+        }
     }
 
     #[tokio::test]
@@ -889,7 +963,7 @@ mod tests {
         let status = report(
             State(state.clone()),
             bearer_headers("valid-token"),
-            Json(test_report("ares")),
+            MachineBody(test_report("ares")),
         )
         .await;
 
@@ -906,7 +980,7 @@ mod tests {
         let status = report(
             State(state.clone()),
             bearer_headers("wrong-token"),
-            Json(test_report("ares")),
+            MachineBody(test_report("ares")),
         )
         .await;
 
@@ -923,7 +997,7 @@ mod tests {
         let status = report(
             State(state.clone()),
             HeaderMap::new(),
-            Json(test_report("ares")),
+            MachineBody(test_report("ares")),
         )
         .await;
 
@@ -939,13 +1013,13 @@ mod tests {
         let with_token = report(
             State(state.clone()),
             bearer_headers("valid-token"),
-            Json(test_report("hermes")),
+            MachineBody(test_report("hermes")),
         )
         .await;
         let without_token = report(
             State(state.clone()),
             HeaderMap::new(),
-            Json(test_report("hermes")),
+            MachineBody(test_report("hermes")),
         )
         .await;
 
@@ -966,7 +1040,7 @@ mod tests {
         let status = report(
             State(state),
             bearer_headers("any-token"),
-            Json(test_report("ares")),
+            MachineBody(test_report("ares")),
         )
         .await;
 
@@ -982,7 +1056,7 @@ mod tests {
         report(
             State(state.clone()),
             bearer_headers("old-token"),
-            Json(test_report("ares")),
+            MachineBody(test_report("ares")),
         )
         .await;
         let last_seen = state.store.get("ares").and_then(|h| h.last_seen);
@@ -991,7 +1065,7 @@ mod tests {
         let response = register(
             State(state.clone()),
             bearer_headers("bootstrap-fixture"),
-            Json(test_registration("ares")),
+            MachineBody(test_registration("ares")),
         )
         .await;
         let (status, _, payload) = json_response(response).await;
@@ -1002,14 +1076,14 @@ mod tests {
         let old = report(
             State(state.clone()),
             bearer_headers("old-token"),
-            Json(test_report("ares")),
+            MachineBody(test_report("ares")),
         )
         .await;
         assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
         let new = report(
             State(state),
             bearer_headers(&reply.token),
-            Json(test_report("ares")),
+            MachineBody(test_report("ares")),
         )
         .await;
         assert_eq!(new.status(), StatusCode::NO_CONTENT);
@@ -1029,7 +1103,7 @@ mod tests {
         let response = report(
             State(state.clone()),
             bearer_headers("valid-token"),
-            Json(test_report("persistence-test")),
+            MachineBody(test_report("persistence-test")),
         )
         .await;
 
@@ -1050,7 +1124,7 @@ mod tests {
         let response = register(
             State(state.clone()),
             bearer_headers("bootstrap-fixture"),
-            Json(test_registration("registration-test")),
+            MachineBody(test_registration("registration-test")),
         )
         .await;
         let (status, _, payload) = json_response(response).await;
@@ -1069,7 +1143,7 @@ mod tests {
         let response = register(
             State(state.clone()),
             bearer_headers("bootstrap-fixture"),
-            Json(test_registration("registration-cache-test")),
+            MachineBody(test_registration("registration-cache-test")),
         )
         .await;
         let (status, headers, payload) = json_response(response).await;
@@ -1098,7 +1172,7 @@ mod tests {
         let response = register(
             State(off.clone()),
             bearer_headers("bootstrap-fixture"),
-            Json(test_registration("ares")),
+            MachineBody(test_registration("ares")),
         )
         .await;
         let (status, _, payload) = json_response(response).await;
@@ -1110,8 +1184,12 @@ mod tests {
             registration_token: Some("bootstrap-fixture".to_string()),
         });
         for headers in [bearer_headers("wrong-fixture"), HeaderMap::new()] {
-            let response =
-                register(State(on.clone()), headers, Json(test_registration("ares"))).await;
+            let response = register(
+                State(on.clone()),
+                headers,
+                MachineBody(test_registration("ares")),
+            )
+            .await;
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
         assert!(on.store.get("ares").is_none());

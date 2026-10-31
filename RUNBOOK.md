@@ -73,6 +73,10 @@ Verify after login: the host appears at `/hosts.json` with `"liveness": "live"`.
 
 ## Rotate a token
 
+A host with no stored hash gets 401: Pharos only checks tokens against its store.
+A store from a server that checked tokens somewhere else has no hash for those
+hosts, so rotate each of them before relying on its reports.
+
 Run the same `POST /register` with the existing host name.
 
 - The old token stops working immediately, so the beacon answers `401` until it

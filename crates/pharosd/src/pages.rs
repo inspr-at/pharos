@@ -1096,6 +1096,10 @@ pub(crate) fn watch_counts(view: &FleetView, index: usize) -> String {
             matches!(
                 on.status.source,
                 CveStatusSource::Computed { stale: true, .. }
+                    | CveStatusSource::Declared {
+                        verification_stale: true,
+                        ..
+                    }
             )
         })
         .count();
@@ -3288,6 +3292,33 @@ mod tests {
             vec![report("ares", "6.18.56", "6.18.56")],
         );
         assert_eq!(watch_counts(&fresh, 0), "1 fixed · none affected");
+    }
+
+    #[test]
+    fn a_stale_declared_status_says_so_on_every_summary() {
+        let row_with = |verified: &str| {
+            view_of(
+                Some(data(
+                    serde_json::json!([library_cve("CVE-2000-0002")]),
+                    serde_json::json!([listed(
+                        "ares",
+                        serde_json::json!({
+                            "CVE-2000-0002": { "state": "fixed", "last_verified": verified }
+                        })
+                    )]),
+                )),
+                None,
+                vec![report("ares", "6.18.56", "6.18.56")],
+            )
+        };
+        assert_eq!(
+            watch_counts(&row_with("2000-01-10T00:00:00Z"), 0),
+            "1 fixed · none affected · 1 stale"
+        );
+        assert_eq!(
+            watch_counts(&row_with("2000-02-25T00:00:00Z"), 0),
+            "1 fixed · none affected"
+        );
     }
 
     #[test]

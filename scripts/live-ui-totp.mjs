@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { LIVE_UI_ORIGINS } from "./live-ui-origins.mjs";
 
 // Unattended TOTP for the personal live UI harness.
 // Zitadel 98272ab5d1c1074ca81ee31e0895d1e3d73d022a posts the verify form to
@@ -15,7 +16,8 @@ export const TOTP_DIGITS = 6;
 export const TOTP_NEAR_EXPIRY_MS = 5000;
 export const TOTP_GRANT_MS = 8000;
 export const TOTP_VERIFY_PATH = "/ui/login/mfa/verify";
-export const TOTP_VERIFY_URL = "https://auth.inspr.at/ui/login/mfa/verify";
+const ISSUER_ORIGIN = LIVE_UI_ORIGINS.issuerOrigin;
+export const TOTP_VERIFY_URL = `${ISSUER_ORIGIN}${TOTP_VERIFY_PATH}`;
 export const MFA_TYPE_TOTP = "0";
 
 const BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -191,7 +193,7 @@ export function inspectTotpForm(root) {
   const view = doc.defaultView;
   if (!view || view.top !== view) return fail("totp-frame");
   const location = doc.location;
-  if (!location || location.origin !== "https://auth.inspr.at") return fail("totp-origin");
+  if (!location || location.origin !== ISSUER_ORIGIN) return fail("totp-origin");
   const forms = [...doc.querySelectorAll("form")];
   if (forms.length !== 1) return fail("totp-form");
   const form = forms[0];
@@ -204,7 +206,7 @@ export function inspectTotpForm(root) {
     return fail("totp-form");
   }
   if (
-    action.origin !== "https://auth.inspr.at" ||
+    action.origin !== ISSUER_ORIGIN ||
     action.pathname !== "/ui/login/mfa/verify" ||
     action.search ||
     action.hash ||
@@ -276,7 +278,7 @@ export function publicTotpInspection(inspected) {
   }
   return {
     ok: true,
-    origin: "https://auth.inspr.at",
+    origin: ISSUER_ORIGIN,
     method: "POST",
     actionPath: TOTP_VERIFY_PATH,
     mfaType: MFA_TYPE_TOTP,
@@ -336,7 +338,7 @@ export function totpVerifyTarget(method, raw) {
   }
   return (
     url.protocol === "https:" &&
-    url.origin === "https://auth.inspr.at" &&
+    url.origin === ISSUER_ORIGIN &&
     url.pathname === TOTP_VERIFY_PATH &&
     !url.username &&
     !url.password

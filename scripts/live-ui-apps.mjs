@@ -1,6 +1,8 @@
+import { LIVE_UI_ORIGINS } from "./live-ui-origins.mjs";
+
 // Fixed, reviewed Flow mounts. Runtime input cannot add an origin, auth route,
 // or read permission. Application writes are denied by the shared guard.
-export const FAMILY_ORIGIN = "https://flow.inspr.at";
+export const FAMILY_ORIGIN = LIVE_UI_ORIGINS.familyOrigin;
 export const FAMILY_SCHEMA = "inspr.uxqa.live-ui-evidence.v1";
 export const FAMILY_VIEWPORTS = Object.freeze({
   desktop: Object.freeze({ width: 1440, height: 1000 }),
@@ -85,7 +87,7 @@ export function familyRoutes(name, projectRef = "") {
 export function classifyFamilyObservation({ app, location, status, probe, callbackConfirmed = false }) {
   if (probe?.accountSetup) return "account-setup-required";
   if (probe?.mfa) return "mfa-required";
-  if (probe?.rateLimited || probe?.authRecovery || probe?.passwordCount > 0 || probe?.loginForm || probe?.authUiVisible || location?.origin === "https://auth.inspr.at" || familyAuthPath(app, location?.pathname || "")) return "auth-required";
+  if (probe?.rateLimited || probe?.authRecovery || probe?.passwordCount > 0 || probe?.loginForm || probe?.authUiVisible || location?.origin === "https://auth.example.test" || familyAuthPath(app, location?.pathname || "")) return "auth-required";
   if (probe?.noAccess || probe?.accessDenied || probe?.accessRequest || status === 403) return "policy-denied";
   if (status === 401) return "auth-required";
   if (familyAppLocation(app, location) && callbackConfirmed && probe?.familyShell && (status === 0 || (status >= 200 && status < 400))) return "authenticated";

@@ -2343,6 +2343,15 @@ pub enum BackupValidationState {
     Unknown,
 }
 
+/// `user:pass@` after a `//`, whether or not a scheme comes before it.
+pub(crate) fn has_url_credentials(value: &str) -> bool {
+    value.split("//").skip(1).any(|rest| {
+        rest.split(|c: char| c == '/' || c.is_whitespace())
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    })
+}
+
 fn safe_observation_text(value: &str) -> bool {
     if value.trim() != value || value.len() > MAX_OBSERVATION_SUMMARY_BYTES {
         return false;
@@ -2352,6 +2361,7 @@ fn safe_observation_text(value: &str) -> bool {
         && !value.contains('\n')
         && !value.contains('\r')
         && !value.contains("://")
+        && !has_url_credentials(value)
         && !value.contains('?')
         && !value.contains('#')
         && !lowered.contains("password")
@@ -3641,6 +3651,20 @@ mod tests {
         let healthy =
             ServiceObservation::nix_freshness(&proven_current_freshness("nixos-unstable"));
         assert_eq!(healthy.state, ServiceObservationState::Healthy);
+    }
+
+    #[test]
+    fn observation_text_refuses_a_credential_with_or_without_a_scheme() {
+        for text in [
+            "https://example-user:example-pass@example.test/private",
+            "//example-user:example-pass@example.test/private",
+            "see //example-user@example.test",
+        ] {
+            assert!(!safe_observation_text(text), "{text}");
+        }
+        for text in ["Up 2 minutes (healthy)", "a//b", "mail me@example.test"] {
+            assert!(safe_observation_text(text), "{text}");
+        }
     }
 
     #[test]

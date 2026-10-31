@@ -3,6 +3,7 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FAMILY_ORIGIN, familyApp, familyReadAllowed, normalizeFamilyPath } from "./live-ui-apps.mjs";
+import { LIVE_UI_ORIGINS } from "./live-ui-origins.mjs";
 import { consumeTotpGrant, decodeTotpPostData, revokeTotpGrant, totpVerifyTarget } from "./live-ui-totp.mjs";
 
 // Browser-side request policy for the personal Pharos live UI harness.
@@ -11,13 +12,10 @@ import { consumeTotpGrant, decodeTotpPostData, revokeTotpGrant, totpVerifyTarget
 // persists a settings workflow, so it is not a safe server-side draft.
 // No application mutation is whitelisted.
 
-export const PERSONAL_APP_ORIGINS = Object.freeze([
-  "https://pharos.barta.cm",
-  "https://flow.inspr.at",
-]);
+export const PERSONAL_APP_ORIGINS = LIVE_UI_ORIGINS.personalAppOrigins;
 export const PERSONAL_BASE_PATH = "/pharos";
-export const PERSONAL_ISSUER_ORIGIN = "https://auth.inspr.at";
-export const ENTRY_URL = "https://pharos.barta.cm/pharos/auth/login";
+export const PERSONAL_ISSUER_ORIGIN = LIVE_UI_ORIGINS.issuerOrigin;
+export const ENTRY_URL = `${PERSONAL_APP_ORIGINS[0]}/pharos/auth/login`;
 export const SERVER_MUTATION_ALLOWLIST = Object.freeze([]);
 export const SESSION_ORDER = Object.freeze([
   "install-request-guard",

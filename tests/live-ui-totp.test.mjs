@@ -49,7 +49,7 @@ const REPO_ROOT = repoRootFromScripts();
 const RFC_SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 const CSRF = "csrf-synthetic-token";
 const AUTH = "auth-synthetic-id";
-const OTP_PATH = "https://auth.inspr.at/ui/login/mfa/otp/verify";
+const OTP_PATH = "https://auth.example.test/ui/login/mfa/otp/verify";
 
 function leaks(value, parts) {
   const blob = typeof value === "string" ? value : JSON.stringify(value);
@@ -405,7 +405,7 @@ test("both layers allow one exact verify POST and then fail closed", async () =>
   assert.equal(decideRequest({ method: "GET", url: TOTP_VERIFY_URL }, policy).reason, "issuer-read");
   assert.equal(decideRequest({ method: "POST", url: OTP_PATH }, policy).allow, false);
   assert.equal(decideRedirect({ method: "POST", url: TOTP_VERIFY_URL, postData: post }, policy).allow, false);
-  const password = decideRequest({ method: "POST", url: "https://auth.inspr.at/ui/login/password" }, policy);
+  const password = decideRequest({ method: "POST", url: "https://auth.example.test/ui/login/password" }, policy);
   assert.equal(password.allow, true);
   assert.equal(policy.totpGrant.uses.primary, 0);
   assert.equal(policy.totpGrant.uses.fetch, 0);
@@ -467,7 +467,7 @@ test("retry, redirect, mutation, leakage, expiry, and guard loss deny the verify
     method: () => "POST",
     resourceType: () => "document",
     postData: () => postData,
-    redirectedFrom: () => (redirected ? { url: "https://auth.inspr.at/ui/login/password" } : null),
+    redirectedFrom: () => (redirected ? { url: "https://auth.example.test/ui/login/password" } : null),
     frame: () => target,
   });
   const deny = (policy, url, postData, event = {}) => {
@@ -501,7 +501,7 @@ test("retry, redirect, mutation, leakage, expiry, and guard loss deny the verify
   deny(factor, OTP_PATH, post);
   assert.equal(decideRequest({
     method: "POST",
-    url: "https://pharos.barta.cm/pharos/agora/requests/host-preferences.json",
+    url: "https://pharos.example.test/pharos/agora/requests/host-preferences.json",
   }, factor).allow, false);
 
   const leakedCode = grantFor(code, secrets);
@@ -523,7 +523,7 @@ test("retry, redirect, mutation, leakage, expiry, and guard loss deny the verify
   const leakedSeed = grantFor(code, secrets);
   const seeded = decideRequest({
     method: "GET",
-    url: `https://pharos.barta.cm/pharos/?q=${RFC_SECRET}`,
+    url: `https://pharos.example.test/pharos/?q=${RFC_SECRET}`,
   }, leakedSeed);
   assert.equal(seeded.reason, "secret-in-url");
   assert.equal(leaks(seeded, [RFC_SECRET, code]), false);
@@ -559,7 +559,7 @@ test("retry, redirect, mutation, leakage, expiry, and guard loss deny the verify
 });
 
 test("screenshots reject a code form and the runner does not prompt or send the seed", async () => {
-  const app = { origin: "https://flow.inspr.at", pathname: "/pharos/map" };
+  const app = { origin: "https://flow.example.test", pathname: "/pharos/map" };
   const ready = { appShell: true, managerShell: true, passwordCount: 0, mfa: false, loginForm: false };
   assert.equal(screenshotPermitted({
     classification: "authenticated",

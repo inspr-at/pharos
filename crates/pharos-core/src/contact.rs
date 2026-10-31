@@ -171,7 +171,7 @@ pub fn host_contact(
     };
 
     // A check that can't run says nothing about the host, whatever its policy.
-    if beacon.is_none() && reachable.is_none() {
+    if beacon_seen.is_none() && reachable.is_none() {
         return contact(
             ContactState::CheckUnavailable,
             ContactTone::Neutral,
@@ -477,7 +477,26 @@ mod tests {
             assert_eq!(seen.state, ContactState::CheckUnavailable, "{policy:?}");
             assert_eq!(seen.tone, ContactTone::Neutral, "{policy:?}");
             assert_eq!(seen.age_secs, Some(61 * DAY as u64), "{policy:?}");
+
+            // A registration that never reported has no contact of its own.
+            let registered = Some(BeaconEvidence {
+                last_seen: None,
+                liveness: Liveness::AwaitingFirstHeartbeat,
+            });
+            let seen = host_contact(policy, registered, probe(None, Some(61 * DAY)), false, NOW);
+            assert_eq!(seen.state, ContactState::CheckUnavailable, "{policy:?}");
+            assert_eq!(seen.tone, ContactTone::Neutral, "{policy:?}");
         }
+
+        // A beacon's own last contact still counts when only the probe can't run.
+        let seen = host_contact(
+            CLIENT,
+            beacon(61 * DAY, Liveness::Down),
+            probe(None, None),
+            false,
+            NOW,
+        );
+        assert_eq!(seen.tone, ContactTone::Danger);
     }
 
     #[test]
