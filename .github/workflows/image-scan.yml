@@ -1,0 +1,44 @@
+name: image scan
+
+# PHAROS-350: release.yml scans only after the tag is pushed, and a refusal there
+# costs a release coordinate. This runs the same scan on the pull request that
+# moves the snapshot or reserves a version. Keep the Trivy pin and flags equal to
+# release.yml's. A package fixed between this run and the tag can still be
+# refused, so the release scan stays the final gate.
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - RELEASE.json
+      - .github/workflows/image-scan.yml
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0 (Node 24)
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0 (Node 24)
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: pharosd:scan
+          provenance: false
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+      - name: scan the image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (composite; Node 24 nested actions)
+        with:
+          image-ref: pharosd:scan
+          version: v0.72.0
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          scanners: vuln
