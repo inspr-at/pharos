@@ -114,7 +114,7 @@ export function fleetData(now) {
       last_verified: checked,
       ...extra,
     });
-  return {
+  return closed({
     schema_version: 3,
     title: "Example fleet",
     updated_at: moment(now, 2 * HOUR),
@@ -279,7 +279,15 @@ export function fleetData(now) {
         ],
       },
     ],
-  };
+  }, "CVE-2000-1005");
+}
+
+// Every listed host answers for the old fixed CVE, so it can leave the watchlist.
+function closed(data, id) {
+  for (const section of data.sections) {
+    for (const host of section.hosts) host.cve[id] ??= { state: "na" };
+  }
+  return data;
 }
 
 function probeRegistry(port) {
@@ -337,7 +345,7 @@ export function writeFixtures(runDir, port) {
   // One CVE fewer, so the fixed card is on the watchlist instead of past its end.
   const flaky = fleetData(now);
   flaky.cves = flaky.cves.filter((cve) => cve.id !== "CVE-2000-1006");
-  flaky.sections[0].hosts[0].cve = {};
+  flaky.sections[0].hosts[0].cve = { "CVE-2000-1005": { state: "na" } };
   writeJson(path.join(runDir, "flaky-fleet.json"), flaky);
   writeJson(path.join(runDir, "hosts.json"), reports(now), 0o600);
   writeJson(path.join(runDir, "hosts.json.host-probes.json"), probeState(now), 0o600);

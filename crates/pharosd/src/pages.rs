@@ -599,8 +599,20 @@ fn update_note(view: &FleetView, row: &HostRow) -> String {
             e(&note.text)
         )
     });
+    let already_stale = parts.is_some_and(|note| note.stale);
+    if !already_stale {
+        if let Some(age) = row.stale_computed_age(view) {
+            let _ = write!(
+                html,
+                r#"<span class="update-state">{}Computed from a report {}{}</span>"#,
+                icon("clock", ""),
+                ago(age),
+                stale_chip()
+            );
+        }
+    }
     // A fresh report says nothing about a status someone wrote down long ago.
-    if !parts.is_some_and(|note| note.stale) {
+    if !already_stale {
         if let Some((at, true)) = row.declared_check(view) {
             let _ = write!(
                 html,
@@ -1701,7 +1713,14 @@ pub(super) fn render_updates(
                 let (state, source) = match report_age(row) {
                     Some(_) => (
                         "Not answered by the report".to_string(),
-                        format!("Report {age}"),
+                        if matches!(
+                            row.updates.source,
+                            UpdatesSource::Report { stale: true, .. }
+                        ) {
+                            format!("Data from {age}{}", stale_chip())
+                        } else {
+                            format!("Report {age}")
+                        },
                     ),
                     None => (e(&contact_label(&row.contact)), e(contact_source(row).1)),
                 };
@@ -1944,6 +1963,14 @@ fn cve_note(view: &FleetView, row: &HostRow, cve: &FleetCve, on: &CveOnHost) -> 
                 (format!("{kernel} · data {} old", span(*age_secs)), true)
             } else {
                 (kernel.to_string(), false)
+            }
+        }
+        (CveStatus::Unknown, CveStatusSource::Computed { age_secs, stale }) => {
+            let reason = capitalized(row.unknown_reason(cve, on));
+            if *stale {
+                (format!("{reason} · data {} old", span(*age_secs)), true)
+            } else {
+                (reason, false)
             }
         }
         (CveStatus::Unknown, _) => (capitalized(row.unknown_reason(cve, on)), false),
@@ -2852,7 +2879,10 @@ mod tests {
         ];
         for page in pages {
             assert_eq!(page.matches(r#"method="post""#).count(), 1, "only sign out");
-            assert!(page.contains(r#"action="/auth/logout" method="post""#));
+            // scripts/live-ui-apps.mjs tells a signed-in page by this form in the sidebar.
+            let start = page.find(r#"<aside class="side""#).unwrap();
+            let side = &page[start..page.find("</aside>").unwrap()];
+            assert!(side.contains(r#"action="/auth/logout" method="post""#));
         }
     }
 
@@ -3111,10 +3141,116 @@ mod tests {
         assert_eq!(fleet_counts(&patched).affected, 0);
         assert_eq!(patched.handled_history().len(), 1);
 
-        // A host Pharos can't check doesn't hold a fixed CVE on the list for ever.
+        // Time alone doesn't make it handled while a host can't answer for it.
         let silent = view_of(Some(fleet()), None, Vec::new());
-        assert!(silent.watchlist.is_empty());
-        assert_eq!(silent.handled_history().len(), 1);
+        assert_eq!(silent.watchlist, [0]);
+        assert!(silent.handled_history().is_empty());
+        assert_eq!(fleet_counts(&silent).unknown, 1);
+
+        let unanswered = view_of(
+            Some(fleet()),
+            None,
+            vec![report("ares", "6.12.1", "6.12.1")],
+        );
+        assert_eq!(unanswered.watchlist, [0]);
+        assert!(unanswered.handled_history().is_empty());
+        assert_eq!(fleet_counts(&unanswered).unknown, 1);
+        assert!(!fleet_page(&unanswered).contains("No watched CVEs"));
+
+        // A status in the file lets it go, which is how an unanswerable host is closed.
+        let mut closed = fleet();
+        closed.sections[0].hosts[0].cve.insert(
+            "CVE-2000-0001".to_string(),
+            serde_json::from_value(serde_json::json!({"state": "na"})).unwrap(),
+        );
+        let closed = view_of(Some(closed), None, Vec::new());
+        assert!(closed.watchlist.is_empty());
+        assert_eq!(closed.handled_history().len(), 1);
+
+        // A host the file doesn't list only holds what its own report can't answer.
+        let empty = || {
+            data(
+                serde_json::json!([fixed_long_ago("CVE-2000-0001")]),
+                serde_json::json!([]),
+            )
+        };
+        let unlisted = view_of(
+            Some(empty()),
+            None,
+            vec![report("ares", "6.12.1", "6.12.1")],
+        );
+        assert_eq!(unlisted.watchlist, [0]);
+        let mut tool = fixed_long_ago("CVE-2000-0001");
+        tool["component"] = "example-library".into();
+        let unlisted = view_of(
+            Some(data(serde_json::json!([tool]), serde_json::json!([]))),
+            None,
+            vec![report("ares", "6.12.1", "6.12.1")],
+        );
+        assert!(unlisted.watchlist.is_empty());
+    }
+
+    #[test]
+    fn stale_evidence_is_labelled_on_every_path_that_shows_it() {
+        let api = |view: &FleetView| {
+            serde_json::to_value(crate::fleet_api::api_host(view, &view.rows[0])).unwrap()
+        };
+
+        // A newer check of the versions doesn't freshen the report behind the CVE.
+        let mut declared = listed("ares", serde_json::json!({}));
+        declared["version"] = "1.0".into();
+        declared["kernel"] = "6.18.56".into();
+        declared["last_verified"] = "2000-02-29T20:00:00Z".into();
+        let declared = view_of(
+            Some(data(
+                serde_json::json!([kernel_cve("CVE-2000-0001", "6.18.56")]),
+                serde_json::json!([declared]),
+            )),
+            None,
+            vec![old_report("6.18.52", "6.18.52")],
+        );
+        let row = &declared.rows[0];
+        assert_eq!(row.stale_computed_age(&declared), Some(2 * 86_400));
+        let note = update_note(&declared, row);
+        assert!(note.contains("Stale"), "{note}");
+        assert_eq!(api(&declared)["stale"], true);
+
+        // An unknown outcome keeps its age and its label, on the CVE page and on Updates.
+        let unknown = view_of(
+            Some(data(
+                serde_json::json!([kernel_cve("CVE-2000-0001", "6.18.56")]),
+                serde_json::json!([listed("ares", serde_json::json!({}))]),
+            )),
+            None,
+            vec![old_report("5.4.1", "5.4.1")],
+        );
+        let row = &unknown.rows[0];
+        let cve = &unknown.data.as_deref().unwrap().cves[0];
+        let (note, stale) = cve_note(&unknown, row, cve, row.on(0).unwrap());
+        assert!(stale, "{note}");
+        assert!(note.contains("data 2 d old"), "{note}");
+        let updates = render_updates(&PublicBasePath::root(), None, &unknown);
+        assert!(updates.contains("Not answered by the report"), "{updates}");
+        assert!(updates.contains("Data from"), "{updates}");
+        assert!(updates.contains("Stale"), "{updates}");
+    }
+
+    #[test]
+    fn next_boot_is_only_what_the_report_says() {
+        let next_boot = |state: &str, expected: Option<&str>| {
+            let mut host = report("ares", "6.18.52", "6.18.52");
+            let mut kernel = serde_json::to_value(host.kernel.take().unwrap()).unwrap();
+            kernel["state"] = state.into();
+            kernel["expected_version"] = expected.into();
+            host.kernel = Some(serde_json::from_value(kernel).unwrap());
+            let view = view_of(None, None, vec![host]);
+            serde_json::to_value(crate::fleet_api::api_host(&view, &view.rows[0])).unwrap()
+                ["next_boot"]
+                .clone()
+        };
+        assert_eq!(next_boot("current", Some("6.18.52")), "6.18.52");
+        assert_eq!(next_boot("reboot_required", Some("6.18.56")), "6.18.56");
+        assert!(next_boot("unknown", None).is_null());
     }
 
     #[test]

@@ -1509,7 +1509,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_operator_token_reads_data_and_changes_nothing() {
-        let mut state = report_test_state();
+        let mut state = report_test_state_with_auth(BeaconAuth {
+            registration_token: Some("bootstrap-fixture".to_string()),
+        });
         register_test_token(&state, "ares", "ares-beacon-token");
         state.auth = AuthState::for_test_operator_token("operator-read-token");
         let store = state.store.clone();
@@ -1584,21 +1586,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.status(), reqwest::StatusCode::UNAUTHORIZED);
-        let register = client
-            .post(format!("{base}/register"))
-            .header("authorization", bearer("operator-read-token"))
-            .json(&json!({
-                "schema": pharos_core::HOST_REGISTRATION_SCHEMA,
-                "version": pharos_core::HOST_REGISTRATION_VERSION,
-                "name": "new-host",
-                "role": "server",
-                "is_nix": true,
-                "heartbeat_interval_secs": 60,
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert!(register.status().is_client_error(), "{}", register.status());
+        let registration = json!({
+            "schema": pharos_core::HOST_REGISTRATION_SCHEMA,
+            "version": pharos_core::HOST_REGISTRATION_VERSION,
+            "name": "new-host",
+            "role": "server",
+            "is_nix": true,
+            "heartbeat_interval_secs": 60,
+        });
+        let register = |token: &'static str| {
+            client
+                .post(format!("{base}/register"))
+                .header("authorization", bearer(token))
+                .json(&registration)
+                .send()
+        };
+        assert_eq!(
+            register("operator-read-token").await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
         let logout = client
             .post(format!("{base}/auth/logout"))
             .header("authorization", bearer("operator-read-token"))
@@ -1612,6 +1618,14 @@ mod tests {
         assert_eq!(after.len(), before.len());
         assert_eq!(after[0].last_seen, before[0].last_seen);
         assert_eq!(after[0].token_hash, before[0].token_hash);
+
+        // The same request does work with the credential that is meant for it.
+        assert!(register("bootstrap-fixture")
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert_eq!(store.list().len(), before.len() + 1);
     }
 
     #[test]

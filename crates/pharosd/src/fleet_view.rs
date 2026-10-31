@@ -257,6 +257,22 @@ impl HostRow {
         found.then_some((oldest, any_stale))
     }
 
+    /// How old the report behind a watched CVE is, when that report is stale.
+    /// A newer hand-declared check of the versions says nothing about it.
+    pub(crate) fn stale_computed_age(&self, view: &FleetView) -> Option<u64> {
+        view.watchlist
+            .iter()
+            .filter_map(|index| self.on(*index))
+            .filter_map(|on| match on.status.source {
+                CveStatusSource::Computed {
+                    age_secs,
+                    stale: true,
+                } => Some(age_secs),
+                _ => None,
+            })
+            .max()
+    }
+
     /// Lower needs attention sooner.
     pub(crate) fn attention_rank(&self, view: &FleetView) -> u8 {
         let security = self.security(view);
@@ -407,14 +423,20 @@ impl FleetView {
     }
 }
 
-/// The file's watchlist, plus any fixed CVE past its days that a host is still on,
-/// so it cannot leave the page while that host stays affected.
+/// The file's watchlist, plus any fixed CVE past its days that a host is still on
+/// or can't answer for, so time alone cannot make it look handled. A kernel report
+/// or a status in the file lets it go. A host the file doesn't list has no way to get
+/// that status, so it only holds a CVE its own report can't answer.
 fn watched(data: &FleetData, rows: &[HostRow], now: i64) -> Vec<usize> {
     let listed = data.watchlist(now);
     let needed = |index: usize| {
         rows.iter().any(|row| {
-            row.on(index).is_some_and(|on| {
-                matches!(on.status.status, CveStatus::Affected | CveStatus::RebootDue)
+            row.on(index).is_some_and(|on| match on.status.status {
+                CveStatus::Affected | CveStatus::RebootDue => true,
+                CveStatus::Unknown => {
+                    row.declared.is_some() || !matches!(on.status.source, CveStatusSource::Nothing)
+                }
+                CveStatus::Fixed | CveStatus::NotApplicable => false,
             })
         })
     };

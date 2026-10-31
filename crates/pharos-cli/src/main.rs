@@ -159,12 +159,29 @@ async fn get(client: &Client, path: &str, token: Option<&str>) -> Result<String,
 }
 
 fn parse_fleet(body: &str) -> Result<Value, String> {
-    let fleet: Value =
+    let mut fleet: Value =
         serde_json::from_str(body).map_err(|_| "Pharos returned malformed JSON".to_string())?;
     if fleet.get("schema").and_then(Value::as_str) != Some(FLEET_VIEW_SCHEMA) {
         return Err("Pharos returned an unknown fleet view".to_string());
     }
+    without_controls(&mut fleet);
     Ok(fleet)
+}
+
+/// Text from the server reaches a terminal only without control characters.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+fn without_controls(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = printable(text),
+        Value::Array(items) => items.iter_mut().for_each(without_controls),
+        Value::Object(fields) => fields.values_mut().for_each(without_controls),
+        _ => {}
+    }
 }
 
 /// What to print, and whether the command succeeded.
@@ -254,18 +271,13 @@ fn lower_first(value: &str) -> String {
 /// Columns padded to their widest cell. The server's words reach a terminal, so
 /// control characters don't get through.
 fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
-    let clean = |cell: &str| {
-        cell.chars()
-            .map(|c| if c.is_control() { '?' } else { c })
-            .collect::<String>()
-    };
     let mut widths: Vec<usize> = headers
         .iter()
         .map(|header| header.chars().count())
         .collect();
     for row in rows {
         for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(clean(cell).chars().count());
+            *width = (*width).max(printable(cell).chars().count());
         }
     }
     let line = |cells: Vec<String>| {
@@ -286,13 +298,13 @@ fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut lines = vec![line(headers.iter().map(ToString::to_string).collect())];
     lines.extend(
         rows.iter()
-            .map(|row| line(row.iter().map(|cell| clean(cell)).collect())),
+            .map(|row| line(row.iter().map(|cell| printable(cell)).collect())),
     );
     lines.join("\n")
 }
 
 fn render_health(status: &str, fleet: Option<&Value>) -> Output {
-    let status = status.trim();
+    let status = printable(status.trim());
     let Some(fleet) = fleet else {
         return Output {
             text: status.to_string(),
@@ -327,9 +339,10 @@ fn render_health(status: &str, fleet: Option<&Value>) -> Output {
 }
 
 fn render_version(body: &str, fleet: Option<&Value>) -> Result<String, String> {
-    let version: Value =
+    let mut version: Value =
         serde_json::from_str(body).map_err(|_| "Pharos returned malformed JSON".to_string())?;
     validate_version_response(&version)?;
+    without_controls(&mut version);
     let mut text = format!("pharos {}", field(&version, "version"));
     if let Some(fleet) = fleet {
         text.push_str(&format!(
@@ -813,6 +826,23 @@ mod tests {
     fn a_control_character_from_the_server_does_not_reach_the_terminal() {
         let printed = table(&["HOST"], &[vec!["ar\u{1b}[31mes".to_string()]]);
         assert!(!printed.contains('\u{1b}'), "{printed:?}");
+
+        let fleet = parse_fleet(
+            &json!({
+                "schema": FLEET_VIEW_SCHEMA,
+                "uptime": "1 h\u{1b}[2J",
+                "data_file": { "configured": true, "problem": "bad\u{1b}[2J\nline" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for printed in [
+            render_health("ok", Some(&fleet)).text,
+            render_health("ok\u{1b}[2J", None).text,
+        ] {
+            assert!(!printed.contains('\u{1b}'), "{printed:?}");
+            assert!(!printed.contains("\nline"), "{printed:?}");
+        }
     }
 
     #[test]

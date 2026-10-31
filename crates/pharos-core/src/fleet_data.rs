@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::error::Category;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
 
@@ -297,8 +298,7 @@ impl FleetData {
     /// Parse and validate one file. Nothing is accepted partly: any problem
     /// refuses the whole file, so a caller keeps its last good data.
     pub fn parse(raw: &str) -> Result<Self, FleetDataError> {
-        let value: serde_json::Value = serde_json::from_str(raw)
-            .map_err(|error| FleetDataError::Malformed(error.to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(malformed)?;
         match value.get("schema_version") {
             None => return Err(FleetDataError::UnsupportedSchema("(missing)".to_string())),
             Some(version) if version.as_u64() == Some(FLEET_DATA_SCHEMA_VERSION) => {}
@@ -311,8 +311,7 @@ impl FleetData {
                 ))
             }
         }
-        let data: Self = serde_json::from_str(raw)
-            .map_err(|error| FleetDataError::Malformed(error.to_string()))?;
+        let data: Self = serde_json::from_str(raw).map_err(malformed)?;
         data.validate()?;
         Ok(data)
     }
@@ -478,6 +477,8 @@ impl FleetHost {
             None => {}
         }
         for (id, status) in &self.cve {
+            // A key that isn't a CVE id could be anything, so it stays out of the path.
+            cve_id(id, &format!("{path}.cve"))?;
             let status_path = format!("{path}.cve.{id}");
             let Some(cve) = data.cves.iter().find(|cve| &cve.id == id) else {
                 return invalid(status_path, "not a CVE in cves");
@@ -617,6 +618,20 @@ fn valid_version_line(value: &str) -> bool {
 }
 
 /// CVE-YYYY-NNNN with four to seven id digits.
+/// The parser's own text quotes the value it choked on, and that value could be
+/// anything. Where it is in the file is enough to find it.
+fn malformed(error: serde_json::Error) -> FleetDataError {
+    let what = match error.classify() {
+        Category::Data => "a field or value doesn't fit the schema",
+        Category::Syntax | Category::Eof | Category::Io => "not JSON",
+    };
+    FleetDataError::Malformed(format!(
+        "{what}, at line {} column {}",
+        error.line(),
+        error.column()
+    ))
+}
+
 fn cve_id(value: &str, path: &str) -> Result<(), FleetDataError> {
     let mut parts = value.split('-');
     let well_formed = parts.next() == Some("CVE")
@@ -689,6 +704,30 @@ mod tests {
             "the types must carry every field of the contract"
         );
         assert!(data.updated_at_unix().is_some());
+    }
+
+    #[test]
+    fn a_refused_file_never_quotes_what_it_holds() {
+        let secret = "https://example-user:example-pass@example.invalid";
+        let refused = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = contract();
+            change(&mut value);
+            value.to_string()
+        };
+        for raw in [
+            refused(&|value| value["cves"][0]["severity"] = secret.into()),
+            refused(&|value| value["cves"][0][secret] = true.into()),
+            refused(&|value| value["cves"][0]["component"] = secret.into()),
+            refused(&|value| {
+                value["sections"][0]["hosts"][0]["cve"][format!("{secret}\u{1b}[2J")] =
+                    serde_json::json!({ "state": "na" });
+            }),
+            format!("{{\"schema_version\": {secret}"),
+        ] {
+            let problem = FleetData::parse(&raw).expect_err("refused").to_string();
+            assert!(!problem.contains("example-pass"), "{problem}");
+            assert!(!problem.contains('\u{1b}'), "{problem}");
+        }
     }
 
     #[test]
@@ -890,7 +929,9 @@ mod tests {
             assert!(FleetData::parse(raw).is_err(), "{raw:?}");
         }
         let message = refused(|value| value["surprise"] = serde_json::json!(true));
-        assert!(message.contains("surprise"), "{message}");
+        assert!(message.contains("doesn't fit the schema"), "{message}");
+        assert!(message.contains("line 1 column"), "{message}");
+        assert!(!message.contains("surprise"), "{message}");
     }
 
     fn host(value: &mut serde_json::Value, name: &str) -> serde_json::Value {
@@ -922,13 +963,13 @@ mod tests {
                 host["availability"] = "sometimes".into();
             });
         });
-        assert!(message.contains("sometimes"), "{message}");
+        assert!(message.contains("doesn't fit the schema"), "{message}");
         let message = refused(|value| {
             set_host(value, "demeter", |host| {
                 host.as_object_mut().unwrap().remove("availability");
             });
         });
-        assert!(message.contains("availability"), "{message}");
+        assert!(message.contains("doesn't fit the schema"), "{message}");
     }
 
     #[test]

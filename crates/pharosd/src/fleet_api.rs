@@ -8,6 +8,7 @@ use axum::Json;
 use pharos_core::contact::{ContactSource, ContactState};
 use pharos_core::fleet_data::{FleetCveState, KERNEL_COMPONENT};
 use pharos_core::updates_due::{UpdatesSource, UpdatesState};
+use pharos_core::KernelPostureState;
 use serde::Serialize;
 
 use crate::fleet_view::{short_span, span, FleetView, HostRow};
@@ -60,7 +61,7 @@ struct Beacons {
 }
 
 #[derive(Serialize)]
-struct ApiHost {
+pub(crate) struct ApiHost {
     name: String,
     site: Option<String>,
     source: &'static str,
@@ -100,7 +101,7 @@ fn is_beacon_host(row: &HostRow) -> bool {
     row.report.is_some() || row.contact.state == ContactState::NeverReported
 }
 
-fn api_host(view: &FleetView, row: &HostRow) -> ApiHost {
+pub(crate) fn api_host(view: &FleetView, row: &HostRow) -> ApiHost {
     let posture = row.report.as_ref().and_then(|host| host.kernel.as_ref());
     let running = posture.and_then(|posture| posture.running_version.clone());
     ApiHost {
@@ -117,16 +118,19 @@ fn api_host(view: &FleetView, row: &HostRow) -> ApiHost {
             .as_ref()
             .and_then(|host| host.last_seen)
             .map(|at| short_span(view.now.saturating_sub(at).max(0) as u64)),
-        next_boot: row
-            .next_boot()
-            .map(ToString::to_string)
-            .or_else(|| running.clone()),
+        // Only a current kernel says it boots again into what is running.
+        next_boot: row.next_boot().map(ToString::to_string).or_else(|| {
+            posture
+                .filter(|posture| posture.state == KernelPostureState::Current)
+                .and_then(|_| running.clone())
+        }),
         running,
         security: security_text(view, row),
         reboot_due: row.reboot_due(),
         hand_declared: row.declared_check(view).is_some(),
         stale: update_note_parts(view, row).is_some_and(|note| note.stale)
-            || row.declared_check(view).is_some_and(|(_, stale)| stale),
+            || row.declared_check(view).is_some_and(|(_, stale)| stale)
+            || row.stale_computed_age(view).is_some(),
     }
 }
 
