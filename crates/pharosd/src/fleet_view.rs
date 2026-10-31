@@ -13,8 +13,8 @@ use pharos_core::cve_status::{
 use pharos_core::fleet_data::{
     CveSeverity, FleetCve, FleetCveState, FleetData, FleetHost, HandledCves,
 };
-use pharos_core::updates_due::{host_updates, HostUpdates, UpdateDue};
-use pharos_core::{liveness, Host, KernelPostureState};
+use pharos_core::updates_due::{host_updates, HostUpdates, UpdateDue, UpdatesState};
+use pharos_core::{liveness, Host, KernelPosture, KernelPostureState};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -118,6 +118,12 @@ impl Security {
     }
 }
 
+fn reboot_target(posture: &KernelPosture) -> Option<&str> {
+    (posture.state == KernelPostureState::RebootRequired)
+        .then_some(posture.expected_version.as_deref())
+        .flatten()
+}
+
 impl HostRow {
     pub(crate) fn role(&self) -> Option<&str> {
         self.declared
@@ -127,11 +133,21 @@ impl HostRow {
             .filter(|role| !role.is_empty())
     }
 
-    /// The running kernel a report gives, or what the file declares.
+    fn report_posture(&self) -> Option<&KernelPosture> {
+        self.report.as_ref().and_then(|host| host.kernel.as_ref())
+    }
+
+    /// The report's posture, until someone checks the file's versions after that
+    /// report has gone stale. Updates follow the file from then on, and so does
+    /// everything shown about the kernel.
+    pub(crate) fn live_posture(&self) -> Option<&KernelPosture> {
+        self.report_posture()
+            .filter(|_| !matches!(self.updates.state, UpdatesState::HandDeclared))
+    }
+
+    /// The running kernel a live report gives, or what the file declares.
     pub(crate) fn kernel(&self) -> Option<&str> {
-        self.report
-            .as_ref()
-            .and_then(|host| host.kernel.as_ref())
+        self.live_posture()
             .and_then(|posture| posture.running_version.as_deref())
             .or_else(|| {
                 self.declared
@@ -141,11 +157,17 @@ impl HostRow {
     }
 
     pub(crate) fn next_boot(&self) -> Option<&str> {
-        self.report
-            .as_ref()
-            .and_then(|host| host.kernel.as_ref())
-            .filter(|posture| posture.state == KernelPostureState::RebootRequired)
-            .and_then(|posture| posture.expected_version.as_deref())
+        self.live_posture().and_then(reboot_target)
+    }
+
+    /// What a computed CVE status rests on, even once the file has replaced it.
+    pub(crate) fn reported_kernel(&self) -> Option<&str> {
+        self.report_posture()
+            .and_then(|posture| posture.running_version.as_deref())
+    }
+
+    pub(crate) fn reported_next_boot(&self) -> Option<&str> {
+        self.report_posture().and_then(reboot_target)
     }
 
     pub(crate) fn os(&self) -> Option<&str> {
@@ -189,10 +211,12 @@ impl HostRow {
     /// Why this host cannot be checked for this CVE.
     pub(crate) fn unknown_reason(&self, cve: &FleetCve, on: &CveOnHost) -> String {
         match on.status.source {
-            CveStatusSource::Computed { .. } => match self.kernel().and_then(kernel_branch) {
-                Some(branch) => format!("no fix line for {branch}"),
-                None => "kernel version not readable".to_string(),
-            },
+            CveStatusSource::Computed { .. } => {
+                match self.reported_kernel().and_then(kernel_branch) {
+                    Some(branch) => format!("no fix line for {branch}"),
+                    None => "kernel version not readable".to_string(),
+                }
+            }
             CveStatusSource::Declared { .. } => self
                 .declared_note(cve)
                 .unwrap_or("not checked yet")

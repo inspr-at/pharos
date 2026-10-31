@@ -102,8 +102,6 @@ fn is_beacon_host(row: &HostRow) -> bool {
 }
 
 pub(crate) fn api_host(view: &FleetView, row: &HostRow) -> ApiHost {
-    let posture = row.report.as_ref().and_then(|host| host.kernel.as_ref());
-    let running = posture.and_then(|posture| posture.running_version.clone());
     ApiHost {
         name: row.name.clone(),
         site: row
@@ -120,11 +118,11 @@ pub(crate) fn api_host(view: &FleetView, row: &HostRow) -> ApiHost {
             .map(|at| short_span(view.now.saturating_sub(at).max(0) as u64)),
         // Only a current kernel says it boots again into what is running.
         next_boot: row.next_boot().map(ToString::to_string).or_else(|| {
-            posture
+            row.live_posture()
                 .filter(|posture| posture.state == KernelPostureState::Current)
-                .and_then(|_| running.clone())
+                .and_then(|posture| posture.running_version.clone())
         }),
-        running,
+        running: row.kernel().map(ToString::to_string),
         security: security_text(view, row),
         reboot_due: row.reboot_due(),
         hand_declared: row.declared_check(view).is_some(),

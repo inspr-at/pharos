@@ -1929,7 +1929,7 @@ fn capitalized(mut text: String) -> String {
 
 /// The note beside a host in one CVE's groups, and whether its evidence is stale.
 fn cve_note(view: &FleetView, row: &HostRow, cve: &FleetCve, on: &CveOnHost) -> (String, bool) {
-    let kernel = row.kernel().unwrap_or("unknown kernel");
+    let kernel = row.reported_kernel().unwrap_or("unknown kernel");
     let aged = |text: String| match on.status.source {
         CveStatusSource::Computed {
             age_secs,
@@ -1949,7 +1949,7 @@ fn cve_note(view: &FleetView, row: &HostRow, cve: &FleetCve, on: &CveOnHost) -> 
         (CveStatus::RebootDue, _) => aged(format!(
             "Running {} · next boot {}",
             kernel,
-            row.next_boot().unwrap_or("unknown")
+            row.reported_next_boot().unwrap_or("unknown")
         )),
         (
             status,
@@ -3345,6 +3345,70 @@ mod tests {
         let (note, _) = cve_note(&view, row, &view.data.as_deref().unwrap().cves[0], on);
         assert!(note.starts_with("6.18.56 · hand-declared"), "{note}");
         assert!(!note.contains("6.18.52"), "{note}");
+    }
+
+    #[test]
+    fn a_report_a_newer_check_replaced_no_longer_speaks_for_the_kernel() {
+        let view_with = |kernel: Option<&str>, cve: serde_json::Value| {
+            let mut host = listed("ares", cve);
+            host["version"] = "1.0".into();
+            host["last_verified"] = "2000-02-29T20:00:00Z".into();
+            if let Some(kernel) = kernel {
+                host["kernel"] = kernel.into();
+            }
+            view_of(
+                Some(data(
+                    serde_json::json!([kernel_cve("CVE-2000-0001", "6.18.56")]),
+                    serde_json::json!([host]),
+                )),
+                None,
+                vec![old_report("6.18.52", "6.18.56")],
+            )
+        };
+        let api = |view: &FleetView| {
+            serde_json::to_value(crate::fleet_api::api_host(view, &view.rows[0])).unwrap()
+        };
+        let declared_fixed = serde_json::json!({
+            "CVE-2000-0001": { "state": "fixed", "last_verified": "2000-02-29T20:00:00Z" }
+        });
+
+        // The file's kernel, everywhere, with no sign of the report's.
+        let view = view_with(Some("6.18.56"), declared_fixed.clone());
+        assert_eq!(view.rows[0].kernel(), Some("6.18.56"));
+        assert_eq!(view.rows[0].next_boot(), None);
+        assert_eq!(api(&view)["running"], "6.18.56");
+        assert!(api(&view)["next_boot"].is_null());
+        assert_eq!(api(&view)["stale"], false);
+        for page in [
+            fleet_page(&view),
+            render_host(&PublicBasePath::root(), None, &view, "ares").unwrap(),
+        ] {
+            assert!(!page.contains("6.18.52"), "{page}");
+            assert!(page.contains("6.18.56"), "{page}");
+            assert!(!page.contains("next boot"), "{page}");
+        }
+
+        // A check that names no kernel doesn't leave the old one looking current.
+        let view = view_with(None, declared_fixed);
+        assert_eq!(view.rows[0].kernel(), None);
+        assert!(api(&view)["running"].is_null());
+
+        // A status still computed from that report names what it was computed from.
+        let view = view_with(Some("6.18.56"), serde_json::json!({}));
+        let row = &view.rows[0];
+        let (note, stale) = cve_note(
+            &view,
+            row,
+            &view.data.as_deref().unwrap().cves[0],
+            row.on(0).unwrap(),
+        );
+        assert_eq!(row.on(0).unwrap().status.status, CveStatus::RebootDue);
+        assert!(stale, "{note}");
+        assert!(
+            note.starts_with("Running 6.18.52 · next boot 6.18.56 · data 2 d old"),
+            "{note}"
+        );
+        assert_eq!(api(&view)["stale"], true);
     }
 
     #[test]
