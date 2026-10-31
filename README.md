@@ -101,6 +101,7 @@ routes answer both there and at the origin root.
 | `PHAROS_PUBLIC_ORIGIN`                                         | Scheme and host of the public address; `PHAROS_OIDC_REDIRECT_URI` must match it |
 | `PHAROS_PUBLIC_BASE_PATH`                                      | Optional public mount such as `/pharos`                                         |
 | `PHAROS_DB`                                                    | JSON host store path                                                            |
+| `PHAROS_FLEET_DATA_FILE`                                       | Fleet data file, re-read on change and never written. Mount its directory read-only, because a single-file bind keeps the old file across an atomic rename |
 | `PHAROS_ALLOW_OPEN`                                            | Allow human routes without login; valid only on a loopback public address       |
 | `PHAROS_OIDC_ISSUER`, `_CLIENT_ID`, `_REDIRECT_URI`            | OIDC login, all or none                                                         |
 | `PHAROS_OIDC_CA_FILE`                                          | Optional read-only PEM CA bundle for OIDC requests                              |

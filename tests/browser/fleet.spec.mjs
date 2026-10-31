@@ -31,6 +31,7 @@ test("fleet page lists hosts under the security policy", async ({ page }) => {
 
   await expect(page.getByRole("heading", { name: "Fleet" })).toBeVisible();
   await expect(page.getByRole("cell", { name: "ares" })).toBeVisible();
+  await expect(page.getByRole("status")).toContainText("Fleet data file loaded.");
   await expect(page.locator("[data-calendar-display]")).toHaveAttribute("data-canonical", /\d/);
 
   expect(violations).toEqual([]);

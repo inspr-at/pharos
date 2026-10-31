@@ -78,7 +78,45 @@ fn account_html(base: &PublicBasePath, user: Option<&AuthUser>) -> String {
     )
 }
 
-fn render_home(base: &PublicBasePath, user: Option<&AuthUser>, hosts: &[Host], now: i64) -> String {
+/// One plain line on the data file: how old it is and what is wrong with it.
+fn fleet_data_status_html(view: Option<&FleetDataView>, now: i64) -> String {
+    let Some(view) = view else {
+        return "<p role=\"status\">Fleet data file: not configured.</p>".to_string();
+    };
+    let age = view
+        .data
+        .as_deref()
+        .and_then(FleetData::updated_at_unix)
+        .map(|updated| format!("Data from {}.", age_text(now.saturating_sub(updated))));
+    let line = match (&view.problem, age) {
+        (Some(problem), Some(age)) => format!(
+            "Fleet data problem: {}. {age} This is the last good copy.",
+            html_escape(problem)
+        ),
+        (Some(problem), None) => {
+            format!("Fleet data problem: {}. No data yet.", html_escape(problem))
+        }
+        (None, Some(age)) => format!("Fleet data file loaded. {age}"),
+        (None, None) => "Fleet data file: no data yet.".to_string(),
+    };
+    format!("<p role=\"status\">{line}</p>")
+}
+
+fn age_text(seconds: i64) -> String {
+    match seconds.max(0) {
+        seconds if seconds < 3_600 => format!("{} min ago", seconds / 60),
+        seconds if seconds < 86_400 => format!("{} h ago", seconds / 3_600),
+        seconds => format!("{} d ago", seconds / 86_400),
+    }
+}
+
+fn render_home(
+    base: &PublicBasePath,
+    user: Option<&AuthUser>,
+    hosts: &[Host],
+    fleet_data: Option<&FleetDataView>,
+    now: i64,
+) -> String {
     let rows: String = hosts
         .iter()
         .map(|host| {
@@ -96,8 +134,9 @@ fn render_home(base: &PublicBasePath, user: Option<&AuthUser>, hosts: &[Host], n
         })
         .collect();
     format!(
-        "{head}<body><main><h1>Fleet</h1><table><thead><tr><th>Host</th><th>Status</th><th>Last report</th></tr></thead><tbody>{rows}</tbody></table></main><footer>{release}{account}</footer></body></html>",
+        "{head}<body><main><h1>Fleet</h1>{fleet_data}<table><thead><tr><th>Host</th><th>Status</th><th>Last report</th></tr></thead><tbody>{rows}</tbody></table></main><footer>{release}{account}</footer></body></html>",
         head = document_head(base),
+        fleet_data = fleet_data_status_html(fleet_data, now),
         release = release_label_html(),
         account = account_html(base, user),
     )
@@ -112,6 +151,11 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
             &state.public_base_path,
             state.auth.human_user(&headers).as_ref(),
             &hosts,
+            state
+                .fleet_data
+                .as_deref()
+                .map(FleetDataRuntime::view)
+                .as_ref(),
             now_unix(),
         ),
     )
@@ -231,10 +275,51 @@ mod tests {
             "freshness": pharos_core::NixFreshness::default(),
         }))
         .expect("host fixture");
-        let html = render_home(&PublicBasePath::root(), None, &[host], 100);
+        let html = render_home(&PublicBasePath::root(), None, &[host], None, 100);
         assert!(html.contains("&lt;ares&gt;"));
         assert!(!html.contains("<ares>"));
         assert!(!html.contains("data-logout-form"));
+    }
+
+    #[test]
+    fn home_always_says_how_old_the_fleet_data_is_and_what_is_wrong() {
+        let good = Arc::new(FleetData::parse(fleet_data::CONTRACT).expect("contract"));
+        let updated = good.updated_at_unix().expect("contract has a time");
+        let now = updated + 3 * 86_400;
+        let line = |data: Option<Arc<FleetData>>, problem: Option<&str>| {
+            let view = FleetDataView {
+                data,
+                problem: problem.map(str::to_string),
+            };
+            render_home(&PublicBasePath::root(), None, &[], Some(&view), now)
+        };
+
+        let html = line(Some(good.clone()), None);
+        assert!(html.contains("Fleet data file loaded. Data from 3 d ago."));
+
+        let html = line(Some(good), Some("the file is <missing>"));
+        assert!(html.contains(
+            "Fleet data problem: the file is &lt;missing&gt;. Data from 3 d ago. \
+             This is the last good copy."
+        ));
+        assert!(html.contains("<h1>Fleet</h1>"), "never a blank page");
+
+        let html = line(None, Some("the file is missing"));
+        assert!(html.contains("Fleet data problem: the file is missing. No data yet."));
+        assert!(html.contains("<h1>Fleet</h1>"), "never a blank page");
+
+        let html = render_home(&PublicBasePath::root(), None, &[], None, now);
+        assert!(html.contains("Fleet data file: not configured."));
+    }
+
+    #[test]
+    fn data_age_reads_in_minutes_hours_and_days() {
+        assert_eq!(age_text(-5), "0 min ago");
+        assert_eq!(age_text(59), "0 min ago");
+        assert_eq!(age_text(3_599), "59 min ago");
+        assert_eq!(age_text(3_600), "1 h ago");
+        assert_eq!(age_text(86_399), "23 h ago");
+        assert_eq!(age_text(86_400), "1 d ago");
     }
 
     #[test]
@@ -246,6 +331,7 @@ mod tests {
             &PublicBasePath::parse("/pharos").unwrap(),
             Some(&user),
             &[],
+            None,
             100,
         );
         assert!(html.contains("&lt;operator&gt;"));

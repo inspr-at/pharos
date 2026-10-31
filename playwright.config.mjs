@@ -38,6 +38,7 @@ export default defineConfig({
       PHAROS_ADDR: `127.0.0.1:${port}`,
       PHAROS_ALLOW_OPEN: "true",
       PHAROS_DB: path.join(runDir, "hosts.json"),
+      PHAROS_FLEET_DATA_FILE: "contracts/fleet-data-v3.json",
       PHAROS_ALLOW_LOCAL_REGISTER: "true",
       PHAROS_REGISTRATION_TOKEN_FILE: path.join(runDir, "registration-token"),
       RUST_LOG: "warn",

@@ -9,6 +9,7 @@ mod auth;
 #[path = "../build_support.rs"]
 mod build_support;
 mod durable_file;
+mod fleet_data;
 mod http_probes;
 mod manifests;
 mod probe_support;
@@ -31,6 +32,7 @@ use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use pharos_core::fleet_data::FleetData;
 use pharos_core::{
     liveness, Host, HostRegistration, HostRegistrationResponse, HostReport, PublicBasePath,
     MAX_HOST_REGISTRATION_BYTES, MAX_HOST_REPORT_BYTES,
@@ -40,6 +42,7 @@ use sha2::{Digest, Sha256};
 
 use crate::appliance_probes::{spawn_appliance_probe_loop, ApplianceProbeRuntime};
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState, AuthUser};
+use crate::fleet_data::{spawn_fleet_data_loop, FleetDataRuntime, FleetDataView};
 use crate::http_probes::{spawn_http_probe_loops, HttpProbeRuntime};
 use crate::manifests::ManifestRegistry;
 use crate::probe_support::ProbeSshConfig;
@@ -55,6 +58,7 @@ struct AppState {
     auth: AuthState,
     beacon_auth: BeaconAuth,
     http_probes: Option<Arc<HttpProbeRuntime>>,
+    fleet_data: Option<Arc<FleetDataRuntime>>,
     public_base_path: PublicBasePath,
 }
 
@@ -374,6 +378,21 @@ fn host_payload(host: &Host, now: i64) -> serde_json::Value {
     })
 }
 
+/// Whether the data file is usable, how old it is, and what is wrong with it.
+fn fleet_data_payload(runtime: Option<&FleetDataRuntime>, now: i64) -> serde_json::Value {
+    let Some(runtime) = runtime else {
+        return json!({ "configured": false });
+    };
+    let view = runtime.view();
+    let updated_at = view.data.as_deref().and_then(FleetData::updated_at_unix);
+    json!({
+        "configured": true,
+        "updated_at": updated_at,
+        "age_secs": updated_at.map(|updated| now.saturating_sub(updated).max(0)),
+        "problem": view.problem,
+    })
+}
+
 async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let now = now_unix();
     let access = access_for_headers(&state.auth, &headers);
@@ -393,6 +412,7 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
             "as_of": now,
             "hosts": hosts,
             "server_probes": server_probes,
+            "fleet_data": fleet_data_payload(state.fleet_data.as_deref(), now),
         })),
     )
 }
@@ -609,6 +629,7 @@ async fn main() {
         auth,
         beacon_auth: startup.beacon_auth,
         http_probes: http_probes.clone(),
+        fleet_data: FleetDataRuntime::from_env(),
         public_base_path: startup.public_base_path.clone(),
     };
     if let Some(runtime) = appliance_probes {
@@ -616,6 +637,9 @@ async fn main() {
     }
     if let Some(runtime) = http_probes {
         spawn_http_probe_loops(runtime);
+    }
+    if let Some(runtime) = state.fleet_data.clone() {
+        spawn_fleet_data_loop(runtime);
     }
 
     let app = build_router(state);
@@ -670,6 +694,7 @@ mod tests {
             auth: AuthState::default(),
             beacon_auth,
             http_probes: None,
+            fleet_data: None,
             public_base_path: PublicBasePath::root(),
         }
     }
@@ -1292,6 +1317,122 @@ mod tests {
                 "{method} {prefix}{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fleet_data_state_is_on_the_api_and_page_without_breaking_either() {
+        let path = temp_path("fleet-data");
+        let mut state = report_test_state();
+        state.fleet_data = Some(FleetDataRuntime::for_test(path.clone()));
+        let base = serve_test_app(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let hosts: serde_json::Value = client
+            .get(format!("{base}/hosts.json"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(hosts["fleet_data"]["configured"], true);
+        assert_eq!(hosts["fleet_data"]["problem"], "the file is missing");
+        assert_eq!(hosts["fleet_data"]["updated_at"], serde_json::Value::Null);
+        let page = client.get(&base).send().await.unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::OK);
+        assert!(page
+            .text()
+            .await
+            .unwrap()
+            .contains("Fleet data problem: the file is missing"));
+
+        std::fs::write(&path, fleet_data::CONTRACT).expect("file written");
+        state.fleet_data.as_ref().unwrap().refresh();
+        let hosts: serde_json::Value = client
+            .get(format!("{base}/hosts.json"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(hosts["fleet_data"]["problem"], serde_json::Value::Null);
+        assert!(hosts["fleet_data"]["age_secs"].as_i64().unwrap() > 0);
+        // The file's contents stay off this API until the page needs them.
+        assert_eq!(hosts["fleet_data"].get("sections"), None);
+        std::fs::remove_file(path).expect("file removed");
+    }
+
+    #[tokio::test]
+    async fn no_route_can_change_the_fleet_data_file() {
+        let path = temp_path("fleet-data-read-only");
+        std::fs::write(&path, fleet_data::CONTRACT).expect("file written");
+        let mut state = report_test_state_with_auth(BeaconAuth {
+            registration_token: Some("registration-fixture".to_string()),
+        });
+        state.fleet_data = Some(FleetDataRuntime::for_test(path.clone()));
+        register_test_token(&state, "ares", "valid-token");
+        let base = serve_test_app(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        for route in [
+            "/",
+            "/hosts.json",
+            "/fleet",
+            "/fleet.json",
+            "/fleet-data",
+            "/fleet-data.json",
+            "/fleet-data/fleet.json",
+            "/data",
+            "/cves",
+            "/handled",
+        ] {
+            for method in [
+                reqwest::Method::POST,
+                reqwest::Method::PUT,
+                reqwest::Method::PATCH,
+                reqwest::Method::DELETE,
+            ] {
+                let response = client
+                    .request(method.clone(), format!("{base}{route}"))
+                    .json(&serde_json::json!({"schema_version": 3}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(
+                        response.status(),
+                        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                    ),
+                    "{method} {route}: {}",
+                    response.status()
+                );
+            }
+        }
+
+        // The routes that do write leave it alone too.
+        let reported = client
+            .post(format!("{base}/report"))
+            .bearer_auth("valid-token")
+            .json(&test_report("ares"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reported.status(), reqwest::StatusCode::NO_CONTENT);
+        let registered = client
+            .post(format!("{base}/register"))
+            .bearer_auth("registration-fixture")
+            .json(&test_registration("hermes"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), reqwest::StatusCode::CREATED);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file reads"),
+            fleet_data::CONTRACT
+        );
+        std::fs::remove_file(path).expect("file removed");
     }
 
     #[tokio::test]
