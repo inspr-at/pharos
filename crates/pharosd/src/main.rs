@@ -12,9 +12,7 @@ mod fleet_api;
 mod fleet_data;
 mod fleet_view;
 mod host_probes;
-mod http_probes;
 mod icons;
-mod manifests;
 mod pages;
 mod probe_support;
 mod public_mount;
@@ -47,8 +45,6 @@ use crate::auth::{Auth, AuthConfig, AuthState, AuthUser};
 use crate::fleet_api::fleet_json;
 use crate::fleet_data::{spawn_fleet_data_loop, FleetDataRuntime};
 use crate::host_probes::{spawn_host_probe_loop, HostProbeRuntime};
-use crate::http_probes::{spawn_http_probe_loops, HttpProbeRuntime};
-use crate::manifests::ManifestRegistry;
 use crate::routes::build_router;
 use crate::startup::*;
 use crate::store::Store;
@@ -60,7 +56,6 @@ struct AppState {
     store: Arc<Store>,
     auth: AuthState,
     beacon_auth: BeaconAuth,
-    http_probes: Option<Arc<HttpProbeRuntime>>,
     host_probes: Option<Arc<HostProbeRuntime>>,
     fleet_data: Option<Arc<FleetDataRuntime>>,
     public_base_path: PublicBasePath,
@@ -398,11 +393,6 @@ async fn hosts_json(State(state): State<AppState>) -> impl IntoResponse {
         .iter()
         .map(|host| host_payload(host, now))
         .collect();
-    let server_probes = state
-        .http_probes
-        .as_deref()
-        .map(|runtime| runtime.snapshot(now))
-        .unwrap_or_default();
     let host_probes = state
         .host_probes
         .as_deref()
@@ -413,7 +403,6 @@ async fn hosts_json(State(state): State<AppState>) -> impl IntoResponse {
         Json(json!({
             "as_of": now,
             "hosts": hosts,
-            "server_probes": server_probes,
             "host_probes": host_probes,
             "fleet_data": fleet_data_payload(state.fleet_data.as_deref(), now),
         })),
@@ -599,13 +588,6 @@ async fn main() {
         Store::new(host_store_path.clone())
             .unwrap_or_else(|error| panic!("host store startup failed: {error}")),
     );
-    let manifests = ManifestRegistry::from_env();
-    for issue in manifests.load_errors() {
-        tracing::warn!(path = %issue.path, error = %issue.error, "declared file not loaded");
-    }
-    let http_probes = HttpProbeRuntime::from_env(manifests.manifests())
-        .unwrap_or_else(|error| panic!("HTTP probe startup failed: {error}"))
-        .map(Arc::new);
     let auth = Auth::from_config(startup.auth, startup.public_base_path.clone())
         .await
         .unwrap_or_else(|err| panic!("Pharos authentication startup failed: {err}"));
@@ -616,7 +598,6 @@ async fn main() {
         store,
         auth,
         beacon_auth: startup.beacon_auth,
-        http_probes: http_probes.clone(),
         host_probes: host_probes.clone(),
         fleet_data: FleetDataRuntime::from_env(),
         public_base_path: startup.public_base_path.clone(),
@@ -624,9 +605,6 @@ async fn main() {
     };
     if let Some(runtime) = host_probes {
         spawn_host_probe_loop(runtime);
-    }
-    if let Some(runtime) = http_probes {
-        spawn_http_probe_loops(runtime);
     }
     if let Some(runtime) = state.fleet_data.clone() {
         spawn_fleet_data_loop(runtime);
@@ -683,7 +661,6 @@ mod tests {
             store: Arc::new(Store::new(None).expect("in-memory host store starts")),
             auth: AuthState::default(),
             beacon_auth,
-            http_probes: None,
             host_probes: None,
             fleet_data: None,
             public_base_path: PublicBasePath::root(),

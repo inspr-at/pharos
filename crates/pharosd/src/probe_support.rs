@@ -8,24 +8,6 @@ use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-use pharos_core::ServiceObservationState;
-use serde::Serialize;
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(super) struct ServerProbeObservation {
-    pub(super) id: String,
-    pub(super) service: String,
-    pub(super) source: &'static str,
-    pub(super) policy: &'static str,
-    pub(super) kind: &'static str,
-    pub(super) target: Option<String>,
-    pub(super) state: ServiceObservationState,
-    pub(super) server_reachable: Option<bool>,
-    pub(super) client_reachable: Option<bool>,
-    pub(super) summary: String,
-    pub(super) checked_at: i64,
-}
-
 pub(super) fn open_trusted_runtime_file(
     path: &Path,
     maximum_bytes: u64,

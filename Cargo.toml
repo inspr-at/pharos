@@ -25,7 +25,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # spin release. Remove this patch when rsa/openidconnect accepts num-bigint-dig
 # 0.9 or newer.
 lazy_static = { path = "vendor/lazy_static" }
-
-# Janus crates (token issuance/rotation) are wired in PHAROS-8, not the scaffold:
-# janus-warden = { git = "https://github.com/inspr-at/janus" }
-# janus-forge  = { git = "https://github.com/inspr-at/janus" }

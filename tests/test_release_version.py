@@ -266,10 +266,10 @@ class CalendarVersionTests(unittest.TestCase):
             FIRST_CALENDAR_SEQUENCE,
         )
 
-    def test_current_release_is_valid_calendar_v2_successor(self):
+    def test_current_release_is_valid_successor_of_the_v1_era(self):
         current = self.release_document()
         self.assertEqual(current["schema"], release_version.RELEASE_SCHEMA_V2)
-        self.assertEqual(current["version_scheme"], release_version.CALENDAR_V2_SCHEME)
+        self.assertIn(current["version_scheme"], release_version.SHARED_COORDINATE_SCHEMES)
         self.assertGreaterEqual(current["release_sequence"], FIRST_V2_SEQUENCE)
         anchor = current["migration_anchor"]
         self.assertEqual(anchor["first_calendar_version"], FIRST_CALENDAR_VERSION)
@@ -283,7 +283,7 @@ class CalendarVersionTests(unittest.TestCase):
             release_version.CALENDAR_SCHEME, *V1_HISTORY[-1]
         )
         current_identity = release_version.ReleaseIdentity(
-            release_version.CALENDAR_V2_SCHEME, current["version"], current["release_sequence"]
+            current["version_scheme"], current["version"], current["release_sequence"]
         )
         self.assertLess(release_version.compare_releases(last_v1, current_identity), 0)
         recorded = list(self.v1_history())

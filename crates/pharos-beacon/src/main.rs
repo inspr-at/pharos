@@ -2,8 +2,7 @@
 //!
 //! Computes this host's Nix freshness (flake.lock age + commits behind nixcfg)
 //! and reports it to pharosd. With PHAROS_INTERVAL set it loops as a recurring
-//! service; otherwise it reports once and exits. Token auth via Janus is
-//! PHAROS-8; the native (musl) Nix-module deployment is PHAROS-6/7.
+//! service; otherwise it reports once and exits.
 //!
 //! Env: PHAROS_URL (required pharosd base),
 //!      PHAROS_INTERVAL (secs; loop if set), NIXCFG_DIR (flake checkout;
@@ -310,7 +309,7 @@ impl ReportFailure {
             ReportFailureCode::LocalContract | ReportFailureCode::HttpContract => {
                 "Pharos release owner"
             }
-            ReportFailureCode::HttpAuthentication => "Janus credential owner",
+            ReportFailureCode::HttpAuthentication => "beacon credential owner",
             ReportFailureCode::HttpRetired => "fleet configuration owner",
             ReportFailureCode::Dns
             | ReportFailureCode::Tls

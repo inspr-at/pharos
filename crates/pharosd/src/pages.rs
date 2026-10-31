@@ -1088,6 +1088,20 @@ pub(crate) fn watch_counts(view: &FleetView, index: usize) -> String {
     if unknown > 0 {
         counts.push(format!("{unknown} can't check"));
     }
+    let stale = view
+        .rows
+        .iter()
+        .filter_map(|row| row.on(index))
+        .filter(|on| {
+            matches!(
+                on.status.source,
+                CveStatusSource::Computed { stale: true, .. }
+            )
+        })
+        .count();
+    if stale > 0 {
+        counts.push(format!("{stale} stale"));
+    }
     counts.join(" · ")
 }
 
@@ -1912,6 +1926,13 @@ fn capitalized(mut text: String) -> String {
 /// The note beside a host in one CVE's groups, and whether its evidence is stale.
 fn cve_note(view: &FleetView, row: &HostRow, cve: &FleetCve, on: &CveOnHost) -> (String, bool) {
     let kernel = row.kernel().unwrap_or("unknown kernel");
+    let aged = |text: String| match on.status.source {
+        CveStatusSource::Computed {
+            age_secs,
+            stale: true,
+        } => (format!("{text} · data {} old", span(age_secs)), true),
+        _ => (text, false),
+    };
     match (on.status.status, &on.status.source) {
         (CveStatus::NotApplicable, _) => (
             capitalized(
@@ -1921,14 +1942,11 @@ fn cve_note(view: &FleetView, row: &HostRow, cve: &FleetCve, on: &CveOnHost) -> 
             ),
             false,
         ),
-        (CveStatus::RebootDue, source) => (
-            format!(
-                "Running {} · next boot {}",
-                kernel,
-                row.next_boot().unwrap_or("unknown")
-            ),
-            matches!(source, CveStatusSource::Computed { stale: true, .. }),
-        ),
+        (CveStatus::RebootDue, _) => aged(format!(
+            "Running {} · next boot {}",
+            kernel,
+            row.next_boot().unwrap_or("unknown")
+        )),
         (
             status,
             CveStatusSource::Declared {
@@ -1941,8 +1959,9 @@ fn cve_note(view: &FleetView, row: &HostRow, cve: &FleetCve, on: &CveOnHost) -> 
                 .map(ToString::to_string)
                 .or_else(|| (status == CveStatus::Unknown).then(|| "not checked yet".to_string()))
                 .or_else(|| {
+                    // The file's kernel: a report's may be older than this check.
                     (cve.component == KERNEL_COMPONENT)
-                        .then(|| row.kernel().map(ToString::to_string))
+                        .then(|| row.declared.as_ref()?.kernel.clone())
                         .flatten()
                 });
             let check = format!(
@@ -1955,23 +1974,12 @@ fn cve_note(view: &FleetView, row: &HostRow, cve: &FleetCve, on: &CveOnHost) -> 
             };
             (text, *verification_stale)
         }
-        (CveStatus::Affected, CveStatusSource::Computed { stale, .. }) => {
-            (format!("{kernel} · waiting for the next deploy"), *stale)
+        (CveStatus::Affected, CveStatusSource::Computed { .. }) => {
+            aged(format!("{kernel} · waiting for the next deploy"))
         }
-        (CveStatus::Fixed, CveStatusSource::Computed { age_secs, stale }) => {
-            if *stale {
-                (format!("{kernel} · data {} old", span(*age_secs)), true)
-            } else {
-                (kernel.to_string(), false)
-            }
-        }
-        (CveStatus::Unknown, CveStatusSource::Computed { age_secs, stale }) => {
-            let reason = capitalized(row.unknown_reason(cve, on));
-            if *stale {
-                (format!("{reason} · data {} old", span(*age_secs)), true)
-            } else {
-                (reason, false)
-            }
+        (CveStatus::Fixed, CveStatusSource::Computed { .. }) => aged(kernel.to_string()),
+        (CveStatus::Unknown, CveStatusSource::Computed { .. }) => {
+            aged(capitalized(row.unknown_reason(cve, on)))
         }
         (CveStatus::Unknown, _) => (capitalized(row.unknown_reason(cve, on)), false),
         _ => (String::new(), false),
@@ -3233,6 +3241,79 @@ mod tests {
         assert!(updates.contains("Not answered by the report"), "{updates}");
         assert!(updates.contains("Data from"), "{updates}");
         assert!(updates.contains("Stale"), "{updates}");
+    }
+
+    #[test]
+    fn no_data_file_is_never_shown_as_clear() {
+        for problem in [None, Some("the file is missing")] {
+            let view = view_of(None, problem, vec![report("ares", "6.18.56", "6.18.56")]);
+            let page = fleet_page(&view);
+            assert!(!page.contains("No watched CVEs"), "{page}");
+            assert_eq!(
+                security_text(&view, &view.rows[0]),
+                "Can't check: no data file"
+            );
+            assert_eq!(fleet_counts(&view).unknown, 1);
+        }
+    }
+
+    #[test]
+    fn a_stale_computed_status_says_so_and_how_old_on_every_summary() {
+        let cve = serde_json::json!([kernel_cve("CVE-2000-0001", "6.18.56")]);
+        let hosts = serde_json::json!([listed("ares", serde_json::json!({}))]);
+        for (running, next_boot, words) in [
+            ("6.18.56", "6.18.56", "1 fixed · none affected · 1 stale"),
+            ("6.18.52", "6.18.52", "1 affected · 1 stale"),
+            ("6.18.52", "6.18.56", "1 reboot due · 1 stale"),
+        ] {
+            let view = view_of(
+                Some(data(cve.clone(), hosts.clone())),
+                None,
+                vec![old_report(running, next_boot)],
+            );
+            assert_eq!(watch_counts(&view, 0), words);
+            let row = &view.rows[0];
+            let (note, stale) = cve_note(
+                &view,
+                row,
+                &view.data.as_deref().unwrap().cves[0],
+                row.on(0).unwrap(),
+            );
+            assert!(stale, "{note}");
+            assert!(note.contains("data 2 d old"), "{note}");
+        }
+        let fresh = view_of(
+            Some(data(cve, hosts)),
+            None,
+            vec![report("ares", "6.18.56", "6.18.56")],
+        );
+        assert_eq!(watch_counts(&fresh, 0), "1 fixed · none affected");
+    }
+
+    #[test]
+    fn a_declared_note_shows_the_declared_kernel_not_an_older_report() {
+        let mut host = listed(
+            "ares",
+            serde_json::json!({
+                "CVE-2000-0001": { "state": "fixed", "last_verified": "2000-02-29T20:00:00Z" }
+            }),
+        );
+        host["kernel"] = "6.18.56".into();
+        host["last_verified"] = "2000-02-29T20:00:00Z".into();
+        let view = view_of(
+            Some(data(
+                serde_json::json!([kernel_cve("CVE-2000-0001", "6.18.56")]),
+                serde_json::json!([host]),
+            )),
+            None,
+            vec![old_report("6.18.52", "6.18.52")],
+        );
+        let row = &view.rows[0];
+        let on = row.on(0).unwrap();
+        assert_eq!(on.status.status, CveStatus::Fixed);
+        let (note, _) = cve_note(&view, row, &view.data.as_deref().unwrap().cves[0], on);
+        assert!(note.starts_with("6.18.56 · hand-declared"), "{note}");
+        assert!(!note.contains("6.18.52"), "{note}");
     }
 
     #[test]

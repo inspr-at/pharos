@@ -596,7 +596,7 @@ fn long_text(value: &str, path: &str) -> Result<(), FleetDataError> {
 }
 
 fn has_url_credentials(value: &str) -> bool {
-    value.split("://").skip(1).any(|rest| {
+    value.split("//").skip(1).any(|rest| {
         rest.split(|c: char| c == '/' || c.is_whitespace())
             .next()
             .is_some_and(|authority| authority.contains('@'))
@@ -704,6 +704,21 @@ mod tests {
             "the types must carry every field of the contract"
         );
         assert!(data.updated_at_unix().is_some());
+    }
+
+    #[test]
+    fn a_credential_in_a_url_is_refused_with_or_without_a_scheme() {
+        for text in [
+            "See https://example-user:example-pass@example.invalid/private",
+            "See //example-user:example-pass@example.invalid/private",
+        ] {
+            let message = refused(|value| value["cves"][0]["eli10"] = text.into());
+            assert!(!message.contains("example-pass"), "{message}");
+        }
+        assert!(has_url_credentials("//user@example.invalid"));
+        assert!(!has_url_credentials(
+            "See https://example.invalid/a//b and a@b"
+        ));
     }
 
     #[test]

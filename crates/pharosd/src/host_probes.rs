@@ -289,8 +289,17 @@ pub(crate) fn spawn_host_probe_loop(runtime: Arc<HostProbeRuntime>) {
 /// stealth mode ignores ICMP, and a Pi may run no SSH.
 async fn probe_host(declaration: &HostProbeDeclaration) -> ProbeResult {
     let target = declaration.target.clone();
-    let presence = tokio::task::spawn_blocking(move || ping_present(&target)).await;
-    if matches!(presence, Ok(Ok(true))) {
+    let presence = tokio::task::spawn_blocking(move || ping_present(&target))
+        .await
+        .unwrap_or(Err(()));
+    answer_after_ping(presence, declaration).await
+}
+
+async fn answer_after_ping(
+    presence: Result<bool, ()>,
+    declaration: &HostProbeDeclaration,
+) -> ProbeResult {
+    if presence == Ok(true) {
         return ProbeResult::Reachable;
     }
     let connected = timeout(
@@ -302,8 +311,8 @@ async fn probe_host(declaration: &HostProbeDeclaration) -> ProbeResult {
         return ProbeResult::Reachable;
     }
     match presence {
-        Ok(Ok(false)) => ProbeResult::NoReply,
-        Ok(Ok(true)) | Ok(Err(())) | Err(_) => ProbeResult::Unavailable,
+        Ok(false) => ProbeResult::NoReply,
+        Ok(true) | Err(()) => ProbeResult::Unavailable,
     }
 }
 
@@ -724,7 +733,39 @@ mod tests {
             target: "127.0.0.1".to_string(),
             tcp_port: listener.local_addr().expect("address").port(),
         };
-        assert_eq!(probe_host(&declaration).await, ProbeResult::Reachable);
+        for presence in [Ok(false), Err(())] {
+            assert_eq!(
+                answer_after_ping(presence, &declaration).await,
+                ProbeResult::Reachable
+            );
+            timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .expect("the probe connected")
+                .expect("accept");
+        }
+
+        // With the port closed the ping's own answer stands. Bound and never
+        // listening, so no parallel test can pick this port up meanwhile.
+        let closed = tokio::net::TcpSocket::new_v4().expect("socket");
+        closed
+            .bind("127.0.0.1:0".parse().expect("address"))
+            .expect("bind");
+        let declaration = HostProbeDeclaration {
+            tcp_port: closed.local_addr().expect("address").port(),
+            ..declaration
+        };
+        assert_eq!(
+            answer_after_ping(Ok(false), &declaration).await,
+            ProbeResult::NoReply
+        );
+        assert_eq!(
+            answer_after_ping(Err(()), &declaration).await,
+            ProbeResult::Unavailable
+        );
+        assert_eq!(
+            answer_after_ping(Ok(true), &declaration).await,
+            ProbeResult::Reachable
+        );
     }
 
     #[test]

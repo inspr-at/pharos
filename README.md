@@ -33,7 +33,7 @@ rollback for everything removed.
 | `pharosd`       | Server: beacon ingestion, login, the Fleet page and its data  |
 | `pharos-beacon` | Host agent that collects bounded facts and reports them       |
 | `pharos-cli`    | Read-only command line client                                 |
-| `pharos-core`   | Shared report, registration and manifest contracts            |
+| `pharos-core`   | Shared report, registration and fleet data contracts            |
 
 State is one JSON store at `PHAROS_DB`, written atomically. Without it, pharosd
 runs in memory.
@@ -115,8 +115,6 @@ routes answer both there and at the origin root.
 | `PHAROS_REGISTRATION_TOKEN_FILE`                               | Bootstrap token for `POST /register`; read only when registration is on         |
 | `PHAROS_REQUIRE_BEACON_TOKEN`                                  | Optional; tokens are always required, and `false` refuses startup               |
 | `PHAROS_BEACON_TOKEN_MODE`                                     | Optional; only `local` is valid, and anything else refuses startup              |
-| `PHAROS_MANIFEST_PATHS`                                        | Read-only declared-host manifests                                               |
-| `PHAROS_HTTP_PROBES_PATH`                                      | Optional `inspr.pharos.http-probes.v1` registry                                 |
 | `PHAROS_HOST_PROBES_PATH`                                      | Optional `inspr.pharos.host-probes.v1` registry; requires `PHAROS_DB`           |
 
 Startup fails closed: partial OIDC settings, open mode on a non-loopback address
@@ -191,10 +189,8 @@ validation, and a missing observation stays unknown.
 
 ## Beaconless probes
 
-Hosts without a beacon can still report reachability. `PHAROS_HTTP_PROBES_PATH`
-binds a manifest service to a credential-free URL with an expected status and
-optional body marker; `contracts/http-probes-v1.json` shows the shape.
-`PHAROS_HOST_PROBES_PATH` runs one ICMP check and one TCP connection per host, with
+Hosts without a beacon can still report reachability. `PHAROS_HOST_PROBES_PATH`
+runs one ICMP check and one TCP connection per host, with
 no credential; `contracts/host-probes-v1.json` shows the shape. The last time a host
 answered is kept in `<PHAROS_DB>.host-probes.json` and survives a restart. A
 configured registry that is missing, invalid, a symlink, or writable by group or

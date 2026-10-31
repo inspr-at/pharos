@@ -210,7 +210,10 @@ impl HostRow {
     pub(crate) fn security(&self, view: &FleetView) -> Security {
         let mut security = Security::default();
         let mut reasons = BTreeSet::new();
+        // Without the file there is no list to be clear of.
         let Some(data) = view.data.as_deref() else {
+            security.unknown = 1;
+            security.reason = Some("no data file".to_string());
             return security;
         };
         for index in &view.watchlist {

@@ -1033,6 +1033,15 @@ fn validated_return_to(public_base_path: &PublicBasePath, candidate: Option<&str
         return home;
     }
     let path = uri.path();
+    // A browser resolves %2e as a dot, so a path that looks canonical can climb
+    // out of the mount once it is redirected to.
+    let lower = path.to_ascii_lowercase();
+    if ["%2e", "%2f", "%5c"]
+        .iter()
+        .any(|code| lower.contains(code))
+    {
+        return home;
+    }
     let local = public_base_path
         .strip(path)
         .unwrap_or_else(|| path.to_string());
@@ -2217,7 +2226,6 @@ mod tests {
             beacon_auth: crate::BeaconAuth {
                 registration_token: None,
             },
-            http_probes: None,
             host_probes: None,
             fleet_data: Some(fleet_data),
             public_base_path: PublicBasePath::root(),
@@ -2702,6 +2710,27 @@ mod tests {
             validated_return_to(&mounted, Some("/pharos/auth/callback")),
             "/pharos"
         );
+        // Each of these reads as inside the mount, and a browser resolves it to outside.
+        for escape in [
+            "/pharos/%2e%2e/outside",
+            "/pharos/%2E%2E/outside",
+            "/pharos/.%2e/outside",
+            "/pharos/%2e./outside",
+            "/pharos%2f..%2foutside",
+            "/pharos/%2E%2E%2Foutside",
+            "/pharos/x%5c..%5coutside",
+        ] {
+            assert_eq!(
+                validated_return_to(&mounted, Some(escape)),
+                "/pharos",
+                "{escape}"
+            );
+        }
+        // One encoding deeper is a literal segment: a browser only decodes dots once.
+        assert_eq!(
+            validated_return_to(&mounted, Some("/pharos/%252e%252e/outside")),
+            "/pharos/%252e%252e/outside"
+        );
         assert_eq!(login_location(&mounted, "/pharos"), "/pharos/auth/login");
         assert_eq!(
             login_location(&mounted, "/pharos/services?flow_project=17"),
@@ -3121,7 +3150,7 @@ mod tests {
     fn display_name_prefers_zitadel_username_claim() {
         let claims = claims(
             r#"{
-                "iss": "https://auth.inspr.at",
+                "iss": "https://issuer.example.test",
                 "sub": "opaque-subject",
                 "aud": "pharos",
                 "exp": 4102444800,
@@ -3142,7 +3171,7 @@ mod tests {
     fn display_name_falls_back_without_username_claim() {
         let claims = claims(
             r#"{
-                "iss": "https://auth.inspr.at",
+                "iss": "https://issuer.example.test",
                 "sub": "opaque-subject",
                 "aud": "pharos",
                 "exp": 4102444800,

@@ -242,11 +242,11 @@ jobs:
               and .release_channel == "stable"
               and .release_sequence == $sequence
               and .git_commit == $commit' <<<"${response}" >/dev/null
-          docker run --rm --network host \
+          printed=$(docker run --rm --network host \
             -e PHAROS_URL=http://127.0.0.1:18088 \
             --entrypoint /usr/local/bin/pharos \
-            "${IMAGE}@${DIGEST}" version | jq -e --arg scheme "${SCHEME}" --arg version "${VERSION}" \
-            '.version_scheme == $scheme and .version == $version' >/dev/null
+            "${IMAGE}@${DIGEST}" version)
+          [[ "${printed}" == "pharos ${VERSION}" ]]
           docker run --rm --cap-drop ALL --security-opt no-new-privileges:true \
             --entrypoint /usr/bin/ping \
             "${IMAGE}@${DIGEST}" -c 1 -W 2 127.0.0.1 >/dev/null

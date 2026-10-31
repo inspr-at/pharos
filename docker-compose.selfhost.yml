@@ -46,15 +46,10 @@ services:
       PHAROS_ALLOW_LOCAL_REGISTER: ${PHAROS_ALLOW_LOCAL_REGISTER:-false}
       PHAROS_REGISTRATION_TOKEN_FILE: ${PHAROS_REGISTRATION_TOKEN_FILE:-}
 
-      # Optional declared-host manifest paths, for example:
-      # PHAROS_MANIFEST_PATHS=/manifests/host-a.json:/manifests/host-b.json
-      PHAROS_MANIFEST_PATHS: ${PHAROS_MANIFEST_PATHS:-}
     ports:
       - "${PHAROS_BIND:-127.0.0.1:8080}:8080"
     volumes:
       - pharos_data:/data
-      # Optional manifest mount for declared hosts:
-      # - ./manifests:/manifests:ro
       # Registration token mount, only while registration is switched on:
       # - ./private/pharos-registration-token:/run/secrets/pharos-registration-token:ro
 

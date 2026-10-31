@@ -170,6 +170,16 @@ pub fn host_contact(
         };
     };
 
+    // A check that can't run says nothing about the host, whatever its policy.
+    if beacon.is_none() && reachable.is_none() {
+        return contact(
+            ContactState::CheckUnavailable,
+            ContactTone::Neutral,
+            source,
+            Some(last),
+        );
+    }
+
     let age_secs = now.saturating_sub(last).max(0) as u64;
     let (state, tone) = match policy {
         ContactPolicy::AlwaysOn => match (beacon.map(|beacon| beacon.liveness), reachable) {
@@ -453,6 +463,21 @@ mod tests {
         let contact = silent(CLIENT, -DAY);
         assert_eq!(contact.age_secs, Some(0));
         assert_eq!(contact.state, ContactState::Asleep { over_days: None });
+    }
+
+    #[test]
+    fn a_check_that_cannot_run_turns_no_policy_red_and_keeps_the_last_contact() {
+        for policy in [
+            CLIENT,
+            ContactPolicy::AlwaysOn,
+            ContactPolicy::Optional,
+            ContactPolicy::Unlisted,
+        ] {
+            let seen = host_contact(policy, None, probe(None, Some(61 * DAY)), false, NOW);
+            assert_eq!(seen.state, ContactState::CheckUnavailable, "{policy:?}");
+            assert_eq!(seen.tone, ContactTone::Neutral, "{policy:?}");
+            assert_eq!(seen.age_secs, Some(61 * DAY as u64), "{policy:?}");
+        }
     }
 
     #[test]
