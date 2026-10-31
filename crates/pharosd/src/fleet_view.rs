@@ -13,7 +13,7 @@ use pharos_core::cve_status::{
 use pharos_core::fleet_data::{
     CveSeverity, FleetCve, FleetCveState, FleetData, FleetHost, HandledCves,
 };
-use pharos_core::updates_due::{host_updates, HostUpdates, UpdateDue, UpdatesState};
+use pharos_core::updates_due::{host_updates, HostUpdates, UpdateDue, UpdatesSource};
 use pharos_core::{liveness, Host, KernelPosture, KernelPostureState};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -137,23 +137,26 @@ impl HostRow {
         self.report.as_ref().and_then(|host| host.kernel.as_ref())
     }
 
-    /// The report's posture, until someone checks the file's versions after that
-    /// report has gone stale. Updates follow the file from then on, and so does
-    /// everything shown about the kernel.
-    pub(crate) fn live_posture(&self) -> Option<&KernelPosture> {
-        self.report_posture()
-            .filter(|_| !matches!(self.updates.state, UpdatesState::HandDeclared))
+    fn report_decides(&self) -> bool {
+        matches!(self.updates.source, UpdatesSource::Report { .. })
     }
 
-    /// The running kernel a live report gives, or what the file declares.
+    /// The report's posture, while the report is what Updates rests on. Once a
+    /// newer check of the file replaces it, everything about the kernel follows.
+    pub(crate) fn live_posture(&self) -> Option<&KernelPosture> {
+        self.report_posture().filter(|_| self.report_decides())
+    }
+
+    /// The running kernel from whichever evidence Updates rests on. A report that
+    /// can't name its kernel leaves none, not an older hand-written one.
     pub(crate) fn kernel(&self) -> Option<&str> {
-        self.live_posture()
-            .and_then(|posture| posture.running_version.as_deref())
-            .or_else(|| {
-                self.declared
-                    .as_ref()
-                    .and_then(|host| host.kernel.as_deref())
-            })
+        if self.report_decides() {
+            self.reported_kernel()
+        } else {
+            self.declared
+                .as_ref()
+                .and_then(|host| host.kernel.as_deref())
+        }
     }
 
     pub(crate) fn next_boot(&self) -> Option<&str> {
@@ -182,11 +185,18 @@ impl HostRow {
             })
     }
 
+    /// A report that decides speaks first. Not every report names a release, and
+    /// the file's value is then all there is.
     pub(crate) fn os_version(&self) -> Option<&str> {
-        self.declared
+        let declared = self
+            .declared
             .as_ref()
-            .and_then(|host| host.version.as_deref())
-            .or_else(|| self.nixpkgs_channel())
+            .and_then(|host| host.version.as_deref());
+        if self.report_decides() {
+            self.nixpkgs_channel().or(declared)
+        } else {
+            declared.or_else(|| self.nixpkgs_channel())
+        }
     }
 
     /// The release a report's nixpkgs follows, without its `nixos-` prefix.

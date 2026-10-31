@@ -8,7 +8,7 @@ use axum::Json;
 use pharos_core::contact::{ContactSource, ContactState};
 use pharos_core::fleet_data::{FleetCveState, KERNEL_COMPONENT};
 use pharos_core::updates_due::{UpdatesSource, UpdatesState};
-use pharos_core::KernelPostureState;
+use pharos_core::{liveness, KernelPostureState, Liveness};
 use serde::Serialize;
 
 use crate::fleet_view::{short_span, span, FleetView, HostRow};
@@ -22,7 +22,7 @@ use crate::AppState;
 const FLEET_VIEW_SCHEMA: &str = "inspr.pharos.fleet-view.v1";
 
 #[derive(Serialize)]
-struct FleetDocument {
+pub(crate) struct FleetDocument {
     schema: &'static str,
     generated_at: i64,
     uptime: String,
@@ -99,6 +99,15 @@ struct ApiUpdate {
 /// A host that has reported, or that the file expects a report from.
 fn is_beacon_host(row: &HostRow) -> bool {
     row.report.is_some() || row.contact.state == ContactState::NeverReported
+}
+
+/// From the beacon's own reports: what a probe sees of the host is a separate matter.
+fn beacon_liveness(row: &HostRow, now: i64) -> Liveness {
+    row.report
+        .as_ref()
+        .map_or(Liveness::AwaitingFirstHeartbeat, |host| {
+            liveness(host.last_seen, host.heartbeat_interval_secs, now)
+        })
 }
 
 pub(crate) fn api_host(view: &FleetView, row: &HostRow) -> ApiHost {
@@ -187,13 +196,13 @@ fn api_cve(view: &FleetView, index: usize) -> Option<ApiCve> {
     })
 }
 
-fn document(view: &FleetView, started_at: i64) -> FleetDocument {
+pub(crate) fn document(view: &FleetView, started_at: i64) -> FleetDocument {
     let data = view.data.as_deref();
     let counts = fleet_counts(view);
-    let beacons_in = |states: fn(&ContactState) -> bool| {
+    let beacons_in = |states: fn(Liveness) -> bool| {
         view.rows
             .iter()
-            .filter(|row| is_beacon_host(row) && states(&row.contact.state))
+            .filter(|row| is_beacon_host(row) && states(beacon_liveness(row, view.now)))
             .count()
     };
     FleetDocument {
@@ -220,16 +229,9 @@ fn document(view: &FleetView, started_at: i64) -> FleetDocument {
             reboots_due: counts.reboots,
         },
         beacons: Beacons {
-            reporting: beacons_in(|state| {
-                matches!(state, ContactState::Online | ContactState::Late)
-            }),
-            offline: beacons_in(|state| {
-                !matches!(
-                    state,
-                    ContactState::Online | ContactState::Late | ContactState::NeverReported
-                )
-            }),
-            never_reported: beacons_in(|state| *state == ContactState::NeverReported),
+            reporting: beacons_in(|state| matches!(state, Liveness::Live | Liveness::Stale)),
+            offline: beacons_in(|state| state == Liveness::Down),
+            never_reported: beacons_in(|state| state == Liveness::AwaitingFirstHeartbeat),
         },
         hosts: view.rows.iter().map(|row| api_host(view, row)).collect(),
         cves: view

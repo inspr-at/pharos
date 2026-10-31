@@ -3412,6 +3412,124 @@ mod tests {
     }
 
     #[test]
+    fn a_report_that_names_no_kernel_leaves_none() {
+        let mut declared = listed("ares", serde_json::json!({}));
+        declared["kernel"] = "6.18.56".into();
+        declared["last_verified"] = "2000-01-10T00:00:00Z".into();
+        let mut unnamed = report("ares", "6.18.52", "6.18.52");
+        let mut posture = serde_json::to_value(unnamed.kernel.take().unwrap()).unwrap();
+        posture["state"] = "unknown".into();
+        posture["running_version"] = serde_json::Value::Null;
+        posture["expected_version"] = serde_json::Value::Null;
+        unnamed.kernel = Some(serde_json::from_value(posture).unwrap());
+        let mut absent = report("ares", "6.18.52", "6.18.52");
+        absent.kernel = None;
+        for host in [unnamed, absent] {
+            let view = view_of(
+                Some(data(serde_json::json!([]), serde_json::json!([declared]))),
+                None,
+                vec![host],
+            );
+            assert_eq!(view.rows[0].kernel(), None);
+            let api =
+                serde_json::to_value(crate::fleet_api::api_host(&view, &view.rows[0])).unwrap();
+            assert!(api["running"].is_null(), "{api}");
+            assert!(api["next_boot"].is_null(), "{api}");
+            for page in [
+                fleet_page(&view),
+                render_host(&PublicBasePath::root(), None, &view, "ares").unwrap(),
+            ] {
+                assert!(!page.contains("6.18.56"), "{page}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_release_comes_from_the_evidence_that_decides() {
+        let view_with = |channel: Option<&str>, reported_at: i64, verified: &str| {
+            let mut declared = listed("ares", serde_json::json!({}));
+            declared["version"] = "24.05".into();
+            declared["last_verified"] = verified.into();
+            let mut host = report("ares", "6.18.52", "6.18.52");
+            host.last_seen = Some(reported_at);
+            host.freshness.nixpkgs_channel = channel.map(ToString::to_string);
+            view_of(
+                Some(data(serde_json::json!([]), serde_json::json!([declared]))),
+                None,
+                vec![host],
+            )
+        };
+        const OLD_CHECK: &str = "2000-01-10T00:00:00Z";
+        const NEW_CHECK: &str = "2000-02-29T20:00:00Z";
+
+        // A fresh report outranks an old hand-written release.
+        let view = view_with(Some("nixos-25.11"), NOW, OLD_CHECK);
+        assert_eq!(view.rows[0].os_version(), Some("25.11"));
+        // A report that names none leaves the file's.
+        let view = view_with(None, NOW, OLD_CHECK);
+        assert_eq!(view.rows[0].os_version(), Some("24.05"));
+        // A check after a stale report replaces what that report said.
+        let view = view_with(Some("nixos-25.11"), NOW - 2 * 86_400, NEW_CHECK);
+        assert_eq!(view.rows[0].os_version(), Some("24.05"));
+    }
+
+    #[test]
+    fn beacon_counts_rest_on_the_beacon_and_not_on_a_probe() {
+        let probed = |reachable: Option<bool>| {
+            BTreeMap::from([(
+                "ares".to_string(),
+                HostProbeObservation {
+                    reachable,
+                    checked_at: Some(NOW),
+                    last_reachable_at: reachable.and_then(|up| up.then_some(NOW)),
+                },
+            )])
+        };
+        let counts = |host: Host, reachable: Option<bool>| {
+            let view = FleetView::build(
+                Some(FleetDataView {
+                    data: Some(Arc::new(data(
+                        serde_json::json!([]),
+                        serde_json::json!([listed("ares", serde_json::json!({}))]),
+                    ))),
+                    problem: None,
+                }),
+                vec![host],
+                probed(reachable),
+                NOW,
+            );
+            let beacons = serde_json::to_value(crate::fleet_api::document(&view, NOW)).unwrap()
+                ["beacons"]
+                .clone();
+            (
+                beacons["reporting"].as_u64().unwrap(),
+                beacons["offline"].as_u64().unwrap(),
+                beacons["never_reported"].as_u64().unwrap(),
+            )
+        };
+        let mut registered = report("ares", "6.18.52", "6.18.52");
+        registered.last_seen = None;
+        for reachable in [None, Some(false), Some(true)] {
+            assert_eq!(
+                counts(registered.clone(), reachable),
+                (0, 0, 1),
+                "{reachable:?}"
+            );
+            // A probe that answers doesn't bring a silent beacon back.
+            assert_eq!(
+                counts(old_report("6.18.52", "6.18.52"), reachable),
+                (0, 1, 0),
+                "{reachable:?}"
+            );
+            assert_eq!(
+                counts(report("ares", "6.18.52", "6.18.52"), reachable),
+                (1, 0, 0),
+                "{reachable:?}"
+            );
+        }
+    }
+
+    #[test]
     fn next_boot_is_only_what_the_report_says() {
         let next_boot = |state: &str, expected: Option<&str>| {
             let mut host = report("ares", "6.18.52", "6.18.52");
