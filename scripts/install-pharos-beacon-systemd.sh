@@ -6,8 +6,7 @@ usage() {
 Usage: install-pharos-beacon-systemd.sh --binary PATH|--binary-url URL --pharos-url URL --token-env PATH|--token-file PATH [options]
 
 Installs pharos-beacon as a native systemd service on non-Nix Linux hosts.
-The token env/file must already exist unless --allow-legacy is set for the
-temporary PHAROS-37 rollout window.
+The token env/file must already exist.
 Host settings are stored privately in /var/lib/pharos-beacon.
 
 Options:
@@ -16,7 +15,6 @@ Options:
   --binary-sha256 HEX    Required SHA-256 for every --binary-url download.
   --token-env PATH       Runtime env file containing PHAROS_TOKEN=...
   --token-file PATH      Runtime file containing only the raw token.
-  --allow-legacy         Allow install without token env file.
   --pharos-url URL       Required pharosd HTTP(S) base URL.
   --host NAME            Reported host name (default: hostname -s).
   --role ROLE            Reported host role (default: server).
@@ -69,7 +67,6 @@ binary_url=""
 binary_sha256=""
 token_env=""
 token_file=""
-allow_legacy=0
 pharos_url="${PHAROS_URL:-}"
 host="${PHAROS_HOSTNAME:-$(hostname -s 2>/dev/null || hostname)}"
 role="${PHAROS_ROLE:-server}"
@@ -120,10 +117,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --token-file=*)
       token_file="${1#--token-file=}"
-      shift
-      ;;
-    --allow-legacy)
-      allow_legacy=1
       shift
       ;;
     --pharos-url)
@@ -229,8 +222,8 @@ fi
 if [[ -n "$token_file" ]]; then
   validate_owned_regular_file "$token_file" "$((8#7077))" "token file"
 fi
-if [[ -z "$token_env" && -z "$token_file" && "$allow_legacy" -ne 1 ]]; then
-  die "set --token-env, --token-file, or explicitly pass --allow-legacy"
+if [[ -z "$token_env" && -z "$token_file" ]]; then
+  die "set --token-env or --token-file"
 fi
 if [[ -n "$binary" ]]; then
   validate_owned_regular_file "$binary" "$((8#7022))" "beacon binary"

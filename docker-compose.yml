@@ -3,10 +3,9 @@
 # Do not copy this file to production; docker-compose.selfhost.yml is the
 # production template.
 #
-# Secrets are intentionally not committed here. If you need to test strict
-# token behavior locally, prefer read-only files with
-# PHAROS_REGISTRATION_TOKEN_FILE / PHAROS_TOKEN_FILE. Direct values remain a
-# compatibility path for local smoke tests only.
+# Secrets are intentionally not committed here. Every report needs a beacon
+# token: register the host first (see RUNBOOK.md), then pass the token to the
+# beacon profile as PHAROS_TOKEN.
 
 name: pharos-local
 
@@ -47,9 +46,8 @@ services:
       PHAROS_INTERVAL: 60
       PHAROS_HOSTNAME: ${PHAROS_HOSTNAME:-local-dev}
       PHAROS_ROLE: ${PHAROS_ROLE:-local}
-      # Optional for strict-token local tests; leave unset for legacy-mode
-      # local smoke tests. A private override can instead mount a token file
-      # and set PHAROS_TOKEN_FILE to its container path.
+      # Without a token every report gets 401. A private override can instead
+      # mount a token file and set PHAROS_TOKEN_FILE to its container path.
       PHAROS_TOKEN: ${PHAROS_TOKEN:-}
 
 volumes:

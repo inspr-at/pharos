@@ -66,35 +66,62 @@ impl FromRef<AppState> for AuthState {
 
 #[derive(Clone)]
 struct BeaconAuth {
+    /// Set only while an operator has registration switched on.
     registration_token: Option<String>,
-    require_report_token: bool,
-    local_register_enabled: bool,
 }
 
 impl BeaconAuth {
     fn from_env() -> Result<Self, String> {
-        if let Some(mode) = env_nonempty("PHAROS_BEACON_TOKEN_MODE") {
-            validate_beacon_token_mode(&mode)?;
+        Self::validated(
+            env_nonempty("PHAROS_BEACON_TOKEN_MODE").as_deref(),
+            env_bool("PHAROS_REQUIRE_BEACON_TOKEN")?,
+            env_bool("PHAROS_ALLOW_LOCAL_REGISTER")?.unwrap_or(false),
+            env_nonempty("PHAROS_REGISTRATION_TOKEN").is_some(),
+            || {
+                pharos_core::secret_input::optional_secret("PHAROS_REGISTRATION_TOKEN")
+                    .map_err(|error| error.to_string())
+            },
+        )
+    }
+
+    fn validated(
+        mode: Option<&str>,
+        require_report_token: Option<bool>,
+        allow_register: bool,
+        inline_registration_token: bool,
+        registration_token_file: impl FnOnce() -> Result<Option<String>, String>,
+    ) -> Result<Self, String> {
+        if let Some(mode) = mode {
+            validate_beacon_token_mode(mode)?;
         }
-        let registration_token =
-            pharos_core::secret_input::optional_secret("PHAROS_REGISTRATION_TOKEN")
-                .map_err(|error| error.to_string())?;
-        let require_report_token =
-            env_bool("PHAROS_REQUIRE_BEACON_TOKEN")?.unwrap_or(registration_token.is_some());
-        let local_register_enabled = env_bool("PHAROS_ALLOW_LOCAL_REGISTER")?.unwrap_or(true);
+        if require_report_token == Some(false) {
+            return Err(
+                "PHAROS_REQUIRE_BEACON_TOKEN=false is not supported; every report needs a bearer token"
+                    .to_string(),
+            );
+        }
+        if inline_registration_token {
+            return Err(
+                "PHAROS_REGISTRATION_TOKEN is not supported; use PHAROS_REGISTRATION_TOKEN_FILE"
+                    .to_string(),
+            );
+        }
+        if !allow_register {
+            return Ok(Self {
+                registration_token: None,
+            });
+        }
+        let registration_token = registration_token_file()?.ok_or_else(|| {
+            "PHAROS_ALLOW_LOCAL_REGISTER=true requires PHAROS_REGISTRATION_TOKEN_FILE".to_string()
+        })?;
         Ok(Self {
-            registration_token,
-            require_report_token,
-            local_register_enabled,
+            registration_token: Some(registration_token),
         })
     }
 
     fn registration_status(&self, headers: &HeaderMap) -> RegistrationAuth {
-        if !self.local_register_enabled {
-            return RegistrationAuth::Disabled;
-        }
         let Some(expected) = &self.registration_token else {
-            return RegistrationAuth::NotConfigured;
+            return RegistrationAuth::Disabled;
         };
         match bearer_token(headers) {
             Some(actual) if constant_time_eq(actual, expected) => RegistrationAuth::Allowed,
@@ -107,7 +134,6 @@ enum RegistrationAuth {
     Allowed,
     Denied,
     Disabled,
-    NotConfigured,
 }
 
 fn now_unix() -> i64 {
@@ -145,7 +171,7 @@ fn env_bool(name: &str) -> Result<Option<bool>, String> {
 /// mode refuses startup rather than silently changing who can report.
 fn validate_beacon_token_mode(value: &str) -> Result<(), String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "local" | "mvp" => Ok(()),
+        "local" => Ok(()),
         _ => Err(format!(
             "unsupported PHAROS_BEACON_TOKEN_MODE value {value:?}; expected local"
         )),
@@ -249,19 +275,13 @@ async fn report(
         tracing::warn!(host = %rep.name, "report rejected: reserved server observation");
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if let Some(token) = bearer_token(&headers) {
-        if !local_token_matches(&state.store, &rep.name, &token_hash(token)) {
-            tracing::warn!(host = %rep.name, "report rejected: invalid bearer token");
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    } else if state.beacon_auth.require_report_token {
+    let Some(token) = bearer_token(&headers) else {
         tracing::warn!(host = %rep.name, "report rejected: missing bearer token");
         return StatusCode::UNAUTHORIZED.into_response();
-    } else {
-        tracing::warn!(
-            host = %rep.name,
-            "accepting legacy unauthenticated report; migrate this host to PHAROS_TOKEN before enabling strict report auth"
-        );
+    };
+    if !local_token_matches(&state.store, &rep.name, &token_hash(token)) {
+        tracing::warn!(host = %rep.name, "report rejected: invalid bearer token");
+        return StatusCode::UNAUTHORIZED.into_response();
     }
     tracing::info!(host = %rep.name, "report received");
     let host_name = rep.name.clone();
@@ -272,8 +292,9 @@ async fn report(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Local host registration for MVP onboarding (PHAROS-8/7). Protected by a
-/// deployment-local bootstrap token; the returned beacon token is shown once.
+/// The one path to add a host or rotate its token. Off unless an operator
+/// switches it on with a token file; the returned beacon token is shown once.
+/// Registering an existing host replaces its token (see RUNBOOK.md).
 async fn register(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -298,12 +319,6 @@ async fn register(
             return register_response(
                 StatusCode::UNAUTHORIZED,
                 json!({ "error": "registration token invalid" }),
-            );
-        }
-        RegistrationAuth::NotConfigured => {
-            return register_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({ "error": "PHAROS_REGISTRATION_TOKEN not configured" }),
             );
         }
     }
@@ -643,11 +658,9 @@ mod tests {
         (status, headers, payload)
     }
 
-    fn report_test_state(require_report_token: bool) -> AppState {
+    fn report_test_state() -> AppState {
         report_test_state_with_auth(BeaconAuth {
             registration_token: None,
-            require_report_token,
-            local_register_enabled: true,
         })
     }
 
@@ -816,32 +829,15 @@ mod tests {
 
     #[test]
     fn beacon_token_mode_accepts_only_store_checked_tokens() {
-        assert!(validate_beacon_token_mode("local").is_ok());
-        assert!(validate_beacon_token_mode(" MVP ").is_ok());
-        for mode in ["janus", "dual", "forge", "typo"] {
+        assert!(validate_beacon_token_mode(" Local ").is_ok());
+        for mode in ["mvp", "janus", "dual", "forge", "typo"] {
             assert!(validate_beacon_token_mode(mode).is_err(), "{mode}");
         }
     }
 
     #[tokio::test]
-    async fn report_accepts_registered_host_without_token_when_strict_disabled() {
-        let state = report_test_state(false);
-        register_test_token(&state, "ares", "valid-token");
-
-        let status = report(
-            State(state.clone()),
-            HeaderMap::new(),
-            Json(test_report("ares")),
-        )
-        .await;
-
-        assert_eq!(status.status(), StatusCode::NO_CONTENT);
-        assert!(state.store.get("ares").and_then(|h| h.last_seen).is_some());
-    }
-
-    #[tokio::test]
     async fn report_rejects_reserved_appliance_observation_without_mutating_host() {
-        let state = report_test_state(false);
+        let state = report_test_state();
         register_test_token(&state, "ares", "valid-token");
         let before = state.store.get("ares").expect("registered host exists");
         let mut spoofed = test_report("ares");
@@ -864,92 +860,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_accepts_valid_token_when_strict_disabled() {
-        let state = report_test_state(false);
+    async fn report_accepts_the_right_token() {
+        let state = report_test_state();
         register_test_token(&state, "ares", "valid-token");
 
         let status = report(
-            State(state),
+            State(state.clone()),
             bearer_headers("valid-token"),
             Json(test_report("ares")),
         )
         .await;
 
         assert_eq!(status.status(), StatusCode::NO_CONTENT);
+        assert!(state.store.get("ares").and_then(|h| h.last_seen).is_some());
     }
 
     #[tokio::test]
-    async fn report_rejects_invalid_token_even_when_strict_disabled() {
-        let state = report_test_state(false);
+    async fn report_rejects_a_wrong_token() {
+        let state = report_test_state();
         register_test_token(&state, "ares", "valid-token");
+        let before = state.store.get("ares");
 
         let status = report(
-            State(state),
+            State(state.clone()),
             bearer_headers("wrong-token"),
             Json(test_report("ares")),
         )
         .await;
 
         assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.store.get("ares"), before);
     }
 
     #[tokio::test]
-    async fn report_rejects_missing_token_when_strict_enabled() {
-        let state = report_test_state(true);
+    async fn report_rejects_a_missing_token() {
+        let state = report_test_state();
         register_test_token(&state, "ares", "valid-token");
-
-        let status = report(State(state), HeaderMap::new(), Json(test_report("ares"))).await;
-
-        assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn report_rejects_token_for_unknown_host_and_does_not_create_it() {
-        let state = report_test_state(true);
-        register_test_token(&state, "ares", "valid-token");
+        let before = state.store.get("ares");
 
         let status = report(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(test_report("ares")),
+        )
+        .await;
+
+        assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.store.get("ares"), before);
+    }
+
+    #[tokio::test]
+    async fn report_rejects_an_unknown_host_and_does_not_create_it() {
+        let state = report_test_state();
+        register_test_token(&state, "ares", "valid-token");
+
+        let with_token = report(
             State(state.clone()),
             bearer_headers("valid-token"),
             Json(test_report("hermes")),
         )
         .await;
+        let without_token = report(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(test_report("hermes")),
+        )
+        .await;
 
-        assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(with_token.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(without_token.status(), StatusCode::UNAUTHORIZED);
         assert!(state.store.get("hermes").is_none());
     }
 
     #[tokio::test]
-    async fn report_accepts_valid_token_when_strict_enabled() {
-        let state = report_test_state(true);
-        register_test_token(&state, "ares", "valid-token");
+    async fn report_rejects_a_known_host_with_no_stored_hash() {
+        let state = report_test_state();
+        state
+            .store
+            .record(test_report("ares"), 100)
+            .expect("host without a hash persists");
+        assert!(state.store.token_hash_for("ares").is_none());
 
         let status = report(
             State(state),
-            bearer_headers("valid-token"),
+            bearer_headers("any-token"),
             Json(test_report("ares")),
         )
         .await;
 
-        assert_eq!(status.status(), StatusCode::NO_CONTENT);
+        assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn registering_again_rotates_the_token_and_keeps_report_history() {
+        let state = report_test_state_with_auth(BeaconAuth {
+            registration_token: Some("bootstrap-fixture".to_string()),
+        });
+        register_test_token(&state, "ares", "old-token");
+        report(
+            State(state.clone()),
+            bearer_headers("old-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+        let last_seen = state.store.get("ares").and_then(|h| h.last_seen);
+        assert!(last_seen.is_some());
+
+        let response = register(
+            State(state.clone()),
+            bearer_headers("bootstrap-fixture"),
+            Json(test_registration("ares")),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let reply: RegistrationReply = serde_json::from_value(payload).unwrap();
+        assert_eq!(state.store.get("ares").and_then(|h| h.last_seen), last_seen);
+
+        let old = report(
+            State(state.clone()),
+            bearer_headers("old-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+        assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
+        let new = report(
+            State(state),
+            bearer_headers(&reply.token),
+            Json(test_report("ares")),
+        )
+        .await;
+        assert_eq!(new.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
     async fn report_returns_unavailable_and_rolls_back_when_host_store_persistence_fails() {
         let path = temp_path("report-persistence-failure");
-        let mut state = report_test_state(false);
-        state.store = Arc::new(Store::new(Some(path.clone())).expect("durable store starts"));
+        let mut state = report_test_state();
+        state.store = Arc::new(Store::new(None).expect("in-memory host store starts"));
+        register_test_token(&state, "persistence-test", "valid-token");
+        let registered = state.store.get("persistence-test");
+        let hosts = state.store.list();
+        state.store = Arc::new(Store::with_failing_path_for_test(path.clone(), hosts));
         std::fs::create_dir(&path).expect("rename-blocking destination created");
 
         let response = report(
             State(state.clone()),
-            HeaderMap::new(),
+            bearer_headers("valid-token"),
             Json(test_report("persistence-test")),
         )
         .await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(state.store.get("persistence-test").is_none());
+        assert_eq!(state.store.get("persistence-test"), registered);
         std::fs::remove_dir_all(path).expect("test destination removed");
     }
 
@@ -958,8 +1021,6 @@ mod tests {
         let path = temp_path("registration-persistence-failure");
         let mut state = report_test_state_with_auth(BeaconAuth {
             registration_token: Some("bootstrap-fixture".to_string()),
-            require_report_token: true,
-            local_register_enabled: true,
         });
         state.store = Arc::new(Store::new(Some(path.clone())).expect("durable store starts"));
         std::fs::create_dir(&path).expect("rename-blocking destination created");
@@ -982,8 +1043,6 @@ mod tests {
     async fn credential_bearing_registration_response_is_never_cacheable() {
         let state = report_test_state_with_auth(BeaconAuth {
             registration_token: Some("bootstrap-fixture".to_string()),
-            require_report_token: true,
-            local_register_enabled: true,
         });
         let response = register(
             State(state.clone()),
@@ -1012,29 +1071,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_local_registration_answers_gone() {
-        let state = report_test_state_with_auth(BeaconAuth {
-            registration_token: Some("bootstrap-fixture".to_string()),
-            require_report_token: true,
-            local_register_enabled: false,
-        });
-
+    async fn registration_is_gone_when_switched_off_and_denied_on_a_wrong_token() {
+        let off = report_test_state();
         let response = register(
-            State(state.clone()),
+            State(off.clone()),
             bearer_headers("bootstrap-fixture"),
             Json(test_registration("ares")),
         )
         .await;
         let (status, _, payload) = json_response(response).await;
-
         assert_eq!(status, StatusCode::GONE);
         assert_eq!(payload["error"], "local registration disabled");
-        assert!(state.store.get("ares").is_none());
+        assert!(off.store.get("ares").is_none());
+
+        let on = report_test_state_with_auth(BeaconAuth {
+            registration_token: Some("bootstrap-fixture".to_string()),
+        });
+        for headers in [bearer_headers("wrong-fixture"), HeaderMap::new()] {
+            let response =
+                register(State(on.clone()), headers, Json(test_registration("ares"))).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(on.store.get("ares").is_none());
+    }
+
+    #[test]
+    fn beacon_auth_startup_is_strict_and_registration_needs_switch_and_file() {
+        let no_file = || Ok(None);
+        let file = || Ok(Some("bootstrap-fixture".to_string()));
+        let untouched = || -> Result<Option<String>, String> {
+            panic!("the registration file is read only when switched on")
+        };
+
+        let default = BeaconAuth::validated(None, None, false, false, untouched).unwrap();
+        assert!(default.registration_token.is_none());
+        let required = BeaconAuth::validated(Some("local"), Some(true), false, false, untouched);
+        assert!(required.unwrap().registration_token.is_none());
+
+        let on = BeaconAuth::validated(None, None, true, false, file).unwrap();
+        assert_eq!(on.registration_token.as_deref(), Some("bootstrap-fixture"));
+
+        let cases: [(Result<BeaconAuth, String>, &str); 4] = [
+            (
+                BeaconAuth::validated(Some("janus"), None, false, false, untouched),
+                "PHAROS_BEACON_TOKEN_MODE",
+            ),
+            (
+                BeaconAuth::validated(None, Some(false), false, false, untouched),
+                "PHAROS_REQUIRE_BEACON_TOKEN",
+            ),
+            (
+                BeaconAuth::validated(None, None, true, true, file),
+                "PHAROS_REGISTRATION_TOKEN_FILE",
+            ),
+            (
+                BeaconAuth::validated(None, None, true, false, no_file),
+                "PHAROS_REGISTRATION_TOKEN_FILE",
+            ),
+        ];
+        for (result, names) in cases {
+            let error = result.err().expect("startup refuses this configuration");
+            assert!(error.contains(names), "{error}");
+        }
     }
 
     #[tokio::test]
-    async fn hosts_json_never_carries_the_stored_token_hash() {
-        let state = report_test_state(true);
+    async fn no_api_or_page_carries_the_stored_token_hash() {
+        let state = report_test_state();
         register_test_token(&state, "ares", "valid-token");
         let hash = token_hash("valid-token");
 
@@ -1052,11 +1155,23 @@ mod tests {
         assert_eq!(payload["hosts"][0]["liveness"], "awaiting_first_heartbeat");
         assert!(!body.contains(&hash));
         assert!(!body.contains("token_hash"));
+
+        let page = test_client()
+            .get(format!("{base}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(page.contains("ares"));
+        assert!(!page.contains(&hash));
+        assert!(!page.contains("token_hash"));
     }
 
     #[tokio::test]
     async fn bearer_credentials_are_refused_on_human_routes() {
-        let state = report_test_state(true);
+        let state = report_test_state();
         register_test_token(&state, "ares", "valid-token");
 
         let base = serve_test_app(state).await;
@@ -1129,10 +1244,10 @@ mod tests {
 
     #[tokio::test]
     async fn cut_route_families_are_gone() {
-        let base = serve_test_app(report_test_state(true)).await;
+        let base = serve_test_app(report_test_state()).await;
         assert_cut_routes_absent(&base, "").await;
 
-        let mut prefixed = report_test_state(true);
+        let mut prefixed = report_test_state();
         prefixed.public_base_path = PublicBasePath::parse("/pharos").unwrap();
         let base = serve_test_app(prefixed).await;
         assert_cut_routes_absent(&base, "").await;
@@ -1141,7 +1256,7 @@ mod tests {
 
     #[tokio::test]
     async fn launch_routes_answer_at_root() {
-        let base = serve_test_app(report_test_state(true)).await;
+        let base = serve_test_app(report_test_state()).await;
         let client = test_client();
         for path in [
             "/",
@@ -1160,7 +1275,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefixed_mount_keeps_machine_routes_at_root_and_browser_routes_under_prefix() {
-        let mut state = report_test_state(true);
+        let mut state = report_test_state();
         state.public_base_path = PublicBasePath::parse("/pharos").unwrap();
         let base = serve_test_app(state).await;
         let client = test_client();
@@ -1189,7 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn host_data_and_page_follow_the_access_grant() {
-        let mut state = report_test_state(true);
+        let mut state = report_test_state();
         register_test_token(&state, "ares", "ares-token");
         register_test_token(&state, "hermes", "hermes-token");
         state.auth = AuthState::for_test_access(AccessGrant::limited(["ares"]));
@@ -1226,7 +1341,7 @@ mod tests {
 
     #[tokio::test]
     async fn home_page_lists_hosts_with_csp_nonce_on_its_style() {
-        let state = report_test_state(true);
+        let state = report_test_state();
         register_test_token(&state, "ares", "valid-token");
         let base = serve_test_app(state).await;
 

@@ -197,6 +197,20 @@ impl Store {
         Ok(host)
     }
 
+    /// An already-seeded store whose next durable write goes to `path`.
+    #[cfg(test)]
+    pub(crate) fn with_failing_path_for_test(path: PathBuf, hosts: Vec<Host>) -> Self {
+        Self {
+            path: Some(path),
+            hosts: RwLock::new(
+                hosts
+                    .into_iter()
+                    .map(|host| (host.name.clone(), host))
+                    .collect(),
+            ),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn has_token(&self, host: &str) -> bool {
         self.hosts

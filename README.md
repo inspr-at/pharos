@@ -40,25 +40,36 @@ runs in memory.
 ## Quick start
 
 ```bash
-docker compose --profile beacon up --build
+docker compose up --build
 ```
 
 Then open <http://127.0.0.1:8080>. Health is at `/healthz` and build metadata
 at `/version`. This Compose file binds to loopback, keeps data in a Docker
-volume and leaves login and strict beacon authentication off, so it is a smoke
-environment only. `docker-compose.selfhost.yml` is the production template.
+volume and leaves login off, so it is a smoke environment only.
+`docker-compose.selfhost.yml` is the production template.
 
-For native development, use the `devenv` environment:
+For native development, use the `devenv` environment and switch registration on
+with a token file:
 
 ```bash
 devenv shell
-PHAROS_ALLOW_OPEN=true cargo run -p pharosd
+umask 077
+printf 'local-dev-only\n' >"$TMPDIR/pharos-registration-token"
+PHAROS_ALLOW_OPEN=true \
+PHAROS_ALLOW_LOCAL_REGISTER=true \
+PHAROS_REGISTRATION_TOKEN_FILE="$TMPDIR/pharos-registration-token" \
+cargo run -p pharosd
 ```
 
-In another shell, send one local report:
+In another shell, register the host and send one report:
 
 ```bash
+token=$(curl -sS -H 'Authorization: Bearer local-dev-only' \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":"inspr.pharos.host-registration.v1","version":1,"name":"local-dev","role":"development","is_nix":false,"heartbeat_interval_secs":60}' \
+  http://127.0.0.1:8080/register | jq -r .token)
 PHAROS_URL=http://127.0.0.1:8080 \
+PHAROS_TOKEN="$token" \
 PHAROS_HOSTNAME=local-dev \
 PHAROS_ROLE="Development host" \
 cargo run -p pharos-beacon
@@ -74,7 +85,7 @@ seconds). Without it, the beacon reports once and exits.
 | `GET /`                                   | Login        | Fleet page                              |
 | `GET /hosts.json`                         | Login        | Fleet data, filtered by access grant    |
 | `POST /report`                            | Beacon token | Beacon report                           |
-| `POST /register`                          | Bootstrap    | Issue a beacon token, shown once        |
+| `POST /register`                          | Bootstrap    | Off by default; issue or rotate a token |
 | `GET /healthz`, `/readyz`, `/version`     | Public       | Health and build metadata               |
 | `/auth/*`                                 | Public       | OIDC login, recovery and logout         |
 
@@ -95,10 +106,10 @@ routes answer both there and at the origin root.
 | `PHAROS_OIDC_CA_FILE`                                          | Optional read-only PEM CA bundle for OIDC requests                              |
 | `PHAROS_ALLOWED_OPERATORS`                                     | `operator-ref:<sha256>`, `verified-email-ref:<sha256>` or `email:<address>`     |
 | `PHAROS_ACCESS_POLICY_FILE`                                    | Optional per-identifier host scopes                                             |
-| `PHAROS_REGISTRATION_TOKEN` / `PHAROS_REGISTRATION_TOKEN_FILE` | Bootstrap authorization for `POST /register`; the file form wins                |
-| `PHAROS_ALLOW_LOCAL_REGISTER`                                  | Set false to answer `POST /register` with 410                                   |
-| `PHAROS_REQUIRE_BEACON_TOKEN`                                  | Require a valid beacon token on every report                                    |
-| `PHAROS_BEACON_TOKEN_MODE`                                     | Only `local` is valid; anything else refuses startup                            |
+| `PHAROS_ALLOW_LOCAL_REGISTER`                                  | `true` switches on `POST /register`, otherwise it answers 410; needs the file   |
+| `PHAROS_REGISTRATION_TOKEN_FILE`                               | Bootstrap token for `POST /register`; read only when registration is on         |
+| `PHAROS_REQUIRE_BEACON_TOKEN`                                  | Optional; tokens are always required, and `false` refuses startup               |
+| `PHAROS_BEACON_TOKEN_MODE`                                     | Optional; only `local` is valid, and anything else refuses startup              |
 | `PHAROS_MANIFEST_PATHS`                                        | Read-only declared-host manifests                                               |
 | `PHAROS_HOST_PREFERENCES_PATH`                                 | Read-only declared host preference registry                                     |
 | `PHAROS_HTTP_PROBES_PATH`                                      | Optional `inspr.pharos.http-probes.v1` registry                                 |
@@ -112,8 +123,11 @@ address stop the server.
 
 - Human and machine routes are separate. A bearer credential is refused on
   human routes and never falls back to a cookie or open mode.
-- Beacon tokens are stored only as SHA-256 hashes and compared in constant time.
-  The store is the only copy, so back it up.
+- Every report needs a beacon token. Tokens are stored only as SHA-256 hashes and
+  compared in constant time. A wrong token, no token or an unknown host gets 401.
+- Registration is off by default. The store is the only copy of the hashes, so
+  back it up. [RUNBOOK.md](RUNBOOK.md) covers adding a host, rotating a token and
+  recovering a lost store.
 - `/hosts.json` is built from named fields, so the stored hash cannot reach it.
 - Pharos never stores or returns raw tokens, private keys, secret contents or
   credential-bearing URLs.

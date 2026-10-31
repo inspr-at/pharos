@@ -171,15 +171,6 @@ in
       '';
     };
 
-    allowLegacyReports = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = ''
-        Allow running without tokenEnvironmentFile during the temporary
-        PHAROS-37 rollout window. Leave false for token-enforced deployments.
-      '';
-    };
-
     user = lib.mkOption {
       type = lib.types.str;
       default = "pharos-beacon";
@@ -202,11 +193,9 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.tokenEnvironmentFile != null || cfg.tokenFile != null || cfg.allowLegacyReports;
+        assertion = cfg.tokenEnvironmentFile != null || cfg.tokenFile != null;
         message = ''
-          services.pharos-beacon requires tokenFile or tokenEnvironmentFile
-          unless allowLegacyReports = true is set explicitly for the PHAROS-37
-          rollout.
+          services.pharos-beacon requires tokenFile or tokenEnvironmentFile.
         '';
       }
     ];

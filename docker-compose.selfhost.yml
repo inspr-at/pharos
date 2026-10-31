@@ -40,11 +40,11 @@ services:
       # Use operator-ref:<sha256>, or email:<address> only when the IdP marks it verified.
       PHAROS_ALLOWED_OPERATORS: ${PHAROS_ALLOWED_OPERATORS:?set PHAROS_ALLOWED_OPERATORS}
 
-      # Machine routes. Local mode requires a read-only registration-token
-      # mount at this container path; add it with a private Compose override.
+      # Registration stays off. Switch it on only for an operator action, with
+      # a read-only token file mounted through a private Compose override.
+      # RUNBOOK.md covers adding a host, rotating a token and recovery.
+      PHAROS_ALLOW_LOCAL_REGISTER: ${PHAROS_ALLOW_LOCAL_REGISTER:-false}
       PHAROS_REGISTRATION_TOKEN_FILE: ${PHAROS_REGISTRATION_TOKEN_FILE:-}
-      PHAROS_REQUIRE_BEACON_TOKEN: "1"
-      PHAROS_BEACON_TOKEN_MODE: ${PHAROS_BEACON_TOKEN_MODE:-local}
 
       # Optional declared-host manifest paths, for example:
       # PHAROS_MANIFEST_PATHS=/manifests/host-a.json:/manifests/host-b.json
@@ -55,7 +55,7 @@ services:
       - pharos_data:/data
       # Optional manifest mount for declared hosts:
       # - ./manifests:/manifests:ro
-      # Local registration token mount (required in local token mode):
+      # Registration token mount, only while registration is switched on:
       # - ./private/pharos-registration-token:/run/secrets/pharos-registration-token:ro
 
 volumes:

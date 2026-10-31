@@ -28,6 +28,9 @@ execFileSync("cargo", ["build", "-p", "pharosd", "--locked"], {
 });
 
 const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "pharos-browser-"));
+fs.writeFileSync(path.join(runDir, "registration-token"), "browser-registration-fixture\n", {
+  mode: 0o600,
+});
 let status = 1;
 try {
   const result = spawnSync(
