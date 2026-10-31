@@ -12,6 +12,7 @@
   "cves": [
     {
       "id": "CVE-2000-0001",
+      "name": "Example takeover",
       "severity": "critical",
       "state": "open",
       "component": "kernel",
@@ -32,6 +33,7 @@
   "handled": [
     {
       "ids": ["CVE-1999-0001"],
+      "name": "Example older flaw",
       "eli10": "An older flaw, patched everywhere.",
       "hosts": ["demeter", "hermes"],
       "action": "Updated and rebooted.",

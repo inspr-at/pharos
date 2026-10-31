@@ -6,6 +6,10 @@ fn human_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(home))
         .route("/hosts.json", get(hosts_json))
+        .route("/updates", get(updates_page))
+        .route("/handled", get(handled_page))
+        .route("/cves/{id}", get(cve_page))
+        .route("/hosts/{name}", get(host_page))
 }
 
 /// Stable machine surface. With a configured browser prefix these routes are
@@ -29,6 +33,7 @@ fn machine_routes() -> Router<AppState> {
 fn browser_public_routes() -> Router<AppState> {
     Router::new()
         .route("/favicon.svg", get(favicon_svg))
+        .route("/assets/ui/{name}", get(ui_asset))
         .route(
             "/assets/calendar-version-bootstrap.mjs",
             get(calendar_version_bootstrap_asset),

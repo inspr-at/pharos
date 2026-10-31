@@ -230,6 +230,7 @@ mod tests {
 
     fn cve(component: &str, lines: &[&str]) -> FleetCve {
         FleetCve {
+            name: None,
             id: "CVE-2000-0001".to_string(),
             severity: CveSeverity::High,
             state: FleetCveState::Open,

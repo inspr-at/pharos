@@ -1,6 +1,13 @@
 //! Release identity, browser assets and the Fleet page.
 
+use axum::extract::Query;
+
 use super::*;
+use crate::fleet_view::FleetView;
+use crate::pages::{
+    render_cve, render_fleet, render_handled, render_host, render_not_found, render_updates,
+    Arrange, FleetQuery,
+};
 
 pub(super) const FAVICON_SVG: &str = include_str!("../assets/ui/favicon.svg");
 pub(super) const APP_VERSION: &str = env!("PHAROS_APP_VERSION");
@@ -20,6 +27,10 @@ pub(super) const FIRST_CALENDAR_V2_RELEASE_SEQUENCE: &str =
     env!("PHAROS_FIRST_CALENDAR_V2_RELEASE_SEQUENCE");
 pub(super) const GIT_COMMIT: &str = env!("PHAROS_GIT_COMMIT");
 const LOGOUT_CSRF_RUNTIME: &str = include_str!("../assets/ui/logout-csrf.html");
+const APP_CSS: &str = include_str!("../assets/ui/app.css");
+const APP_JS: &str = include_str!("../assets/ui/app.js");
+const FLEET_HORIZON_WEBP: &[u8] = include_bytes!("../assets/ui/fleet-horizon.webp");
+const SIDEBAR_LIGHTHOUSE_WEBP: &[u8] = include_bytes!("../assets/ui/sidebar-lighthouse.webp");
 pub(super) const CALENDAR_VERSION_BOOTSTRAP_JS: &str =
     include_str!("../assets/calendar-version-bootstrap.mjs");
 pub(super) const CALENDAR_VERSION_JS: &str =
@@ -57,108 +68,174 @@ fn app_href(base: &PublicBasePath, endpoint: &str) -> String {
     html_escape(&base.href(endpoint))
 }
 
-fn document_head(base: &PublicBasePath) -> String {
+pub(super) fn document_head(base: &PublicBasePath, title: &str) -> String {
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pharos</title><link rel="icon" href="{favicon}"><style>body{{font:15px/1.5 system-ui,sans-serif;margin:2rem auto;max-width:60rem;padding:0 1rem}}table{{border-collapse:collapse;width:100%}}th,td{{border-bottom:1px solid #8884;padding:.4rem .6rem;text-align:left}}</style><meta name="inspr-calendar-version-display" content="{display}"><script type="module" src="{bootstrap}"></script></head>"#,
+        r#"<!doctype html><html lang="en" class="fl" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} · Pharos</title><link rel="icon" href="{favicon}"><link rel="stylesheet" href="{stylesheet}"><meta name="inspr-calendar-version-display" content="{display}"><script src="{script}"></script><script type="module" src="{bootstrap}"></script></head>"#,
+        title = html_escape(title),
         favicon = app_href(base, "/favicon.svg"),
+        stylesheet = app_href(base, "/assets/ui/app.css"),
+        script = app_href(base, "/assets/ui/app.js"),
         display = html_escape(CALENDAR_VERSION_DISPLAY_JSON),
         bootstrap = app_href(base, "/assets/calendar-version-bootstrap.mjs"),
     )
 }
 
 /// Double-submit logout: the runtime copies the CSRF cookie into the form.
-fn account_html(base: &PublicBasePath, user: Option<&AuthUser>) -> String {
+pub(super) fn account_html(base: &PublicBasePath, user: Option<&AuthUser>) -> String {
     let Some(user) = user else {
         return String::new();
     };
     format!(
-        r#"<p>{name} <form action="{logout}" method="post" data-logout-form><input type="hidden" name="csrf" value="" data-logout-csrf><button type="submit">Log out</button></form></p>{LOGOUT_CSRF_RUNTIME}"#,
+        r#"<div class="side-foot"><span class="side-user"><span class="side-avatar" aria-hidden="true"></span><span class="side-name">{name}</span></span><form class="side-logout-form" action="{logout}" method="post" data-logout-form><input type="hidden" name="csrf" value="" data-logout-csrf><button class="side-logout" type="submit" aria-label="Sign out" title="Sign out">{sign_out}</button></form></div>{LOGOUT_CSRF_RUNTIME}"#,
         name = html_escape(&user.display_name),
         logout = app_href(base, "/auth/logout"),
+        sign_out = crate::icons::icon("sign-out", ""),
     )
 }
 
-/// One plain line on the data file: how old it is and what is wrong with it.
-fn fleet_data_status_html(view: Option<&FleetDataView>, now: i64) -> String {
-    let Some(view) = view else {
-        return "<p role=\"status\">Fleet data file: not configured.</p>".to_string();
-    };
-    let age = view
-        .data
-        .as_deref()
-        .and_then(FleetData::updated_at_unix)
-        .map(|updated| format!("Data from {}.", age_text(now.saturating_sub(updated))));
-    let line = match (&view.problem, age) {
-        (Some(problem), Some(age)) => format!(
-            "Fleet data problem: {}. {age} This is the last good copy.",
-            html_escape(problem)
-        ),
-        (Some(problem), None) => {
-            format!("Fleet data problem: {}. No data yet.", html_escape(problem))
-        }
-        (None, Some(age)) => format!("Fleet data file loaded. {age}"),
-        (None, None) => "Fleet data file: no data yet.".to_string(),
-    };
-    format!("<p role=\"status\">{line}</p>")
+#[derive(Default, serde::Deserialize)]
+pub(super) struct FleetParams {
+    cve: Option<String>,
+    arrange: Option<String>,
+    q: Option<String>,
 }
 
-fn age_text(seconds: i64) -> String {
-    match seconds.max(0) {
-        seconds if seconds < 3_600 => format!("{} min ago", seconds / 60),
-        seconds if seconds < 86_400 => format!("{} h ago", seconds / 3_600),
-        seconds => format!("{} d ago", seconds / 86_400),
+/// Everything a page shows, for this viewer, at this moment.
+fn fleet_view(state: &AppState, headers: &HeaderMap) -> FleetView {
+    let now = now_unix();
+    let access = access_for_headers(&state.auth, headers);
+    let probes = state
+        .host_probes
+        .as_deref()
+        .map(|runtime| runtime.snapshot(now))
+        .unwrap_or_default();
+    FleetView::build(
+        state.fleet_data.as_deref().map(FleetDataRuntime::view),
+        state.store.list(),
+        probes,
+        |host| access.allows_host(host),
+        now,
+    )
+}
+
+pub(super) async fn home(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<FleetParams>,
+) -> impl IntoResponse {
+    let query = FleetQuery {
+        cve: params.cve,
+        arrange: Arrange::parse(params.arrange.as_deref()),
+        q: params.q.unwrap_or_default(),
+    };
+    no_store_html(
+        &state,
+        render_fleet(
+            &state.public_base_path,
+            state.auth.human_user(&headers).as_ref(),
+            &fleet_view(&state, &headers),
+            &query,
+        ),
+    )
+}
+
+pub(super) async fn updates_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    no_store_html(
+        &state,
+        render_updates(
+            &state.public_base_path,
+            state.auth.human_user(&headers).as_ref(),
+            &fleet_view(&state, &headers),
+        ),
+    )
+}
+
+pub(super) async fn handled_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    no_store_html(
+        &state,
+        render_handled(
+            &state.public_base_path,
+            state.auth.human_user(&headers).as_ref(),
+            &fleet_view(&state, &headers),
+        ),
+    )
+}
+
+fn found_or_404(
+    state: &AppState,
+    headers: &HeaderMap,
+    page: Option<String>,
+    what: &str,
+) -> Response {
+    match page {
+        Some(page) => no_store_html(state, page).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            no_store_html(
+                state,
+                render_not_found(
+                    &state.public_base_path,
+                    state.auth.human_user(headers).as_ref(),
+                    what,
+                    now_unix(),
+                ),
+            ),
+        )
+            .into_response(),
     }
 }
 
-fn render_home(
-    base: &PublicBasePath,
-    user: Option<&AuthUser>,
-    hosts: &[Host],
-    fleet_data: Option<&FleetDataView>,
-    now: i64,
-) -> String {
-    let rows: String = hosts
-        .iter()
-        .map(|host| {
-            let last_seen = host.last_seen.map_or_else(
-                || "never".to_string(),
-                |seen| format!("{}s ago", now.saturating_sub(seen).max(0)),
-            );
-            format!(
-                "<tr><td>{name}</td><td>{liveness}</td><td>{last_seen}</td></tr>",
-                name = html_escape(&host.name),
-                liveness = liveness(host.last_seen, host.heartbeat_interval_secs, now)
-                    .badge()
-                    .1,
-            )
-        })
-        .collect();
-    format!(
-        "{head}<body><main><h1>Fleet</h1>{fleet_data}<table><thead><tr><th>Host</th><th>Status</th><th>Last report</th></tr></thead><tbody>{rows}</tbody></table></main><footer>{release}{account}</footer></body></html>",
-        head = document_head(base),
-        fleet_data = fleet_data_status_html(fleet_data, now),
-        release = release_label_html(),
-        account = account_html(base, user),
-    )
+pub(super) async fn cve_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let page = render_cve(
+        &state.public_base_path,
+        state.auth.human_user(&headers).as_ref(),
+        &fleet_view(&state, &headers),
+        &id,
+    );
+    found_or_404(&state, &headers, page, &id)
 }
 
-pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let access = access_for_headers(&state.auth, &headers);
-    let hosts = filter_hosts_by_access(state.store.list(), &access);
-    no_store_html(
-        &state,
-        render_home(
-            &state.public_base_path,
-            state.auth.human_user(&headers).as_ref(),
-            &hosts,
-            state
-                .fleet_data
-                .as_deref()
-                .map(FleetDataRuntime::view)
-                .as_ref(),
-            now_unix(),
-        ),
+pub(super) async fn host_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    let page = render_host(
+        &state.public_base_path,
+        state.auth.human_user(&headers).as_ref(),
+        &fleet_view(&state, &headers),
+        &name,
+    );
+    found_or_404(&state, &headers, page, &name)
+}
+
+/// The page's stylesheet, script and art. Nothing here says anything about a host.
+pub(super) async fn ui_asset(AxumPath(name): AxumPath<String>) -> Response {
+    let (content_type, body): (&str, &[u8]) = match name.as_str() {
+        "app.css" => ("text/css; charset=utf-8", APP_CSS.as_bytes()),
+        "app.js" => ("application/javascript; charset=utf-8", APP_JS.as_bytes()),
+        "fleet-horizon.webp" => ("image/webp", FLEET_HORIZON_WEBP),
+        "sidebar-lighthouse.webp" => ("image/webp", SIDEBAR_LIGHTHOUSE_WEBP),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache, must-revalidate"),
+        ],
+        body,
     )
+        .into_response()
 }
 
 pub(super) async fn calendar_version_bootstrap_asset() -> impl IntoResponse {
@@ -256,87 +333,27 @@ mod tests {
     }
 
     #[test]
-    fn document_head_carries_one_embedded_config_and_base_aware_bootstrap() {
-        let head = document_head(&PublicBasePath::parse("/pharos").unwrap());
+    fn document_head_carries_one_embedded_config_and_base_aware_assets() {
+        let head = document_head(&PublicBasePath::parse("/pharos").unwrap(), "Fleet");
         assert_eq!(head.matches("inspr-calendar-version-display").count(), 1);
         assert!(head.contains("inspr.calendar-version-display.v2"));
         assert!(head.contains(r#"src="/pharos/assets/calendar-version-bootstrap.mjs""#));
         assert!(head.contains(r#"href="/pharos/favicon.svg""#));
+        assert!(head.contains(r#"href="/pharos/assets/ui/app.css""#));
+        assert!(head.contains(r#"src="/pharos/assets/ui/app.js""#));
+        assert!(head.contains("<title>Fleet · Pharos</title>"));
     }
 
     #[test]
-    fn home_escapes_host_names() {
-        let host: Host = serde_json::from_value(json!({
-            "name": "<ares>",
-            "role": "server",
-            "is_nix": true,
-            "last_seen": null,
-            "heartbeat_interval_secs": null,
-            "freshness": pharos_core::NixFreshness::default(),
-        }))
-        .expect("host fixture");
-        let html = render_home(&PublicBasePath::root(), None, &[host], None, 100);
-        assert!(html.contains("&lt;ares&gt;"));
-        assert!(!html.contains("<ares>"));
-        assert!(!html.contains("data-logout-form"));
-    }
-
-    #[test]
-    fn home_always_says_how_old_the_fleet_data_is_and_what_is_wrong() {
-        let good = Arc::new(FleetData::parse(fleet_data::CONTRACT).expect("contract"));
-        let updated = good.updated_at_unix().expect("contract has a time");
-        let now = updated + 3 * 86_400;
-        let line = |data: Option<Arc<FleetData>>, problem: Option<&str>| {
-            let view = FleetDataView {
-                data,
-                problem: problem.map(str::to_string),
-            };
-            render_home(&PublicBasePath::root(), None, &[], Some(&view), now)
-        };
-
-        let html = line(Some(good.clone()), None);
-        assert!(html.contains("Fleet data file loaded. Data from 3 d ago."));
-
-        let html = line(Some(good), Some("the file is <missing>"));
-        assert!(html.contains(
-            "Fleet data problem: the file is &lt;missing&gt;. Data from 3 d ago. \
-             This is the last good copy."
-        ));
-        assert!(html.contains("<h1>Fleet</h1>"), "never a blank page");
-
-        let html = line(None, Some("the file is missing"));
-        assert!(html.contains("Fleet data problem: the file is missing. No data yet."));
-        assert!(html.contains("<h1>Fleet</h1>"), "never a blank page");
-
-        let html = render_home(&PublicBasePath::root(), None, &[], None, now);
-        assert!(html.contains("Fleet data file: not configured."));
-    }
-
-    #[test]
-    fn data_age_reads_in_minutes_hours_and_days() {
-        assert_eq!(age_text(-5), "0 min ago");
-        assert_eq!(age_text(59), "0 min ago");
-        assert_eq!(age_text(3_599), "59 min ago");
-        assert_eq!(age_text(3_600), "1 h ago");
-        assert_eq!(age_text(86_399), "23 h ago");
-        assert_eq!(age_text(86_400), "1 d ago");
-    }
-
-    #[test]
-    fn signed_in_home_offers_a_mount_aware_logout() {
+    fn signed_in_pages_offer_a_mount_aware_logout() {
         let user = AuthUser {
             display_name: "<operator>".to_string(),
         };
-        let html = render_home(
-            &PublicBasePath::parse("/pharos").unwrap(),
-            Some(&user),
-            &[],
-            None,
-            100,
-        );
+        let html = account_html(&PublicBasePath::parse("/pharos").unwrap(), Some(&user));
         assert!(html.contains("&lt;operator&gt;"));
         assert!(html.contains(r#"action="/pharos/auth/logout""#));
         assert!(html.contains("data-logout-csrf"));
+        assert!(account_html(&PublicBasePath::root(), None).is_empty());
     }
 
     #[tokio::test]

@@ -5,8 +5,8 @@
 //! listener, so a partial or drifted production configuration cannot silently
 //! disable authentication.
 //!
-//! Public client (PKCE, no client secret). The human routes (`/`, `/hosts.json`)
-//! are gated; machine routes (`POST /register`, `POST /report`) use the
+//! Public client (PKCE, no client secret). The human routes (every page and
+//! `/hosts.json`) are gated; machine routes (`POST /register`, `POST /report`) use the
 //! PHAROS-8 beacon token flow instead of browser login, while `/healthz` and
 //! `/version` stay open.
 //!
@@ -2088,6 +2088,206 @@ mod tests {
             parameters.get("state").cloned().unwrap(),
             response_cookie(&response, FLOW_COOKIE).unwrap(),
         )
+    }
+
+    /// What only a signed-in person may read: (route, a path that matches it).
+    const HUMAN_ROUTES: [(&str, &str); 6] = [
+        ("/", "/"),
+        ("/hosts.json", "/hosts.json"),
+        ("/updates", "/updates"),
+        ("/handled", "/handled"),
+        ("/cves/{id}", "/cves/CVE-2000-0001"),
+        ("/hosts/{name}", "/hosts/route-walk-host"),
+    ];
+    /// Open by design: (route, method, a path that matches it). None of them may
+    /// say anything about a host.
+    const OPEN_ROUTES: [(&str, Method, &str); 17] = [
+        ("/healthz", Method::GET, "/healthz"),
+        ("/readyz", Method::GET, "/readyz"),
+        ("/version", Method::GET, "/version"),
+        ("/register", Method::POST, "/register"),
+        ("/report", Method::POST, "/report"),
+        ("/favicon.svg", Method::GET, "/favicon.svg"),
+        ("/assets/ui/{name}", Method::GET, "/assets/ui/app.css"),
+        (
+            "/assets/calendar-version-bootstrap.mjs",
+            Method::GET,
+            "/assets/calendar-version-bootstrap.mjs",
+        ),
+        (
+            "/assets/vendor/calendar-version-display/{name}",
+            Method::GET,
+            "/assets/vendor/calendar-version-display/version.js",
+        ),
+        ("/auth/login", Method::GET, "/auth/login"),
+        ("/auth/callback", Method::GET, "/auth/callback"),
+        ("/auth/recover", Method::GET, "/auth/recover"),
+        ("/auth/logout", Method::POST, "/auth/logout"),
+        ("/auth/logged-out", Method::GET, "/auth/logged-out"),
+        ("/assets/ui/{name}", Method::GET, "/assets/ui/app.js"),
+        (
+            "/assets/ui/{name}",
+            Method::GET,
+            "/assets/ui/fleet-horizon.webp",
+        ),
+        (
+            "/assets/ui/{name}",
+            Method::GET,
+            "/assets/ui/sidebar-lighthouse.webp",
+        ),
+    ];
+
+    /// Every route written in routes.rs, read from the source so a new one cannot
+    /// be left out of this walk.
+    fn declared_routes() -> std::collections::BTreeSet<String> {
+        include_str!("routes.rs")
+            .split(".route(")
+            .skip(1)
+            .filter_map(|tail| tail.trim_start().strip_prefix('"'))
+            .filter_map(|tail| tail.split('"').next())
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    async fn signed_in_cookie(auth: &AuthState, provider: &MockOidcProvider) -> String {
+        let login_response = login(State(auth.clone()), login_params(None)).await;
+        let parameters = authorization_parameters(&login_response, provider);
+        let state = parameters.get("state").cloned().unwrap();
+        let flow_cookie = response_cookie(&login_response, FLOW_COOKIE).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, flow_cookie.parse().unwrap());
+        let callback_response = callback(
+            State(auth.clone()),
+            headers,
+            callback_params(Some("single-use-code"), Some(state), None),
+        )
+        .await;
+        response_cookie(&callback_response, SESSION_COOKIE).unwrap()
+    }
+
+    #[tokio::test]
+    async fn without_a_login_no_route_says_anything_about_a_host() {
+        let (provider, server) = start_mock_oidc().await;
+        let auth = auth_for_provider(&provider).await;
+
+        let directory =
+            std::env::temp_dir().join(format!("pharos-route-walk-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let store_path = directory.join("hosts.json");
+        std::fs::write(
+            &store_path,
+            serde_json::json!([{
+                "name": "route-walk-host",
+                "role": "Server",
+                "is_nix": true,
+                "last_seen": crate::now_unix(),
+                "heartbeat_interval_secs": 3600,
+                "freshness": {
+                    "applicable": true,
+                    "flake_lock_age_days": 1,
+                    "commits_behind": 0,
+                },
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let data_path = directory.join("fleet.json");
+        std::fs::write(&data_path, crate::fleet_data::CONTRACT).unwrap();
+        let fleet_data = crate::fleet_data::FleetDataRuntime::for_test(data_path);
+        fleet_data.refresh();
+
+        let state = crate::AppState {
+            store: Arc::new(crate::store::Store::new(Some(store_path)).unwrap()),
+            auth: auth.clone(),
+            beacon_auth: crate::BeaconAuth {
+                registration_token: None,
+            },
+            http_probes: None,
+            host_probes: None,
+            fleet_data: Some(fleet_data),
+            public_base_path: PublicBasePath::root(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::routes::build_router(state);
+        let app_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let says_something = |body: &str| {
+            ["route-walk-host", "demeter", "hermes", "CVE-2000-"]
+                .iter()
+                .any(|needle| body.contains(needle))
+        };
+
+        // The walk covers exactly what the router declares.
+        let walked: std::collections::BTreeSet<String> = HUMAN_ROUTES
+            .iter()
+            .map(|(route, _)| route.to_string())
+            .chain(OPEN_ROUTES.iter().map(|(route, _, _)| route.to_string()))
+            .collect();
+        assert_eq!(walked, declared_routes());
+
+        for (route, path) in HUMAN_ROUTES {
+            let url = format!("{base}{path}");
+            let anonymous = client.get(&url).send().await.unwrap();
+            assert_eq!(anonymous.status(), StatusCode::SEE_OTHER, "{route}");
+            let location = anonymous.headers()[header::LOCATION.as_str()]
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(location.starts_with("/auth/login"), "{route}: {location}");
+            assert!(!says_something(&anonymous.text().await.unwrap()), "{route}");
+
+            let with_token = client
+                .get(&url)
+                .bearer_auth("not-a-browser-session")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(with_token.status(), StatusCode::UNAUTHORIZED, "{route}");
+            assert!(
+                !says_something(&with_token.text().await.unwrap()),
+                "{route}"
+            );
+        }
+
+        for (route, method, path) in &OPEN_ROUTES {
+            let response = client
+                .request(method.clone(), format!("{base}{path}"))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            assert_ne!(status, StatusCode::NOT_FOUND, "{route}: {path}");
+            assert!(!status.is_server_error(), "{route}: {path}: {status}");
+            let body = response.bytes().await.unwrap();
+            assert!(
+                !says_something(&String::from_utf8_lossy(&body)),
+                "{route}: {path}"
+            );
+        }
+
+        // The same routes do open for a person who signed in, so the walk above
+        // proves the login is what stood in the way.
+        let cookie = signed_in_cookie(&auth, &provider).await;
+        for (route, path) in HUMAN_ROUTES {
+            let response = client
+                .get(format!("{base}{path}"))
+                .header(header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert!(says_something(&response.text().await.unwrap()), "{route}");
+        }
+
+        app_task.abort();
+        drop(server);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

@@ -83,11 +83,14 @@ seconds). Without it, the beacon reports once and exits.
 | Route                                     | Access       | Purpose                                 |
 | ----------------------------------------- | ------------ | --------------------------------------- |
 | `GET /`                                   | Login        | Fleet page                              |
+| `GET /updates`, `/handled`                | Login        | Updates due, handled CVEs               |
+| `GET /cves/{id}`, `/hosts/{name}`         | Login        | One CVE, one host                       |
 | `GET /hosts.json`                         | Login        | Fleet data, filtered by access grant    |
 | `POST /report`                            | Beacon token | Beacon report                           |
 | `POST /register`                          | Bootstrap    | Off by default; issue or rotate a token |
 | `GET /healthz`, `/readyz`, `/version`     | Public       | Health and build metadata               |
 | `/auth/*`                                 | Public       | OIDC login, recovery and logout         |
+| `GET /assets/*`, `/favicon.svg`           | Public       | Page assets; no host data               |
 
 With `PHAROS_PUBLIC_BASE_PATH`, browser routes live under that prefix. Machine
 routes answer both there and at the origin root.

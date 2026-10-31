@@ -9,9 +9,12 @@ mod auth;
 mod build_support;
 mod durable_file;
 mod fleet_data;
+mod fleet_view;
 mod host_probes;
 mod http_probes;
+mod icons;
 mod manifests;
+mod pages;
 mod probe_support;
 mod public_mount;
 mod routes;
@@ -40,7 +43,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState, AuthUser};
-use crate::fleet_data::{spawn_fleet_data_loop, FleetDataRuntime, FleetDataView};
+use crate::fleet_data::{spawn_fleet_data_loop, FleetDataRuntime};
 use crate::host_probes::{spawn_host_probe_loop, HostProbeRuntime};
 use crate::http_probes::{spawn_http_probe_loops, HttpProbeRuntime};
 use crate::manifests::ManifestRegistry;
@@ -1308,11 +1311,7 @@ mod tests {
         assert_eq!(hosts["fleet_data"]["updated_at"], serde_json::Value::Null);
         let page = client.get(&base).send().await.unwrap();
         assert_eq!(page.status(), reqwest::StatusCode::OK);
-        assert!(page
-            .text()
-            .await
-            .unwrap()
-            .contains("Fleet data problem: the file is missing"));
+        assert!(page.text().await.unwrap().contains("the file is missing"));
 
         std::fs::write(&path, fleet_data::CONTRACT).expect("file written");
         state.fleet_data.as_ref().unwrap().refresh();

@@ -22,6 +22,8 @@ const MAX_SHORT_TEXT_BYTES: usize = 200;
 const MAX_LONG_TEXT_BYTES: usize = 4 * 1024;
 /// The component whose fixed-in lines Pharos compares with reported versions.
 pub const KERNEL_COMPONENT: &str = "kernel";
+/// A fixed CVE stays on the watchlist this many days, then moves to the history.
+pub const WATCH_FIXED_FOR_DAYS: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FleetDataError {
@@ -76,7 +78,7 @@ pub struct OfflineThresholds {
     pub offline_red_days: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CveSeverity {
     Critical,
@@ -97,6 +99,9 @@ pub enum FleetCveState {
 #[serde(deny_unknown_fields)]
 pub struct FleetCve {
     pub id: String,
+    /// A plain name for the page. Without one the page shows the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub severity: CveSeverity,
     pub state: FleetCveState,
     /// What the CVE is in. Only `kernel` can be answered by reported versions;
@@ -113,6 +118,8 @@ pub struct FleetCve {
 #[serde(deny_unknown_fields)]
 pub struct HandledCves {
     pub ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub eli10: String,
     pub hosts: Vec<String>,
     pub action: String,
@@ -233,12 +240,50 @@ impl FleetHost {
 }
 
 impl FleetData {
-    /// The handled history, newest first. A day's entries keep the file's order.
-    pub fn handled_newest_first(&self) -> Vec<&HandledCves> {
-        let mut handled: Vec<&HandledCves> = self.handled.iter().collect();
+    /// What the watchlist shows, most urgent first: every CVE not yet fixed, and a
+    /// fixed one for its last few days. A severity's entries keep the file's order.
+    pub fn watchlist(&self, now: i64) -> Vec<&FleetCve> {
+        let mut watched: Vec<&FleetCve> = self
+            .cves
+            .iter()
+            .filter(|cve| !cve.left_the_watchlist(now))
+            .collect();
+        watched.sort_by_key(|cve| (cve.state == FleetCveState::Fixed, cve.severity));
+        watched
+    }
+
+    /// The handled history, newest first: the file's entries, and the fixed CVEs
+    /// that have left the watchlist, so none vanishes before the file records it.
+    /// A day's entries keep the file's order.
+    pub fn handled_history(&self, now: i64) -> Vec<HandledCves> {
+        let mut history = self.handled.clone();
+        history.extend(
+            self.cves
+                .iter()
+                .filter(|cve| cve.left_the_watchlist(now))
+                .map(|cve| HandledCves {
+                    ids: vec![cve.id.clone()],
+                    name: cve.name.clone(),
+                    eli10: cve.eli10.clone(),
+                    hosts: self
+                        .sections
+                        .iter()
+                        .flat_map(|section| &section.hosts)
+                        .filter(|host| {
+                            host.cve
+                                .get(&cve.id)
+                                .is_some_and(|status| status.state == DeclaredCveState::Fixed)
+                        })
+                        .map(|host| host.name.clone())
+                        .collect(),
+                    action: "Marked fixed in the data file.".to_string(),
+                    done: cve.fixed_on.clone().unwrap_or_default(),
+                    ticket: None,
+                }),
+        );
         // Validation guarantees YYYY-MM-DD, which sorts as text.
-        handled.sort_by(|left, right| right.done.cmp(&left.done));
-        handled
+        history.sort_by(|left, right| right.done.cmp(&left.done));
+        history
     }
 
     /// Parse and validate one file. Nothing is accepted partly: any problem
@@ -313,8 +358,20 @@ impl FleetData {
 }
 
 impl FleetCve {
+    fn left_the_watchlist(&self, now: i64) -> bool {
+        let (FleetCveState::Fixed, Some(fixed_on)) = (self.state, self.fixed_on.as_deref()) else {
+            return false;
+        };
+        let Ok(fixed_on) = calendar_date(fixed_on, "fixed_on") else {
+            return false;
+        };
+        OffsetDateTime::from_unix_timestamp(now)
+            .is_ok_and(|now| (now.date() - fixed_on).whole_days() >= WATCH_FIXED_FOR_DAYS)
+    }
+
     fn validate(&self, path: &str, updated: OffsetDateTime) -> Result<(), FleetDataError> {
         cve_id(&self.id, &format!("{path}.id"))?;
+        optional_short_text(self.name.as_deref(), &format!("{path}.name"))?;
         if !valid_slug(&self.component) {
             return invalid(format!("{path}.component"), "expected a lowercase slug");
         }
@@ -361,6 +418,7 @@ impl HandledCves {
                 return invalid(id_path, "a CVE cannot be in both cves and handled");
             }
         }
+        optional_short_text(self.name.as_deref(), &format!("{path}.name"))?;
         if self.hosts.is_empty() {
             return invalid(format!("{path}.hosts"), "expected at least one host");
         }
@@ -642,11 +700,8 @@ mod tests {
             dated("2000-01-02", "CVE-1999-0004"),
         ]);
         let data = FleetData::parse(&value.to_string()).expect("valid");
-        let order: Vec<&str> = data
-            .handled_newest_first()
-            .iter()
-            .map(|entry| entry.ids[0].as_str())
-            .collect();
+        let history = data.handled_history(0);
+        let order: Vec<&str> = history.iter().map(|entry| entry.ids[0].as_str()).collect();
         assert_eq!(
             order,
             [
@@ -656,6 +711,109 @@ mod tests {
                 "CVE-1999-0003"
             ]
         );
+    }
+
+    fn watch_fixture() -> serde_json::Value {
+        let mut value: serde_json::Value = serde_json::from_str(CONTRACT).expect("contract");
+        let cve = |id: &str, severity: &str, state: &str, fixed_on: Option<&str>| {
+            let mut cve = serde_json::json!({
+                "id": id, "severity": severity, "state": state, "component": "example-library",
+                "eli10": "A flaw.", "tip": "Update.", "fixed_in": ["1.2.3"],
+            });
+            if let Some(fixed_on) = fixed_on {
+                cve["fixed_on"] = serde_json::json!(fixed_on);
+            }
+            cve
+        };
+        value["cves"] = serde_json::json!([
+            cve("CVE-2000-0010", "low", "open", None),
+            cve("CVE-2000-0011", "critical", "fixed", Some("2000-01-02")),
+            cve("CVE-2000-0012", "medium", "mitigated", None),
+            cve("CVE-2000-0013", "critical", "open", None),
+            cve("CVE-2000-0014", "high", "open", None),
+            cve("CVE-2000-0015", "high", "open", None),
+            cve("CVE-2000-0016", "low", "fixed", Some("2000-01-01")),
+        ]);
+        for section in value["sections"].as_array_mut().expect("sections") {
+            for host in section["hosts"].as_array_mut().expect("hosts") {
+                host.as_object_mut().expect("host").remove("cve");
+            }
+        }
+        value["sections"][0]["hosts"][0]["cve"] = serde_json::json!({
+            "CVE-2000-0011": { "state": "fixed", "last_verified": "2000-01-02T09:00:00Z" },
+            "CVE-2000-0016": { "state": "na" },
+        });
+        value
+    }
+
+    /// Unix seconds at noon, UTC, on a January 2000 day.
+    fn january_2000(day: i64) -> i64 {
+        946_684_800 + (day - 1) * 86_400 + 43_200
+    }
+
+    #[test]
+    fn the_watchlist_puts_the_most_urgent_first_and_fixed_last() {
+        let data = FleetData::parse(&watch_fixture().to_string()).expect("valid");
+        let order = |now: i64| -> Vec<String> {
+            data.watchlist(now)
+                .iter()
+                .map(|cve| cve.id.clone())
+                .collect()
+        };
+        assert_eq!(
+            order(january_2000(3)),
+            [
+                "CVE-2000-0013",
+                "CVE-2000-0014",
+                "CVE-2000-0015",
+                "CVE-2000-0012",
+                "CVE-2000-0010",
+                "CVE-2000-0011",
+                "CVE-2000-0016",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fixed_cve_leaves_the_watchlist_after_three_days_and_keeps_a_history_row() {
+        let data = FleetData::parse(&watch_fixture().to_string()).expect("valid");
+        let watched = |now: i64| {
+            data.watchlist(now)
+                .iter()
+                .any(|cve| cve.id == "CVE-2000-0011")
+        };
+        let in_history = |now: i64| {
+            data.handled_history(now)
+                .iter()
+                .any(|entry| entry.ids == ["CVE-2000-0011"])
+        };
+        // Fixed on the 2nd: the 2nd, 3rd and 4th, then history from the 5th.
+        assert!(watched(january_2000(4)));
+        assert!(!in_history(january_2000(4)));
+        assert!(!watched(january_2000(5)));
+        assert!(in_history(january_2000(5)));
+
+        let history = data.handled_history(january_2000(5));
+        let moved = history
+            .iter()
+            .find(|entry| entry.ids == ["CVE-2000-0011"])
+            .expect("the history row");
+        assert_eq!(moved.done, "2000-01-02");
+        assert_eq!(moved.hosts, ["demeter"], "only hosts declared fixed");
+        assert_eq!(moved.ticket, None);
+    }
+
+    #[test]
+    fn a_cve_name_is_optional_and_validated_like_other_short_text() {
+        let mut value: serde_json::Value = serde_json::from_str(CONTRACT).expect("contract");
+        value["cves"][0]["name"] = serde_json::json!("Kernel takeover");
+        value["handled"][0]["name"] = serde_json::json!("Older flaw");
+        let data = FleetData::parse(&value.to_string()).expect("valid");
+        assert_eq!(data.cves[0].name.as_deref(), Some("Kernel takeover"));
+        assert_eq!(data.handled[0].name.as_deref(), Some("Older flaw"));
+
+        value["cves"][0]["name"] = serde_json::json!("");
+        assert!(FleetData::parse(&value.to_string()).is_err());
     }
 
     #[test]

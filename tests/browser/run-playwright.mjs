@@ -7,6 +7,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { writeFixtures } from "./fixtures.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -28,9 +29,8 @@ execFileSync("cargo", ["build", "-p", "pharosd", "--locked"], {
 });
 
 const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "pharos-browser-"));
-fs.writeFileSync(path.join(runDir, "registration-token"), "browser-registration-fixture\n", {
-  mode: 0o600,
-});
+const port = String(await freeLoopbackPort());
+writeFixtures(runDir, port);
 let status = 1;
 try {
   const result = spawnSync(
@@ -41,7 +41,9 @@ try {
       stdio: "inherit",
       env: {
         ...process.env,
-        PHAROS_BROWSER_PORT: String(await freeLoopbackPort()),
+        PHAROS_BROWSER_PORT: port,
+        PHAROS_BROWSER_BARE_PORT: String(await freeLoopbackPort()),
+        PHAROS_BROWSER_FLAKY_PORT: String(await freeLoopbackPort()),
         PHAROS_BROWSER_RUN_DIR: runDir,
       },
     },

@@ -31,7 +31,8 @@ const DEFAULT_PROBE_INTERVAL_SECS: u64 = 30;
 const MIN_PROBE_INTERVAL_SECS: u64 = 10;
 const MAX_PROBE_INTERVAL_SECS: u64 = 3600;
 const STALE_AFTER_INTERVALS: u64 = 3;
-const PRESENCE_TIMEOUT: Duration = Duration::from_secs(2);
+// Past ping's own wait, which takes about two seconds on macOS for a one-second -W.
+const PRESENCE_TIMEOUT: Duration = Duration::from_secs(3);
 const TCP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

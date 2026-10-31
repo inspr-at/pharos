@@ -102,12 +102,29 @@ fn declared_updates(declared: &FleetHost, now: UnixSeconds) -> HostUpdates {
 }
 
 /// The answer to one check.
-enum Check {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateCheck {
     Due(UpdateDue),
     Done,
     NotKnown,
     /// This check says nothing about this kind of host.
     DoesNotApply,
+}
+
+/// What a report answers, one check at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateChecks {
+    pub kernel: UpdateCheck,
+    pub config: UpdateCheck,
+    pub nixpkgs: UpdateCheck,
+}
+
+pub fn host_update_checks(host: &Host, now: UnixSeconds) -> UpdateChecks {
+    UpdateChecks {
+        kernel: kernel_check(host),
+        config: config_check(host),
+        nixpkgs: nixpkgs_check(host, now),
+    }
 }
 
 fn reported_updates(
@@ -116,19 +133,22 @@ fn reported_updates(
     fresh: bool,
     now: UnixSeconds,
 ) -> HostUpdates {
-    let checks = [
-        kernel_check(host),
-        config_check(host),
-        nixpkgs_check(host, now),
-    ];
+    let UpdateChecks {
+        kernel,
+        config,
+        nixpkgs,
+    } = host_update_checks(host, now);
+    let checks = [kernel, config, nixpkgs];
     let answered = checks
         .iter()
-        .any(|check| matches!(check, Check::Due(_) | Check::Done));
-    let not_known = checks.iter().any(|check| matches!(check, Check::NotKnown));
+        .any(|check| matches!(check, UpdateCheck::Due(_) | UpdateCheck::Done));
+    let not_known = checks
+        .iter()
+        .any(|check| matches!(check, UpdateCheck::NotKnown));
     let due: Vec<UpdateDue> = checks
         .into_iter()
         .filter_map(|check| match check {
-            Check::Due(item) => Some(item),
+            UpdateCheck::Due(item) => Some(item),
             _ => None,
         })
         .collect();
@@ -152,50 +172,50 @@ fn reported_updates(
     }
 }
 
-fn kernel_check(host: &Host) -> Check {
+fn kernel_check(host: &Host) -> UpdateCheck {
     let Some(posture) = host.kernel.as_ref() else {
         return if host.freshness.applicable {
-            Check::NotKnown
+            UpdateCheck::NotKnown
         } else {
-            Check::DoesNotApply
+            UpdateCheck::DoesNotApply
         };
     };
     match posture.state {
-        KernelPostureState::RebootRequired => Check::Due(UpdateDue::Reboot {
+        KernelPostureState::RebootRequired => UpdateCheck::Due(UpdateDue::Reboot {
             running_version: posture.running_version.clone(),
             next_boot_version: posture.expected_version.clone(),
         }),
-        KernelPostureState::Current => Check::Done,
-        KernelPostureState::Unknown => Check::NotKnown,
-        KernelPostureState::NotApplicable => Check::DoesNotApply,
+        KernelPostureState::Current => UpdateCheck::Done,
+        KernelPostureState::Unknown => UpdateCheck::NotKnown,
+        KernelPostureState::NotApplicable => UpdateCheck::DoesNotApply,
     }
 }
 
-fn config_check(host: &Host) -> Check {
+fn config_check(host: &Host) -> UpdateCheck {
     let freshness = &host.freshness;
     if !freshness.applicable {
-        return Check::DoesNotApply;
+        return UpdateCheck::DoesNotApply;
     }
     let comparison = freshness.nixcfg_comparison.as_ref();
     match comparison.map(|comparison| (comparison.relation, comparison.commits_behind)) {
         Some((GitRevisionRelation::Behind, Some(commits))) if commits > 0 => {
-            Check::Due(UpdateDue::BehindConfig { commits })
+            UpdateCheck::Due(UpdateDue::BehindConfig { commits })
         }
         Some((GitRevisionRelation::Current, _)) if freshness.deployment_evidence.is_some() => {
-            Check::Done
+            UpdateCheck::Done
         }
         // Ahead or diverged is not behind, and it is not the declared config either.
-        _ => Check::NotKnown,
+        _ => UpdateCheck::NotKnown,
     }
 }
 
-fn nixpkgs_check(host: &Host, now: UnixSeconds) -> Check {
+fn nixpkgs_check(host: &Host, now: UnixSeconds) -> UpdateCheck {
     let freshness = &host.freshness;
     if !freshness.applicable {
-        return Check::DoesNotApply;
+        return UpdateCheck::DoesNotApply;
     }
     if freshness.deployment_evidence.is_none() {
-        return Check::NotKnown;
+        return UpdateCheck::NotKnown;
     }
     let age_days = freshness.nixpkgs_age_days_at(now);
     match (
@@ -205,15 +225,15 @@ fn nixpkgs_check(host: &Host, now: UnixSeconds) -> Check {
             .map(|comparison| comparison.relation),
         age_days,
     ) {
-        (Some(NixpkgsRevisionRelation::Current), _) => Check::Done,
+        (Some(NixpkgsRevisionRelation::Current), _) => UpdateCheck::Done,
         (Some(NixpkgsRevisionRelation::Different), Some(age_days)) => {
             if age_days > OLD_NIXPKGS_AFTER_DAYS {
-                Check::Due(UpdateDue::OldNixpkgs { age_days })
+                UpdateCheck::Due(UpdateDue::OldNixpkgs { age_days })
             } else {
-                Check::Done
+                UpdateCheck::Done
             }
         }
-        _ => Check::NotKnown,
+        _ => UpdateCheck::NotKnown,
     }
 }
 
