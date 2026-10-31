@@ -1,8 +1,8 @@
 {
   "repository": "inspr-at/inspr",
-  "revision": "317f872bc061576fc0b45d274d3a22f69bcd4c8a",
-  "expectedConfigSha256": "7843f3515ce329277d2d576000bd60ac410d725b241d502a9a3fecb2533d956d",
-  "schema": "inspr.calendar-version-display.v2",
+  "revision": "bd0a13816f728ad91c36d849f88168bcac4fdc6e",
+  "expectedConfigSha256": "bf6aa144cd73dc97dc941f0f0914138b04ae0a28fbead5123465b15b1f2a2fd9",
+  "schema": "inspr.calver-display.v3",
   "mode": "build-time-only",
   "consumers": [],
   "runtimeConsumers": false,
@@ -10,44 +10,32 @@
     {
       "sourcePath": "packages/versioning/config/display.json",
       "outputPath": "display.json",
-      "sha256": "7843f3515ce329277d2d576000bd60ac410d725b241d502a9a3fecb2533d956d",
-      "size": 1656
+      "sha256": "bf6aa144cd73dc97dc941f0f0914138b04ae0a28fbead5123465b15b1f2a2fd9",
+      "size": 1423
     },
     {
       "sourcePath": "packages/versioning/public/version.js",
       "outputPath": "version.js",
-      "sha256": "9a09693e0cef3af586f617ba24cdae96165d95d12f5c447b1d2e67d35a70c9b8",
-      "size": 4871
+      "sha256": "5711296a2f551745073dc416c1cf676c0fa584976ea7680dedff923cf7ac5faf",
+      "size": 6334
     },
     {
       "sourcePath": "packages/versioning/public/presentation.js",
       "outputPath": "presentation.js",
-      "sha256": "fd0354837edd05179aeeaa86c271bced25031a3f29e148c448b684116b7dd3ca",
-      "size": 2769
+      "sha256": "37ae4b7757c76bb46960219724f448e4027396a017748d96edb89d25a7c54fe2",
+      "size": 5275
     },
     {
       "sourcePath": "packages/versioning/public/version-interaction.js",
       "outputPath": "version-interaction.js",
-      "sha256": "cfe539ad84651666d18b192f37659dab7c36aa8e68c43c9bdd42b42e85de2ba1",
-      "size": 7671
-    },
-    {
-      "sourcePath": "packages/versioning/public/auto-animate.js",
-      "outputPath": "auto-animate.js",
-      "sha256": "2fae336f3ed3e814356df4721cfa747a393ff037fee2644d95bbbe1236551753",
-      "size": 28022
-    },
-    {
-      "sourcePath": "packages/versioning/public/auto-animate-license.js",
-      "outputPath": "auto-animate-license.js",
-      "sha256": "57677685789ebe6233671cef7f78b37f74942936b0d42ef2168d6a2195acf606",
-      "size": 1100
+      "sha256": "37d420e346defff5c01fe849c39c1f7ed93017e62f7e2a8d0b6299e00ede99ff",
+      "size": 8317
     },
     {
       "sourcePath": "packages/versioning/config/schemes.json",
       "outputPath": "schemes.json",
-      "sha256": "4c903f9f4dc63ae141f48131b6e5150d86e8381d50ecde89782cf77ad2f4a5b7",
-      "size": 169
+      "sha256": "d88195791de1fe2c8a1fcaa1098c85f1af9c58fc049ef4186c28d6962da0474d",
+      "size": 284
     },
     {
       "sourcePath": null,

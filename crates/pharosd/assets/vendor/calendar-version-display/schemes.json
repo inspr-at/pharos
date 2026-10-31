@@ -1,8 +1,11 @@
 {
-  "schema": "inspr.version-scheme-labels.v1",
+  "schema": "inspr.version-scheme-labels.v2",
+  "current": "inspr-calver-3",
+  "deprecated": ["inspr-calendar-v2"],
   "labels": {
-    "inspr-calendar-v2": "INSPR-VER2",
-    "inspr-calendar-v1": "INSPR-VER1",
+    "inspr-calver-3": "INSPR-CalVer3",
+    "inspr-calendar-v2": "INSPR-CalVer2",
+    "inspr-calendar-v1": "INSPR-CalVer1",
     "legacy": "Legacy"
   }
 }

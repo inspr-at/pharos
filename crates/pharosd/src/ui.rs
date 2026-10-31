@@ -39,13 +39,9 @@ pub(super) const CALENDAR_VERSION_PRESENTATION_JS: &str =
     include_str!("../assets/vendor/calendar-version-display/presentation.js");
 pub(super) const CALENDAR_VERSION_INTERACTION_JS: &str =
     include_str!("../assets/vendor/calendar-version-display/version-interaction.js");
-pub(super) const CALENDAR_VERSION_AUTO_ANIMATE_JS: &str =
-    include_str!("../assets/vendor/calendar-version-display/auto-animate.js");
-pub(super) const CALENDAR_VERSION_AUTO_ANIMATE_LICENSE_JS: &str =
-    include_str!("../assets/vendor/calendar-version-display/auto-animate-license.js");
 
-/// Calendar v2 display settings from the complete, pinned INSPR renderer bundle.
-/// The check script and build script verify every local module and its license.
+/// Display settings from the complete, pinned INSPR renderer bundle. The check
+/// script and build script verify every file in it.
 pub(super) const CALENDAR_VERSION_DISPLAY_JSON: &str =
     include_str!("../assets/vendor/calendar-version-display/display.json");
 
@@ -254,8 +250,6 @@ pub(super) async fn calendar_version_bundle_asset(AxumPath(name): AxumPath<Strin
         "version.js" => CALENDAR_VERSION_JS,
         "presentation.js" => CALENDAR_VERSION_PRESENTATION_JS,
         "version-interaction.js" => CALENDAR_VERSION_INTERACTION_JS,
-        "auto-animate.js" => CALENDAR_VERSION_AUTO_ANIMATE_JS,
-        "auto-animate-license.js" => CALENDAR_VERSION_AUTO_ANIMATE_LICENSE_JS,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     (
@@ -311,11 +305,13 @@ mod tests {
     fn calendar_version_display_embeds_the_pinned_pretty_contract() {
         let data: serde_json::Value =
             serde_json::from_str(CALENDAR_VERSION_DISPLAY_JSON).expect("display configuration");
-        assert_eq!(data["schema"], "inspr.calendar-version-display.v2");
-        assert_eq!(data["scheme"], "inspr-calendar-v2");
-        assert_eq!(data["design_revision"], 3);
-        assert_eq!(data["weights"]["v"], 0.05);
-        assert_eq!(data["weights"]["tail"], 0.05);
+        assert_eq!(data["schema"], "inspr.calver-display.v3");
+        assert_eq!(data["scheme"], "inspr-calver-3");
+        assert_eq!(data["design_revision"], 4);
+        assert_eq!(
+            data["segments"],
+            serde_json::json!(["yy", "mm", "dd", "hh", "mi", "ss"])
+        );
         assert!(data["pretty"]["separators"].is_object());
     }
 
@@ -334,7 +330,7 @@ mod tests {
     fn document_head_carries_one_embedded_config_and_base_aware_assets() {
         let head = document_head(&PublicBasePath::parse("/pharos").unwrap(), "Fleet");
         assert_eq!(head.matches("inspr-calendar-version-display").count(), 1);
-        assert!(head.contains("inspr.calendar-version-display.v2"));
+        assert!(head.contains("inspr.calver-display.v3"));
         assert!(head.contains(r#"src="/pharos/assets/calendar-version-bootstrap.mjs""#));
         assert!(head.contains(r#"href="/pharos/favicon.svg""#));
         assert!(head.contains(r#"href="/pharos/assets/ui/app.css""#));

@@ -28,6 +28,11 @@ try {
   assert.equal((await readProbe(page, policy)).familyShell, false);
   await page.setContent("<main data-inspr-flow-reviewer><h1>Restricted Flow review</h1><form action='/janus/logout'><button>Sign out</button></form></main>");
   assert.equal((await readProbe(page, policy)).familyShell, true);
+  const pharosPolicy = { ...policy, familyApp: "pharos" };
+  await page.setContent("<aside class='side'><form action='/pharos/auth/logout' method='post'><button>Sign out</button></form></aside>");
+  assert.equal((await readProbe(page, pharosPolicy)).familyShell, true);
+  await page.setContent("<main><form action='/pharos/auth/logout' method='post'><button>Sign out</button></form></main>");
+  assert.equal((await readProbe(page, pharosPolicy)).familyShell, false);
   const paimosPolicy = { ...policy, familyApp: "paimos" };
   for (const shell of [
     "<div class='layout'><button class='logout-btn' title='Log out'>Sign out</button></div>",

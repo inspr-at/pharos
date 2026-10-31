@@ -25,8 +25,12 @@ const APPS = Object.freeze({
     base: "/pharos",
     login: "/pharos/auth/login",
     callback: "/pharos/auth/callback",
-    shell: "[data-can-manage-fleet='true'], [data-can-manage='true']",
-    routes: Object.freeze([{ name: "landing", path: "/pharos/" }, { name: "list", path: "/pharos/?view=list" }]),
+    shell: "aside.side form[action='/pharos/auth/logout']",
+    routes: Object.freeze([
+      { name: "landing", path: "/pharos/" },
+      { name: "updates", path: "/pharos/updates" },
+      { name: "handled", path: "/pharos/handled" },
+    ]),
   }),
   janus: Object.freeze({
     base: "/janus",

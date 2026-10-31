@@ -3,8 +3,8 @@ import test from 'node:test';
 import { hydrateCalendarVersions, hydrateVersionHost } from '../crates/pharosd/assets/calendar-version-bootstrap.mjs';
 
 const config = {
-  schema: 'inspr.calendar-version-display.v2',
-  scheme: 'inspr-calendar-v2',
+  schema: 'inspr.calver-display.v3',
+  scheme: 'inspr-calver-3',
   weights: { v: 0, yy: 1, mm: 0.9, dd: 0.8, hh: 0.7, mi: 0.6, ss: 0.5, tail: 0 },
 };
 

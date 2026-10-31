@@ -466,6 +466,10 @@ pub enum ArtifactVersionScheme {
     /// SemVer-shaped on purpose and still never inferred from punctuation.
     #[serde(rename = "inspr-calendar-v2")]
     InsprCalendarV2,
+    /// INSPR-CalVer3: the same coordinate as v2 under the identifier new
+    /// reservations declare. Beacons on either keep reporting during a rollout.
+    #[serde(rename = "inspr-calver-3")]
+    InsprCalver3,
 }
 
 impl ArtifactVersionScheme {
@@ -474,6 +478,7 @@ impl ArtifactVersionScheme {
             Self::Legacy => "legacy",
             Self::InsprCalendarV1 => "inspr-calendar-v1",
             Self::InsprCalendarV2 => "inspr-calendar-v2",
+            Self::InsprCalver3 => "inspr-calver-3",
         }
     }
 
@@ -483,7 +488,7 @@ impl ArtifactVersionScheme {
         match self {
             Self::Legacy => true,
             Self::InsprCalendarV1 => valid_inspr_calendar_version(value),
-            Self::InsprCalendarV2 => valid_inspr_calendar_v2_version(value),
+            Self::InsprCalendarV2 | Self::InsprCalver3 => valid_inspr_calendar_v2_version(value),
         }
     }
 }
@@ -540,12 +545,12 @@ impl DeployedArtifactEvidence {
                     );
                 }
             }
-            ArtifactVersionScheme::InsprCalendarV2 => {
+            ArtifactVersionScheme::InsprCalendarV2 | ArtifactVersionScheme::InsprCalver3 => {
                 if !valid_inspr_calendar_v2_version(&self.artifact_version) {
-                    return Err(
-                        "inspr-calendar-v2 artifact version is not a valid YYMMDDhhmmss.0.0 coordinate"
-                            .to_string(),
-                    );
+                    return Err(format!(
+                        "{} artifact version is not a valid YYMMDDhhmmss.0.0 coordinate",
+                        self.version_scheme.key()
+                    ));
                 }
             }
         }
@@ -947,6 +952,7 @@ fn parse_measured_version_scheme(value: &str) -> Result<ArtifactVersionScheme, S
         "legacy" => Ok(ArtifactVersionScheme::Legacy),
         "inspr-calendar-v1" => Ok(ArtifactVersionScheme::InsprCalendarV1),
         "inspr-calendar-v2" => Ok(ArtifactVersionScheme::InsprCalendarV2),
+        "inspr-calver-3" => Ok(ArtifactVersionScheme::InsprCalver3),
         _ => Err("version_scheme is not an explicit supported scheme".to_string()),
     }
 }
@@ -2916,6 +2922,16 @@ mod tests {
         assert_eq!(
             parse_measured_version_scheme("inspr-calendar-v2").unwrap(),
             ArtifactVersionScheme::InsprCalendarV2
+        );
+        assert_eq!(
+            parse_measured_version_scheme("inspr-calver-3").unwrap(),
+            ArtifactVersionScheme::InsprCalver3
+        );
+        assert!(ArtifactVersionScheme::InsprCalver3.accepts_version("260909194540.0.0"));
+        assert!(!ArtifactVersionScheme::InsprCalver3.accepts_version("26.09.09.19.45.40"));
+        assert_eq!(
+            serde_json::to_string(&ArtifactVersionScheme::InsprCalver3).unwrap(),
+            "\"inspr-calver-3\""
         );
         assert!(parse_measured_version_scheme("inspr-calendar-v3").is_err());
         assert_eq!(

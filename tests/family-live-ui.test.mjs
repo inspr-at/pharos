@@ -71,6 +71,7 @@ test("named routes cannot introduce arbitrary origins or production route suffix
   assert.deepEqual(familyRoutes("paimos", "42"), [{ name: "landing", path: "/paimos/" }, { name: "sandbox", path: "/paimos/projects/42" }]);
   for (const bad of ["../1", "1/issues", "https://foreign.example", "x?project=1"]) assert.throws(() => familyRoutes("paimos", bad));
   assert.throws(() => familyRoutes("janus", "42"));
+  assert.deepEqual(familyRoutes("pharos").map((route) => route.path), ["/pharos/", "/pharos/updates", "/pharos/handled"]);
   assert.equal(familyRoutes("aithema", "project:inspr-uxqa")[1].path, "/aithema/projects/project%3Ainspr-uxqa");
   for (const suffix of ["", "/flow-state"]) {
     assert.equal(decideRequest({ method: "GET", url: `${FAMILY_ORIGIN}/aithema/projects/project%3Ainspr-uxqa${suffix}` }, { familyApp: "aithema" }).allow, true);

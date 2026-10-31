@@ -18,7 +18,10 @@ from pathlib import Path
 
 CALENDAR_SCHEME = "inspr-calendar-v1"
 CALENDAR_V2_SCHEME = "inspr-calendar-v2"
-CALENDAR_SCHEMES = (CALENDAR_SCHEME, CALENDAR_V2_SCHEME)
+CALVER3_SCHEME = "inspr-calver-3"
+# CalVer2 and CalVer3 share one coordinate: only the declared identifier differs.
+SHARED_COORDINATE_SCHEMES = (CALENDAR_V2_SCHEME, CALVER3_SCHEME)
+CALENDAR_SCHEMES = (CALENDAR_SCHEME, *SHARED_COORDINATE_SCHEMES)
 LEGACY_SCHEME = "legacy"
 RELEASE_SCHEMA_V1 = "inspr.release-coordinate.v1"
 RELEASE_SCHEMA_V2 = "inspr.release-coordinate.v2"
@@ -26,6 +29,9 @@ RELEASE_SCHEMA_V2 = "inspr.release-coordinate.v2"
 LAST_CALENDAR_V1_VERSION = "26.09.08.23.58.28"
 LAST_CALENDAR_V1_SEQUENCE = 5
 FIRST_CALENDAR_V2_SEQUENCE = 6
+# The last reservation that may declare CalVer2. Everything later is CalVer3.
+LAST_CALENDAR_V2_VERSION = "261022144327.0.0"
+LAST_CALENDAR_V2_SEQUENCE = 27
 CALENDAR_LONG = re.compile(
     r"^([0-9]{2})\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])\."
     r"([01][0-9]|2[0-3])\.([0-5][0-9])\.([0-5][0-9])$"
@@ -95,7 +101,7 @@ def parse_calendar_v2(value: str) -> tuple[int, int, int, int, int, int]:
 def parse_scheme_version(scheme: str, value: str) -> tuple[int, int, int, int, int, int]:
     if scheme == CALENDAR_SCHEME:
         return parse_calendar(value)
-    if scheme == CALENDAR_V2_SCHEME:
+    if scheme in SHARED_COORDINATE_SCHEMES:
         return parse_calendar_v2(value)
     raise ReleaseVersionError("absent, unknown, ambiguous, or invalid version scheme")
 
@@ -156,7 +162,7 @@ class ReleaseIdentity:
             raise ReleaseVersionError("release sequence must be non-negative")
         if self.scheme == CALENDAR_SCHEME:
             return parse_calendar(self.version)
-        if self.scheme == CALENDAR_V2_SCHEME:
+        if self.scheme in SHARED_COORDINATE_SCHEMES:
             return parse_calendar_v2(self.version)
         if self.scheme == LEGACY_SCHEME and LEGACY_SEMVER.fullmatch(self.version):
             return tuple(int(part) for part in self.version.split("."))
@@ -166,7 +172,7 @@ class ReleaseIdentity:
 def compare_releases(left: ReleaseIdentity, right: ReleaseIdentity) -> int:
     left_key = left.validated_key()
     right_key = right.validated_key()
-    if left.scheme == right.scheme:
+    if left.scheme == right.scheme or {left.scheme, right.scheme} == set(SHARED_COORDINATE_SCHEMES):
         result = (left_key > right_key) - (left_key < right_key)
         sequence_result = (left.sequence > right.sequence) - (left.sequence < right.sequence)
         if result != sequence_result:
@@ -199,7 +205,7 @@ def validate_reservation_history(
         for key in V1_ANCHOR_KEYS:
             if anchor.get(key) != current_anchor.get(key):
                 raise ReleaseVersionError("repository Calendar reservations disagree on migration anchor")
-        if candidate["version_scheme"] == CALENDAR_V2_SCHEME:
+        if candidate["version_scheme"] in SHARED_COORDINATE_SCHEMES:
             for key in V2_ANCHOR_EXTRA_KEYS:
                 if anchor.get(key) != current_anchor.get(key):
                     raise ReleaseVersionError("repository Calendar reservations disagree on the v2 migration anchor")
@@ -224,7 +230,7 @@ def validate_reservation_history(
         right = ReleaseIdentity(str(following["version_scheme"]), str(following["version"]), int(following["release_sequence"]))
         if compare_releases(left, right) >= 0:
             raise ReleaseVersionError("repository Calendar coordinates are not strictly monotonic")
-        if previous["version_scheme"] == CALENDAR_V2_SCHEME and following["version_scheme"] == CALENDAR_SCHEME:
+        if previous["version_scheme"] in SHARED_COORDINATE_SCHEMES and following["version_scheme"] == CALENDAR_SCHEME:
             raise ReleaseVersionError("calendar v1 reservations are closed after the first v2 coordinate")
     if ordered[-1] != current:
         raise ReleaseVersionError("current reservation does not follow the full stable-channel history")
@@ -372,8 +378,9 @@ def _validate_release_v2(release: dict[str, object]) -> None:
         raise ReleaseVersionError("RELEASE.json fields do not match the v2 contract")
     if release["schema"] != RELEASE_SCHEMA_V2 or release["schema_version"] != 2:
         raise ReleaseVersionError("release coordinate schema is unsupported")
-    if release["version_scheme"] != CALENDAR_V2_SCHEME:
-        raise ReleaseVersionError("version_scheme must be inspr-calendar-v2 in a v2 record")
+    scheme = release["version_scheme"]
+    if scheme not in SHARED_COORDINATE_SCHEMES:
+        raise ReleaseVersionError("version_scheme must be inspr-calver-3 or inspr-calendar-v2 in a v2 record")
     if release["release_channel"] != "stable":
         raise ReleaseVersionError("release_channel must be stable")
     version = release["version"]
@@ -409,7 +416,11 @@ def _validate_release_v2(release: dict[str, object]) -> None:
         raise ReleaseVersionError("migration anchor does not bind the last calendar v1 release to the first v2 coordinate")
     parse_calendar_v2(first_v2)
     first_identity = ReleaseIdentity(CALENDAR_V2_SCHEME, first_v2, FIRST_CALENDAR_V2_SEQUENCE)
-    current = ReleaseIdentity(CALENDAR_V2_SCHEME, version, sequence)
+    current = ReleaseIdentity(str(scheme), version, sequence)
+    if (scheme == CALVER3_SCHEME) != (sequence > LAST_CALENDAR_V2_SEQUENCE):
+        raise ReleaseVersionError("a new reservation must declare inspr-calver-3, and history keeps inspr-calendar-v2")
+    last_v2 = ReleaseIdentity(CALENDAR_V2_SCHEME, LAST_CALENDAR_V2_VERSION, LAST_CALENDAR_V2_SEQUENCE)
+    compare_releases(last_v2, current)
     if sequence < FIRST_CALENDAR_V2_SEQUENCE or compare_releases(first_identity, current) > 0:
         raise ReleaseVersionError("release predates the immutable first-calendar-v2 anchor")
     if (sequence == FIRST_CALENDAR_V2_SEQUENCE) != (version == first_v2):
@@ -660,7 +671,7 @@ def _tagged_calendar_releases(repo: Path) -> tuple[dict[str, object], ...]:
         except ReleaseVersionError:
             try:
                 parse_calendar_v2(value)
-                tag_scheme = CALENDAR_V2_SCHEME
+                tag_scheme = None
             except ReleaseVersionError:
                 if re.fullmatch(r"v[0-9]{2}\..*", tag) or re.fullmatch(r"v[0-9]{10,}\..*", tag):
                     raise ReleaseVersionError(f"Calendar-looking tag is invalid: {tag}")
@@ -691,7 +702,9 @@ def _tagged_calendar_releases(repo: Path) -> tuple[dict[str, object], ...]:
         if not isinstance(release, dict):
             raise ReleaseVersionError(f"Calendar tag release coordinate is not an object: {tag}")
         validate_release(release)
-        if release["version_scheme"] != tag_scheme or release["version"] != value:
+        # The tag's shape can't tell CalVer2 from CalVer3, so its record says which.
+        tag_schemes = (tag_scheme,) if tag_scheme else SHARED_COORDINATE_SCHEMES
+        if release["version_scheme"] not in tag_schemes or release["version"] != value:
             raise ReleaseVersionError(f"Calendar tag does not match its explicit release identity: {tag}")
         releases.append(release)
     return tuple(releases)

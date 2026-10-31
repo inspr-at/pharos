@@ -19,7 +19,7 @@ export function hydrateVersionHost(host, config, renderer = renderVersion) {
 export function hydrateCalendarVersions(root = document, renderer = renderVersion) {
   try {
     const config = JSON.parse(root.querySelector(CONFIG_SELECTOR)?.content || '');
-    if (config?.schema !== 'inspr.calendar-version-display.v2' || config?.scheme !== 'inspr-calendar-v2') return 0;
+    if (config?.schema !== 'inspr.calver-display.v3' || config?.scheme !== 'inspr-calver-3') return 0;
     let hydrated = 0;
     for (const host of root.querySelectorAll(HOST_SELECTOR)) {
       if (hydrateVersionHost(host, config, renderer)) hydrated += 1;

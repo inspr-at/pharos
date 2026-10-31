@@ -21,9 +21,10 @@ Pharos is part of the open INSPR product family and is authored and published
 by [Markus Barta](https://github.com/markus-barta). Augmentoring's professional
 services deploy and operate Pharos; Augmentoring is not the product owner.
 
-Pharos 2 is being built on this branch line. The last release of the earlier,
-larger product is tag `v261022144327.0.0`, which stays the reference and the
-rollback for everything removed here.
+Pharos 2 deliberately does less: the Fleet page, a CVE watchlist with per-host
+status and history, updates due per host, and a CLI, all read-only. The earlier,
+larger product ends at tag `v261022144327.0.0`, which stays the reference and the
+rollback for everything removed.
 
 ## Workspace
 

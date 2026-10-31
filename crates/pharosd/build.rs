@@ -3,11 +3,11 @@ use std::{collections::BTreeSet, env, fs, path::Path, path::PathBuf, process::Co
 
 mod build_support;
 
-const DISPLAY_SOURCE: &str = "317f872bc061576fc0b45d274d3a22f69bcd4c8a";
+const DISPLAY_SOURCE: &str = "bd0a13816f728ad91c36d849f88168bcac4fdc6e";
 const DISPLAY_CONFIG_SHA256: &str =
-    "7843f3515ce329277d2d576000bd60ac410d725b241d502a9a3fecb2533d956d";
+    "bf6aa144cd73dc97dc941f0f0914138b04ae0a28fbead5123465b15b1f2a2fd9";
 const DISPLAY_MANIFEST_SHA256: &str =
-    "b1125b92bf8c0bb0a9e14968924230f04503d226b63d0a0aee544efbdaf00af2";
+    "a3d2d8d45f4f9c2c1f978225f4737d2248f654595237cb12231e78cff0e2ed6e";
 
 fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -21,8 +21,6 @@ fn verify_calendar_bundle(manifest_dir: &Path) {
         "version.js",
         "presentation.js",
         "version-interaction.js",
-        "auto-animate.js",
-        "auto-animate-license.js",
         "package.json",
         "manifest.json",
     ]
@@ -62,7 +60,7 @@ fn verify_calendar_bundle(manifest_dir: &Path) {
     assert_eq!(manifest["repository"], "inspr-at/inspr");
     assert_eq!(manifest["revision"], DISPLAY_SOURCE);
     assert_eq!(manifest["expectedConfigSha256"], DISPLAY_CONFIG_SHA256);
-    assert_eq!(manifest["schema"], "inspr.calendar-version-display.v2");
+    assert_eq!(manifest["schema"], "inspr.calver-display.v3");
     assert_eq!(manifest["mode"], "build-time-only");
     assert_eq!(manifest["consumers"], serde_json::json!([]));
     assert_eq!(manifest["runtimeConsumers"], false);
@@ -71,7 +69,7 @@ fn verify_calendar_bundle(manifest_dir: &Path) {
         .expect("calendar display manifest files are an array");
     assert_eq!(
         entries.len(),
-        8,
+        6,
         "calendar display manifest entry count drifted"
     );
     for entry in entries {
