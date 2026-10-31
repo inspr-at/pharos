@@ -1,5 +1,21 @@
 # Pharos Changelog
 
+## 261031155226.0.0 - 2026-10-31
+
+- Pharos 2: a small, read-only fleet view for CVE handling and updates. Pharos reports state and never changes a host; configuration management does the work and Pharos confirms when it is done. The earlier, larger product ends at tag `v261022144327.0.0`, which stays the reference and the rollback for everything removed (PHAROS-336).
+- Remove onboarding, providers and provisioning, guarded host actions, alerts, the backups, map and host settings pages, Flow and Agora, the Janus, Paimos and Aeon integrations, machine-operator auth, `/metrics`, per-person access policy, manifest TCP probes and HTTP probes (PHAROS-337, PHAROS-344, PHAROS-345).
+- Require a bearer token checked against the store on every beacon report. Startup refuses any `PHAROS_BEACON_TOKEN_MODE` other than `local`, and a missing, wrong or unknown-host token answers 401 (PHAROS-338).
+- Keep the store format and report schemas: a store written by `v261022144327.0.0` loads and round-trips unchanged and its tokens authenticate. Beacons stop writing settings a server sends (PHAROS-339).
+- Read one versioned fleet data file (`contracts/fleet-data-v3.json`) from `PHAROS_FLEET_DATA_FILE`. A missing or invalid file never stops the server: it keeps the last good copy and the page and API show the problem and the data's age (PHAROS-346).
+- Compute each host's status for a CVE. A kernel CVE compares fixed-in lines with the running and next-boot kernels; every other CVE takes its status from the file, labelled hand-declared with its last-verified time. Anything the code cannot show is unknown (PHAROS-340).
+- Show reboot due for a staged kernel by reading the system profile when the beacon has the Nix mounts (PHAROS-341).
+- Compute what each host is waiting for: a kernel reboot, commits behind the declared config and an old nixpkgs. Done is only ever a later report (PHAROS-342).
+- Replace the appliance probes with credential-free host probes for hosts without a beacon, and keep each host's last answer across restarts. Ping runs under dropped capabilities (PHAROS-343).
+- Add the Fleet, Updates, Handled, CVE and host pages behind login. Contact says how loudly a host's silence shows, by declared availability, separately from patch status (PHAROS-347).
+- Refuse anyone off the login allow-list at the callback with a 403 and no session. Add one read-only operator token for `GET /hosts.json` and the new `GET /fleet.json`, and the `pharos` CLI commands `health`, `version`, `hosts`, `beacon`, `cves` and `updates` (PHAROS-344).
+- Accept RUSTSEC-2026-0387 with its reason in `deny.toml`: `crypto-bigint` 0.5 is reached only through public-key ID-token signature verification (PHAROS-345).
+- Declare `inspr-calver-3` from this release, with `release_sequence` continuing at 28 after the last CalVer2, `261022144327.0.0` at 27. The version display moves to `inspr.calver-display.v3` from `inspr-at/inspr` `bd0a138`, vendored verbatim (PHAROS-345).
+
 ## 261022144327.0.0 - 2026-10-22
 
 - Release image: Debian snapshot 20261022T120000Z and `libexpat1` pinned to 2.5.0-1+deb12u5 (CVE-2025-59375, CVE-2026-77214, both HIGH). The release scan refused the 261022140452.0.0 candidate on these; 261022140452.0.0 was never published.

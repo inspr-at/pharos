@@ -57,6 +57,10 @@ V2_HISTORY = (
     ("261022140452.0.0", 26),
     ("261022144327.0.0", 27),
 )
+# Published CalVer3 reservations. The first follows the last v2 in sequence.
+CALVER3_HISTORY = (
+    ("261031155226.0.0", 28),
+)
 
 
 class CalendarVersionTests(unittest.TestCase):
@@ -301,6 +305,13 @@ class CalendarVersionTests(unittest.TestCase):
             release_version.LAST_CALENDAR_V2_SEQUENCE,
         )
         self.assertEqual(V2_HISTORY[-1], (last_version, last_sequence))
+        self.assertEqual(CALVER3_HISTORY[0][1], last_sequence + 1)
+        self.assertGreater(CALVER3_HISTORY[0][0], last_version)
+        release = self.release_document()
+        self.assertEqual(release["version_scheme"], release_version.CALVER3_SCHEME)
+        self.assertEqual(
+            CALVER3_HISTORY[-1], (release["version"], release["release_sequence"])
+        )
         first = self.calver3_release("261101120000.0.0", last_sequence + 1)
         release_version.validate_release(first)
         recorded = list(self.v1_history())

@@ -3,7 +3,7 @@
 **Which hosts are patched, which are not, and what is due.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-261022144327.0.0-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-261031155226.0.0-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a small, self-hosted, read-only fleet view. Beacons report what each
