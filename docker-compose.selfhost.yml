@@ -42,32 +42,9 @@ services:
 
       # Machine routes. Local mode requires a read-only registration-token
       # mount at this container path; add it with a private Compose override.
-      # Janus mode requires this to remain unset.
       PHAROS_REGISTRATION_TOKEN_FILE: ${PHAROS_REGISTRATION_TOKEN_FILE:-}
       PHAROS_REQUIRE_BEACON_TOKEN: "1"
       PHAROS_BEACON_TOKEN_MODE: ${PHAROS_BEACON_TOKEN_MODE:-local}
-
-      # Optional public Janus URL used only to open value-free provider setup.
-      # Secret values remain in Janus/agenix and private runtime mounts.
-      PHAROS_JANUS_PUBLIC_URL: ${PHAROS_JANUS_PUBLIC_URL:-}
-
-      # Optional existing-host native bootstrap executor. It remains disabled
-      # unless every trust/route input is supplied explicitly. Mount the
-      # referenced SSH files read-only with a local compose override.
-      PHAROS_EXISTING_HOST_EXECUTE: ${PHAROS_EXISTING_HOST_EXECUTE:-0}
-      PHAROS_EXISTING_HOST_PHAROS_URL: ${PHAROS_EXISTING_HOST_PHAROS_URL:-}
-      PHAROS_EXISTING_HOST_IDENTITY_FILE: ${PHAROS_EXISTING_HOST_IDENTITY_FILE:-}
-      PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE: ${PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE:-}
-
-      # Optional Hetzner Cloud executor. Keep the API token in a mounted
-      # runtime file. The project label is non-secret operator-facing context;
-      # the SSH public key and firewall must already exist in that project.
-      PHAROS_HCLOUD_EXECUTE: ${PHAROS_HCLOUD_EXECUTE:-0}
-      PHAROS_HCLOUD_API_TOKEN_FILE: ${PHAROS_HCLOUD_API_TOKEN_FILE:-}
-      PHAROS_HCLOUD_PROJECT_LABEL: ${PHAROS_HCLOUD_PROJECT_LABEL:-}
-      PHAROS_HCLOUD_APPROVAL_TTL_SECS: ${PHAROS_HCLOUD_APPROVAL_TTL_SECS:-900}
-      PHAROS_HCLOUD_SSH_KEY_REF: ${PHAROS_HCLOUD_SSH_KEY_REF:-}
-      PHAROS_HCLOUD_FIREWALL_REF: ${PHAROS_HCLOUD_FIREWALL_REF:-}
 
       # Optional declared-host manifest paths, for example:
       # PHAROS_MANIFEST_PATHS=/manifests/host-a.json:/manifests/host-b.json
@@ -78,12 +55,8 @@ services:
       - pharos_data:/data
       # Optional manifest mount for declared hosts:
       # - ./manifests:/manifests:ro
-      # Optional bootstrap SSH mount (use a private local compose override):
-      # - ./private/pharos-ssh:/run/pharos/ssh:ro
       # Local registration token mount (required in local token mode):
       # - ./private/pharos-registration-token:/run/secrets/pharos-registration-token:ro
-      # Optional provider token mount (use a private local compose override):
-      # - ./private/hcloud-token:/run/pharos/hcloud-token:ro
 
 volumes:
   pharos_data: {}

@@ -48,8 +48,6 @@ jobs:
             [[ "$script" == scripts/check-calendar-version-display-pin.sh ]] || shfmt_files+=("$script")
           done
           shfmt -d -i 2 -ci "${shfmt_files[@]}"
-      - name: fleet browser lifecycle
-        run: node --test tests/fleet-refresh.test.mjs
       - name: install live UI test dependencies
         run: npm ci --ignore-scripts
       - name: live UI request guard
@@ -60,12 +58,8 @@ jobs:
           scripts/check-github-actions-node24.sh
       - name: release consistency
         run: scripts/check-release-consistency.sh
-      - name: pinned Paimos delivery contract
-        run: scripts/check-paimos-delivery-contract.sh
       - name: check the vendored calendar v2 display weights
         run: scripts/check-calendar-version-display.sh
-      - name: flow-shell vendor manifest
-        run: scripts/check-flow-shell-vendor.sh
       - name: native systemd settings state dry run
         run: |
           work="$(mktemp -d)"
@@ -89,25 +83,6 @@ jobs:
           grep -F 'StateDirectoryMode=0700' <<<"$output"
           grep -F 'UMask=0077' <<<"$output"
           ! grep -F 'test-only-placeholder' <<<"$output"
-      - name: nixos-anywhere handoff dry run
-        run: |
-          work="$(mktemp -d)"
-          cleanup() {
-            find "$work" -type f -delete 2>/dev/null || true
-            find "$work" -depth -type d -exec rmdir '{}' \; 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          printf 'pharos_test_token\n' >"$work/token"
-          chmod 0600 "$work/token"
-          printf 'test-host-key\n' >"$work/known_hosts"
-          chmod 0644 "$work/known_hosts"
-          output="$(scripts/bootstrap-pharos-nixos-anywhere.sh \
-            --flake '.#test-host' \
-            --target root@test-host \
-            --token-file "$work/token" \
-            --known-hosts "$work/known_hosts" \
-            --dry-run)"
-          test "$output" = $'nixos_bootstrap_dry_run=ok\ntoken_transport=extra-files\nhost_key_policy=strict-preserved'
       - name: self-host compose syntax
         run: |
           PHAROS_OIDC_ISSUER=https://issuer.example \
@@ -121,45 +96,16 @@ jobs:
         run: scripts/check-compose-observation-contract.sh
       - name: build
         run: cargo build --all --locked
-      - name: persistence and alert failure injection
-        run: |
-          cargo test -p pharosd --locked store::tests
-          cargo test -p pharosd --locked provider_connections::tests
-          cargo test -p pharosd --locked alerts::tests
+      - name: persistence failure injection
+        run: cargo test -p pharosd --locked store::tests
       - name: OIDC authorization-code end to end
         run: cargo test -p pharosd --locked auth::tests::oidc_authorization_code_pkce_flow_creates_a_browser_bound_session
       - name: report and registration contract properties
         run: cargo test -p pharos-core --locked --test report_contract_properties
       - name: security header contract
         run: cargo test -p pharosd --locked rendered_html_receives_nonce_csp_and_browser_security_headers
-      - name: managed-service secret assurance
-        run: scripts/assure-managed-service-secrets.sh
-      - name: Paimos encoded-response boundary
-        run: cargo test -p pharosd --locked --features paimos-compression-test paimos_delivery::tests::wire_level_media_and_receipt_abuse_fails_closed
       - name: test
         run: cargo test --all --locked
-
-  janus-contract:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
-      - name: checkout the reviewed Janus producer
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
-        with:
-          repository: inspr-at/janus
-          # PHAROS-195: go-envelope-v1.178, the version deployed in production.
-          # Keep this at or ahead of the deployed Janus line, otherwise the
-          # contract check proves compatibility against a producer nobody runs.
-          ref: b40026f00b232b60237ed37349e8cd6e071be156
-          path: janus
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (composite)
-        with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (Node 24)
-        with:
-          key: janus-contract
-      - name: producer and consumer schema compatibility
-        run: scripts/check-janus-contract.sh "$GITHUB_WORKSPACE/janus"
 
   coverage:
     runs-on: ubuntu-24.04
@@ -197,14 +143,8 @@ jobs:
           npx playwright install --with-deps chromium
       - name: build test server
         run: cargo build -p pharosd --locked
-      - name: accessibility, focus, responsive, and visual-layout QA
+      - name: browser page, accessibility and responsive QA
         run: npm run test:browser
-      - name: flow host browser harness
-        run: npm run test:flow-host
-      - name: flow host browser harness against a loopback Aeon (PHAROS-313)
-        run: npm run test:flow-host
-        env:
-          PHAROS_FLOW_HARNESS_UPSTREAM: aeon
       - name: retain browser failure evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (Node 24)

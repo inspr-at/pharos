@@ -40,10 +40,6 @@ use openidconnect::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::janus_projections::{
-    optional_capability_root_from_env, JanusCapability, MachineOperatorPrincipal,
-    MachineOperatorTokenStore, MACHINE_OPERATOR_HASH_DIR_ENV,
-};
 use pharos_core::PublicBasePath;
 
 const SESSION_COOKIE: &str = "__Host-pharos_session";
@@ -65,7 +61,6 @@ const MAX_OIDC_CA_CERTIFICATES: usize = 32;
 const ALLOW_OPEN_ENV: &str = "PHAROS_ALLOW_OPEN";
 const OPERATOR_REF_DOMAIN: &str = "pharos:oidc-principal:operator-ref:v2:";
 const VERIFIED_EMAIL_REF_DOMAIN: &str = "pharos:oidc-principal:verified-email-ref:v1:";
-const MANAGED_HUMAN_SESSION_REF_DOMAIN: &str = "inspr.managed-service-human-session.v1";
 
 type OidcClient = CoreClient<
     EndpointSet,
@@ -187,8 +182,6 @@ impl RateWindow {
 
 #[derive(Clone, Debug)]
 pub struct AuthUser {
-    pub operator_ref: String,
-    pub managed_human_session_ref: String,
     pub display_name: String,
 }
 
@@ -196,7 +189,6 @@ pub struct AuthUser {
 pub struct AccessGrant {
     all_hosts: bool,
     hosts: BTreeSet<String>,
-    agora: bool,
 }
 
 impl AccessGrant {
@@ -204,7 +196,6 @@ impl AccessGrant {
         Self {
             all_hosts: true,
             hosts: BTreeSet::new(),
-            agora: true,
         }
     }
 
@@ -212,20 +203,11 @@ impl AccessGrant {
         Self {
             all_hosts: false,
             hosts: BTreeSet::new(),
-            agora: false,
-        }
-    }
-
-    pub(crate) fn fleet_read() -> Self {
-        Self {
-            all_hosts: true,
-            hosts: BTreeSet::new(),
-            agora: false,
         }
     }
 
     #[cfg(test)]
-    pub fn limited<I, S>(hosts: I, agora: bool) -> Self
+    pub fn limited<I, S>(hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -233,7 +215,6 @@ impl AccessGrant {
         Self {
             all_hosts: false,
             hosts: hosts.into_iter().map(Into::into).collect(),
-            agora,
         }
     }
 
@@ -241,25 +222,9 @@ impl AccessGrant {
         self.all_hosts || self.hosts.contains(host)
     }
 
-    pub fn can_agora(&self) -> bool {
-        self.agora
-    }
-
-    pub fn can_manage_fleet(&self) -> bool {
-        self.agora && self.all_hosts
-    }
-
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        !self.all_hosts && self.hosts.is_empty() && !self.agora
-    }
-
-    pub(crate) fn revision_material(&self) -> String {
-        if self.all_hosts {
-            format!("all:agora={}", self.agora)
-        } else {
-            let hosts: Vec<&str> = self.hosts.iter().map(String::as_str).collect();
-            format!("hosts={}:agora={}", hosts.join(","), self.agora)
-        }
+        !self.all_hosts && self.hosts.is_empty()
     }
 }
 
@@ -291,22 +256,18 @@ pub struct Auth {
     session_rate: Mutex<RateWindow>,
 }
 
-/// Human OIDC plus the independent scoped machine-operator verifier.
+/// Human OIDC login state.
 #[derive(Clone, Default)]
 pub struct AuthState {
     human: Option<Arc<Auth>>,
-    machine: Option<MachineOperatorTokenStore>,
     pub(crate) public_base_path: pharos_core::PublicBasePath,
     #[cfg(test)]
     fixed_access: Option<AccessGrant>,
-    #[cfg(test)]
-    fixed_user: Option<AuthUser>,
 }
 
 /// Fully validated human-authentication startup configuration.
 pub(crate) struct AuthConfig {
     mode: AuthConfigMode,
-    machine_root: Option<PathBuf>,
 }
 
 enum AuthConfigMode {
@@ -360,10 +321,6 @@ impl AuthConfig {
         if let AuthConfigMode::Oidc(oidc) = &mut config.mode {
             oidc.oidc_ca_file = oidc_ca_file;
         }
-        config.machine_root = optional_capability_root_from_env(
-            JanusCapability::PharosMachineOperator,
-            MACHINE_OPERATOR_HASH_DIR_ENV,
-        )?;
         Ok(config)
     }
 
@@ -400,7 +357,6 @@ impl AuthConfig {
             }
             return Ok(Self {
                 mode: AuthConfigMode::Open,
-                machine_root: None,
             });
         };
 
@@ -430,7 +386,6 @@ impl AuthConfig {
                 access_policy_file,
                 oidc_ca_file: None,
             })),
-            machine_root: None,
         })
     }
 }
@@ -587,21 +542,11 @@ impl Auth {
         config: AuthConfig,
         public_base_path: pharos_core::PublicBasePath,
     ) -> Result<AuthState, String> {
-        let machine = config
-            .machine_root
-            .map(MachineOperatorTokenStore::load)
-            .transpose()
-            .map_err(|error| {
-                format!("machine-operator projection failed startup validation: {error}")
-            })?;
         let AuthConfigMode::Oidc(config) = config.mode else {
             tracing::warn!("human routes are open on an explicitly allowed loopback listener");
             return Ok(AuthState {
                 human: None,
-                machine,
                 public_base_path,
-                #[cfg(test)]
-                fixed_user: None,
                 #[cfg(test)]
                 fixed_access: None,
             });
@@ -649,10 +594,7 @@ impl Auth {
                 login_rate: Mutex::new(RateWindow::default()),
                 session_rate: Mutex::new(RateWindow::default()),
             })),
-            machine,
             public_base_path,
-            #[cfg(test)]
-            fixed_user: None,
             #[cfg(test)]
             fixed_access: None,
         })
@@ -745,7 +687,9 @@ impl Auth {
             .expect("sessions lock")
             .get(&sid)
             .filter(|s| s.expires > now())
-            .map(|session| AuthUser::from_session(session, self.issuer.as_str()))
+            .map(|session| AuthUser {
+                display_name: session.display_name.clone(),
+            })
     }
 
     pub fn current_access(&self, headers: &HeaderMap) -> AccessGrant {
@@ -789,14 +733,6 @@ impl Auth {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum MachineAuthentication {
-    Absent,
-    Authenticated(MachineOperatorPrincipal),
-    Denied,
-    Unavailable,
-}
-
 impl AuthState {
     #[cfg(test)]
     pub(crate) fn for_test_access(access: AccessGrant) -> Self {
@@ -806,87 +742,13 @@ impl AuthState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test_human(access: AccessGrant, user: AuthUser) -> Self {
-        Self {
-            fixed_access: Some(access),
-            fixed_user: Some(user),
-            ..Self::default()
-        }
-    }
-
     fn human(&self) -> Option<&Arc<Auth>> {
         self.human.as_ref()
-    }
-
-    pub(crate) fn human_configured(&self) -> bool {
-        self.human.is_some()
-    }
-
-    pub(crate) fn operator_configured(&self) -> bool {
-        self.human.is_some() || self.machine.is_some()
-    }
-
-    pub(crate) fn is_some(&self) -> bool {
-        self.human_configured()
-    }
-
-    pub(crate) fn machine_readiness(&self) -> Option<bool> {
-        self.machine.as_ref().map(MachineOperatorTokenStore::ready)
-    }
-
-    fn machine_authentication(&self, headers: &HeaderMap) -> MachineAuthentication {
-        let Some(value) = headers.get(header::AUTHORIZATION) else {
-            return MachineAuthentication::Absent;
-        };
-        let Some(token) = value
-            .to_str()
-            .ok()
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return MachineAuthentication::Denied;
-        };
-        let Some(store) = self.machine.as_ref() else {
-            return MachineAuthentication::Denied;
-        };
-        match store.authenticate(token) {
-            Ok(Some(principal)) => MachineAuthentication::Authenticated(principal),
-            Ok(None) => MachineAuthentication::Denied,
-            Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    capability = JanusCapability::PharosMachineOperator.as_str(),
-                    "machine-operator verifier unavailable"
-                );
-                MachineAuthentication::Unavailable
-            }
-        }
-    }
-
-    pub(crate) fn current_user(&self, headers: &HeaderMap) -> Option<AuthUser> {
-        match self.machine_authentication(headers) {
-            MachineAuthentication::Authenticated(principal) => Some(AuthUser {
-                operator_ref: principal.operator_ref,
-                managed_human_session_ref: String::new(),
-                display_name: principal.label,
-            }),
-            MachineAuthentication::Denied | MachineAuthentication::Unavailable => None,
-            MachineAuthentication::Absent => self
-                .human
-                .as_ref()
-                .and_then(|auth| auth.current_user(headers)),
-        }
     }
 
     pub(crate) fn human_user(&self, headers: &HeaderMap) -> Option<AuthUser> {
         if headers.contains_key(header::AUTHORIZATION) {
             return None;
-        }
-        #[cfg(test)]
-        if let Some(user) = &self.fixed_user {
-            return Some(user.clone());
         }
         self.human
             .as_ref()
@@ -898,19 +760,12 @@ impl AuthState {
         if let Some(access) = &self.fixed_access {
             return access.clone();
         }
-        match self.machine_authentication(headers) {
-            MachineAuthentication::Authenticated(principal) if principal.can_write => {
-                AccessGrant::full()
-            }
-            MachineAuthentication::Authenticated(_) => AccessGrant::fleet_read(),
-            MachineAuthentication::Denied | MachineAuthentication::Unavailable => {
-                AccessGrant::empty()
-            }
-            MachineAuthentication::Absent => match &self.human {
-                Some(auth) => auth.current_access(headers),
-                None if self.machine.is_some() => AccessGrant::empty(),
-                None => AccessGrant::full(),
-            },
+        if headers.contains_key(header::AUTHORIZATION) {
+            return AccessGrant::empty();
+        }
+        match &self.human {
+            Some(auth) => auth.current_access(headers),
+            None => AccessGrant::full(),
         }
     }
 }
@@ -950,26 +805,6 @@ where
     }
     entries.insert(key, value);
     Ok(())
-}
-
-impl AuthUser {
-    fn from_session(session: &Session, issuer: &str) -> Self {
-        Self {
-            operator_ref: operator_ref_from_principal(issuer, &session.subject),
-            managed_human_session_ref: managed_human_session_ref(issuer, &session.subject),
-            display_name: session.display_name.clone(),
-        }
-    }
-}
-
-fn managed_human_session_ref(issuer: &str, subject: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(MANAGED_HUMAN_SESSION_REF_DOMAIN.as_bytes());
-    hasher.update([0]);
-    hasher.update(issuer.trim_end_matches('/').as_bytes());
-    hasher.update([0]);
-    hasher.update(subject.as_bytes());
-    format!("hsn_{:x}", hasher.finalize())
 }
 
 fn operator_ref_from_principal(issuer: &str, subject: &str) -> String {
@@ -1040,8 +875,9 @@ struct AccessPolicyEntry {
     identifiers: Vec<String>,
     #[serde(default)]
     hosts: Vec<String>,
-    #[serde(default)]
-    agora: bool,
+    /// Retired grant kept so existing policy files still load; it grants nothing.
+    #[serde(default, rename = "agora")]
+    _agora: bool,
 }
 
 impl AccessPolicyDocument {
@@ -1072,9 +908,6 @@ impl AccessPolicyDocument {
                     .any(|identifier| entry.identifiers.contains(identifier))
             {
                 continue;
-            }
-            if entry.agora {
-                grant.agora = true;
             }
             for host in &entry.hosts {
                 let host = host.trim();
@@ -1503,20 +1336,13 @@ fn rate_limited_response() -> Response {
         .into_response()
 }
 
-/// Middleware gating operator routes. Browser sessions and scoped machine
-/// bearer credentials share the route group; invalid or unavailable machine
-/// authentication never falls back to a cookie or open mode.
+/// Middleware gating operator routes. A bearer credential is never accepted
+/// here and never falls back to a cookie or open mode.
 pub async fn guard(State(auth): State<AuthState>, req: Request, next: Next) -> Response {
-    match auth.machine_authentication(req.headers()) {
-        MachineAuthentication::Authenticated(_) => return next.run(req).await,
-        MachineAuthentication::Denied => return StatusCode::UNAUTHORIZED.into_response(),
-        MachineAuthentication::Unavailable => {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
-        MachineAuthentication::Absent => {}
+    if req.headers().contains_key(header::AUTHORIZATION) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
     match auth.human() {
-        None if auth.machine.is_some() => StatusCode::UNAUTHORIZED.into_response(),
         None => next.run(req).await,
         Some(human) if human.is_authed(req.headers()) => next.run(req).await,
         Some(_) => {
@@ -2301,10 +2127,9 @@ mod tests {
         let mut session_headers = HeaderMap::new();
         session_headers.insert(header::COOKIE, session_cookie.parse().unwrap());
         let user = auth_state
-            .current_user(&session_headers)
+            .human_user(&session_headers)
             .expect("OIDC callback creates a session");
         assert_eq!(user.display_name, "oidc-e2e-user");
-        assert_eq!(user.operator_ref.len(), 64);
 
         let logout_csrf_cookie = response_cookie(&callback_response, LOGOUT_CSRF_COOKIE).unwrap();
         let logout_csrf = logout_csrf_cookie
@@ -2327,7 +2152,7 @@ mod tests {
         )
         .await;
         assert_eq!(rejected_logout.status(), StatusCode::FORBIDDEN);
-        assert!(auth_state.current_user(&session_headers).is_some());
+        assert!(auth_state.human_user(&session_headers).is_some());
 
         let logout_response = logout(
             State(auth_state.clone()),
@@ -2350,7 +2175,7 @@ mod tests {
                 .count(),
             2
         );
-        assert!(auth_state.current_user(&session_headers).is_none());
+        assert!(auth_state.human_user(&session_headers).is_none());
 
         server.shutdown().await;
     }
@@ -2954,24 +2779,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_user_derives_operator_ref_from_private_session_subject() {
-        let session = Session {
-            subject: "opaque-subject".to_string(),
-            display_name: "Markus".to_string(),
-            identifiers: vec!["markus".to_string()],
-            expires: i64::MAX,
-        };
-
-        let user = AuthUser::from_session(&session, "https://issuer.example.test");
-
-        assert_eq!(
-            user.operator_ref,
-            "6672d3b0e81375008a36d203936aeec654db7566abda3451e7a672be5d36170d"
-        );
-        assert_eq!(user.display_name, "Markus");
-    }
-
-    #[test]
     fn operator_policy_allows_when_not_configured() {
         assert!(!OperatorPolicy::from_raw(None).unwrap().is_enforced());
     }
@@ -3016,30 +2823,13 @@ mod tests {
     }
 
     #[test]
-    fn managed_human_session_binding_matches_janus_and_normalizes_issuer_slash() {
-        let expected = "hsn_9faf4f59563351db0902dcb553e34717e3d37497b11422efcbd54d9b367c415a";
-        assert_eq!(
-            managed_human_session_ref("https://issuer.example.test", "subject-1"),
-            expected
-        );
-        assert_eq!(
-            managed_human_session_ref("https://issuer.example.test/", "subject-1"),
-            expected
-        );
-        assert_ne!(
-            managed_human_session_ref("https://issuer.example.test", "subject-2"),
-            expected
-        );
-    }
-
-    #[test]
-    fn access_policy_grants_hosts_and_agora_by_identifier() {
+    fn access_policy_grants_hosts_by_identifier() {
         let policy = AccessPolicyDocument::from_json(
             r#"{
                 "grants": [
                     {
-                        "identifiers": ["email:dad@example.invalid"],
-                        "hosts": ["hsb8"],
+                        "identifiers": ["email:limited@example.invalid"],
+                        "hosts": ["athena"],
                         "agora": false
                     },
                     {
@@ -3052,15 +2842,13 @@ mod tests {
         )
         .expect("policy parses");
 
-        let dad = policy.grant_for(&["email:dad@example.invalid".to_string()]);
-        assert!(dad.allows_host("hsb8"));
-        assert!(!dad.allows_host("csb1"));
-        assert!(!dad.can_agora());
+        let limited = policy.grant_for(&["email:limited@example.invalid".to_string()]);
+        assert!(limited.allows_host("athena"));
+        assert!(!limited.allows_host("ares"));
 
-        let markus = policy.grant_for(&[format!("operator-ref:{}", "a".repeat(64))]);
-        assert!(markus.allows_host("csb1"));
-        assert!(markus.allows_host("hsb8"));
-        assert!(markus.can_agora());
+        let everyone = policy.grant_for(&[format!("operator-ref:{}", "a".repeat(64))]);
+        assert!(everyone.allows_host("ares"));
+        assert!(everyone.allows_host("athena"));
     }
 
     #[test]
@@ -3069,7 +2857,7 @@ mod tests {
             r#"{
                 "grants": [
                     {
-                        "identifiers": ["email:markus@example.invalid"],
+                        "identifiers": ["email:operator@example.invalid"],
                         "hosts": ["*"],
                         "agora": true
                     }
@@ -3080,8 +2868,7 @@ mod tests {
 
         let unknown = policy.grant_for(&["email:new-user@example.invalid".to_string()]);
         assert!(unknown.is_empty());
-        assert!(!unknown.allows_host("csb1"));
-        assert!(!unknown.can_agora());
+        assert!(!unknown.allows_host("ares"));
     }
 
     #[test]
@@ -3611,75 +3398,5 @@ mod tests {
         let result =
             AuthConfig::from_values(true, issuer, client_id, redirect, true, policy(None), None);
         assert!(result.is_err());
-    }
-
-    fn machine_auth_state(scopes: &[&str]) -> (AuthState, String, PathBuf) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "pharos-auth-machine-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let credential = format!("machine-fixture-{}-{sequence}", std::process::id());
-        let credential_hash = format!("{:x}", Sha256::digest(credential.as_bytes()));
-        crate::janus_projections::write_test_generation(
-            &root,
-            "operator:machine-fixture",
-            "machine fixture",
-            &credential_hash,
-            scopes,
-        );
-        let state = AuthState {
-            human: None,
-            machine: Some(MachineOperatorTokenStore::load(root.clone()).unwrap()),
-            public_base_path: PublicBasePath::root(),
-            fixed_access: None,
-            fixed_user: None,
-        };
-        (state, credential, root)
-    }
-
-    #[test]
-    fn machine_operator_scope_is_independent_and_fail_closed() {
-        let (read_state, credential, read_root) = machine_auth_state(&["fleet:read"]);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {credential}").parse().unwrap(),
-        );
-        let read_access = access_for_headers(&read_state, &headers);
-        assert!(read_access.allows_host("any-host"));
-        assert!(!read_access.can_manage_fleet());
-        assert_eq!(
-            read_state.current_user(&headers).unwrap().operator_ref,
-            "operator:machine-fixture"
-        );
-        assert!(access_for_headers(&read_state, &HeaderMap::new()).is_empty());
-
-        let (write_state, write_credential, write_root) =
-            machine_auth_state(&["fleet:read", "fleet:write"]);
-        headers.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {write_credential}").parse().unwrap(),
-        );
-        assert!(access_for_headers(&write_state, &headers).can_manage_fleet());
-
-        let unconfigured = AuthState::default();
-        assert!(access_for_headers(&unconfigured, &headers).is_empty());
-        assert!(matches!(
-            unconfigured.machine_authentication(&headers),
-            MachineAuthentication::Denied
-        ));
-
-        std::fs::remove_dir_all(read_root).unwrap();
-        std::fs::remove_dir_all(write_root).unwrap();
     }
 }

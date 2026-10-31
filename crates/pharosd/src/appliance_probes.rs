@@ -21,9 +21,9 @@ use tokio::time::{sleep, timeout};
 
 use crate::durable_file::{atomic_write_json, load_optional_json, DurableFileError};
 use crate::manifests::ManifestRegistry;
-use crate::provisioning::{
+use crate::probe_support::{
     open_trusted_runtime_file, read_trusted_runtime_file, run_child_with_deadline,
-    valid_bootstrap_name, valid_ssh_endpoint, valid_ssh_user, ExistingHostRuntimeConfig,
+    valid_bootstrap_name, valid_ssh_endpoint, valid_ssh_user, ProbeSshConfig,
 };
 use crate::store::Store;
 
@@ -208,13 +208,13 @@ pub(crate) struct ApplianceProbeRuntime {
     registry: ApplianceProbeRegistry,
     state_path: PathBuf,
     state: Mutex<ApplianceProbeStateDocument>,
-    ssh: ExistingHostRuntimeConfig,
+    ssh: ProbeSshConfig,
 }
 
 impl ApplianceProbeRuntime {
     pub(crate) fn from_env(
         host_store_path: Option<&Path>,
-        ssh: ExistingHostRuntimeConfig,
+        ssh: ProbeSshConfig,
     ) -> Result<Option<Self>, String> {
         let Some(registry_path) = std::env::var("PHAROS_APPLIANCE_PROBES_PATH")
             .ok()
@@ -238,7 +238,7 @@ impl ApplianceProbeRuntime {
     fn new(
         registry: ApplianceProbeRegistry,
         state_path: PathBuf,
-        ssh: ExistingHostRuntimeConfig,
+        ssh: ProbeSshConfig,
     ) -> Result<Self, String> {
         registry.validate()?;
         let mut state = match load_optional_json::<ApplianceProbeStateDocument>(&state_path) {
@@ -474,7 +474,7 @@ fn observation_for_sample(
 
 async fn probe_appliance(
     declaration: &ApplianceProbeDeclaration,
-    ssh: ExistingHostRuntimeConfig,
+    ssh: ProbeSshConfig,
 ) -> ApplianceProbeSample {
     let target = declaration.target.clone();
     let presence = tokio::task::spawn_blocking(move || ping_present(&target)).await;
@@ -576,10 +576,7 @@ fn ping_arguments(target: &str) -> Vec<String> {
     ]
 }
 
-fn read_marker(
-    declaration: &ApplianceProbeDeclaration,
-    ssh: &ExistingHostRuntimeConfig,
-) -> MarkerResult {
+fn read_marker(declaration: &ApplianceProbeDeclaration, ssh: &ProbeSshConfig) -> MarkerResult {
     let (Some(known_hosts), Some(identity)) = (
         ssh.known_hosts_file.as_deref(),
         ssh.identity_file.as_deref(),
@@ -765,12 +762,9 @@ mod tests {
     fn appliance_membership_requires_existing_record_and_declared_workstation_kind() {
         let state_path = temporary_path("host-policy-state");
         let preferences_path = temporary_path("host-policy-preferences");
-        let runtime = ApplianceProbeRuntime::new(
-            registry(),
-            state_path.clone(),
-            ExistingHostRuntimeConfig::default(),
-        )
-        .unwrap();
+        let runtime =
+            ApplianceProbeRuntime::new(registry(), state_path.clone(), ProbeSshConfig::default())
+                .unwrap();
         let store = Store::new(None).unwrap();
         store
             .register(
@@ -812,9 +806,8 @@ mod tests {
         let manifests = ManifestRegistry::from_sources(Vec::new(), Some(preferences_path.clone()));
         assert!(
             runtime.validate_host_records(&store, &manifests).is_ok(),
-            "manifest issues: {:?}; declared: {:?}",
-            manifests.load_errors(),
-            manifests.declared_preferences()
+            "manifest issues: {:?}",
+            manifests.load_errors()
         );
 
         let _ = std::fs::remove_file(state_path);
@@ -882,12 +875,9 @@ mod tests {
     #[test]
     fn debounce_survives_restart_without_persisting_probe_targets() {
         let state_path = temporary_path("debounce");
-        let runtime = ApplianceProbeRuntime::new(
-            registry(),
-            state_path.clone(),
-            ExistingHostRuntimeConfig::default(),
-        )
-        .unwrap();
+        let runtime =
+            ApplianceProbeRuntime::new(registry(), state_path.clone(), ProbeSshConfig::default())
+                .unwrap();
         let declaration = declaration();
         for now in [100, 101] {
             let observations = runtime
@@ -906,12 +896,9 @@ mod tests {
         let persisted = std::fs::read_to_string(&state_path).unwrap();
         assert!(!persisted.contains("appliance.example.test"));
         assert!(!persisted.contains(".appliance-converged"));
-        let reloaded = ApplianceProbeRuntime::new(
-            registry(),
-            state_path.clone(),
-            ExistingHostRuntimeConfig::default(),
-        )
-        .unwrap();
+        let reloaded =
+            ApplianceProbeRuntime::new(registry(), state_path.clone(), ProbeSshConfig::default())
+                .unwrap();
         let observations = reloaded
             .apply_samples(
                 vec![(declaration.clone(), ApplianceProbeSample::OnlineWithoutSsh)],
@@ -927,17 +914,14 @@ mod tests {
             .starts_with("un-converged:"));
         drop(reloaded);
 
-        let after_long_gap = ApplianceProbeRuntime::new(
-            registry(),
-            state_path.clone(),
-            ExistingHostRuntimeConfig::default(),
-        )
-        .unwrap()
-        .apply_samples(
-            vec![(declaration, ApplianceProbeSample::OnlineWithoutSsh)],
-            1_000,
-        )
-        .unwrap();
+        let after_long_gap =
+            ApplianceProbeRuntime::new(registry(), state_path.clone(), ProbeSshConfig::default())
+                .unwrap()
+                .apply_samples(
+                    vec![(declaration, ApplianceProbeSample::OnlineWithoutSsh)],
+                    1_000,
+                )
+                .unwrap();
         assert_eq!(
             after_long_gap["appliance-test"].state,
             ServiceObservationState::Unknown
@@ -965,17 +949,14 @@ mod tests {
             },
         )
         .unwrap();
-        let after_threshold_lowering = ApplianceProbeRuntime::new(
-            registry(),
-            state_path.clone(),
-            ExistingHostRuntimeConfig::default(),
-        )
-        .unwrap()
-        .apply_samples(
-            vec![(declaration(), ApplianceProbeSample::OnlineWithoutSsh)],
-            101,
-        )
-        .unwrap();
+        let after_threshold_lowering =
+            ApplianceProbeRuntime::new(registry(), state_path.clone(), ProbeSshConfig::default())
+                .unwrap()
+                .apply_samples(
+                    vec![(declaration(), ApplianceProbeSample::OnlineWithoutSsh)],
+                    101,
+                )
+                .unwrap();
         assert_eq!(
             after_threshold_lowering["appliance-test"].state,
             ServiceObservationState::Unknown
@@ -988,7 +969,7 @@ mod tests {
         assert!(ApplianceProbeRuntime::new(
             registry(),
             state_path.clone(),
-            ExistingHostRuntimeConfig::default(),
+            ProbeSshConfig::default(),
         )
         .is_ok());
         let _ = std::fs::remove_file(state_path);

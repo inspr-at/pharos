@@ -1,9 +1,7 @@
 # Local-only Pharos topology for development smoke tests.
 #
-# Production compose is owned by nixcfg (hosts/csb1/docker/docker-compose.yml)
-# and uses GHCR images, Traefik, Zitadel OIDC, operator allowlists, tailnet
-# ports, manifests, backups, and eventually strict beacon tokens. Do not copy
-# this file to production.
+# Do not copy this file to production; docker-compose.selfhost.yml is the
+# production template.
 #
 # Secrets are intentionally not committed here. If you need to test strict
 # token behavior locally, prefer read-only files with
@@ -25,7 +23,7 @@ services:
       RUST_LOG: info
       PHAROS_DB: /data/pharos.json
       # Optional: mount a local manifest directory and set, for example:
-      # PHAROS_MANIFEST_PATHS: /manifests/hsb8.json
+      # PHAROS_MANIFEST_PATHS: /manifests/host-a.json
       # OIDC/operator policy is intentionally off. Open mode is explicitly
       # limited to the loopback-only published port above.
     ports:

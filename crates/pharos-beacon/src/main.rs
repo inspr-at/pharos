@@ -4264,7 +4264,7 @@ mod tests {
           "schema": "inspr.pharos.host-preferences.v1",
           "version": 1,
           "hosts": {
-            "gpc0": {
+            "demeter": {
               "accent": "#9868d0",
               "kind": "workstation",
               "alerts": {
@@ -4276,7 +4276,7 @@ mod tests {
           }
         }"##;
 
-        let preferences = parse_host_preferences(raw, "gpc0").expect("preferences parse");
+        let preferences = parse_host_preferences(raw, "demeter").expect("preferences parse");
         assert_eq!(preferences.accent.as_deref(), Some("#9868d0"));
         assert_eq!(preferences.kind, pharos_core::HostKind::Workstation);
         assert!(preferences.alerts.suppress_down);
@@ -4287,19 +4287,19 @@ mod tests {
             .expect("preferences serialize")
             .contains("heartbeat_grace_secs"));
         let mut registry: serde_json::Value = serde_json::from_str(raw).unwrap();
-        registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
-        let overridden = parse_host_preferences(&registry.to_string(), "gpc0").unwrap();
+        registry["hosts"]["demeter"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
+        let overridden = parse_host_preferences(&registry.to_string(), "demeter").unwrap();
         assert_eq!(overridden.alerts.nixpkgs_warn_after_days, Some(7));
-        registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(0);
-        assert!(parse_host_preferences(&registry.to_string(), "gpc0").is_err());
-        registry["hosts"]["gpc0"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
-        registry["hosts"]["gpc0"]["alerts"]["heartbeat_grace_secs"] = serde_json::json!(0);
-        let grace = parse_host_preferences(&registry.to_string(), "gpc0").unwrap();
+        registry["hosts"]["demeter"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(0);
+        assert!(parse_host_preferences(&registry.to_string(), "demeter").is_err());
+        registry["hosts"]["demeter"]["alerts"]["nixpkgs_warn_after_days"] = serde_json::json!(7);
+        registry["hosts"]["demeter"]["alerts"]["heartbeat_grace_secs"] = serde_json::json!(0);
+        let grace = parse_host_preferences(&registry.to_string(), "demeter").unwrap();
         assert_eq!(grace.alerts.heartbeat_grace_secs, Some(0));
-        registry["hosts"]["gpc0"]["alerts"]["heartbeat_grace_secs"] = serde_json::json!(3601);
-        assert!(parse_host_preferences(&registry.to_string(), "gpc0").is_err());
-        registry["hosts"]["gpc0"]["alerts"]["heartbeat_grace_secs"] = serde_json::Value::Null;
-        let cleared = parse_host_preferences(&registry.to_string(), "gpc0").unwrap();
+        registry["hosts"]["demeter"]["alerts"]["heartbeat_grace_secs"] = serde_json::json!(3601);
+        assert!(parse_host_preferences(&registry.to_string(), "demeter").is_err());
+        registry["hosts"]["demeter"]["alerts"]["heartbeat_grace_secs"] = serde_json::Value::Null;
+        let cleared = parse_host_preferences(&registry.to_string(), "demeter").unwrap();
         assert_eq!(cleared.alerts.heartbeat_grace_secs, None);
     }
 
@@ -4309,7 +4309,7 @@ mod tests {
           "schema": "inspr.pharos.host-preferences.v1",
           "version": 1,
           "hosts": {
-            "gpc0": {
+            "demeter": {
               "accent": "#9868d0",
               "kind": "workstation",
               "alerts": {
@@ -4323,10 +4323,10 @@ mod tests {
         }"##;
         let previous = HostPreferences::default();
 
-        assert!(parse_host_preferences(extended, "gpc0").is_err());
+        assert!(parse_host_preferences(extended, "demeter").is_err());
         assert!(parse_host_preferences(
             r#"{"schema":"inspr.pharos.host-preferences.v1","version":1,"hosts":{}}"#,
-            "gpc0"
+            "demeter"
         )
         .is_err());
         assert_eq!(previous, HostPreferences::default());
@@ -4348,15 +4348,15 @@ mod tests {
                 heartbeat_grace_secs: None,
             },
         };
-        let response = HostReportResponse::pending("gpc0", preferences.clone())
+        let response = HostReportResponse::pending("demeter", preferences.clone())
             .expect("pending response validates");
         let body = serde_json::to_string(&response).expect("response serializes");
 
-        let applied = apply_report_response(&body, "gpc0", false, Some(&path))
+        let applied = apply_report_response(&body, "demeter", false, Some(&path))
             .expect("pending preferences apply");
         assert_eq!(applied, Some(preferences.clone()));
         assert_eq!(
-            read_host_preferences(&path, "gpc0").expect("written registry parses"),
+            read_host_preferences(&path, "demeter").expect("written registry parses"),
             preferences
         );
         #[cfg(unix)]
@@ -4387,11 +4387,11 @@ mod tests {
             accent: Some("#1f7fb5".to_string()),
             ..Default::default()
         };
-        let initial = HostReportResponse::pending("gpc0", previous.clone())
+        let initial = HostReportResponse::pending("demeter", previous.clone())
             .expect("initial response validates");
         apply_report_response(
             &serde_json::to_string(&initial).expect("initial response serializes"),
-            "gpc0",
+            "demeter",
             false,
             Some(&path),
         )
@@ -4405,7 +4405,7 @@ mod tests {
             "schema":"inspr.pharos.host-preferences.v1",
             "version":1,
             "hosts":{
-              "gpc0":{
+              "demeter":{
                 "accent":"#48b8a8",
                 "kind":"workstation",
                 "alerts":{},
@@ -4415,7 +4415,7 @@ mod tests {
           }
         }"##;
         assert_eq!(
-            apply_report_response(invalid, "gpc0", false, Some(&path)),
+            apply_report_response(invalid, "demeter", false, Some(&path)),
             Err(PreferencesApplyError::InvalidResponse)
         );
 
@@ -4430,7 +4430,7 @@ mod tests {
         assert_eq!(
             apply_report_response(
                 &serde_json::to_string(&wrong_host).expect("response serializes"),
-                "gpc0",
+                "demeter",
                 false,
                 Some(&path),
             ),
@@ -4446,7 +4446,7 @@ mod tests {
     #[test]
     fn pending_preferences_require_a_non_nix_host_and_configured_file() {
         let response = HostReportResponse::pending(
-            "gpc0",
+            "demeter",
             HostPreferences {
                 accent: Some("#48b8a8".to_string()),
                 ..Default::default()
@@ -4456,13 +4456,13 @@ mod tests {
         let body = serde_json::to_string(&response).expect("response serializes");
 
         assert_eq!(
-            apply_report_response(&body, "gpc0", false, None),
+            apply_report_response(&body, "demeter", false, None),
             Err(PreferencesApplyError::NotConfigured)
         );
         assert_eq!(
             apply_report_response(
                 &body,
-                "gpc0",
+                "demeter",
                 true,
                 Some(Path::new("/unused/preferences.json")),
             ),
@@ -4564,7 +4564,7 @@ mod tests {
     #[test]
     fn success_log_line_keeps_operational_context_without_report_body() {
         let line = success_log_line(
-            "hsb8",
+            "hermes",
             "http://pharos.example/report",
             204,
             &NixFreshness {
@@ -4582,7 +4582,7 @@ mod tests {
             &[],
         );
 
-        assert!(line.contains("hsb8"));
+        assert!(line.contains("hermes"));
         assert!(line.contains("http://pharos.example/report"));
         assert!(line.contains("HTTP 204"));
         assert!(line.contains("generation=unverified"));
@@ -4634,7 +4634,7 @@ mod tests {
     fn restic_backup_options_extract_repository_only() {
         assert_eq!(
             restic_repository_args_from_backup_options(
-                "-r sftp:backup.example.invalid:/ --host csb1 --verbose"
+                "-r sftp:backup.example.invalid:/ --host apollo --verbose"
             ),
             vec![
                 "-r".to_string(),
@@ -4668,7 +4668,7 @@ mod tests {
                 "/run/agenix/restic-repository".to_string()
             ]
         );
-        assert!(restic_repository_args_from_backup_options("--host csb1").is_empty());
+        assert!(restic_repository_args_from_backup_options("--host apollo").is_empty());
     }
 
     #[test]
@@ -4683,7 +4683,7 @@ mod tests {
     fn restic_snapshot_metadata_classifies_healthy_stale_and_missing() {
         let raw = r#"[{
             "time": "2023-11-14T21:13:20Z",
-            "hostname": "csb1",
+            "hostname": "apollo",
             "paths": ["/backup/home"],
             "id": "abcdef"
         }]"#;
@@ -6335,7 +6335,7 @@ mod tests {
         Some((matching_flake_lock(dir.to_str()?, &evidence)?, evidence))
     }
 
-    /// The real csb1 lock shape. The system tracks nixos-unstable and is 21
+    /// The real apollo lock shape. The system tracks nixos-unstable and is 21
     /// days old, while a separate root input sits 218 days stale on an expired
     /// channel and transitive inputs of nixos-hardware are older still.
     /// PHAROS-196: only the system input may drive the reported number.

@@ -5,173 +5,15 @@ use super::*;
 fn human_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(home))
-        .route("/map", get(map_page))
-        .route("/map/data.json", get(map_data_json))
-        .route("/alerts", get(alerts_page))
-        .route("/backups", get(backups_page))
-        .route("/activity", get(activity_page))
-        .route("/access/request", get(access_request_page))
-        .route("/services", get(managed_service_ui::services_page))
-        .route(
-            "/services/{host_ref}/{service_ref}",
-            get(managed_service_ui::service_detail_page),
-        )
-        .route("/settings/providers", get(provider_settings_page))
-        .route("/settings/fleet.json", post(update_fleet_settings))
-        .route("/settings/providers.json", get(provider_connections_json))
-        .route(
-            "/settings/providers/{provider}",
-            get(provider_settings_detail_page),
-        )
-        .route(
-            "/settings/providers/hetzner-cloud/test",
-            post(test_hetzner_provider_connection),
-        )
-        .route(
-            "/settings/providers/hetzner-cloud/preferences",
-            post(update_hetzner_provider_preferences),
-        )
-        .route(
-            "/settings/providers/hetzner-cloud/disconnect",
-            post(disconnect_hetzner_provider),
-        )
-        .route("/agora", get(agora::page))
-        .route("/hosts/{host}", get(agora::host_workspace_page))
-        .route("/hosts/{host}/settings", get(agora::host_settings_entry))
-        .route(
-            "/hosts/{host}/workflow-receipts.json",
-            get(host_workflow_receipts_json),
-        )
-        .route(
-            "/agora/proposals/host-palette.json",
-            get(agora::palette_proposal),
-        )
-        .route(
-            "/agora/requests/host-preferences.json",
-            post(agora::request_host_preferences),
-        )
-        .route(
-            "/agora/proposals/host-location.json",
-            get(agora::location_proposal),
-        )
         .route("/hosts.json", get(hosts_json))
-        .route("/flow/shell-state.json", get(flow_shell_state_json))
-        .route(
-            "/flow/intents",
-            post(flow_intents_json).layer(DefaultBodyLimit::max(flow_host::FLOW_INTENT_MAX_BYTES)),
-        )
-        .route("/assets/vendor/flow-shell/{*path}", get(flow_shell_asset))
-        .route("/assets/flow-host-bootstrap.mjs", get(flow_host_bootstrap))
-        .route("/setup/provider-plan.json", get(setup_provider_plan_json))
-        .route("/setup/provisioning-jobs", post(create_provisioning_job))
-        .route("/host-need-intents", post(create_host_need_intent))
-        .route("/setup/provisioning-jobs/{id}", get(provisioning_job_json))
-        .route(
-            "/setup/provisioning-jobs/{id}/confirm",
-            post(confirm_paid_provisioning_job),
-        )
-        .route(
-            "/setup/provisioning-jobs/{id}/create",
-            post(create_paid_provisioning_job),
-        )
-        .route(
-            "/setup/provisioning-jobs/{id}/cleanup",
-            post(cleanup_provisioning_job),
-        )
-        .route(
-            "/setup/provisioning-jobs/{id}/host-key",
-            post(attest_provisioning_host_key),
-        )
-        .route(
-            "/setup/provisioning-jobs/{id}/retry-bootstrap",
-            post(retry_provisioning_bootstrap),
-        )
-        .route(
-            "/setup/provisioning-jobs/{id}/reconcile-bootstrap",
-            post(reconcile_provisioning_bootstrap),
-        )
-        .route(
-            "/setup/existing-host/preflight",
-            post(existing_host_preflight_json),
-        )
-        .route("/declared-hosts.json", get(declared_hosts_json))
-        .route("/proof/{host}", get(host_proof_json))
-        .route(
-            "/managed-service-declarations.json",
-            get(managed_service_declarations_json),
-        )
-        .route(
-            "/managed-service-setup-intents",
-            post(create_managed_setup_intent).layer(DefaultBodyLimit::max(4 * 1024)),
-        )
-        .route(
-            "/managed-service-setup-intents/{intent_ref}/cancel",
-            post(cancel_managed_setup_intent),
-        )
-        .route(
-            "/managed-service-operations/{operation_ref}/retry-verification",
-            post(retry_managed_service_verification),
-        )
-        .route("/host-actions/system-update", post(request_system_update))
-        .route(
-            "/host-actions/{host}/update-restart/review",
-            post(request_update_restart_review),
-        )
-        .route("/host-actions/jobs/{id}", get(host_action_job_json))
-        .route(
-            "/host-actions/jobs/{id}/apply-declared",
-            post(apply_declared_settings_change),
-        )
-        .route(
-            "/host-actions/jobs/{id}/acknowledge-dispatch-uncertainty",
-            post(acknowledge_dispatch_uncertainty),
-        )
-        .route(
-            "/host-actions/jobs/{id}/reconcile-accepted-dispatch",
-            post(reconcile_accepted_dispatch),
-        )
-        .route(
-            "/host-actions/jobs/{id}/continue-settings-dispatch",
-            post(continue_legacy_settings_dispatch),
-        )
-        .route(
-            "/host-actions/jobs/{id}/retry",
-            post(retry_update_restart_review),
-        )
-        .route(
-            "/host-actions/jobs/{id}/cancel",
-            post(cancel_update_restart_review),
-        )
-        .route(
-            "/host-actions/jobs/{id}/withdraw",
-            post(withdraw_settings_change),
-        )
-        .route(
-            "/host-actions/jobs/{id}/confirm",
-            post(confirm_update_restart),
-        )
-        .route(
-            "/host-actions/jobs/{id}/recover",
-            post(recover_update_restart),
-        )
-        .route("/host-actions/{host}/remove", post(request_host_removal))
-        .route(
-            "/host-actions/jobs/{id}/retry-retirement",
-            post(retry_host_retirement),
-        )
-        .route(
-            "/host-actions/{host}/allow-reonboarding",
-            post(allow_host_reonboarding),
-        )
 }
 
 /// Stable machine surface. With a configured browser prefix these routes are
-/// mounted both there and at origin root for existing beacon and agent clients.
+/// mounted both there and at origin root for existing beacon clients.
 fn machine_routes() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
         .route("/version", get(version))
         .route(
             "/register",
@@ -181,66 +23,12 @@ fn machine_routes() -> Router<AppState> {
             "/report",
             post(report).layer(DefaultBodyLimit::max(MAX_HOST_REPORT_BYTES)),
         )
-        .route("/agent/actions/claim", post(claim_host_action))
-        .route(
-            "/agent/actions/{id}/result",
-            post(record_host_action_result),
-        )
-        .route("/agent/retirements/claim", post(claim_retirement_action))
-        .route(
-            "/agent/retirements/{id}/result",
-            post(record_retirement_action_result),
-        )
-        .route(
-            "/agent/provisioning/claim",
-            post(claim_managed_provisioning_action),
-        )
-        .route(
-            "/agent/provisioning/{id}/result",
-            post(record_managed_provisioning_result),
-        )
-        .route(
-            "/agent/managed-services/claim",
-            post(claim_managed_service_operation)
-                .layer(DefaultBodyLimit::max(MAX_MANAGED_OPERATION_REQUEST_BYTES)),
-        )
-        .route(
-            "/agent/managed-services/{operation_ref}/result",
-            post(record_managed_service_operation_result)
-                .layer(DefaultBodyLimit::max(MAX_MANAGED_OPERATION_REQUEST_BYTES)),
-        )
-        .route(
-            "/agent/managed-services/{operation_ref}",
-            get(retrieve_managed_service_operation_for_host),
-        )
-        .route(
-            "/internal/managed-service-setup-intents/{intent_ref}",
-            get(retrieve_managed_setup_intent),
-        )
-        .route(
-            "/internal/managed-service-operations",
-            post(register_managed_service_operation)
-                .layer(DefaultBodyLimit::max(MAX_MANAGED_OPERATION_REQUEST_BYTES)),
-        )
-        .route(
-            "/internal/managed-service-operations/{operation_ref}",
-            get(retrieve_managed_service_operation),
-        )
 }
 
 /// Browser support and account routes follow the configured public mount only.
 fn browser_public_routes() -> Router<AppState> {
     Router::new()
         .route("/favicon.svg", get(favicon_svg))
-        .route("/assets/fleet-horizon.png", get(fleet_horizon_asset))
-        .route(
-            "/assets/sidebar-lighthouse.png",
-            get(sidebar_lighthouse_asset),
-        )
-        .route(
-            "/assets/sidebar-lighthouse-motion-v1.mp4",
-            get(sidebar_lighthouse_motion_asset),
-        )
         .route(
             "/assets/calendar-version-bootstrap.mjs",
             get(calendar_version_bootstrap_asset),
@@ -248,27 +36,6 @@ fn browser_public_routes() -> Router<AppState> {
         .route(
             "/assets/vendor/calendar-version-display/{name}",
             get(calendar_version_bundle_asset),
-        )
-        .route(
-            "/assets/vendor/leaflet-1.9.4/leaflet.css",
-            get(leaflet_css_asset),
-        )
-        .route(
-            "/assets/vendor/leaflet-1.9.4/leaflet.js",
-            get(leaflet_js_asset),
-        )
-        .route(
-            "/assets/vendor/leaflet-1.9.4/images/{name}",
-            get(leaflet_image_asset),
-        )
-        .route("/assets/vendor/d3-7.9.0/d3.min.js", get(d3_js_asset))
-        .route(
-            "/assets/vendor/maplibre-gl-5.24.0/{name}",
-            get(maplibre_asset),
-        )
-        .route(
-            "/assets/vendor/maplibre-gl-leaflet-0.1.3/leaflet-maplibre-gl.js",
-            get(maplibre_leaflet_asset),
         )
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))

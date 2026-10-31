@@ -15,8 +15,9 @@ use serde::Deserialize;
 use tokio::time::sleep;
 use url::Url;
 
-use crate::provisioning::{read_trusted_runtime_file, valid_bootstrap_name};
-use crate::ui::ServerProbeObservation;
+use crate::probe_support::{
+    read_trusted_runtime_file, valid_bootstrap_name, ServerProbeObservation,
+};
 
 const HTTP_PROBE_REGISTRY_ENV: &str = "PHAROS_HTTP_PROBES_PATH";
 const HTTP_PROBE_REGISTRY_SCHEMA: &str = "inspr.pharos.http-probes.v1";
@@ -224,13 +225,6 @@ impl HttpProbeRuntime {
             client,
             observations: RwLock::new(observations),
         })
-    }
-
-    pub(crate) fn declares(&self, host: &str, service: &str) -> bool {
-        self.registry
-            .probes
-            .iter()
-            .any(|probe| probe.host == host && probe.service == service)
     }
 
     pub(crate) fn snapshot(&self, now: i64) -> BTreeMap<String, Vec<ServerProbeObservation>> {
@@ -622,7 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declared_probe_projects_once_and_replaces_legacy_tcp_probe() {
+    async fn declared_probe_projects_once() {
         let manifest = manifest();
         let runtime = HttpProbeRuntime::new(
             registry(declaration(
@@ -631,7 +625,7 @@ mod tests {
             std::slice::from_ref(&manifest),
         )
         .unwrap();
-        let projected = crate::ui::server_probe_overlays(&[manifest], 1_000, Some(&runtime)).await;
+        let projected = runtime.snapshot(1_000);
         assert_eq!(projected["host-one"].len(), 1);
         let probe = &projected["host-one"][0];
         assert_eq!(probe.id, "http-probe-service-one");
@@ -640,8 +634,5 @@ mod tests {
             probe.target.as_deref(),
             Some("https://private-route.example.test")
         );
-        assert!(crate::ui::server_probe_overlays(&[], 1_000, Some(&runtime))
-            .await
-            .is_empty());
     }
 }

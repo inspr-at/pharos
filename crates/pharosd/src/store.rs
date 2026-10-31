@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 
 use pharos_core::{
-    Host, HostPreferences, HostRegistration, HostReport, InboundRttObservation, NixFreshness,
-    ServiceObservation, UnixSeconds,
+    Host, HostRegistration, HostReport, InboundRttObservation, NixFreshness, ServiceObservation,
+    UnixSeconds,
 };
 
 use crate::durable_file::{atomic_write_json, load_optional_json, DurableFileError};
@@ -19,21 +19,6 @@ pub(crate) enum StoreError {
     Persistence(DurableFileError),
     InvalidState(&'static str),
     InvalidContract,
-    HostNotFound,
-    InvalidPreferences,
-}
-
-impl StoreError {
-    pub(crate) fn safe_message(&self) -> &'static str {
-        match self {
-            Self::HostNotFound => "host not found",
-            Self::InvalidContract => "invalid host contract",
-            Self::InvalidPreferences => "invalid host preferences",
-            Self::Persistence(_) | Self::InvalidState(_) => {
-                "fleet state could not be durably recorded"
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for StoreError {
@@ -42,8 +27,6 @@ impl std::fmt::Display for StoreError {
             Self::Persistence(error) => write!(formatter, "{error}"),
             Self::InvalidState(reason) => write!(formatter, "invalid host store: {reason}"),
             Self::InvalidContract => formatter.write_str("invalid host contract"),
-            Self::HostNotFound => formatter.write_str("host not found"),
-            Self::InvalidPreferences => formatter.write_str("invalid host preferences"),
         }
     }
 }
@@ -153,20 +136,6 @@ impl Store {
         Ok(missing)
     }
 
-    pub(crate) fn remove(&self, host: &str) -> Result<Option<Host>, StoreError> {
-        let mut hosts = self.hosts.write().expect("store lock");
-        let removed = hosts.remove(host);
-        if let Some(previous) = removed.as_ref() {
-            if let Err(error) = self.persist(&hosts) {
-                if !store_error_replaced_final_file(&error) {
-                    hosts.insert(host.to_string(), previous.clone());
-                }
-                return Err(error);
-            }
-        }
-        Ok(removed)
-    }
-
     /// Register or rotate a host token. Existing heartbeat/report data is kept
     /// so manual rotation does not make a live host look new again.
     pub(crate) fn register(
@@ -244,50 +213,6 @@ impl Store {
             .expect("store lock")
             .get(host)
             .and_then(|h| h.token_hash.clone())
-    }
-
-    pub(crate) fn request_preferences(
-        &self,
-        host_name: &str,
-        requested: HostPreferences,
-    ) -> Result<Host, StoreError> {
-        requested
-            .validate_contract()
-            .map_err(|_| StoreError::InvalidPreferences)?;
-        let mut map = self.hosts.write().expect("store lock");
-        let host = map.get_mut(host_name).ok_or(StoreError::HostNotFound)?;
-        let previous = host.requested_preferences.clone();
-        host.requested_preferences = if host.preferences == requested {
-            None
-        } else {
-            Some(requested)
-        };
-        let host = host.clone();
-        if let Err(error) = self.persist(&map) {
-            if !store_error_replaced_final_file(&error) {
-                map.get_mut(host_name)
-                    .expect("mutated host remains present")
-                    .requested_preferences = previous;
-            }
-            return Err(error);
-        }
-        Ok(host)
-    }
-
-    pub(crate) fn clear_requested_preferences(&self, host_name: &str) -> Result<Host, StoreError> {
-        let mut map = self.hosts.write().expect("store lock");
-        let host = map.get_mut(host_name).ok_or(StoreError::HostNotFound)?;
-        let previous = host.requested_preferences.take();
-        let host = host.clone();
-        if let Err(error) = self.persist(&map) {
-            if !store_error_replaced_final_file(&error) {
-                map.get_mut(host_name)
-                    .expect("mutated host remains present")
-                    .requested_preferences = previous;
-            }
-            return Err(error);
-        }
-        Ok(host)
     }
 
     /// Upsert from a beacon report. `now` is the **server** receive time — the
@@ -527,31 +452,6 @@ mod tests {
         assert!(store.get("new-host").is_none());
         assert!(store.record(basic_report("reported-host"), 100).is_err());
         assert!(store.get("reported-host").is_none());
-
-        let seed = Store::new(None).expect("in-memory store starts");
-        let host = seed
-            .register(registration("existing-host"), "hash".into())
-            .expect("seed host registers");
-        let mut hosts = BTreeMap::new();
-        hosts.insert(host.name.clone(), host);
-        let store = Store {
-            path: Some(failing_path),
-            hosts: RwLock::new(hosts),
-        };
-        let requested = HostPreferences {
-            accent: Some("#48b8a8".to_string()),
-            ..Default::default()
-        };
-        assert!(store
-            .request_preferences("existing-host", requested)
-            .is_err());
-        assert!(store
-            .get("existing-host")
-            .expect("host rolled back")
-            .requested_preferences
-            .is_none());
-        assert!(store.remove("existing-host").is_err());
-        assert!(store.get("existing-host").is_some());
 
         std::fs::remove_dir_all(directory).expect("temporary directory removed");
     }
@@ -840,113 +740,6 @@ mod tests {
         assert_eq!(updated.last_seen, Some(150));
         assert!(updated.inbound_rtt.is_none());
         assert!(updated.backup_observations.is_empty());
-    }
-
-    #[test]
-    fn preference_request_persists_until_matching_host_report_applies_it() {
-        let path = std::env::temp_dir().join(format!(
-            "pharos-host-preferences-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock after epoch")
-                .as_nanos()
-        ));
-        let report = |preferences: HostPreferences| HostReport {
-            schema: HOST_REPORT_SCHEMA.to_string(),
-            version: HOST_REPORT_VERSION,
-            name: "athena".to_string(),
-            role: "server".to_string(),
-            is_nix: true,
-            heartbeat_interval_secs: 60,
-            freshness: NixFreshness {
-                applicable: true,
-                ..Default::default()
-            },
-            kernel: None,
-            service_observations: vec![],
-            backup_observations: vec![],
-            inbound_rtt_ms: None,
-            location: None,
-            preferences,
-            deployed_artifact: None,
-        };
-        let requested = HostPreferences {
-            accent: Some("#48b8a8".to_string()),
-            alerts: pharos_core::HostAlertPreferences {
-                suppress_down: true,
-                suppress_backup: false,
-                suppress_nix_freshness: true,
-                nixpkgs_warn_after_days: None,
-                heartbeat_grace_secs: Some(20),
-            },
-            ..Default::default()
-        };
-
-        let store = Store::new(Some(path.clone())).expect("durable store starts");
-        store
-            .record(report(HostPreferences::default()), 100)
-            .expect("initial report persists");
-        let queued = store
-            .request_preferences("athena", requested.clone())
-            .expect("request queued");
-        assert_eq!(queued.preferences, HostPreferences::default());
-        assert_eq!(queued.requested_preferences.as_ref(), Some(&requested));
-        drop(store);
-
-        let reloaded = Store::new(Some(path.clone())).expect("durable store reloads");
-        assert_eq!(
-            reloaded.list()[0].requested_preferences.as_ref(),
-            Some(&requested)
-        );
-
-        reloaded
-            .record(report(HostPreferences::default()), 160)
-            .expect("old report persists");
-        assert_eq!(
-            reloaded.list()[0].requested_preferences.as_ref(),
-            Some(&requested),
-            "an old host report must not acknowledge a pending request"
-        );
-
-        reloaded
-            .record(report(requested.clone()), 220)
-            .expect("matching report persists");
-        let applied = reloaded.list().pop().expect("host remains");
-        assert_eq!(applied.preferences, requested);
-        assert!(applied.requested_preferences.is_none());
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn preference_request_rejects_invalid_or_unknown_host_state() {
-        let store = Store::new(None).expect("in-memory store starts");
-        let malformed = HostPreferences {
-            accent: Some("orange".to_string()),
-            ..Default::default()
-        };
-
-        assert!(matches!(
-            store.request_preferences("missing", HostPreferences::default()),
-            Err(StoreError::HostNotFound)
-        ));
-        assert!(matches!(
-            store.request_preferences("missing", malformed),
-            Err(StoreError::InvalidPreferences)
-        ));
-        let mut out_of_range = HostPreferences::default();
-        out_of_range.alerts.heartbeat_grace_secs = Some(3601);
-        assert!(matches!(
-            store.request_preferences("missing", out_of_range),
-            Err(StoreError::InvalidPreferences)
-        ));
-        let mut inherit = HostPreferences::default();
-        inherit.alerts.heartbeat_grace_secs = None;
-        assert!(matches!(
-            store.request_preferences("missing", inherit),
-            Err(StoreError::HostNotFound)
-        ));
     }
 
     #[test]
