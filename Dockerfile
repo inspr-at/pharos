@@ -12,7 +12,7 @@ RUN GIT_COMMIT="${GIT_COMMIT}" cargo build --release --locked -p pharosd -p phar
     && strip target/release/pharosd target/release/pharos-beacon target/release/pharos
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
-ARG DEBIAN_SNAPSHOT=20261022T120000Z
+ARG DEBIAN_SNAPSHOT=20261031T120000Z
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # git: the beacon shells out to it for commits-behind (rev-list HEAD..@{u}).
 # restic: optional PHAROS_BACKUP_MODE=restic collector; no credentials are
