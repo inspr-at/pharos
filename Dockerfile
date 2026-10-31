@@ -17,6 +17,7 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # git: the beacon shells out to it for commits-behind (rev-list HEAD..@{u}).
 # restic: optional PHAROS_BACKUP_MODE=restic collector; no credentials are
 # baked into the image.
+# openssh-client: restic's sftp: backend runs the external ssh program.
 # iputils-ping: the fixed presence signal for beaconless host probes. Debian ships
 # it with cap_net_raw=ep, and the kernel refuses to exec that under cap_drop: ALL,
 # so the capability is removed. Ping then uses an unprivileged ICMP socket, which
@@ -46,7 +47,7 @@ RUN printf '%s\n' \
       > /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates=20250419~deb12u2 iputils-ping \
-      libpcre2-8-0=10.42-1+deb12u2 libexpat1=2.5.0-1+deb12u5 restic \
+      libpcre2-8-0=10.42-1+deb12u2 libexpat1=2.5.0-1+deb12u5 openssh-client restic \
     && setcap -r /usr/bin/ping \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 pharos
