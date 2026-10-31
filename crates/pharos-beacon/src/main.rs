@@ -55,6 +55,7 @@ const NIXPKGS_CHANNEL_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_NIXPKGS_REVISION_BYTES: u64 = 128;
 const DEFAULT_NIXPKGS_CHANNEL_BASE_URL: &str = "https://channels.nixos.org/";
 const OFFICIAL_NIXPKGS_GIT_REMOTE: &str = "https://github.com/NixOS/nixpkgs.git";
+const SYSTEM_PROFILES_DIR: &str = "/nix/var/nix/profiles";
 const MAX_DEPLOYMENT_EVIDENCE_BYTES: u64 = 4 * 1024;
 const MAX_FLAKE_LOCK_BYTES: u64 = 8 * 1024 * 1024;
 const BEACON_HEALTH_PATH: &str = "/tmp/pharos-beacon-health-v1";
@@ -1308,7 +1309,24 @@ fn kernel_running_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/proc/sys/kernel/osrelease"))
 }
 
+/// Where the next boot's kernel is listed, when the system profile is visible.
+///
+/// `nixos-rebuild boot` moves only this profile, so `/run/current-system` misses
+/// a staged kernel. A bind of the resolved modules path is fixed when the
+/// container starts, so seeing later generations takes the profiles directory
+/// and the store, each mounted read-only at its own path. Once the profile is
+/// there it decides: if it no longer resolves the answer is unknown, not an
+/// older directory.
+fn next_boot_modules_dir(profiles: &Path) -> Option<PathBuf> {
+    std::fs::symlink_metadata(profiles.join("system"))
+        .is_ok()
+        .then(|| profiles.join("system/kernel-modules/lib/modules"))
+}
+
 fn kernel_expected_modules_dir() -> PathBuf {
+    if let Some(path) = next_boot_modules_dir(Path::new(SYSTEM_PROFILES_DIR)) {
+        return path;
+    }
     if let Some(path) = env_value("PHAROS_CURRENT_KERNEL_MODULES_DIR") {
         return PathBuf::from(path);
     }
@@ -4234,6 +4252,87 @@ mod tests {
         );
         staged.validate_contract().expect("staged posture valid");
         std::fs::remove_dir_all(staged_root).expect("remove staged fixture");
+    }
+
+    /// A store path holding a system whose `kernel-modules` links to a second
+    /// store path, the way a NixOS generation does.
+    fn write_generation(root: &Path, generation: u32, kernel: &str) {
+        let store = root.join("store");
+        let modules = store.join(format!("modules-{kernel}"));
+        std::fs::create_dir_all(modules.join("lib/modules").join(kernel)).expect("modules");
+        let system = store.join(format!("system-{generation}"));
+        std::fs::create_dir_all(&system).expect("system");
+        std::os::unix::fs::symlink(&modules, system.join("kernel-modules")).expect("link modules");
+        std::os::unix::fs::symlink(
+            &system,
+            root.join("profiles")
+                .join(format!("system-{generation}-link")),
+        )
+        .expect("link generation");
+    }
+
+    /// Moves the profile the way Nix does: a new name, then a rename over it.
+    fn point_system_profile_at(root: &Path, generation: u32) {
+        let profiles = root.join("profiles");
+        let next = profiles.join("system.next");
+        std::os::unix::fs::symlink(format!("system-{generation}-link"), &next).expect("link");
+        std::fs::rename(next, profiles.join("system")).expect("move profile");
+    }
+
+    #[test]
+    fn expected_kernel_follows_the_system_profile_through_a_staged_boot() {
+        let root = kernel_fixture("profile");
+        let profiles = root.join("profiles");
+        std::fs::create_dir_all(&profiles).expect("profiles");
+        let running = root.join("osrelease");
+        std::fs::write(&running, "6.18.26\n").expect("running kernel");
+        write_generation(&root, 1, "6.18.26");
+        point_system_profile_at(&root, 1);
+        let modules = next_boot_modules_dir(&profiles).expect("profile present");
+
+        let before = collect_kernel_posture_at(true, 100, &running, &modules);
+        assert_eq!(before.state, pharos_core::KernelPostureState::Current);
+
+        // `nixos-rebuild boot`: only the profile moves, and the path stays valid.
+        write_generation(&root, 2, "7.0.14");
+        point_system_profile_at(&root, 2);
+        let staged = collect_kernel_posture_at(true, 200, &running, &modules);
+        assert_eq!(
+            staged.state,
+            pharos_core::KernelPostureState::RebootRequired
+        );
+        assert_eq!(staged.running_version.as_deref(), Some("6.18.26"));
+        assert_eq!(staged.expected_version.as_deref(), Some("7.0.14"));
+        staged.validate_contract().expect("staged posture valid");
+
+        // The reboot.
+        std::fs::write(&running, "7.0.14\n").expect("running kernel");
+        let after = collect_kernel_posture_at(true, 300, &running, &modules);
+        assert_eq!(after.state, pharos_core::KernelPostureState::Current);
+
+        std::fs::remove_dir_all(root).expect("remove profile fixture");
+    }
+
+    #[test]
+    fn a_profile_that_no_longer_resolves_is_unknown_and_no_profile_falls_back() {
+        let root = kernel_fixture("profile-gone");
+        let profiles = root.join("profiles");
+        std::fs::create_dir_all(&profiles).expect("profiles");
+        assert_eq!(next_boot_modules_dir(&profiles), None);
+        assert_eq!(next_boot_modules_dir(&root.join("no-mount")), None);
+
+        let running = root.join("osrelease");
+        std::fs::write(&running, "6.18.26\n").expect("running kernel");
+        write_generation(&root, 1, "6.18.26");
+        point_system_profile_at(&root, 1);
+        // The profiles directory is mounted but the store is not.
+        std::fs::remove_dir_all(root.join("store")).expect("remove store");
+        let modules = next_boot_modules_dir(&profiles).expect("the link itself is there");
+        let posture = collect_kernel_posture_at(true, 100, &running, &modules);
+        assert_eq!(posture.state, pharos_core::KernelPostureState::Unknown);
+        assert_eq!(posture.expected_version, None);
+
+        std::fs::remove_dir_all(root).expect("remove profile fixture");
     }
 
     #[test]

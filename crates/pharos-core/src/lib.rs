@@ -1516,6 +1516,8 @@ pub struct KernelPosture {
     pub state: KernelPostureState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running_version: Option<String>,
+    /// The kernel a reboot would run. Beacons that cannot see the system profile
+    /// report the active system's kernel here instead, which misses a staged boot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
     pub observed_at: UnixSeconds,
