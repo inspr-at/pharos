@@ -22,7 +22,7 @@ function freeLoopbackPort() {
   });
 }
 
-execFileSync("cargo", ["build", "-p", "pharosd", "--locked"], {
+execFileSync("cargo", ["build", "-p", "pharosd", "-p", "pharos-cli", "--locked"], {
   cwd: repoRoot,
   env: { ...process.env, CARGO_TARGET_DIR: path.join(repoRoot, "target") },
   stdio: "inherit",

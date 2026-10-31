@@ -1,6 +1,7 @@
 // A fictional fleet with one host in every state the pages can show. Times are
 // relative to now, so a state never ages out from under a test. Only example
 // names and documentation addresses belong here: this repository is public.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -324,6 +325,14 @@ function writeJson(file, value, mode = 0o644) {
 /** Everything the servers read from the run directory. */
 export function writeFixtures(runDir, port) {
   const now = Math.floor(Date.now() / 1000);
+  // A token for this run only. The server gets its hash, the CLI the token.
+  const token = crypto.randomBytes(32).toString("hex");
+  fs.writeFileSync(path.join(runDir, "operator-token"), token, { mode: 0o600 });
+  fs.writeFileSync(
+    path.join(runDir, "operator-token.sha256"),
+    crypto.createHash("sha256").update(token).digest("hex"),
+    { mode: 0o600 },
+  );
   writeJson(path.join(runDir, "fleet.json"), fleetData(now));
   // One CVE fewer, so the fixed card is on the watchlist instead of past its end.
   const flaky = fleetData(now);

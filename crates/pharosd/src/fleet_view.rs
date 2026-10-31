@@ -60,6 +60,16 @@ pub(crate) fn span(seconds: u64) -> String {
     }
 }
 
+/// The same in a table's width: "12m", "5h", "2d".
+pub(crate) fn short_span(seconds: u64) -> String {
+    match seconds {
+        seconds if seconds < 60 => "<1m".to_string(),
+        seconds if seconds < 3_600 => format!("{}m", seconds / 60),
+        seconds if seconds < 86_400 => format!("{}h", seconds / 3_600),
+        seconds => format!("{}d", seconds / 86_400),
+    }
+}
+
 /// `major.minor` of a plain kernel version, for naming the missing fix line.
 fn kernel_branch(version: &str) -> Option<String> {
     let parts: Vec<&str> = version.split('.').collect();
@@ -295,7 +305,6 @@ impl FleetView {
         fleet_data: Option<FleetDataView>,
         hosts: Vec<Host>,
         probes: BTreeMap<String, HostProbeObservation>,
-        allows: impl Fn(&str) -> bool,
         now: i64,
     ) -> Self {
         let configured = fleet_data.is_some();
@@ -310,7 +319,7 @@ impl FleetView {
         let mut rows = Vec::new();
         if let Some(data) = data.as_deref() {
             for (section, entry) in data.sections.iter().enumerate() {
-                for host in entry.hosts.iter().filter(|host| allows(&host.name)) {
+                for host in &entry.hosts {
                     let report = reports.remove(&host.name);
                     let probe = probes.remove(&host.name);
                     rows.push(host_row(
@@ -327,12 +336,7 @@ impl FleetView {
         }
         // Anything that reports or answers but is not in the file stays on the
         // page, in its own group, so nothing vanishes silently.
-        let others: BTreeSet<String> = reports
-            .keys()
-            .chain(probes.keys())
-            .filter(|name| allows(name))
-            .cloned()
-            .collect();
+        let others: BTreeSet<String> = reports.keys().chain(probes.keys()).cloned().collect();
         for name in others {
             let report = reports.remove(&name);
             let probe = probes.remove(&name);
@@ -573,11 +577,7 @@ mod tests {
         }
     }
 
-    fn view(
-        hosts: Vec<Host>,
-        probes: Vec<(&str, HostProbeObservation)>,
-        allows: impl Fn(&str) -> bool,
-    ) -> FleetView {
+    fn view(hosts: Vec<Host>, probes: Vec<(&str, HostProbeObservation)>) -> FleetView {
         FleetView::build(
             Some(FleetDataView {
                 data: Some(Arc::new(fleet())),
@@ -588,7 +588,6 @@ mod tests {
                 .into_iter()
                 .map(|(name, probe)| (name.to_string(), probe))
                 .collect(),
-            allows,
             NOW,
         )
     }
@@ -598,7 +597,6 @@ mod tests {
         let view = view(
             vec![report("nyx", "6.18.56")],
             vec![("charon", probe(Some(true)))],
-            |_| true,
         );
         let names: Vec<&str> = view.rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["ares", "artemis", "apollo", "charon", "nyx"]);
@@ -610,29 +608,14 @@ mod tests {
     }
 
     #[test]
-    fn a_limited_grant_hides_declared_reported_and_probed_hosts_alike() {
-        let view = view(
-            vec![report("ares", "6.18.56"), report("nyx", "6.18.56")],
-            vec![
-                ("artemis", probe(Some(true))),
-                ("charon", probe(Some(true))),
-            ],
-            |name| name == "ares",
-        );
-        let names: Vec<&str> = view.rows.iter().map(|row| row.name.as_str()).collect();
-        assert_eq!(names, ["ares"]);
-        assert_eq!(view.last_report(), Some(NOW - 60));
-    }
-
-    #[test]
     fn a_fixed_cve_comes_after_the_open_ones_on_the_watchlist() {
-        let view = view(Vec::new(), Vec::new(), |_| true);
+        let view = view(Vec::new(), Vec::new());
         assert_eq!(view.watchlist, [1, 2, 0]);
     }
 
     #[test]
     fn security_counts_what_is_open_and_names_one_shared_reason() {
-        let view = view(vec![report("ares", "6.18.52")], Vec::new(), |_| true);
+        let view = view(vec![report("ares", "6.18.52")], Vec::new());
         let ares = view.row("ares").unwrap().security(&view);
         assert_eq!(ares.by_severity, [1, 0, 0, 0]);
         assert_eq!(ares.affected(), 1);
@@ -651,7 +634,7 @@ mod tests {
         let kernel = host.kernel.as_mut().unwrap();
         kernel.state = KernelPostureState::RebootRequired;
         kernel.expected_version = Some("6.18.56".to_string());
-        let view = view(vec![host], Vec::new(), |_| true);
+        let view = view(vec![host], Vec::new());
         let row = view.row("ares").unwrap();
         assert_eq!(row.on(1).unwrap().status.status, CveStatus::RebootDue);
         assert_eq!(row.security(&view).by_severity, [1, 0, 0, 0]);
@@ -661,7 +644,7 @@ mod tests {
 
     #[test]
     fn different_reasons_are_not_collapsed_into_one() {
-        let view = view(vec![report("ares", "5.4.1")], Vec::new(), |_| true);
+        let view = view(vec![report("ares", "5.4.1")], Vec::new());
         let ares = view.row("ares").unwrap().security(&view);
         assert_eq!(ares.unknown, 3);
         assert_eq!(ares.reason, None);
@@ -678,7 +661,6 @@ mod tests {
         let view = view(
             vec![report("ares", "6.18.52"), report("nyx", "6.18.56")],
             Vec::new(),
-            |_| true,
         );
         let rank = |name| view.row(name).unwrap().attention_rank(&view);
         // Critical, then high, then only things that cannot be checked.
@@ -689,7 +671,7 @@ mod tests {
 
     #[test]
     fn the_oldest_hand_check_decides_how_old_a_declaration_is() {
-        let view = view(Vec::new(), Vec::new(), |_| true);
+        let view = view(Vec::new(), Vec::new());
         let artemis = view.row("artemis").unwrap();
         let (at, stale) = artemis.declared_check(&view).unwrap();
         assert_eq!(at, verified_at("2000-02-20T00:00:00Z"));
@@ -704,7 +686,6 @@ mod tests {
         let view = view(
             vec![report("ares", "6.18.52"), report("nyx", "6.18.56")],
             Vec::new(),
-            |_| true,
         );
         let names = |statuses: &[CveStatus]| -> Vec<String> {
             view.hosts_with(1, statuses)

@@ -85,11 +85,11 @@ seconds). Without it, the beacon reports once and exits.
 | `GET /`                                   | Login        | Fleet page                              |
 | `GET /updates`, `/handled`                | Login        | Updates due, handled CVEs               |
 | `GET /cves/{id}`, `/hosts/{name}`         | Login        | One CVE, one host                       |
-| `GET /hosts.json`                         | Login        | Fleet data, filtered by access grant    |
+| `GET /hosts.json`, `/fleet.json`          | Login, token | Fleet data; the operator token only reads|
 | `POST /report`                            | Beacon token | Beacon report                           |
 | `POST /register`                          | Bootstrap    | Off by default; issue or rotate a token |
 | `GET /healthz`, `/readyz`, `/version`     | Public       | Health and build metadata               |
-| `/auth/*`                                 | Public       | OIDC login, recovery and logout         |
+| `/auth/*`                                 | Public       | Sign-in, OIDC, recovery and sign-out    |
 | `GET /assets/*`, `/favicon.svg`           | Public       | Page assets; no host data               |
 
 With `PHAROS_PUBLIC_BASE_PATH`, browser routes live under that prefix. Machine
@@ -109,7 +109,7 @@ routes answer both there and at the origin root.
 | `PHAROS_OIDC_ISSUER`, `_CLIENT_ID`, `_REDIRECT_URI`            | OIDC login, all or none                                                         |
 | `PHAROS_OIDC_CA_FILE`                                          | Optional read-only PEM CA bundle for OIDC requests                              |
 | `PHAROS_ALLOWED_OPERATORS`                                     | `operator-ref:<sha256>`, `verified-email-ref:<sha256>` or `email:<address>`     |
-| `PHAROS_ACCESS_POLICY_FILE`                                    | Optional per-identifier host scopes                                             |
+| `PHAROS_OPERATOR_TOKEN_HASH_FILE`                              | Optional read-only CLI access: the token's SHA-256 as 64 lowercase hex digits   |
 | `PHAROS_ALLOW_LOCAL_REGISTER`                                  | `true` switches on `POST /register`, otherwise it answers 410; needs the file   |
 | `PHAROS_REGISTRATION_TOKEN_FILE`                               | Bootstrap token for `POST /register`; read only when registration is on         |
 | `PHAROS_REQUIRE_BEACON_TOKEN`                                  | Optional; tokens are always required, and `false` refuses startup               |
@@ -118,19 +118,44 @@ routes answer both there and at the origin root.
 | `PHAROS_HTTP_PROBES_PATH`                                      | Optional `inspr.pharos.http-probes.v1` registry                                 |
 | `PHAROS_HOST_PROBES_PATH`                                      | Optional `inspr.pharos.host-probes.v1` registry; requires `PHAROS_DB`           |
 
-Startup fails closed: partial OIDC settings or open mode on a non-loopback
-address stop the server.
+Startup fails closed: partial OIDC settings, open mode on a non-loopback address
+or an unreadable token hash file stop the server. The hash file is read once, so
+rotating the token means a restart.
+
+## CLI
+
+`pharos` reads what the pages show, as plain tables. It changes nothing.
+
+```sh
+export PHAROS_URL=https://pharos.example.test
+export PHAROS_OPERATOR_TOKEN_FILE=~/.config/pharos/operator-token   # mode 0600
+pharos health            # exits 1 while the data file can't be used
+pharos version
+pharos hosts
+pharos beacon [HOST]
+pharos beacon last-seen [HOST]
+pharos cves
+pharos updates
+```
+
+`health` and `version` work without a token and say more with one; everything
+else needs it. A rejected token fails the command.
 
 ## Trust model
 
 - Human and machine routes are separate. A bearer credential is refused on
   human routes and never falls back to a cookie or open mode.
+- A sign-in outside `PHAROS_ALLOWED_OPERATORS` is refused with no session. The
+  list is required on anything but a loopback listener.
+- The operator token opens `/hosts.json` and `/fleet.json` and nothing else. Both
+  only answer GET, and a test holds every route that can write against it. Pharos
+  holds only its hash.
 - Every report needs a beacon token. Tokens are stored only as SHA-256 hashes and
   compared in constant time. A wrong token, no token or an unknown host gets 401.
 - Registration is off by default. The store is the only copy of the hashes, so
   back it up. [RUNBOOK.md](RUNBOOK.md) covers adding a host, rotating a token and
   recovering a lost store.
-- `/hosts.json` is built from named fields, so the stored hash cannot reach it.
+- The data routes are built from named fields, so the stored hash cannot reach them.
 - Pharos never stores or returns raw tokens, private keys, secret contents or
   credential-bearing URLs.
 - HTML responses carry a per-response nonce CSP. Assets are local; the page

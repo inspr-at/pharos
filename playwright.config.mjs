@@ -55,6 +55,7 @@ export default defineConfig({
       PHAROS_DB: path.join(runDir, "hosts.json"),
       PHAROS_FLEET_DATA_FILE: path.join(runDir, "fleet.json"),
       PHAROS_HOST_PROBES_PATH: path.join(runDir, "host-probes.json"),
+      PHAROS_OPERATOR_TOKEN_HASH_FILE: path.join(runDir, "operator-token.sha256"),
     }),
     // No data file configured.
     server(barePort, { PHAROS_DB: path.join(runDir, "bare-hosts.json") }),
@@ -62,6 +63,7 @@ export default defineConfig({
     server(flakyPort, {
       PHAROS_DB: path.join(runDir, "flaky-hosts.json"),
       PHAROS_FLEET_DATA_FILE: path.join(runDir, "flaky-fleet.json"),
+      PHAROS_OPERATOR_TOKEN_HASH_FILE: path.join(runDir, "operator-token.sha256"),
     }),
   ],
 });

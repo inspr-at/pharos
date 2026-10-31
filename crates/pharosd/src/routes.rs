@@ -5,11 +5,17 @@ use super::*;
 fn human_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(home))
-        .route("/hosts.json", get(hosts_json))
         .route("/updates", get(updates_page))
         .route("/handled", get(handled_page))
         .route("/cves/{id}", get(cve_page))
         .route("/hosts/{name}", get(host_page))
+}
+
+/// What the read-only operator token opens. Nothing here may change state.
+fn data_routes() -> Router<AppState> {
+    Router::new()
+        .route("/hosts.json", get(hosts_json))
+        .route("/fleet.json", get(fleet_json))
 }
 
 /// Stable machine surface. With a configured browser prefix these routes are
@@ -42,6 +48,7 @@ fn browser_public_routes() -> Router<AppState> {
             "/assets/vendor/calendar-version-display/{name}",
             get(calendar_version_bundle_asset),
         )
+        .route("/auth/sign-in", get(auth::sign_in))
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         .route("/auth/recover", get(auth::recover))
@@ -59,6 +66,10 @@ pub(super) fn build_router(state: AppState) -> Router {
     let public_base_path = state.public_base_path.clone();
     let inner = human_routes()
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
+        .merge(data_routes().route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::data_guard,
+        )))
         .merge(machine_and_public_routes());
     if public_base_path.is_root() {
         inner
@@ -99,6 +110,7 @@ mod tests {
     #[test]
     fn protected_and_public_route_groups_build_independently() {
         assert!(human_routes().has_routes());
+        assert!(data_routes().has_routes());
         assert!(machine_routes().has_routes());
         assert!(browser_public_routes().has_routes());
         assert!(machine_and_public_routes().has_routes());

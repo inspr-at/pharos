@@ -20,7 +20,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::*;
-use crate::fleet_view::{short_date, short_day, span, CveOnHost, FleetView, HostRow};
+use crate::fleet_view::{short_date, short_day, short_span, span, CveOnHost, FleetView, HostRow};
 use crate::icons::{icon, sprite, WAVE};
 
 const WATCH_CARDS: usize = 4;
@@ -90,7 +90,7 @@ fn verified_text(last_verified: Option<&str>, now: i64) -> String {
         )
 }
 
-fn severity_parts(severity: CveSeverity) -> (&'static str, &'static str, &'static str) {
+pub(crate) fn severity_parts(severity: CveSeverity) -> (&'static str, &'static str, &'static str) {
     match severity {
         CveSeverity::Critical => ("Critical", "sev-critical", "critical"),
         CveSeverity::High => ("High", "sev-high", "high"),
@@ -106,7 +106,7 @@ const SEVERITIES: [CveSeverity; 4] = [
     CveSeverity::Low,
 ];
 
-fn cve_title(cve: &FleetCve) -> &str {
+pub(crate) fn cve_title(cve: &FleetCve) -> &str {
     cve.name.as_deref().unwrap_or(&cve.id)
 }
 
@@ -153,7 +153,7 @@ fn contact_icon(contact: &HostContact) -> &'static str {
     }
 }
 
-fn contact_label(contact: &HostContact) -> String {
+pub(crate) fn contact_label(contact: &HostContact) -> String {
     let age = contact.age_secs.unwrap_or_default();
     match contact.state {
         ContactState::Online => format!("Online · {}", ago(age)),
@@ -175,6 +175,29 @@ fn contact_label(contact: &HostContact) -> String {
     }
 }
 
+/// A contact state in a table's width, for the CLI.
+pub(crate) fn contact_short_label(contact: &HostContact) -> String {
+    let age = short_span(contact.age_secs.unwrap_or_default());
+    match contact.state {
+        ContactState::Online => format!("online {age}"),
+        ContactState::Reachable => format!("reachable {age}"),
+        ContactState::Late => format!("late {age}"),
+        ContactState::Offline => format!("offline {age}"),
+        ContactState::Asleep { over_days: None } => format!("asleep {age}"),
+        ContactState::Asleep {
+            over_days: Some(days),
+        } => format!("asleep {age}, over {days}d"),
+        ContactState::OfflineOptional => format!("offline {age}, optional"),
+        ContactState::NoAnswerYet => "no answer yet".to_string(),
+        ContactState::CheckUnavailable if contact.age_secs.is_some() => {
+            format!("can't check, last {age}")
+        }
+        ContactState::CheckUnavailable => "no result yet".to_string(),
+        ContactState::NoContactData => "no contact data".to_string(),
+        ContactState::NeverReported => "never".to_string(),
+    }
+}
+
 /// The source line under a contact state, with its icon.
 fn contact_source(row: &HostRow) -> (&'static str, &'static str) {
     match row.contact.source {
@@ -193,7 +216,7 @@ fn contact_source(row: &HostRow) -> (&'static str, &'static str) {
     }
 }
 
-fn contact_short_source(row: &HostRow) -> &'static str {
+pub(crate) fn contact_short_source(row: &HostRow) -> &'static str {
     match row.contact.source {
         ContactSource::Beacon => "Beacon",
         ContactSource::Probe => "Probe",
@@ -201,7 +224,7 @@ fn contact_short_source(row: &HostRow) -> &'static str {
     }
 }
 
-fn data_age(view: &FleetView) -> Option<String> {
+pub(crate) fn data_age(view: &FleetView) -> Option<String> {
     view.data
         .as_deref()
         .and_then(FleetData::updated_at_unix)
@@ -381,17 +404,27 @@ fn metric(class: &str, icon_name: &str, value: u32, label: &str) -> String {
     )
 }
 
-fn security_line(view: &FleetView, row: &HostRow) -> String {
+/// What a security cell says, each part with the class it is drawn in.
+struct SecurityCell {
+    icon: &'static str,
+    icon_class: &'static str,
+    parts: Vec<(&'static str, String)>,
+}
+
+fn security_cell(view: &FleetView, row: &HostRow) -> SecurityCell {
     let security = row.security(view);
-    let parts: Vec<String> = SEVERITIES
+    let mut parts: Vec<(&'static str, String)> = SEVERITIES
         .iter()
         .filter(|severity| security.by_severity[**severity as usize] > 0)
         .map(|severity| {
-            let (_, class, _) = severity_parts(*severity);
-            format!(
-                r#"<span class="sevc {class}">{} {}</span>"#,
-                security.by_severity[*severity as usize],
-                severity_parts(*severity).0.to_lowercase(),
+            let (label, class, _) = severity_parts(*severity);
+            (
+                class,
+                format!(
+                    "{} {}",
+                    security.by_severity[*severity as usize],
+                    label.to_lowercase()
+                ),
             )
         })
         .collect();
@@ -400,50 +433,78 @@ fn security_line(view: &FleetView, row: &HostRow) -> String {
         .find(|severity| security.by_severity[**severity as usize] > 0)
     {
         let (_, class, icon_name) = severity_parts(*top);
-        let unknown = if security.unknown > 0 {
-            format!(
-                r#" · <span class="ink2">{} can't check</span>"#,
-                security.unknown
-            )
-        } else {
-            String::new()
+        if security.unknown > 0 {
+            parts.push(("ink2", format!("{} can't check", security.unknown)));
+        }
+        return SecurityCell {
+            icon: icon_name,
+            icon_class: class,
+            parts,
         };
-        return format!(
-            r#"<span class="security-line">{}{}{unknown}</span>"#,
-            icon(icon_name, class),
-            parts.join(" · ")
-        );
     }
     if security.unknown > 0 {
         let reason = security
             .reason
             .as_deref()
-            .map(|reason| format!(": {}", e(reason)))
+            .map(|reason| format!(": {reason}"))
             .unwrap_or_default();
-        return format!(
-            r#"<span class="security-line">{}Can't check{reason}</span>"#,
-            icon("unknown", "muted")
-        );
+        return SecurityCell {
+            icon: "unknown",
+            icon_class: "muted",
+            parts: vec![("", format!("Can't check{reason}"))],
+        };
     }
+    SecurityCell {
+        icon: "check",
+        icon_class: "ok",
+        parts: vec![("", "No watched CVEs".to_string())],
+    }
+}
+
+fn security_line(view: &FleetView, row: &HostRow) -> String {
+    let cell = security_cell(view, row);
+    let parts: Vec<String> = cell
+        .parts
+        .iter()
+        .map(|(class, text)| match *class {
+            "" => e(text),
+            "ink2" => format!(r#"<span class="ink2">{}</span>"#, e(text)),
+            class => format!(r#"<span class="sevc {class}">{}</span>"#, e(text)),
+        })
+        .collect();
     format!(
-        r#"<span class="security-line">{}No watched CVEs</span>"#,
-        icon("check", "ok")
+        r#"<span class="security-line">{}{}</span>"#,
+        icon(cell.icon, cell.icon_class),
+        parts.join(" · ")
     )
 }
 
+/// The security cell in words, for the data routes.
+pub(crate) fn security_text(view: &FleetView, row: &HostRow) -> String {
+    security_cell(view, row)
+        .parts
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// The second line of a security cell: how current this host's picture is.
-fn update_note(view: &FleetView, row: &HostRow) -> String {
-    let state = |class: &str, icon_name: &str, text: String, stale: bool| {
-        let class = if class.is_empty() {
-            "update-state".to_string()
-        } else {
-            format!("update-state {class}")
-        };
-        let chip = if stale { stale_chip() } else { String::new() };
-        format!(
-            r#"<span class="{class}">{}{text}{chip}</span>"#,
-            icon(icon_name, "")
-        )
+pub(crate) struct UpdateNote {
+    class: &'static str,
+    icon: &'static str,
+    pub(crate) text: String,
+    pub(crate) stale: bool,
+}
+
+pub(crate) fn update_note_parts(view: &FleetView, row: &HostRow) -> Option<UpdateNote> {
+    let state = |class, icon, text, stale| {
+        Some(UpdateNote {
+            class,
+            icon,
+            text,
+            stale,
+        })
     };
     let report_age = match row.updates.source {
         UpdatesSource::Report {
@@ -500,7 +561,7 @@ fn update_note(view: &FleetView, row: &HostRow) -> String {
                 last_verified,
                 verification_stale,
             } => hand(last_verified.as_deref(), *verification_stale),
-            _ => String::new(),
+            _ => None,
         },
         UpdatesState::Unknown => match report_age {
             Some((age, true)) => state("", "clock", format!("Data from {}", ago(age)), true),
@@ -513,10 +574,31 @@ fn update_note(view: &FleetView, row: &HostRow) -> String {
                     stale,
                 ),
                 Some((None, stale)) => hand(None, stale),
-                None => String::new(),
+                None => None,
             },
         },
     }
+}
+
+fn update_note(view: &FleetView, row: &HostRow) -> String {
+    let Some(note) = update_note_parts(view, row) else {
+        return String::new();
+    };
+    let class = if note.class.is_empty() {
+        "update-state".to_string()
+    } else {
+        format!("update-state {}", note.class)
+    };
+    let chip = if note.stale {
+        stale_chip()
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<span class="{class}">{}{}{chip}</span>"#,
+        icon(note.icon, ""),
+        e(&note.text)
+    )
 }
 
 fn commits_behind(commits: u32) -> String {
@@ -744,16 +826,36 @@ fn hosts_count(count: usize) -> String {
     }
 }
 
+pub(crate) struct FleetCounts {
+    pub(crate) affected: u32,
+    pub(crate) unknown: u32,
+    pub(crate) reboots: u32,
+}
+
+/// The summary at the top of Fleet. A host with an affected CVE and one it can't
+/// check counts in both.
+pub(crate) fn fleet_counts(view: &FleetView) -> FleetCounts {
+    let mut counts = FleetCounts {
+        affected: 0,
+        unknown: 0,
+        reboots: 0,
+    };
+    for row in &view.rows {
+        let security = row.security(view);
+        counts.affected += u32::from(security.affected() > 0);
+        counts.unknown += u32::from(security.unknown > 0);
+        counts.reboots += u32::from(row.reboot_due());
+    }
+    counts
+}
+
 fn group_summary(view: &FleetView, rows: &[&HostRow]) -> String {
     let mut affected = 0;
     let mut unknown = 0;
     for row in rows {
         let security = row.security(view);
-        if security.affected() > 0 {
-            affected += 1;
-        } else if security.unknown > 0 {
-            unknown += 1;
-        }
+        affected += u32::from(security.affected() > 0);
+        unknown += u32::from(security.unknown > 0);
     }
     match (affected, unknown) {
         (0, 0) => "No watched CVEs".to_string(),
@@ -900,26 +1002,6 @@ fn watch_card(
     } else {
         format!(r#"<span class="chips">{chips}</span>"#)
     };
-    let affected = view.hosts_with(index, &[CveStatus::Affected]).len();
-    let reboot = view.hosts_with(index, &[CveStatus::RebootDue]).len();
-    let unknown = view.hosts_with(index, &[CveStatus::Unknown]).len();
-    let fixed = view.hosts_with(index, &[CveStatus::Fixed]).len();
-    let mut counts = Vec::new();
-    if affected > 0 {
-        counts.push(format!("{affected} affected"));
-    }
-    if reboot > 0 {
-        counts.push(format!("{reboot} reboot due"));
-    }
-    if affected == 0 && reboot == 0 {
-        if fixed > 0 {
-            counts.push(format!("{fixed} fixed"));
-        }
-        counts.push("none affected".to_string());
-    }
-    if unknown > 0 {
-        counts.push(format!("{unknown} can't check"));
-    }
     let source = if cve.component == KERNEL_COMPONENT {
         format!(
             r#"<span class="wnote">{}Computed from kernel</span>"#,
@@ -952,8 +1034,33 @@ fn watch_card(
         severity_icon = icon(severity_icon, ""),
         name = e(cve_title(cve)),
         id = e(&cve.id),
-        counts = counts.join(" · "),
+        counts = watch_counts(view, index),
     )
+}
+
+/// One watched CVE across the fleet, in words: the card's line and the CLI's.
+pub(crate) fn watch_counts(view: &FleetView, index: usize) -> String {
+    let affected = view.hosts_with(index, &[CveStatus::Affected]).len();
+    let reboot = view.hosts_with(index, &[CveStatus::RebootDue]).len();
+    let unknown = view.hosts_with(index, &[CveStatus::Unknown]).len();
+    let fixed = view.hosts_with(index, &[CveStatus::Fixed]).len();
+    let mut counts = Vec::new();
+    if affected > 0 {
+        counts.push(format!("{affected} affected"));
+    }
+    if reboot > 0 {
+        counts.push(format!("{reboot} reboot due"));
+    }
+    if affected == 0 && reboot == 0 {
+        if fixed > 0 {
+            counts.push(format!("{fixed} fixed"));
+        }
+        counts.push("none affected".to_string());
+    }
+    if unknown > 0 {
+        counts.push(format!("{unknown} can't check"));
+    }
+    counts.join(" · ")
 }
 
 fn watchlist_html(
@@ -1165,20 +1272,11 @@ pub(super) fn render_fleet(
             .find(|index| data.cves.get(*index).is_some_and(|cve| cve.id == id))
     });
 
-    let mut affected = 0;
-    let mut unknown = 0;
-    let mut reboots = 0;
-    for row in &view.rows {
-        let security = row.security(view);
-        if security.affected() > 0 {
-            affected += 1;
-        } else if security.unknown > 0 {
-            unknown += 1;
-        }
-        if row.reboot_due() {
-            reboots += 1;
-        }
-    }
+    let FleetCounts {
+        affected,
+        unknown,
+        reboots,
+    } = fleet_counts(view);
     let metrics = format!(
         r#"<section class="metrics" aria-label="Fleet summary">{}{}{}{}</section>"#,
         metric("", "server", view.rows.len() as u32, "hosts"),
@@ -1378,6 +1476,20 @@ fn updates_row(
         b = headers[1],
         c = headers[2],
     )
+}
+
+/// What a host is waiting for, in the Updates page's words.
+pub(crate) fn due_text(row: &HostRow) -> String {
+    row.updates
+        .due
+        .iter()
+        .map(|due| match due {
+            UpdateDue::Reboot { .. } => "Reboot due".to_string(),
+            UpdateDue::BehindConfig { commits } => commits_behind(*commits),
+            UpdateDue::OldNixpkgs { age_days } => format!("Lock {age_days} d old"),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn report_age(row: &HostRow) -> Option<u64> {
@@ -2601,7 +2713,6 @@ mod tests {
             }),
             hosts,
             BTreeMap::<String, HostProbeObservation>::new(),
-            |_| true,
             NOW,
         )
     }
@@ -2758,7 +2869,6 @@ mod tests {
             None,
             Vec::new(),
             BTreeMap::<String, HostProbeObservation>::new(),
-            |_| true,
             NOW,
         );
         assert!(fleet_page(&unconfigured).contains("No data file is configured."));
@@ -2912,7 +3022,6 @@ mod tests {
             }),
             Vec::new(),
             probes,
-            |_| true,
             NOW,
         );
         let page = fleet_page(&view);

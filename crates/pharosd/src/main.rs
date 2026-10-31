@@ -8,6 +8,7 @@ mod auth;
 #[path = "../build_support.rs"]
 mod build_support;
 mod durable_file;
+mod fleet_api;
 mod fleet_data;
 mod fleet_view;
 mod host_probes;
@@ -42,7 +43,8 @@ use pharos_core::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState, AuthUser};
+use crate::auth::{Auth, AuthConfig, AuthState, AuthUser};
+use crate::fleet_api::fleet_json;
 use crate::fleet_data::{spawn_fleet_data_loop, FleetDataRuntime};
 use crate::host_probes::{spawn_host_probe_loop, HostProbeRuntime};
 use crate::http_probes::{spawn_http_probe_loops, HttpProbeRuntime};
@@ -62,6 +64,7 @@ struct AppState {
     host_probes: Option<Arc<HostProbeRuntime>>,
     fleet_data: Option<Arc<FleetDataRuntime>>,
     public_base_path: PublicBasePath,
+    started_at: i64,
 }
 
 impl FromRef<AppState> for AuthState {
@@ -387,25 +390,24 @@ fn fleet_data_payload(runtime: Option<&FleetDataRuntime>, now: i64) -> serde_jso
     })
 }
 
-async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+async fn hosts_json(State(state): State<AppState>) -> impl IntoResponse {
     let now = now_unix();
-    let access = access_for_headers(&state.auth, &headers);
-    let hosts: Vec<_> = filter_hosts_by_access(state.store.list(), &access)
+    let hosts: Vec<_> = state
+        .store
+        .list()
         .iter()
         .map(|host| host_payload(host, now))
         .collect();
-    let mut server_probes = state
+    let server_probes = state
         .http_probes
         .as_deref()
         .map(|runtime| runtime.snapshot(now))
         .unwrap_or_default();
-    server_probes.retain(|host, _| access.allows_host(host));
-    let mut host_probes = state
+    let host_probes = state
         .host_probes
         .as_deref()
         .map(|runtime| runtime.snapshot(now))
         .unwrap_or_default();
-    host_probes.retain(|host, _| access.allows_host(host));
     (
         no_store_headers(),
         Json(json!({
@@ -567,13 +569,6 @@ fn no_store_html(state: &AppState, body: String) -> impl IntoResponse {
     )
 }
 
-fn filter_hosts_by_access(hosts: Vec<Host>, access: &AccessGrant) -> Vec<Host> {
-    hosts
-        .into_iter()
-        .filter(|host| access.allows_host(&host.name))
-        .collect()
-}
-
 #[tokio::main]
 async fn main() {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("healthcheck")) {
@@ -625,6 +620,7 @@ async fn main() {
         host_probes: host_probes.clone(),
         fleet_data: FleetDataRuntime::from_env(),
         public_base_path: startup.public_base_path.clone(),
+        started_at: now_unix(),
     };
     if let Some(runtime) = host_probes {
         spawn_host_probe_loop(runtime);
@@ -691,6 +687,7 @@ mod tests {
             host_probes: None,
             fleet_data: None,
             public_base_path: PublicBasePath::root(),
+            started_at: now_unix(),
         }
     }
 
@@ -1491,41 +1488,149 @@ mod tests {
         assert_eq!(trailing.headers()[header::LOCATION.as_str()], "/pharos");
     }
 
+    /// Every route whose handler can take a write, read from the source so a new
+    /// one cannot be missed.
+    fn mutating_routes() -> Vec<String> {
+        let mut routes: Vec<String> = include_str!("routes.rs")
+            .split(".route(")
+            .skip(1)
+            .filter(|tail| {
+                ["post(", "put(", "patch(", "delete("]
+                    .iter()
+                    .any(|method| tail.contains(method))
+            })
+            .filter_map(|tail| tail.trim_start().strip_prefix('"'))
+            .filter_map(|tail| tail.split('"').next())
+            .map(ToString::to_string)
+            .collect();
+        routes.sort();
+        routes
+    }
+
     #[tokio::test]
-    async fn host_data_and_page_follow_the_access_grant() {
+    async fn the_operator_token_reads_data_and_changes_nothing() {
         let mut state = report_test_state();
-        register_test_token(&state, "ares", "ares-token");
-        register_test_token(&state, "hermes", "hermes-token");
-        state.auth = AuthState::for_test_access(AccessGrant::limited(["ares"]));
+        register_test_token(&state, "ares", "ares-beacon-token");
+        state.auth = AuthState::for_test_operator_token("operator-read-token");
+        let store = state.store.clone();
+        let before = store.list();
         let base = serve_test_app(state).await;
         let client = test_client();
+        let bearer = |token: &str| format!("Bearer {token}");
 
-        let payload: serde_json::Value = client
-            .get(format!("{base}/hosts.json"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let names: Vec<_> = payload["hosts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|host| host["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, ["ares"]);
+        for path in ["/hosts.json", "/fleet.json"] {
+            let url = format!("{base}{path}");
+            let read = client
+                .get(&url)
+                .header("authorization", bearer("operator-read-token"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(read.status(), reqwest::StatusCode::OK, "{path}");
+            assert!(read.text().await.unwrap().contains("ares"), "{path}");
 
+            for token in ["wrong-token", "ares-beacon-token", ""] {
+                let refused = client
+                    .get(&url)
+                    .header("authorization", bearer(token))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    refused.status(),
+                    reqwest::StatusCode::UNAUTHORIZED,
+                    "{path}"
+                );
+                assert!(!refused.text().await.unwrap().contains("ares"), "{path}");
+            }
+
+            // These routes only read: no method that writes is routed at all.
+            for method in [
+                reqwest::Method::POST,
+                reqwest::Method::PUT,
+                reqwest::Method::PATCH,
+                reqwest::Method::DELETE,
+            ] {
+                let write = client
+                    .request(method.clone(), &url)
+                    .header("authorization", bearer("operator-read-token"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    write.status(),
+                    reqwest::StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path}"
+                );
+            }
+        }
+
+        // Pages are for people, and a token never opens one.
         let page = client
             .get(format!("{base}/"))
+            .header("authorization", bearer("operator-read-token"))
             .send()
             .await
-            .unwrap()
-            .text()
+            .unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // Every route that can change state refuses it, with a well-formed request.
+        assert_eq!(mutating_routes(), ["/auth/logout", "/register", "/report"]);
+        let report = client
+            .post(format!("{base}/report"))
+            .header("authorization", bearer("operator-read-token"))
+            .json(&test_report("ares"))
+            .send()
             .await
             .unwrap();
-        assert!(page.contains("ares"));
-        assert!(!page.contains("hermes"));
+        assert_eq!(report.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let register = client
+            .post(format!("{base}/register"))
+            .header("authorization", bearer("operator-read-token"))
+            .json(&json!({
+                "schema": pharos_core::HOST_REGISTRATION_SCHEMA,
+                "version": pharos_core::HOST_REGISTRATION_VERSION,
+                "name": "new-host",
+                "role": "server",
+                "is_nix": true,
+                "heartbeat_interval_secs": 60,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(register.status().is_client_error(), "{}", register.status());
+        let logout = client
+            .post(format!("{base}/auth/logout"))
+            .header("authorization", bearer("operator-read-token"))
+            .form(&[("csrf", "operator-read-token")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let after = store.list();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0].last_seen, before[0].last_seen);
+        assert_eq!(after[0].token_hash, before[0].token_hash);
+    }
+
+    #[test]
+    fn auth_has_no_way_to_reach_janus() {
+        let auth = include_str!("auth.rs").to_lowercase();
+        assert!(!auth.contains("janus"));
+    }
+
+    #[tokio::test]
+    async fn without_an_operator_token_configured_no_bearer_opens_data() {
+        let state = report_test_state();
+        let base = serve_test_app(state).await;
+        let refused = test_client()
+            .get(format!("{base}/fleet.json"))
+            .header("authorization", "Bearer anything")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

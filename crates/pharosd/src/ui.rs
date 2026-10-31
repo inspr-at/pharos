@@ -100,10 +100,9 @@ pub(super) struct FleetParams {
     q: Option<String>,
 }
 
-/// Everything a page shows, for this viewer, at this moment.
-fn fleet_view(state: &AppState, headers: &HeaderMap) -> FleetView {
+/// Everything a page shows at this moment.
+pub(super) fn fleet_view(state: &AppState) -> FleetView {
     let now = now_unix();
-    let access = access_for_headers(&state.auth, headers);
     let probes = state
         .host_probes
         .as_deref()
@@ -113,7 +112,6 @@ fn fleet_view(state: &AppState, headers: &HeaderMap) -> FleetView {
         state.fleet_data.as_deref().map(FleetDataRuntime::view),
         state.store.list(),
         probes,
-        |host| access.allows_host(host),
         now,
     )
 }
@@ -133,7 +131,7 @@ pub(super) async fn home(
         render_fleet(
             &state.public_base_path,
             state.auth.human_user(&headers).as_ref(),
-            &fleet_view(&state, &headers),
+            &fleet_view(&state),
             &query,
         ),
     )
@@ -148,7 +146,7 @@ pub(super) async fn updates_page(
         render_updates(
             &state.public_base_path,
             state.auth.human_user(&headers).as_ref(),
-            &fleet_view(&state, &headers),
+            &fleet_view(&state),
         ),
     )
 }
@@ -162,7 +160,7 @@ pub(super) async fn handled_page(
         render_handled(
             &state.public_base_path,
             state.auth.human_user(&headers).as_ref(),
-            &fleet_view(&state, &headers),
+            &fleet_view(&state),
         ),
     )
 }
@@ -199,7 +197,7 @@ pub(super) async fn cve_page(
     let page = render_cve(
         &state.public_base_path,
         state.auth.human_user(&headers).as_ref(),
-        &fleet_view(&state, &headers),
+        &fleet_view(&state),
         &id,
     );
     found_or_404(&state, &headers, page, &id)
@@ -213,7 +211,7 @@ pub(super) async fn host_page(
     let page = render_host(
         &state.public_base_path,
         state.auth.human_user(&headers).as_ref(),
-        &fleet_view(&state, &headers),
+        &fleet_view(&state),
         &name,
     );
     found_or_404(&state, &headers, page, &name)

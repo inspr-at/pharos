@@ -1,23 +1,27 @@
-//! Read-only Pharos operator CLI (PHAROS-210).
+//! Read-only Pharos operator CLI (PHAROS-210, PHAROS-344). The page's data as plain
+//! tables. No command changes anything.
 
 use std::path::Path;
 use std::time::Duration;
 
 use reqwest::{Client, StatusCode};
-use serde_json::{json, Value};
+use serde_json::Value;
 use url::Url;
 
-const USAGE: &str = "usage: pharos <health|version|hosts|declared [status]|beacon last-seen [HOST]|proof HOST|job ID>";
+const USAGE: &str =
+    "usage: pharos <health|version|hosts|beacon [HOST]|beacon last-seen [HOST]|cves|updates>";
+const TOKEN_FILE_ENV: &str = "PHAROS_OPERATOR_TOKEN_FILE";
+const FLEET_VIEW_SCHEMA: &str = "inspr.pharos.fleet-view.v1";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Health,
     Version,
     Hosts,
-    DeclaredStatus,
+    Beacon(Option<String>),
     BeaconLastSeen(Option<String>),
-    Proof(String),
-    Job(String),
+    Cves,
+    Updates,
 }
 
 impl Command {
@@ -25,40 +29,34 @@ impl Command {
         !matches!(self, Self::Health | Self::Version)
     }
 
-    fn path(&self) -> String {
+    /// Where the command starts. Everything else comes from `/fleet.json`.
+    fn path(&self) -> &'static str {
         match self {
-            Self::Health => "/healthz".to_string(),
-            Self::Version => "/version".to_string(),
-            Self::Hosts | Self::BeaconLastSeen(_) => "/hosts.json".to_string(),
-            Self::DeclaredStatus => "/declared-hosts.json".to_string(),
-            Self::Proof(host) => format!("/proof/{host}"),
-            Self::Job(id) => format!("/setup/provisioning-jobs/{id}"),
+            Self::Health => "healthz",
+            Self::Version => "version",
+            _ => "fleet.json",
         }
     }
 }
 
 fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let values = arguments.into_iter().collect::<Vec<_>>();
+    let values = values.iter().map(String::as_str).collect::<Vec<_>>();
+    let host = |host: &str| valid_component(host).then(|| host.to_string());
     match values.as_slice() {
-        [command] if command == "health" => Ok(Command::Health),
-        [command] if command == "version" => Ok(Command::Version),
-        [command] if command == "hosts" => Ok(Command::Hosts),
-        [command] if command == "declared" => Ok(Command::DeclaredStatus),
-        [command, subcommand] if command == "declared" && subcommand == "status" => {
-            Ok(Command::DeclaredStatus)
-        }
-        [command, subcommand] if command == "beacon" && subcommand == "last-seen" => {
-            Ok(Command::BeaconLastSeen(None))
-        }
-        [command, subcommand, host]
-            if command == "beacon" && subcommand == "last-seen" && valid_component(host) =>
-        {
-            Ok(Command::BeaconLastSeen(Some(host.clone())))
-        }
-        [command, host] if command == "proof" && valid_component(host) => {
-            Ok(Command::Proof(host.clone()))
-        }
-        [command, id] if command == "job" && valid_component(id) => Ok(Command::Job(id.clone())),
+        ["health"] => Ok(Command::Health),
+        ["version"] => Ok(Command::Version),
+        ["hosts"] => Ok(Command::Hosts),
+        ["cves"] => Ok(Command::Cves),
+        ["updates"] => Ok(Command::Updates),
+        ["beacon"] => Ok(Command::Beacon(None)),
+        ["beacon", "last-seen"] => Ok(Command::BeaconLastSeen(None)),
+        ["beacon", "last-seen", name] => host(name)
+            .map(|name| Command::BeaconLastSeen(Some(name)))
+            .ok_or_else(|| USAGE.to_string()),
+        ["beacon", name] => host(name)
+            .map(|name| Command::Beacon(Some(name)))
+            .ok_or_else(|| USAGE.to_string()),
         _ => Err(USAGE.to_string()),
     }
 }
@@ -71,6 +69,7 @@ fn valid_component(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+/// `PHAROS_URL` may carry a mount; requests are made relative to it.
 fn base_url() -> Result<Url, String> {
     let raw = std::env::var("PHAROS_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     let mut url = Url::parse(&raw).map_err(|_| "PHAROS_URL is invalid".to_string())?;
@@ -80,115 +79,385 @@ fn base_url() -> Result<Url, String> {
         || url.fragment().is_some()
         || !matches!(url.scheme(), "http" | "https")
         || (url.scheme() == "http"
-            && !matches!(url.host_str(), Some("127.0.0.1" | "::1" | "localhost")))
+            && !matches!(
+                url.host_str(),
+                Some("127.0.0.1" | "::1" | "[::1]" | "localhost")
+            ))
     {
         return Err(
             "PHAROS_URL must be HTTPS, or HTTP on loopback, without credentials/query/fragment"
                 .to_string(),
         );
     }
-    url.set_path("/");
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
     Ok(url)
 }
 
-fn operator_token() -> Result<String, String> {
-    let path = std::env::var("PHAROS_OPERATOR_TOKEN_FILE")
-        .map_err(|_| "PHAROS_OPERATOR_TOKEN_FILE is required for this command".to_string())?;
-    let path = Path::new(&path);
+fn operator_token(path: &str) -> Result<String, String> {
+    let path = Path::new(path);
     let metadata = std::fs::symlink_metadata(path)
-        .map_err(|_| "PHAROS_OPERATOR_TOKEN_FILE is not readable UTF-8".to_string())?;
+        .map_err(|_| format!("{TOKEN_FILE_ENV} is not readable UTF-8"))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 4096 {
-        return Err("PHAROS_OPERATOR_TOKEN_FILE is not a safe regular file".to_string());
+        return Err(format!("{TOKEN_FILE_ENV} is not a safe regular file"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(
-                "PHAROS_OPERATOR_TOKEN_FILE must not be accessible by group or others".to_string(),
-            );
+            return Err(format!(
+                "{TOKEN_FILE_ENV} must not be accessible by group or others"
+            ));
         }
     }
     let value = std::fs::read_to_string(path)
-        .map_err(|_| "PHAROS_OPERATOR_TOKEN_FILE is not readable UTF-8".to_string())?;
+        .map_err(|_| format!("{TOKEN_FILE_ENV} is not readable UTF-8"))?;
     let value = value.trim_end_matches(['\r', '\n']).to_string();
     if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
-        return Err("PHAROS_OPERATOR_TOKEN_FILE contains an invalid credential".to_string());
+        return Err(format!("{TOKEN_FILE_ENV} contains an invalid credential"));
     }
     Ok(value)
 }
 
-async fn request(command: &Command) -> Result<(StatusCode, String), String> {
-    let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|_| "could not initialize the HTTP client".to_string())?;
+/// The token when one is set up. Commands that need it fail without it.
+fn configured_token(required: bool) -> Result<Option<String>, String> {
+    match std::env::var(TOKEN_FILE_ENV) {
+        Ok(path) => operator_token(&path).map(Some),
+        Err(_) if required => Err(format!("{TOKEN_FILE_ENV} is required for this command")),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn get(client: &Client, path: &str, token: Option<&str>) -> Result<String, String> {
     let url = base_url()?
-        .join(&command.path())
+        .join(path)
         .map_err(|_| "could not construct the Pharos request".to_string())?;
     let mut request = client.get(url);
-    if command.requires_auth() {
-        request = request.bearer_auth(operator_token()?);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
     }
     let response = request
         .send()
         .await
         .map_err(|_| "Pharos is unavailable".to_string())?;
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|_| "Pharos returned an unreadable response".to_string())?;
-    Ok((status, body))
-}
-
-fn render(command: &Command, status: StatusCode, body: &str) -> Result<String, String> {
+    if status == StatusCode::UNAUTHORIZED {
+        return Err("Pharos rejected the operator token".to_string());
+    }
     if !status.is_success() {
         return Err(format!(
             "Pharos request failed with HTTP {}",
             status.as_u16()
         ));
     }
-    if matches!(command, Command::Health) {
-        return Ok(body.trim().to_string());
-    }
-    let value: Value =
+    response
+        .text()
+        .await
+        .map_err(|_| "Pharos returned an unreadable response".to_string())
+}
+
+fn parse_fleet(body: &str) -> Result<Value, String> {
+    let fleet: Value =
         serde_json::from_str(body).map_err(|_| "Pharos returned malformed JSON".to_string())?;
-    let value = match command {
-        Command::Version => {
-            validate_version_response(&value)?;
-            value
-        }
-        Command::BeaconLastSeen(host_filter) => {
-            let hosts = value
-                .get("hosts")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "Pharos hosts response is missing hosts".to_string())?;
-            let entries = hosts
-                .iter()
-                .filter(|host| {
-                    host_filter.as_ref().is_none_or(|expected| {
-                        host.get("name").and_then(Value::as_str) == Some(expected.as_str())
-                    })
-                })
-                .map(|host| {
-                    json!({
-                        "host": host.get("name"),
-                        "last_seen": host.get("last_seen"),
-                        "liveness": host.get("liveness"),
-                    })
-                })
-                .collect::<Vec<_>>();
-            if host_filter.is_some() && entries.is_empty() {
-                return Err("host was not found".to_string());
-            }
-            json!({ "beacons": entries })
-        }
-        _ => value,
+    if fleet.get("schema").and_then(Value::as_str) != Some(FLEET_VIEW_SCHEMA) {
+        return Err("Pharos returned an unknown fleet view".to_string());
+    }
+    Ok(fleet)
+}
+
+/// What to print, and whether the command succeeded.
+struct Output {
+    text: String,
+    healthy: bool,
+}
+
+async fn run(command: &Command) -> Result<Output, String> {
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| "could not initialize the HTTP client".to_string())?;
+    let token = configured_token(command.requires_auth())?;
+    let first = get(
+        &client,
+        command.path(),
+        token.as_deref().filter(|_| command.requires_auth()),
+    )
+    .await?;
+    let fleet = match (command.requires_auth(), &token) {
+        (true, _) => Some(parse_fleet(&first)?),
+        (false, Some(token)) => Some(parse_fleet(
+            &get(&client, "fleet.json", Some(token)).await?,
+        )?),
+        (false, None) => None,
     };
-    serde_json::to_string_pretty(&value)
-        .map_err(|_| "could not render the Pharos response".to_string())
+    render(command, &first, fleet.as_ref())
+}
+
+fn render(command: &Command, first: &str, fleet: Option<&Value>) -> Result<Output, String> {
+    let text = |text| {
+        Ok(Output {
+            text,
+            healthy: true,
+        })
+    };
+    match (command, fleet) {
+        (Command::Health, fleet) => Ok(render_health(first, fleet)),
+        (Command::Version, fleet) => text(render_version(first, fleet)?),
+        (Command::Hosts, Some(fleet)) => text(render_hosts(fleet)),
+        (Command::Beacon(host), Some(fleet)) => text(render_beacon(fleet, host.as_deref(), true)?),
+        (Command::BeaconLastSeen(host), Some(fleet)) => {
+            text(render_beacon(fleet, host.as_deref(), false)?)
+        }
+        (Command::Cves, Some(fleet)) => text(render_cves(fleet)),
+        (Command::Updates, Some(fleet)) => text(render_updates(fleet)),
+        _ => Err(USAGE.to_string()),
+    }
+}
+
+fn field<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+fn count(value: &Value, section: &str, key: &str) -> u64 {
+    value
+        .get(section)
+        .and_then(|section| section.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn items<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+fn or_dash(value: &str) -> String {
+    if value.is_empty() {
+        "-".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn lower_first(value: &str) -> String {
+    let mut chars = value.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_lowercase().chain(chars).collect()
+    })
+}
+
+/// Columns padded to their widest cell. The server's words reach a terminal, so
+/// control characters don't get through.
+fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let clean = |cell: &str| {
+        cell.chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect::<String>()
+    };
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|header| header.chars().count())
+        .collect();
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(clean(cell).chars().count());
+        }
+    }
+    let line = |cells: Vec<String>| {
+        let last = cells.len().saturating_sub(1);
+        cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                if index == last {
+                    cell.clone()
+                } else {
+                    format!("{cell:<width$}", width = widths[index])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let mut lines = vec![line(headers.iter().map(ToString::to_string).collect())];
+    lines.extend(
+        rows.iter()
+            .map(|row| line(row.iter().map(|cell| clean(cell)).collect())),
+    );
+    lines.join("\n")
+}
+
+fn render_health(status: &str, fleet: Option<&Value>) -> Output {
+    let status = status.trim();
+    let Some(fleet) = fleet else {
+        return Output {
+            text: status.to_string(),
+            healthy: status == "ok",
+        };
+    };
+    let data = fleet.get("data_file").unwrap_or(&Value::Null);
+    let updated = field(data, "updated_ago");
+    let problem = field(data, "problem");
+    let configured = data.get("configured").and_then(Value::as_bool) == Some(true);
+    let (file, file_ok) = match (configured, problem.is_empty(), updated.is_empty()) {
+        (false, _, _) => ("no data file configured".to_string(), true),
+        (true, false, true) => (format!("data file can't be used: {problem}"), false),
+        (true, false, false) => (
+            format!("data file invalid: {problem}; showing the last good file from {updated}"),
+            false,
+        ),
+        (true, true, true) => ("data file not loaded yet".to_string(), false),
+        (true, true, false) => (format!("data file valid, updated {updated}"), true),
+    };
+    let text = format!(
+        "{status} · server up {} · {file}\nbeacons: {} reporting · {} offline · {} never reported",
+        field(fleet, "uptime"),
+        count(fleet, "beacons", "reporting"),
+        count(fleet, "beacons", "offline"),
+        count(fleet, "beacons", "never_reported"),
+    );
+    Output {
+        text,
+        healthy: status == "ok" && file_ok,
+    }
+}
+
+fn render_version(body: &str, fleet: Option<&Value>) -> Result<String, String> {
+    let version: Value =
+        serde_json::from_str(body).map_err(|_| "Pharos returned malformed JSON".to_string())?;
+    validate_version_response(&version)?;
+    let mut text = format!("pharos {}", field(&version, "version"));
+    if let Some(fleet) = fleet {
+        text.push_str(&format!(
+            "\ndata file schema {} · {} hosts · {} watched CVEs",
+            count(fleet, "data_file", "schema_version"),
+            count(fleet, "data_file", "hosts"),
+            count(fleet, "data_file", "watched_cves"),
+        ));
+    }
+    Ok(text)
+}
+
+fn render_hosts(fleet: &Value) -> String {
+    let rows: Vec<Vec<String>> = items(fleet, "hosts")
+        .iter()
+        .map(|host| {
+            let mut security = lower_first(field(host, "security")).replace(" · ", ", ");
+            for (key, word) in [
+                ("reboot_due", "reboot due"),
+                ("hand_declared", "declared"),
+                ("stale", "stale"),
+            ] {
+                if host.get(key).and_then(Value::as_bool) == Some(true) {
+                    security.push_str(" · ");
+                    security.push_str(word);
+                }
+            }
+            vec![
+                field(host, "name").to_string(),
+                or_dash(&field(host, "site").to_lowercase()),
+                field(host, "source").to_lowercase(),
+                field(host, "contact").to_string(),
+                security,
+            ]
+        })
+        .collect();
+    format!(
+        "{}\n{} hosts · {} affected · {} can't check",
+        table(&["HOST", "SITE", "SOURCE", "CONTACT", "SECURITY"], &rows),
+        count(fleet, "summary", "hosts"),
+        count(fleet, "summary", "affected"),
+        count(fleet, "summary", "cant_check"),
+    )
+}
+
+fn render_beacon(fleet: &Value, only: Option<&str>, kernels: bool) -> Result<String, String> {
+    let hosts: Vec<&Value> = items(fleet, "hosts")
+        .iter()
+        .filter(|host| host.get("beacon").and_then(Value::as_bool) == Some(true))
+        .filter(|host| only.is_none_or(|name| field(host, "name") == name))
+        .collect();
+    if only.is_some() && hosts.is_empty() {
+        return Err("host was not found".to_string());
+    }
+    let last_seen = |host: &Value| match field(host, "last_seen") {
+        "" => "never".to_string(),
+        seen => seen.to_string(),
+    };
+    if !kernels {
+        let rows: Vec<Vec<String>> = hosts
+            .iter()
+            .map(|host| vec![field(host, "name").to_string(), last_seen(host)])
+            .collect();
+        return Ok(table(&["HOST", "LAST SEEN"], &rows));
+    }
+    let rows: Vec<Vec<String>> = hosts
+        .iter()
+        .map(|host| {
+            vec![
+                field(host, "name").to_string(),
+                last_seen(host),
+                or_dash(field(host, "running")),
+                or_dash(field(host, "next_boot")),
+            ]
+        })
+        .collect();
+    Ok(table(&["HOST", "LAST SEEN", "RUNNING", "NEXT BOOT"], &rows))
+}
+
+fn render_cves(fleet: &Value) -> String {
+    let rows: Vec<Vec<String>> = items(fleet, "cves")
+        .iter()
+        .map(|cve| {
+            ["id", "severity", "state", "source", "hosts"]
+                .iter()
+                .map(|key| field(cve, key).to_string())
+                .collect()
+        })
+        .collect();
+    table(&["ID", "SEV", "STATE", "SOURCE", "HOSTS"], &rows)
+}
+
+fn render_updates(fleet: &Value) -> String {
+    let updates = items(fleet, "updates");
+    let in_state = |states: &[&str]| {
+        updates
+            .iter()
+            .filter(|update| states.contains(&field(update, "state")))
+            .count()
+    };
+    let rows: Vec<Vec<String>> = updates
+        .iter()
+        .filter(|update| field(update, "state") == "due")
+        .map(|update| {
+            let mut source = format!("{} {}", field(update, "source"), field(update, "age"))
+                .trim_end()
+                .to_string();
+            if update.get("stale").and_then(Value::as_bool) == Some(true) {
+                source.push_str(" · stale");
+            }
+            vec![
+                field(update, "host").to_string(),
+                field(update, "due")
+                    .split(" · ")
+                    .map(lower_first)
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                source,
+            ]
+        })
+        .collect();
+    format!(
+        "{}\n{} hand-declared · {} up to date · {} can't tell",
+        table(&["HOST", "DUE", "SOURCE"], &rows),
+        in_state(&["hand_declared"]),
+        in_state(&["up_to_date"]),
+        in_state(&["unknown", "last_known"]),
+    )
 }
 
 fn validate_version_response(value: &Value) -> Result<(), String> {
@@ -214,8 +483,12 @@ fn validate_version_response(value: &Value) -> Result<(), String> {
     match scheme {
         "legacy" if sequence == 0 && valid_legacy_version(version) => Ok(()),
         "inspr-calendar-v1" if sequence > 0 && valid_calendar_version(version) => Ok(()),
-        "inspr-calendar-v2" if sequence > 0 && valid_calendar_v2_version(version) => Ok(()),
-        "legacy" | "inspr-calendar-v1" | "inspr-calendar-v2" => {
+        "inspr-calendar-v2" | "inspr-calver-3"
+            if sequence > 0 && valid_calendar_v2_version(version) =>
+        {
+            Ok(())
+        }
+        "legacy" | "inspr-calendar-v1" | "inspr-calendar-v2" | "inspr-calver-3" => {
             Err("Pharos version response has invalid release metadata".to_string())
         }
         _ => Err("Pharos version response has an unknown version scheme".to_string()),
@@ -232,8 +505,8 @@ fn valid_legacy_version(value: &str) -> bool {
         })
 }
 
-/// INSPR calendar v2 (PHAROS-259): exactly `YYMMDDhhmmss.0.0` with a real UTC
-/// date. The CLI keeps its own copy so it stays independent of pharos-core.
+/// INSPR calendar v2 (PHAROS-259) and INSPR-CalVer3, which keep one format: exactly
+/// `YYMMDDhhmmss.0.0` with a real UTC date. The CLI keeps its own copy so it stays independent of pharos-core.
 fn valid_calendar_v2_version(value: &str) -> bool {
     let parts = value.split('.').collect::<Vec<_>>();
     let [stamp, minor, patch] = parts.as_slice() else {
@@ -312,12 +585,13 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let result = match request(&command).await {
-        Ok((status, body)) => render(&command, status, &body),
-        Err(error) => Err(error),
-    };
-    match result {
-        Ok(output) => println!("{output}"),
+    match run(&command).await {
+        Ok(output) => {
+            println!("{}", output.text);
+            if !output.healthy {
+                std::process::exit(1);
+            }
+        }
         Err(error) => {
             eprintln!("pharos: {error}");
             std::process::exit(1);
@@ -327,55 +601,218 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
-    #[test]
-    fn command_surface_is_read_only_and_does_not_wrap_agent_routes() {
-        let commands = [
-            parse_command(["health".to_string()]).unwrap(),
-            parse_command(["version".to_string()]).unwrap(),
-            parse_command(["hosts".to_string()]).unwrap(),
-            parse_command(["declared".to_string(), "status".to_string()]).unwrap(),
-            parse_command([
-                "beacon".to_string(),
-                "last-seen".to_string(),
-                "ares".to_string(),
-            ])
-            .unwrap(),
-            parse_command(["proof".to_string(), "ares".to_string()]).unwrap(),
-            parse_command(["job".to_string(), "setup-1".to_string()]).unwrap(),
-        ];
-        assert!(commands
-            .iter()
-            .all(|command| !command.path().starts_with("/agent/")));
-        assert!(commands
-            .iter()
-            .all(|command| !command.path().contains("confirm")));
-        assert!(parse_command(["create".to_string()]).is_err());
+    fn fleet() -> Value {
+        json!({
+            "schema": FLEET_VIEW_SCHEMA,
+            "uptime": "3 d",
+            "data_file": {
+                "configured": true, "problem": null, "schema_version": 3,
+                "updated_ago": "2 h ago", "hosts": 2, "watched_cves": 1
+            },
+            "summary": {"hosts": 2, "affected": 1, "cant_check": 1, "reboots_due": 1},
+            "beacons": {"reporting": 1, "offline": 0, "never_reported": 1},
+            "hosts": [
+                {"name": "ares", "site": "Home", "source": "Beacon", "contact": "online 2m",
+                 "beacon": true, "last_seen": "2m", "running": "6.18.52", "next_boot": "6.18.56",
+                 "security": "1 critical · 1 high", "reboot_due": true, "hand_declared": false,
+                 "stale": false},
+                {"name": "hermes", "site": null, "source": "Hand-declared", "contact": "never",
+                 "beacon": true, "last_seen": null, "running": null, "next_boot": null,
+                 "security": "Can't check", "reboot_due": false, "hand_declared": true,
+                 "stale": true}
+            ],
+            "cves": [{"id": "CVE-2000-1001", "severity": "critical", "state": "open",
+                      "source": "kernel", "hosts": "1 affected · 1 can't check"}],
+            "updates": [
+                {"host": "ares", "state": "due", "due": "Reboot due · 3 commits behind · Lock 74 d old",
+                 "source": "beacon", "age": "2m", "stale": true},
+                {"host": "hermes", "state": "unknown", "due": "", "source": "nothing",
+                 "age": null, "stale": false}
+            ]
+        })
+    }
+
+    fn command(words: &[&str]) -> Result<Command, String> {
+        parse_command(words.iter().map(ToString::to_string))
     }
 
     #[test]
-    fn protected_commands_require_machine_operator_auth() {
+    fn the_command_surface_only_reads() {
+        for (words, expected) in [
+            (vec!["health"], Command::Health),
+            (vec!["version"], Command::Version),
+            (vec!["hosts"], Command::Hosts),
+            (vec!["cves"], Command::Cves),
+            (vec!["updates"], Command::Updates),
+            (vec!["beacon"], Command::Beacon(None)),
+            (vec!["beacon", "ares"], Command::Beacon(Some("ares".into()))),
+            (vec!["beacon", "last-seen"], Command::BeaconLastSeen(None)),
+            (
+                vec!["beacon", "last-seen", "ares"],
+                Command::BeaconLastSeen(Some("ares".into())),
+            ),
+        ] {
+            assert_eq!(command(&words).unwrap(), expected);
+        }
+        for retired in [
+            vec!["declared"],
+            vec!["declared", "status"],
+            vec!["proof", "ares"],
+            vec!["job", "setup-1"],
+            vec!["create"],
+            vec!["beacon", "../etc"],
+            vec![],
+        ] {
+            assert!(command(&retired).is_err(), "{retired:?}");
+        }
+    }
+
+    #[test]
+    fn only_health_and_version_work_without_a_token() {
         assert!(!Command::Health.requires_auth());
         assert!(!Command::Version.requires_auth());
-        assert!(Command::Hosts.requires_auth());
-        assert!(Command::Proof("ares".to_string()).requires_auth());
+        for command in [
+            Command::Hosts,
+            Command::Beacon(None),
+            Command::BeaconLastSeen(None),
+            Command::Cves,
+            Command::Updates,
+        ] {
+            assert!(command.requires_auth(), "{command:?}");
+            assert_eq!(command.path(), "fleet.json");
+        }
     }
 
     #[test]
-    fn beacon_view_contains_only_observation_fields() {
-        let body = serde_json::to_string(&json!({
-            "hosts": [{
-                "name": "ares",
-                "last_seen": 42,
-                "liveness": "live",
-                "role": "server"
-            }]
-        }))
-        .unwrap();
-        let output = render(&Command::BeaconLastSeen(None), StatusCode::OK, &body).unwrap();
-        assert!(output.contains("last_seen"));
-        assert!(!output.contains("role"));
+    fn hosts_are_a_table_with_every_row_and_a_summary() {
+        assert_eq!(
+            render_hosts(&fleet()),
+            "HOST    SITE  SOURCE         CONTACT    SECURITY\n\
+             ares    home  beacon         online 2m  1 critical, 1 high · reboot due\n\
+             hermes  -     hand-declared  never      can't check · declared · stale\n\
+             2 hosts · 1 affected · 1 can't check"
+        );
+    }
+
+    #[test]
+    fn beacons_show_last_seen_and_kernels_and_find_one_host() {
+        assert_eq!(
+            render_beacon(&fleet(), None, true).unwrap(),
+            "HOST    LAST SEEN  RUNNING  NEXT BOOT\n\
+             ares    2m         6.18.52  6.18.56\n\
+             hermes  never      -        -"
+        );
+        assert_eq!(
+            render_beacon(&fleet(), Some("ares"), false).unwrap(),
+            "HOST  LAST SEEN\nares  2m"
+        );
+        assert_eq!(
+            render_beacon(&fleet(), Some("nobody"), true).unwrap_err(),
+            "host was not found"
+        );
+    }
+
+    #[test]
+    fn cves_and_updates_use_the_servers_words() {
+        assert_eq!(
+            render_cves(&fleet()),
+            "ID             SEV       STATE  SOURCE  HOSTS\n\
+             CVE-2000-1001  critical  open   kernel  1 affected · 1 can't check"
+        );
+        assert_eq!(
+            render_updates(&fleet()),
+            "HOST  DUE                                            SOURCE\n\
+             ares  reboot due · 3 commits behind · lock 74 d old  beacon 2m · stale\n\
+             0 hand-declared · 0 up to date · 1 can't tell"
+        );
+    }
+
+    #[test]
+    fn health_says_ok_only_when_the_data_file_is_fine() {
+        let plain = render_health("ok\n", None);
+        assert_eq!(plain.text, "ok");
+        assert!(plain.healthy);
+
+        let good = render_health("ok", Some(&fleet()));
+        assert_eq!(
+            good.text,
+            "ok · server up 3 d · data file valid, updated 2 h ago\n\
+             beacons: 1 reporting · 0 offline · 1 never reported"
+        );
+        assert!(good.healthy);
+
+        let mut invalid = fleet();
+        invalid["data_file"]["problem"] = json!("unsupported schema_version 9");
+        let bad = render_health("ok", Some(&invalid));
+        assert!(!bad.healthy);
+        assert!(
+            bad.text.contains("data file invalid: unsupported"),
+            "{}",
+            bad.text
+        );
+        assert!(
+            bad.text.contains("last good file from 2 h ago"),
+            "{}",
+            bad.text
+        );
+
+        invalid["data_file"]["updated_ago"] = Value::Null;
+        let none = render_health("ok", Some(&invalid));
+        assert!(!none.healthy);
+        assert!(none.text.contains("can't be used"), "{}", none.text);
+
+        let mut loading = fleet();
+        loading["data_file"]["updated_ago"] = Value::Null;
+        assert!(!render_health("ok", Some(&loading)).healthy);
+
+        let mut unconfigured = fleet();
+        unconfigured["data_file"]["configured"] = json!(false);
+        unconfigured["data_file"]["updated_ago"] = Value::Null;
+        let quiet = render_health("ok", Some(&unconfigured));
+        assert!(quiet.healthy);
+        assert!(
+            quiet.text.contains("no data file configured"),
+            "{}",
+            quiet.text
+        );
+
+        assert!(!render_health("starting", None).healthy);
+    }
+
+    #[test]
+    fn version_adds_the_data_file_when_a_token_is_there() {
+        let version = json!({
+            "version_scheme": "inspr-calver-3",
+            "version": "261101120000.0.0",
+            "release_channel": "stable",
+            "release_sequence": 28
+        })
+        .to_string();
+        assert_eq!(
+            render_version(&version, None).unwrap(),
+            "pharos 261101120000.0.0"
+        );
+        assert_eq!(
+            render_version(&version, Some(&fleet())).unwrap(),
+            "pharos 261101120000.0.0\ndata file schema 3 · 2 hosts · 1 watched CVEs"
+        );
+    }
+
+    #[test]
+    fn an_unknown_fleet_view_is_refused() {
+        assert!(parse_fleet(r#"{"schema":"other"}"#).is_err());
+        assert!(parse_fleet("not json").is_err());
+        assert!(parse_fleet(&fleet().to_string()).is_ok());
+    }
+
+    #[test]
+    fn a_control_character_from_the_server_does_not_reach_the_terminal() {
+        let printed = table(&["HOST"], &[vec!["ar\u{1b}[31mes".to_string()]]);
+        assert!(!printed.contains('\u{1b}'), "{printed:?}");
     }
 
     #[test]
@@ -400,7 +837,7 @@ mod tests {
                 "release_sequence": 6
             }),
         ] {
-            assert!(render(&Command::Version, StatusCode::OK, &body.to_string()).is_ok());
+            assert!(render_version(&body.to_string(), None).is_ok());
         }
     }
 
@@ -445,7 +882,7 @@ mod tests {
                 "release_sequence": 1
             }),
         ] {
-            assert!(render(&Command::Version, StatusCode::OK, &body.to_string()).is_err());
+            assert!(render_version(&body.to_string(), None).is_err());
         }
     }
 }
