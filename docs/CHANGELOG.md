@@ -1,7 +1,8 @@
 # Pharos Changelog
 
-## 261031155226.0.0 - 2026-10-31
+## 261031180823.0.0 - 2026-10-31
 
+- Release image: Debian snapshot 20261031T120000Z, for `libbrotli1` 1.0.9-2+deb12u1 (CVE-2026-111497, CRITICAL) and `libssl3` and `openssl` 3.0.22-1~deb12u2 (CVE-2026-84782, HIGH). The release scan refused the 261031155226.0.0 candidate on these; 261031155226.0.0 was never published and stays in the history at sequence 28 (PHAROS-345).
 - Pharos 2: a small, read-only fleet view for CVE handling and updates. Pharos reports state and never changes a host; configuration management does the work and Pharos confirms when it is done. The earlier, larger product ends at tag `v261022144327.0.0`, which stays the reference and the rollback for everything removed (PHAROS-336).
 - Remove onboarding, providers and provisioning, guarded host actions, alerts, the backups, map and host settings pages, Flow and Agora, the Janus, Paimos and Aeon integrations, machine-operator auth, `/metrics`, per-person access policy, manifest TCP probes and HTTP probes (PHAROS-337, PHAROS-344, PHAROS-345).
 - Require a bearer token checked against the store on every beacon report. Startup refuses any `PHAROS_BEACON_TOKEN_MODE` other than `local`, and a missing, wrong or unknown-host token answers 401 (PHAROS-338).
@@ -14,7 +15,7 @@
 - Add the Fleet, Updates, Handled, CVE and host pages behind login. Contact says how loudly a host's silence shows, by declared availability, separately from patch status (PHAROS-347).
 - Refuse anyone off the login allow-list at the callback with a 403 and no session. Add one read-only operator token for `GET /hosts.json` and the new `GET /fleet.json`, and the `pharos` CLI commands `health`, `version`, `hosts`, `beacon`, `cves` and `updates` (PHAROS-344).
 - Accept RUSTSEC-2026-0387 with its reason in `deny.toml`: `crypto-bigint` 0.5 is reached only through public-key ID-token signature verification (PHAROS-345).
-- Declare `inspr-calver-3` from this release, with `release_sequence` continuing at 28 after the last CalVer2, `261022144327.0.0` at 27. The version display moves to `inspr.calver-display.v3` from `inspr-at/inspr` `bd0a138`, vendored verbatim (PHAROS-345).
+- Declare `inspr-calver-3` from this release, with `release_sequence` continuing after the last CalVer2, `261022144327.0.0` at 27: `261031155226.0.0` at 28 was never published, and this release is 29. The version display moves to `inspr.calver-display.v3` from `inspr-at/inspr` `bd0a138`, vendored verbatim (PHAROS-345).
 
 ## 261022144327.0.0 - 2026-10-22
 

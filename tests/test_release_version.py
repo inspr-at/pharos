@@ -60,6 +60,7 @@ V2_HISTORY = (
 # Published CalVer3 reservations. The first follows the last v2 in sequence.
 CALVER3_HISTORY = (
     ("261031155226.0.0", 28),
+    ("261031180823.0.0", 29),
 )
 
 
@@ -295,6 +296,11 @@ class CalendarVersionTests(unittest.TestCase):
         recorded.extend(
             self.calendar_v2_release(version, sequence)
             for version, sequence in V2_HISTORY
+            if sequence < current["release_sequence"]
+        )
+        recorded.extend(
+            self.calver3_release(version, sequence)
+            for version, sequence in CALVER3_HISTORY
             if sequence < current["release_sequence"]
         )
         release_version.validate_reservation_history(current, tuple(recorded), ())

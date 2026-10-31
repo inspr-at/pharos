@@ -12,7 +12,7 @@ RUN GIT_COMMIT="${GIT_COMMIT}" cargo build --release --locked -p pharosd -p phar
     && strip target/release/pharosd target/release/pharos-beacon target/release/pharos
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
-ARG DEBIAN_SNAPSHOT=20261022T120000Z
+ARG DEBIAN_SNAPSHOT=20261031T120000Z
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # git: the beacon shells out to it for commits-behind (rev-list HEAD..@{u}).
 # restic: optional PHAROS_BACKUP_MODE=restic collector; no credentials are
@@ -25,7 +25,9 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # The runtime base image is pinned by digest. Package indexes are pinned to a
 # separate immutable snapshot; those pins need not share a date.
 # The snapshot follows DLA-4845-1 (2026-10-20). Pin ca-certificates to the
-# release removing emSign ECC Root CA - G3 and Comodo AAA Services root.
+# release removing emSign ECC Root CA - G3 and Comodo AAA Services root. It also carries
+# libbrotli1 1.0.9-2+deb12u1 and libssl3/openssl 3.0.22-1~deb12u2; the base image ships
+# none of them, so apt takes those from this snapshot without a pin.
 # Keep the explicit PCRE2 pin aligned with the refreshed snapshot. libexpat1 is pinned because the
 # base image already ships it and apt would otherwise keep the vulnerable deb12u4 (CVE-2025-59375, CVE-2026-77214). HTTP transport
 # is safe here because apt verifies Debian's signed Release metadata and package
