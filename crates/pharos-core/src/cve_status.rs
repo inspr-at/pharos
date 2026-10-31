@@ -137,7 +137,7 @@ fn verified_at(last_verified: Option<&str>) -> Option<OffsetDateTime> {
 }
 
 /// True when the last check is missing or past the limit.
-pub(crate) fn declared_verification_stale(last_verified: Option<&str>, now: UnixSeconds) -> bool {
+pub fn declared_verification_stale(last_verified: Option<&str>, now: UnixSeconds) -> bool {
     !verified_at(last_verified).is_some_and(|at| {
         i128::from(now) * NANOS_PER_SEC - at.unix_timestamp_nanos()
             <= i128::from(DECLARED_STALE_AFTER_SECS) * NANOS_PER_SEC

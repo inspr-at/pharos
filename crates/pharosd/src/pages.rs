@@ -637,14 +637,31 @@ fn commits_behind(commits: u32) -> String {
     }
 }
 
-fn os_html(row: &HostRow) -> String {
+fn hand_declared_line(last_verified: Option<&str>, stale: bool, now: i64) -> String {
+    format!(
+        "{}Hand-declared · {}{}",
+        icon("hand", ""),
+        verified_text(last_verified, now),
+        if stale { stale_chip() } else { String::new() }
+    )
+}
+
+fn file_release_line(view: &FleetView, row: &HostRow) -> Option<String> {
+    row.file_release_check(view.now)
+        .map(|(last_verified, stale)| hand_declared_line(last_verified, stale, view.now))
+}
+
+fn os_html(view: &FleetView, row: &HostRow) -> String {
     match row.os() {
         Some(os) => {
             let version = row
                 .os_version()
                 .map(|version| format!(r#"<span class="sub mono">{}</span>"#, e(version)))
                 .unwrap_or_default();
-            format!("{}{version}", e(os))
+            let check = file_release_line(view, row)
+                .map(|line| format!(r#"<span class="sub">{line}</span>"#))
+                .unwrap_or_default();
+            format!("{}{version}{check}", e(os))
         }
         None => unknown_mark(),
     }
@@ -778,7 +795,7 @@ fn fleet_row(
         hidden = hidden_attr(row, query),
         label = host_label(base, row),
         role = role_text(view, row, with_site),
-        os = os_html(row),
+        os = os_html(view, row),
         kernel = kernel_html(row),
         tone = tone_class(row.contact.tone),
         contact_icon = icon(contact_icon(&row.contact), ""),
@@ -809,6 +826,7 @@ fn phone_item(
             None => e(os),
         });
     }
+    meta.extend(file_release_line(view, row));
     if let Some(kernel) = row.kernel() {
         meta.push(format!("kernel {}", e(kernel)));
     }
@@ -2331,16 +2349,7 @@ fn updates_tiles(view: &FleetView, row: &HostRow) -> (String, String) {
                 last_verified,
                 verification_stale,
             } => (
-                format!(
-                    "{}Hand-declared · {}{}",
-                    icon("hand", ""),
-                    verified_text(last_verified.as_deref(), view.now),
-                    if *verification_stale {
-                        stale_chip()
-                    } else {
-                        String::new()
-                    }
-                ),
+                hand_declared_line(last_verified.as_deref(), *verification_stale, view.now),
                 "Declared values only",
             ),
             _ => (
@@ -2546,7 +2555,14 @@ pub(super) fn render_host(
         kv(
             "OS",
             match (row.os(), row.os_version()) {
-                (Some(os), Some(version)) => format!("{} {}", e(os), e(version)),
+                (Some(os), Some(version)) => format!(
+                    "{} {}{}",
+                    e(os),
+                    e(version),
+                    file_release_line(view, row)
+                        .map(|line| format!(r#"<span class="sub">{line}</span>"#))
+                        .unwrap_or_default()
+                ),
                 (Some(os), None) => e(os),
                 _ => r#"<span class="muted">Not known</span>"#.to_string(),
             },
@@ -3448,6 +3464,7 @@ mod tests {
     fn the_release_comes_from_the_evidence_that_decides() {
         let view_with = |channel: Option<&str>, reported_at: i64, verified: &str| {
             let mut declared = listed("ares", serde_json::json!({}));
+            declared["os"] = "Example OS".into();
             declared["version"] = "24.05".into();
             declared["last_verified"] = verified.into();
             let mut host = report("ares", "6.18.52", "6.18.52");
@@ -3465,9 +3482,28 @@ mod tests {
         // A fresh report outranks an old hand-written release.
         let view = view_with(Some("nixos-25.11"), NOW, OLD_CHECK);
         assert_eq!(view.rows[0].os_version(), Some("25.11"));
-        // A report that names none leaves the file's.
+        let host_page =
+            |view: &FleetView| render_host(&PublicBasePath::root(), None, view, "ares").unwrap();
+        assert!(!fleet_page(&view).contains("Hand-declared ·"));
+        assert!(!host_page(&view).contains("Hand-declared ·"));
+        // A report that names none leaves the file's, and a heartbeat doesn't vouch for it.
         let view = view_with(None, NOW, OLD_CHECK);
         assert_eq!(view.rows[0].os_version(), Some("24.05"));
+        // Fleet shows it in the table and in the list of hosts.
+        for (page, places) in [(fleet_page(&view), 2), (host_page(&view), 1)] {
+            assert!(page.contains("24.05"), "{page}");
+            assert_eq!(
+                page.matches("Hand-declared · verified 10 Jan").count(),
+                places,
+                "{page}"
+            );
+            assert!(page.contains(&stale_chip()), "{page}");
+        }
+        let view = view_with(None, NOW, "2000-02-25T00:00:00Z");
+        for page in [fleet_page(&view), host_page(&view)] {
+            assert!(page.contains("Hand-declared · verified"), "{page}");
+            assert!(!page.contains(&stale_chip()), "{page}");
+        }
         // A check after a stale report replaces what that report said.
         let view = view_with(Some("nixos-25.11"), NOW - 2 * 86_400, NEW_CHECK);
         assert_eq!(view.rows[0].os_version(), Some("24.05"));

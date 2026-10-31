@@ -8,7 +8,8 @@ use pharos_core::contact::{
     ProbeEvidence,
 };
 use pharos_core::cve_status::{
-    host_cve_status, CveStatus, CveStatusSource, HostCveStatus, KernelReport,
+    declared_verification_stale, host_cve_status, CveStatus, CveStatusSource, HostCveStatus,
+    KernelReport,
 };
 use pharos_core::fleet_data::{
     CveSeverity, FleetCve, FleetCveState, FleetData, FleetHost, HandledCves,
@@ -197,6 +198,23 @@ impl HostRow {
         } else {
             declared.or_else(|| self.nixpkgs_channel())
         }
+    }
+
+    /// The check behind a release shown under a report that names none. A heartbeat
+    /// says nothing about that value, so it keeps its own date and stale label.
+    pub(crate) fn file_release_check(&self, now: i64) -> Option<(Option<&str>, bool)> {
+        if !self.report_decides() || self.nixpkgs_channel().is_some() {
+            return None;
+        }
+        let host = self
+            .declared
+            .as_ref()
+            .filter(|host| host.version.is_some())?;
+        let last_verified = host.last_verified.as_deref();
+        Some((
+            last_verified,
+            declared_verification_stale(last_verified, now),
+        ))
     }
 
     /// The release a report's nixpkgs follows, without its `nixos-` prefix.

@@ -577,7 +577,20 @@ fn text(value: &str, path: &str, max_bytes: usize) -> Result<(), FleetDataError>
     if looks_like_secret_material(value) || has_url_credentials(value) {
         return invalid(path.to_string(), "text looks like a credential");
     }
+    if has_url_query(value) {
+        return invalid(path.to_string(), "a URL in text can't carry a query");
+    }
     Ok(())
+}
+
+/// A query can hold a signature under any name, so no list of names can vouch for one.
+fn has_url_query(value: &str) -> bool {
+    value.split("//").skip(1).any(|rest| {
+        rest.split(char::is_whitespace)
+            .next()
+            .and_then(|url| url.split_once('?'))
+            .is_some_and(|(_, query)| !query.is_empty())
+    })
 }
 
 fn short_text(value: &str, path: &str) -> Result<(), FleetDataError> {
@@ -711,6 +724,26 @@ mod tests {
         assert!(!has_url_credentials(
             "See https://example.invalid/a//b and a@b"
         ));
+    }
+
+    #[test]
+    fn a_url_with_a_query_is_refused_and_its_query_is_not_quoted() {
+        for text in [
+            "Download https://files.example.invalid/patch?sig=example-signature",
+            "See //files.example.invalid/patch?X-Example=example-signature now",
+            "https://files.example.invalid/record?id=CVE-2000-0001",
+        ] {
+            let message = refused(|value| value["cves"][0]["tip"] = text.into());
+            assert!(message.contains("can't carry a query"), "{message}");
+            assert!(!message.contains("example-signature"), "{message}");
+        }
+        for text in [
+            "Is it at https://files.example.invalid/patch? Check first.",
+            "Read https://files.example.invalid/advisory and update?",
+            "What about a?b",
+        ] {
+            assert!(!has_url_query(text), "{text}");
+        }
     }
 
     #[test]
