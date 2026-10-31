@@ -1470,26 +1470,38 @@ fn run_docker_text_command(
 ) -> Result<String, &'static str> {
     let mut command = docker_cli(command, socket)?;
     command.args(args);
-    let mut child = command
-        .spawn()
-        .map_err(|_| "deployed artifact command failed")?;
+    let mut child = command.spawn().map_err(|_error| {
+        #[cfg(test)]
+        eprintln!("docker fixture did not start: {_error}");
+        "deployed artifact command failed"
+    })?;
     let stdout = child
         .stdout
         .take()
         .map(|pipe| drain_bounded(pipe, DEPLOYED_ARTIFACT_COMMAND_OUTPUT_LIMIT_BYTES))
         .ok_or("deployed artifact output unavailable")?;
     let deadline = Instant::now() + DEPLOYED_ARTIFACT_COMMAND_TIMEOUT;
-    let status = wait_for_child(&mut child, deadline).map_err(|reason| match reason {
-        "timeout" => "deployed artifact command timed out",
-        _ => "deployed artifact command failed",
+    let status = wait_for_child(&mut child, deadline).map_err(|reason| {
+        #[cfg(test)]
+        eprintln!("docker fixture wait failed: {reason}");
+        match reason {
+            "timeout" => "deployed artifact command timed out",
+            _ => "deployed artifact command failed",
+        }
     })?;
     let stdout = collect_bounded(&stdout, deadline)
         .and_then(output_string)
-        .map_err(|reason| match reason {
-            "output_limit" => "deployed artifact output exceeded the limit",
-            _ => "deployed artifact output unavailable",
+        .map_err(|reason| {
+            #[cfg(test)]
+            eprintln!("docker fixture output failed: {reason}");
+            match reason {
+                "output_limit" => "deployed artifact output exceeded the limit",
+                _ => "deployed artifact output unavailable",
+            }
         })?;
     if !status.success() {
+        #[cfg(test)]
+        eprintln!("docker fixture exited with {status}: {args:?}");
         return Err("deployed artifact command failed");
     }
     Ok(stdout)
@@ -1593,9 +1605,11 @@ fn resolve_config_from_image_save(
     };
     let mut command = docker_cli(command, socket)?;
     command.args(["save", identity]);
-    let mut child = command
-        .spawn()
-        .map_err(|_| "deployed artifact command failed")?;
+    let mut child = command.spawn().map_err(|_error| {
+        #[cfg(test)]
+        eprintln!("docker fixture save did not start: {_error}");
+        "deployed artifact command failed"
+    })?;
     let stdout = child
         .stdout
         .take()
@@ -1681,7 +1695,12 @@ fn collect_measured_deployed_artifact_at(
         return None;
     }
     let image_config_digest =
-        measured_image_config_digest(command, socket, &observation.image_identity, cache).ok()?;
+        measured_image_config_digest(command, socket, &observation.image_identity, cache)
+            .map_err(|_error| {
+                #[cfg(test)]
+                eprintln!("docker fixture image digest failed: {_error}");
+            })
+            .ok()?;
     let final_raw = run_running_container_command(command, socket, container).ok()?;
     let final_observation = parse_running_container_format(&final_raw).ok()?;
     if !configured_container_matches_measurement(container, &final_observation.container_id)
