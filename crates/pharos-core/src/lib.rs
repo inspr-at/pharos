@@ -10,6 +10,7 @@ pub mod fleet_data;
 pub mod image_identity;
 pub mod public_path;
 pub mod secret_input;
+pub mod updates_due;
 
 pub use image_identity::{
     classify_image_identity, classify_media_type, parse_image_descriptor_format,
