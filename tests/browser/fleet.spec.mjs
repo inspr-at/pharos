@@ -241,6 +241,41 @@ test.describe("fleet page", () => {
     await expect(page.getByLabel("Search hosts")).toHaveValue("artem");
   });
 
+  test("choosing a card keeps the search as it is now", async ({ page }) => {
+    await page.goto("/");
+    await page.getByLabel("Search hosts").fill("artem");
+    await page.locator("a.wcard").first().click();
+    await expect(page).toHaveURL(/cve=.*q=artem/);
+    await expect(page.getByLabel("Search hosts")).toHaveValue("artem");
+    await expect(hostRow(page, "artemis")).toBeVisible();
+    await expect(hostRow(page, "ares")).toBeHidden();
+
+    await page.getByLabel("Search hosts").fill("");
+    await page.getByRole("link", { name: "Show all hosts" }).click();
+    await expect(page).not.toHaveURL(/q=/);
+    await expect(hostRow(page, "ares")).toBeVisible();
+  });
+
+  test("a browser that refuses storage still runs the page", async ({ page }) => {
+    await page.addInitScript(() => {
+      for (const name of ["localStorage", "sessionStorage"]) {
+        Object.defineProperty(window, name, {
+          get() {
+            throw new Error("denied by policy");
+          },
+        });
+      }
+    });
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto("/");
+    await page.getByLabel("Search hosts").fill("artem");
+    await expect(hostRow(page, "ares")).toBeHidden();
+    await page.locator("a.wcard").first().click();
+    await expect(page).toHaveURL(/cve=/);
+    expect(errors).toEqual([]);
+  });
+
   test("hosts arrange by attention and by name", async ({ page }) => {
     await page.goto("/");
     await page.getByLabel("Arrange by").selectOption("name");

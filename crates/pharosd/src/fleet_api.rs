@@ -125,7 +125,8 @@ fn api_host(view: &FleetView, row: &HostRow) -> ApiHost {
         security: security_text(view, row),
         reboot_due: row.reboot_due(),
         hand_declared: row.declared_check(view).is_some(),
-        stale: update_note_parts(view, row).is_some_and(|note| note.stale),
+        stale: update_note_parts(view, row).is_some_and(|note| note.stale)
+            || row.declared_check(view).is_some_and(|(_, stale)| stale),
     }
 }
 

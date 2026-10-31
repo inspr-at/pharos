@@ -581,24 +581,40 @@ pub(crate) fn update_note_parts(view: &FleetView, row: &HostRow) -> Option<Updat
 }
 
 fn update_note(view: &FleetView, row: &HostRow) -> String {
-    let Some(note) = update_note_parts(view, row) else {
-        return String::new();
-    };
-    let class = if note.class.is_empty() {
-        "update-state".to_string()
-    } else {
-        format!("update-state {}", note.class)
-    };
-    let chip = if note.stale {
-        stale_chip()
-    } else {
-        String::new()
-    };
-    format!(
-        r#"<span class="{class}">{}{}{chip}</span>"#,
-        icon(note.icon, ""),
-        e(&note.text)
-    )
+    let parts = update_note_parts(view, row);
+    let mut html = parts.as_ref().map_or_else(String::new, |note| {
+        let class = if note.class.is_empty() {
+            "update-state".to_string()
+        } else {
+            format!("update-state {}", note.class)
+        };
+        let chip = if note.stale {
+            stale_chip()
+        } else {
+            String::new()
+        };
+        format!(
+            r#"<span class="{class}">{}{}{chip}</span>"#,
+            icon(note.icon, ""),
+            e(&note.text)
+        )
+    });
+    // A fresh report says nothing about a status someone wrote down long ago.
+    if !parts.is_some_and(|note| note.stale) {
+        if let Some((at, true)) = row.declared_check(view) {
+            let _ = write!(
+                html,
+                r#"<span class="update-state">{}Declared CVE status, {}{}</span>"#,
+                icon("hand", ""),
+                at.map_or_else(
+                    || "not verified".to_string(),
+                    |at| format!("verified {}", short_date(at, view.now))
+                ),
+                stale_chip()
+            );
+        }
+    }
+    html
 }
 
 fn commits_behind(commits: u32) -> String {
@@ -1030,7 +1046,7 @@ fn watch_card(
         ""
     };
     format!(
-        r#"<a class="{class}" href="{target}"{current} data-keep-scroll><span class="wcard-top"><span class="{severity_class}">{severity_icon}{severity_label}</span>{state}</span><span class="wcard-name">{name}</span><span class="cve-id">{id}</span>{chips}<span class="wcard-counts">{counts}</span>{workaround}{source}</a>"#,
+        r#"<a class="{class}" href="{target}"{current} data-keep-scroll data-keep-search><span class="wcard-top"><span class="{severity_class}">{severity_icon}{severity_label}</span>{state}</span><span class="wcard-name">{name}</span><span class="cve-id">{id}</span>{chips}<span class="wcard-counts">{counts}</span>{workaround}{source}</a>"#,
         severity_icon = icon(severity_icon, ""),
         name = e(cve_title(cve)),
         id = e(&cve.id),
@@ -1096,7 +1112,7 @@ fn watchlist_html(
                 .hosts_with(index, &[CveStatus::Affected, CveStatus::RebootDue])
                 .len();
             format!(
-                r#"<span class="ink2">{count} for {name}</span><a class="btn" href="{open}">Open CVE{arrow}</a><a class="textlink" href="{all}" data-keep-scroll>Show all hosts</a>"#,
+                r#"<span class="ink2">{count} for {name}</span><a class="btn" href="{open}">Open CVE{arrow}</a><a class="textlink" href="{all}" data-keep-scroll data-keep-search>Show all hosts</a>"#,
                 count = hosts_count(hosts),
                 name = e(cve_title(cve)),
                 open = cve_href(base, &cve.id),
@@ -1170,10 +1186,10 @@ fn handled_rows(entries: &[HandledCves], now: i64, full: bool) -> String {
 }
 
 fn handled_summary(base: &PublicBasePath, view: &FleetView) -> String {
-    let Some(data) = view.data.as_deref() else {
+    if view.data.is_none() {
         return String::new();
-    };
-    let history = data.handled_history(view.now);
+    }
+    let history = view.handled_history();
     let count = history.iter().map(|entry| entry.ids.len()).sum::<usize>();
     let summary = match history.first() {
         Some(latest) => format!(
@@ -1279,7 +1295,16 @@ pub(super) fn render_fleet(
     } = fleet_counts(view);
     let metrics = format!(
         r#"<section class="metrics" aria-label="Fleet summary">{}{}{}{}</section>"#,
-        metric("", "server", view.rows.len() as u32, "hosts"),
+        metric(
+            "",
+            "server",
+            view.rows.len() as u32,
+            if view.rows.len() == 1 {
+                "host"
+            } else {
+                "hosts"
+            }
+        ),
         metric(
             if affected > 0 { "m-down" } else { "m-ok" },
             if affected > 0 { "high" } else { "check" },
@@ -1291,7 +1316,11 @@ pub(super) fn render_fleet(
             if reboots > 0 { "m-sun" } else { "" },
             "reboot",
             reboots,
-            "reboots due"
+            if reboots == 1 {
+                "reboot due"
+            } else {
+                "reboots due"
+            }
         ),
     );
     let coverage = format!(
@@ -1567,6 +1596,14 @@ pub(super) fn render_updates(
     let mut current = Vec::new();
     for row in &view.rows {
         let age = report_age(row).map(ago).unwrap_or_default();
+        let chip = if matches!(
+            row.updates.source,
+            UpdatesSource::Report { stale: true, .. }
+        ) {
+            stale_chip()
+        } else {
+            String::new()
+        };
         for due in &row.updates.due {
             match due {
                 UpdateDue::Reboot {
@@ -1586,7 +1623,7 @@ pub(super) fn render_updates(
                         [
                             version(running_version),
                             version(next_boot_version),
-                            format!("Reboot pending · report {age}"),
+                            format!("Reboot pending · report {age}{chip}"),
                         ],
                     ));
                 }
@@ -1598,7 +1635,7 @@ pub(super) fn render_updates(
                     [
                         format!(r#"<span class="warn">{}</span>"#, commits_behind(*commits)),
                         "Waiting for the next deploy".to_string(),
-                        format!("Report {age}"),
+                        format!("Report {age}{chip}"),
                     ],
                 )),
                 UpdateDue::OldNixpkgs { age_days } => old.push(updates_row(
@@ -1611,7 +1648,7 @@ pub(super) fn render_updates(
                             format!(r#"<span class="mono">{}</span>"#, e(channel))
                         }),
                         format!(r#"<span class="warn">Lock {age_days} d old</span>"#),
-                        format!("Older than {OLD_NIXPKGS_AFTER_DAYS} d · report {age}"),
+                        format!("Older than {OLD_NIXPKGS_AFTER_DAYS} d · report {age}{chip}"),
                     ],
                 )),
             }
@@ -1707,7 +1744,11 @@ pub(super) fn render_updates(
             if reboot.is_empty() { "" } else { "m-sun" },
             "reboot",
             reboot.len() as u32,
-            "reboots due"
+            if reboot.len() == 1 {
+                "reboot due"
+            } else {
+                "reboots due"
+            }
         ),
         metric(
             if behind.is_empty() { "" } else { "m-sun" },
@@ -1723,13 +1764,19 @@ pub(super) fn render_updates(
         ),
         metric("", "hand", declared.len() as u32, "hand-declared"),
     );
-    let nothing_due = if reboot.is_empty() && behind.is_empty() && old.is_empty() {
+    let nothing_known_due = reboot.is_empty() && behind.is_empty() && old.is_empty();
+    let nothing_due = if !nothing_known_due || view.rows.is_empty() {
+        String::new()
+    } else if unknown.is_empty() && declared.is_empty() {
         format!(
             r#"<p class="note">{}Nothing is due.</p>"#,
             icon("check", "ok")
         )
     } else {
-        String::new()
+        format!(
+            r#"<p class="note">{}Nothing is known to be due, but Pharos can't tell for every host.</p>"#,
+            icon("info", "")
+        )
     };
     let main = format!(
         "{head}{notice}{metrics}{nothing_due}{a}{b}{c}{d}{f}{g}",
@@ -1798,11 +1845,7 @@ pub(super) fn render_handled(
     user: Option<&AuthUser>,
     view: &FleetView,
 ) -> String {
-    let history = view
-        .data
-        .as_deref()
-        .map(|data| data.handled_history(view.now))
-        .unwrap_or_default();
+    let history = view.handled_history();
     let count = history.iter().map(|entry| entry.ids.len()).sum::<usize>();
     let meta = match history.first() {
         Some(latest) => format!(
@@ -1859,13 +1902,13 @@ fn cve_note(view: &FleetView, row: &HostRow, cve: &FleetCve, on: &CveOnHost) -> 
             ),
             false,
         ),
-        (CveStatus::RebootDue, _) => (
+        (CveStatus::RebootDue, source) => (
             format!(
                 "Running {} · next boot {}",
                 kernel,
                 row.next_boot().unwrap_or("unknown")
             ),
-            false,
+            matches!(source, CveStatusSource::Computed { stale: true, .. }),
         ),
         (
             status,
@@ -2232,11 +2275,10 @@ fn tile(label: &str, class: &str, icon_name: &str, value: &str, sub: &str) -> St
 }
 
 fn updates_tiles(view: &FleetView, row: &HostRow) -> (String, String) {
-    let Some(host) = row
-        .report
-        .as_ref()
-        .filter(|_| !matches!(row.updates.state, UpdatesState::HandDeclared))
-    else {
+    // A host that registered but never reported has nothing to show here yet.
+    let Some(host) = row.report.as_ref().filter(|host| {
+        host.last_seen.is_some() && !matches!(row.updates.state, UpdatesState::HandDeclared)
+    }) else {
         let declared = row.declared.as_ref();
         let os = declared
             .map(|_| declared_os(row))
@@ -3028,5 +3070,168 @@ mod tests {
         assert!(page.contains("No result yet"));
         assert!(page.contains("Probe · reachability only"));
         assert!(!page.contains("Not probed"));
+    }
+
+    fn fixed_long_ago(id: &str) -> serde_json::Value {
+        let mut cve = kernel_cve(id, "6.18.56");
+        cve["state"] = serde_json::json!("fixed");
+        cve["fixed_on"] = serde_json::json!("2000-02-01");
+        cve
+    }
+
+    fn old_report(running: &str, next_boot: &str) -> Host {
+        let mut host = report("ares", running, next_boot);
+        host.last_seen = Some(NOW - 2 * 86_400);
+        host
+    }
+
+    #[test]
+    fn a_fixed_cve_stays_watched_while_a_host_is_still_on_it() {
+        let fleet = || {
+            data(
+                serde_json::json!([fixed_long_ago("CVE-2000-0001")]),
+                serde_json::json!([listed("ares", serde_json::json!({}))]),
+            )
+        };
+        for (running, next_boot) in [("6.18.52", "6.18.52"), ("6.18.52", "6.18.56")] {
+            let view = view_of(Some(fleet()), None, vec![old_report(running, next_boot)]);
+            assert_eq!(view.watchlist, [0], "{running} {next_boot}");
+            assert_eq!(fleet_counts(&view).affected, 1, "{running} {next_boot}");
+            assert!(view.handled_history().is_empty(), "{running} {next_boot}");
+            let page = fleet_page(&view);
+            assert!(page.contains(r#"<span class="cve-id">CVE-2000-0001</span>"#));
+        }
+
+        let patched = view_of(
+            Some(fleet()),
+            None,
+            vec![report("ares", "6.18.56", "6.18.56")],
+        );
+        assert!(patched.watchlist.is_empty());
+        assert_eq!(fleet_counts(&patched).affected, 0);
+        assert_eq!(patched.handled_history().len(), 1);
+
+        // A host Pharos can't check doesn't hold a fixed CVE on the list for ever.
+        let silent = view_of(Some(fleet()), None, Vec::new());
+        assert!(silent.watchlist.is_empty());
+        assert_eq!(silent.handled_history().len(), 1);
+    }
+
+    #[test]
+    fn a_host_affected_by_one_cve_and_unchecked_on_another_counts_in_both() {
+        let view = view_of(
+            Some(data(
+                serde_json::json!([
+                    kernel_cve("CVE-2000-0001", "6.18.56"),
+                    library_cve("CVE-2000-0002")
+                ]),
+                serde_json::json!([listed("ares", serde_json::json!({}))]),
+            )),
+            None,
+            vec![report("ares", "6.18.52", "6.18.52")],
+        );
+        let counts = fleet_counts(&view);
+        assert_eq!((counts.affected, counts.unknown), (1, 1));
+        let rows: Vec<&HostRow> = view.rows.iter().collect();
+        assert_eq!(group_summary(&view, &rows), "1 affected · 1 can't check");
+    }
+
+    #[test]
+    fn nothing_is_due_only_when_pharos_can_say_so_for_every_host() {
+        let updates = |hosts: serde_json::Value, reports: Vec<Host>| {
+            let view = view_of(Some(data(serde_json::json!([]), hosts)), None, reports);
+            render_updates(&PublicBasePath::root(), None, &view)
+        };
+        let ares = serde_json::json!([listed("ares", serde_json::json!({}))]);
+
+        let mut answered = report("ares", "6.18.56", "6.18.56");
+        answered.freshness.applicable = false;
+        let current = updates(ares.clone(), vec![answered]);
+        assert!(current.contains("Nothing is due."), "{current}");
+
+        let never = updates(ares, Vec::new());
+        assert!(!never.contains("Nothing is due."), "{never}");
+        assert!(never.contains("Nothing is known to be due"), "{never}");
+
+        let empty = updates(serde_json::json!([]), Vec::new());
+        assert!(!empty.contains("Nothing is"), "{empty}");
+    }
+
+    #[test]
+    fn an_old_report_is_marked_stale_wherever_it_is_used() {
+        let chip = r#"class="stale""#;
+        let view = view_of(
+            Some(data(
+                serde_json::json!([kernel_cve("CVE-2000-0001", "6.18.56")]),
+                serde_json::json!([listed("ares", serde_json::json!({}))]),
+            )),
+            None,
+            vec![old_report("6.18.52", "6.18.56")],
+        );
+        let cve = render_cve(&PublicBasePath::root(), None, &view, "CVE-2000-0001").unwrap();
+        assert!(cve.contains(chip), "{cve}");
+        let updates = render_updates(&PublicBasePath::root(), None, &view);
+        assert!(updates.contains(chip), "{updates}");
+
+        let fresh = view_of(
+            Some(data(
+                serde_json::json!([kernel_cve("CVE-2000-0001", "6.18.56")]),
+                serde_json::json!([listed("ares", serde_json::json!({}))]),
+            )),
+            None,
+            vec![report("ares", "6.18.52", "6.18.56")],
+        );
+        let cve = render_cve(&PublicBasePath::root(), None, &fresh, "CVE-2000-0001").unwrap();
+        assert!(!cve.contains(chip), "{cve}");
+        let updates = render_updates(&PublicBasePath::root(), None, &fresh);
+        assert!(!updates.contains(chip), "{updates}");
+    }
+
+    #[test]
+    fn a_fresh_report_does_not_vouch_for_an_old_declared_status() {
+        let row_with = |verified: &str| {
+            view_of(
+                Some(data(
+                    serde_json::json!([library_cve("CVE-2000-0002")]),
+                    serde_json::json!([listed(
+                        "ares",
+                        serde_json::json!({
+                            "CVE-2000-0002": { "state": "affected", "last_verified": verified }
+                        })
+                    )]),
+                )),
+                None,
+                vec![report("ares", "6.18.56", "6.18.56")],
+            )
+        };
+        let old = row_with("2000-01-10T00:00:00Z");
+        let note = update_note(&old, old.row("ares").unwrap());
+        assert!(
+            note.contains("Declared CVE status, verified 10 Jan"),
+            "{note}"
+        );
+        assert!(note.contains(r#"class="stale""#), "{note}");
+
+        let recent = row_with("2000-02-25T00:00:00Z");
+        let note = update_note(&recent, recent.row("ares").unwrap());
+        assert!(!note.contains("Declared CVE status"), "{note}");
+        assert!(!note.contains(r#"class="stale""#), "{note}");
+    }
+
+    #[test]
+    fn a_host_that_never_reported_has_no_report_age() {
+        let mut host = report("ares", "6.18.56", "6.18.56");
+        host.last_seen = None;
+        let view = view_of(
+            Some(data(
+                serde_json::json!([]),
+                serde_json::json!([listed("ares", serde_json::json!({}))]),
+            )),
+            None,
+            vec![host],
+        );
+        let page = render_host(&PublicBasePath::root(), None, &view, "ares").unwrap();
+        assert!(page.contains("No report from this host"), "{page}");
+        assert!(!page.contains("under 1 min ago"), "{page}");
     }
 }

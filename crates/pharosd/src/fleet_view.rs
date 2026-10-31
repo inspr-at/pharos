@@ -10,7 +10,9 @@ use pharos_core::contact::{
 use pharos_core::cve_status::{
     host_cve_status, CveStatus, CveStatusSource, HostCveStatus, KernelReport,
 };
-use pharos_core::fleet_data::{CveSeverity, FleetCve, FleetData, FleetHost};
+use pharos_core::fleet_data::{
+    CveSeverity, FleetCve, FleetCveState, FleetData, FleetHost, HandledCves,
+};
 use pharos_core::updates_due::{host_updates, HostUpdates, UpdateDue};
 use pharos_core::{liveness, Host, KernelPostureState};
 use time::format_description::well_known::Rfc3339;
@@ -353,12 +355,7 @@ impl FleetView {
 
         let watchlist = data
             .as_deref()
-            .map(|data| {
-                data.watchlist(now)
-                    .into_iter()
-                    .filter_map(|cve| data.cves.iter().position(|other| other.id == cve.id))
-                    .collect()
-            })
+            .map(|data| watched(data, &rows, now))
             .unwrap_or_default();
         Self {
             data,
@@ -372,6 +369,20 @@ impl FleetView {
 
     pub(crate) fn row(&self, name: &str) -> Option<&HostRow> {
         self.rows.iter().find(|row| row.name == name)
+    }
+
+    /// The handled history, without the CVEs a host keeps on the watchlist.
+    pub(crate) fn handled_history(&self) -> Vec<HandledCves> {
+        let Some(data) = self.data.as_deref() else {
+            return Vec::new();
+        };
+        let watched: Vec<&str> = self
+            .watchlist
+            .iter()
+            .filter_map(|index| data.cves.get(*index))
+            .map(|cve| cve.id.as_str())
+            .collect();
+        data.handled_history_without(self.now, &watched)
     }
 
     /// The latest report from any host.
@@ -394,6 +405,31 @@ impl FleetView {
             .filter(|(_, on)| statuses.contains(&on.status.status))
             .collect()
     }
+}
+
+/// The file's watchlist, plus any fixed CVE past its days that a host is still on,
+/// so it cannot leave the page while that host stays affected.
+fn watched(data: &FleetData, rows: &[HostRow], now: i64) -> Vec<usize> {
+    let listed = data.watchlist(now);
+    let needed = |index: usize| {
+        rows.iter().any(|row| {
+            row.on(index).is_some_and(|on| {
+                matches!(on.status.status, CveStatus::Affected | CveStatus::RebootDue)
+            })
+        })
+    };
+    let mut watched: Vec<usize> = data
+        .cves
+        .iter()
+        .enumerate()
+        .filter(|(index, cve)| listed.iter().any(|other| other.id == cve.id) || needed(*index))
+        .map(|(index, _)| index)
+        .collect();
+    watched.sort_by_key(|index| {
+        let cve = &data.cves[*index];
+        (cve.state == FleetCveState::Fixed, cve.severity)
+    });
+    watched
 }
 
 fn host_row(

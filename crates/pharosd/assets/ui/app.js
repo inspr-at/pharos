@@ -1,15 +1,16 @@
 // Theme, menu, live search and a quiet refresh. The pages work without it.
 (() => {
-  const stored = (storage, key) => {
+  // A browser policy can make reaching the storage itself throw, so take its name.
+  const stored = (name, key) => {
     try {
-      return storage.getItem(key);
+      return window[name].getItem(key);
     } catch {
       return null;
     }
   };
-  const store = (storage, key, value) => {
+  const store = (name, key, value) => {
     try {
-      storage.setItem(key, value);
+      window[name].setItem(key, value);
     } catch {
       // Private windows may refuse storage; the choice just does not persist.
     }
@@ -20,7 +21,7 @@
   const REFRESH_MS = 60_000;
 
   const root = document.documentElement;
-  const saved = stored(localStorage, THEME_KEY);
+  const saved = stored("localStorage", THEME_KEY);
   const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
   root.dataset.theme = saved === "light" || saved === "dark" ? saved : prefersDark ? "dark" : "light";
 
@@ -44,10 +45,16 @@
     }
     const empty = document.querySelector("[data-host-empty]");
     if (empty) empty.hidden = Boolean(document.querySelector("[data-host-group]:not([hidden])"));
-    const url = new URL(window.location.href);
-    if (query) url.searchParams.set("q", input.value.trim());
-    else url.searchParams.delete("q");
-    window.history.replaceState(null, "", url);
+    const keep = (url) => {
+      if (query) url.searchParams.set("q", input.value.trim());
+      else url.searchParams.delete("q");
+      return url;
+    };
+    window.history.replaceState(null, "", keep(new URL(window.location.href)));
+    // Links drawn by the server still carry the search it was drawn with.
+    for (const link of document.querySelectorAll("a[data-keep-search]")) {
+      link.href = keep(new URL(link.href));
+    }
   };
 
   document.addEventListener("DOMContentLoaded", () => {
@@ -55,7 +62,7 @@
     for (const button of document.querySelectorAll("[data-set-theme]")) {
       button.addEventListener("click", () => {
         root.dataset.theme = button.dataset.setTheme;
-        store(localStorage, THEME_KEY, root.dataset.theme);
+        store("localStorage", THEME_KEY, root.dataset.theme);
         showTheme();
       });
     }
@@ -80,12 +87,12 @@
 
     // Selecting a card loads the same page, so keep the reader where they were.
     for (const link of document.querySelectorAll("[data-keep-scroll]")) {
-      link.addEventListener("click", () => store(sessionStorage, SCROLL_KEY, String(window.scrollY)));
+      link.addEventListener("click", () => store("sessionStorage", SCROLL_KEY, String(window.scrollY)));
     }
-    const scroll = stored(sessionStorage, SCROLL_KEY);
+    const scroll = stored("sessionStorage", SCROLL_KEY);
     if (scroll !== null) {
       try {
-        sessionStorage.removeItem(SCROLL_KEY);
+        window.sessionStorage.removeItem(SCROLL_KEY);
       } catch {
         // Nothing to clean up without storage.
       }

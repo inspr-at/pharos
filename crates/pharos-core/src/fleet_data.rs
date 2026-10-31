@@ -256,11 +256,19 @@ impl FleetData {
     /// that have left the watchlist, so none vanishes before the file records it.
     /// A day's entries keep the file's order.
     pub fn handled_history(&self, now: i64) -> Vec<HandledCves> {
+        self.handled_history_without(now, &[])
+    }
+
+    /// The same, leaving out fixed CVEs that stay watched because a host is still
+    /// on them. An entry the file itself wrote always stays.
+    pub fn handled_history_without(&self, now: i64, still_watched: &[&str]) -> Vec<HandledCves> {
         let mut history = self.handled.clone();
         history.extend(
             self.cves
                 .iter()
-                .filter(|cve| cve.left_the_watchlist(now))
+                .filter(|cve| {
+                    cve.left_the_watchlist(now) && !still_watched.contains(&cve.id.as_str())
+                })
                 .map(|cve| HandledCves {
                     ids: vec![cve.id.clone()],
                     name: cve.name.clone(),
@@ -772,6 +780,17 @@ mod tests {
                 "CVE-2000-0016",
             ]
         );
+    }
+
+    #[test]
+    fn a_cve_a_host_is_still_on_stays_out_of_the_handled_history() {
+        let data = FleetData::parse(&watch_fixture().to_string()).expect("valid");
+        let now = january_2000(20);
+        let has =
+            |history: Vec<HandledCves>| history.iter().any(|entry| entry.ids == ["CVE-2000-0011"]);
+        assert!(has(data.handled_history(now)));
+        assert!(!has(data.handled_history_without(now, &["CVE-2000-0011"])));
+        assert!(has(data.handled_history_without(now, &["CVE-2000-0012"])));
     }
 
     #[test]

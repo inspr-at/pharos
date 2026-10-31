@@ -109,6 +109,12 @@ impl PublicOrigin {
     }
 }
 
+/// The first segment of every route, which a mount must not share.
+const RESERVED_FIRST_SEGMENTS: [&str; 11] = [
+    "assets", "auth", "cves", "handled", "healthz", "hosts", "readyz", "register", "report",
+    "updates", "version",
+];
+
 pub fn normalize_public_base_path(value: &str) -> Result<String, String> {
     if value.is_empty() {
         return Ok(String::new());
@@ -146,6 +152,13 @@ pub fn normalize_public_base_path(value: &str) -> Result<String, String> {
     }
     if segments.is_empty() {
         return Err("public base path must use one or more [A-Za-z0-9_-] segments".to_string());
+    }
+    // A link to `/hosts/ares` under a mount at `/hosts` would look already mounted.
+    if RESERVED_FIRST_SEGMENTS.contains(&segments[0]) {
+        return Err(format!(
+            "public base path must not start with /{}, which Pharos uses as a route",
+            segments[0]
+        ));
     }
     Ok(value.to_string())
 }
@@ -301,6 +314,30 @@ fn valid_origin_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mount_cannot_share_a_routes_first_segment() {
+        for mount in [
+            "/assets",
+            "/auth",
+            "/cves",
+            "/handled",
+            "/healthz",
+            "/hosts",
+            "/hosts/ares",
+            "/readyz",
+            "/register",
+            "/report",
+            "/updates",
+            "/version",
+        ] {
+            let error = PublicBasePath::parse(mount).unwrap_err();
+            assert!(error.contains("uses as a route"), "{mount}: {error}");
+        }
+        for mount in ["/pharos", "/ops/hosts", "/hostsx", "/updates-page"] {
+            assert!(PublicBasePath::parse(mount).is_ok(), "{mount}");
+        }
+    }
 
     #[test]
     fn empty_default_is_standalone_root() {
