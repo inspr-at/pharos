@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## Unreleased
+
+- Accept `PHAROS_OPERATOR_TOKEN=<token>` in the CLI operator token file and prefer a non-empty `PHAROS_OPERATOR_TOKEN` environment value over the file (PHAROS-353).
+
 ## 261031180823.0.0 - 2026-10-31
 
 - Release image: Debian snapshot 20261031T120000Z, for `libbrotli1` 1.0.9-2+deb12u1 (CVE-2026-111497, CRITICAL) and `libssl3` and `openssl` 3.0.22-1~deb12u2 (CVE-2026-84782, HIGH). The release scan refused the 261031155226.0.0 candidate on these; 261031155226.0.0 was never published and stays in the history at sequence 28 (PHAROS-345).
@@ -63,8 +67,6 @@
 ## 260922214617.0.0 - 2026-09-22
 
 - Fleet cards, list and quick preview rebuilt on the approved Harbor design: fluid grid that fills the viewport (1 to 5 columns), fixed card regions with one attention line, a two-column protection panel, the moving heartbeat stage and a configuration footer; six-column list; 420px quick preview sheet with exact times and heartbeat history; phone and tablet layouts without horizontal scroll (PHAROS-310).
-
-## Unreleased
 
 ## 260922141211.0.0 - 2026-09-22
 

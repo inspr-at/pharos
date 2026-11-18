@@ -140,6 +140,18 @@ pharos updates
 `health` and `version` work without a token and say more with one; everything
 else needs it. A rejected token fails the command.
 
+The mode-0600 token file accepts a raw token or an assignment line. The
+assignment line must be exactly `PHAROS_OPERATOR_TOKEN=<token>`: unquoted,
+with no `export` and no leading space. Anything else is sent unchanged and
+is rejected.
+
+Alternatively, export `PHAROS_OPERATOR_TOKEN` from a sourced secret file. Never
+put the value on a command line, where it can enter shell history; child
+processes inherit the environment. A non-empty environment value takes
+precedence over the file. A non-empty but invalid value fails the command; it
+does not fall back to the file. A trailing CR in the environment value is not
+trimmed and fails validation. An empty value falls back to the file.
+
 ## Trust model
 
 - Human and machine routes are separate. A bearer credential is refused on
