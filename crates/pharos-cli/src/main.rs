@@ -684,7 +684,7 @@ mod tests {
 
     impl Drop for TokenDirectory {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -756,7 +756,10 @@ mod tests {
                 format!("{TOKEN_FILE_ENV} is not a safe regular file")
             );
         }
-        assert!(operator_token(directory.0.to_str().unwrap()).is_err());
+        assert_eq!(
+            operator_token(directory.0.to_str().unwrap()).unwrap_err(),
+            format!("{TOKEN_FILE_ENV} is not a safe regular file")
+        );
     }
 
     #[cfg(unix)]
@@ -802,7 +805,10 @@ mod tests {
         }
         for token in [None, Some("")] {
             assert_eq!(configured_token_from_values(false, token, None), Ok(None));
-            assert!(configured_token_from_values(true, token, None).is_err());
+            assert_eq!(
+                configured_token_from_values(true, token, None).unwrap_err(),
+                format!("{TOKEN_ENV} or {TOKEN_FILE_ENV} is required for this command")
+            );
         }
     }
 
@@ -813,6 +819,7 @@ mod tests {
         for value in [
             "dummy\tvalue".to_string(),
             "dummy\n".to_string(),
+            "dummy\r".to_string(),
             "dummy\u{85}value".to_string(),
             "d".repeat(4097),
         ] {

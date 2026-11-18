@@ -178,6 +178,52 @@ test.describe("the pharos CLI", () => {
     expect(unset.stderr).toContain("rejected");
   });
 
+  test("hosts accepts an exact assignment line in the token file", async () => {
+    const token = fs.readFileSync(TOKEN_FILE, "utf8").trimEnd();
+    const assignmentFile = path.join(RUN_DIR, "assignment-token");
+    fs.writeFileSync(assignmentFile, `PHAROS_OPERATOR_TOKEN=${token}\n`, { mode: 0o600 });
+    const result = await pharos(["hosts"], { PHAROS_OPERATOR_TOKEN_FILE: assignmentFile });
+    expect(result.code).toBe(0);
+  });
+
+  test("hosts accepts an environment token without a token file", async () => {
+    const token = fs.readFileSync(TOKEN_FILE, "utf8").trimEnd();
+    const result = await pharos(["hosts"], {
+      PHAROS_OPERATOR_TOKEN: token,
+      PHAROS_OPERATOR_TOKEN_FILE: undefined,
+    });
+    expect(result.code).toBe(0);
+  });
+
+  test("an environment token wins over a wrong token file", async () => {
+    const token = fs.readFileSync(TOKEN_FILE, "utf8").trimEnd();
+    const wrongFile = path.join(RUN_DIR, "wrong-token");
+    fs.writeFileSync(wrongFile, "not-the-token", { mode: 0o600 });
+    const result = await pharos(["hosts"], {
+      PHAROS_OPERATOR_TOKEN: token,
+      PHAROS_OPERATOR_TOKEN_FILE: wrongFile,
+    });
+    expect(result.code).toBe(0);
+  });
+
+  test("an empty environment token falls back to the token file", async () => {
+    const result = await pharos(["hosts"], {
+      PHAROS_OPERATOR_TOKEN: "",
+      PHAROS_OPERATOR_TOKEN_FILE: TOKEN_FILE,
+    });
+    expect(result.code).toBe(0);
+  });
+
+  test("a wrong environment token is rejected without falling back or printing data", async () => {
+    const result = await pharos(["hosts"], {
+      PHAROS_OPERATOR_TOKEN: "not-the-token",
+      PHAROS_OPERATOR_TOKEN_FILE: TOKEN_FILE,
+    });
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("Pharos rejected the operator token");
+    expect(result.stdout).toBe("");
+  });
+
   test("the server refuses to start with a bad token hash file", async () => {
     const run = (hashFile) =>
       new Promise((resolve) => {
