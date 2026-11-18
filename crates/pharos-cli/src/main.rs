@@ -10,6 +10,7 @@ use url::Url;
 
 const USAGE: &str =
     "usage: pharos <health|version|hosts|beacon [HOST]|beacon last-seen [HOST]|cves|updates>";
+const TOKEN_ENV: &str = "PHAROS_OPERATOR_TOKEN";
 const TOKEN_FILE_ENV: &str = "PHAROS_OPERATOR_TOKEN_FILE";
 const FLEET_VIEW_SCHEMA: &str = "inspr.pharos.fleet-view.v1";
 
@@ -114,19 +115,47 @@ fn operator_token(path: &str) -> Result<String, String> {
     }
     let value = std::fs::read_to_string(path)
         .map_err(|_| format!("{TOKEN_FILE_ENV} is not readable UTF-8"))?;
-    let value = value.trim_end_matches(['\r', '\n']).to_string();
+    let value = value.trim_end_matches(['\r', '\n']);
+    let value = value
+        .strip_prefix("PHAROS_OPERATOR_TOKEN=")
+        .unwrap_or(value);
+    validate_token(value, TOKEN_FILE_ENV)
+}
+
+fn validate_token(value: &str, source: &str) -> Result<String, String> {
     if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
-        return Err(format!("{TOKEN_FILE_ENV} contains an invalid credential"));
+        return Err(format!("{source} contains an invalid credential"));
     }
-    Ok(value)
+    Ok(value.to_string())
 }
 
 /// The token when one is set up. Commands that need it fail without it.
 fn configured_token(required: bool) -> Result<Option<String>, String> {
-    match std::env::var(TOKEN_FILE_ENV) {
-        Ok(path) => operator_token(&path).map(Some),
-        Err(_) if required => Err(format!("{TOKEN_FILE_ENV} is required for this command")),
-        Err(_) => Ok(None),
+    let token = match std::env::var(TOKEN_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{TOKEN_ENV} contains an invalid credential"));
+        }
+    };
+    let path = std::env::var(TOKEN_FILE_ENV).ok();
+    configured_token_from_values(required, token.as_deref(), path.as_deref())
+}
+
+fn configured_token_from_values(
+    required: bool,
+    token: Option<&str>,
+    path: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(value) = token.filter(|value| !value.is_empty()) {
+        return validate_token(value, TOKEN_ENV).map(Some);
+    }
+    match path {
+        Some(path) => operator_token(path).map(Some),
+        None if required => Err(format!(
+            "{TOKEN_ENV} or {TOKEN_FILE_ENV} is required for this command"
+        )),
+        None => Ok(None),
     }
 }
 
@@ -614,9 +643,193 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use serde_json::json;
 
     use super::*;
+
+    struct TokenDirectory(PathBuf);
+
+    impl TokenDirectory {
+        fn new() -> Self {
+            static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+            loop {
+                let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("pharos-cli-token-{}-{id}", std::process::id()));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("could not create test directory: {error}"),
+                }
+            }
+        }
+
+        fn write(&self, name: &str, value: &[u8]) -> String {
+            let path = self.0.join(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(&path).unwrap().write_all(value).unwrap();
+            path.to_str().unwrap().to_string()
+        }
+    }
+
+    impl Drop for TokenDirectory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn token_files_accept_raw_tokens_and_only_the_exact_assignment_prefix() {
+        let directory = TokenDirectory::new();
+        for (index, (contents, expected)) in [
+            ("dummy", "dummy"),
+            ("dummy\n", "dummy"),
+            ("PHAROS_OPERATOR_TOKEN=dummy", "dummy"),
+            ("PHAROS_OPERATOR_TOKEN=dummy\n", "dummy"),
+            ("PHAROS_OPERATOR_TOKEN=dummy\r\n", "dummy"),
+            ("OTHER=dummy", "OTHER=dummy"),
+            ("ab=cd", "ab=cd"),
+            ("PHAROS_OPERATOR_TOKEN=ab=cd", "ab=cd"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = directory.write(&index.to_string(), contents.as_bytes());
+            assert_eq!(operator_token(&path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn token_files_reject_empty_invalid_utf8_and_control_values_without_echoing_them() {
+        let directory = TokenDirectory::new();
+        for (index, contents) in [
+            "",
+            "\r\n",
+            "PHAROS_OPERATOR_TOKEN=",
+            "PHAROS_OPERATOR_TOKEN=\n",
+            "dummy\nvalue",
+            "PHAROS_OPERATOR_TOKEN=dummy\tvalue",
+            "dummy\u{85}value",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = directory.write(&index.to_string(), contents.as_bytes());
+            assert_eq!(
+                operator_token(&path).unwrap_err(),
+                format!("{TOKEN_FILE_ENV} contains an invalid credential")
+            );
+        }
+        let path = directory.write("invalid-utf8", &[0xff]);
+        assert_eq!(
+            operator_token(&path).unwrap_err(),
+            format!("{TOKEN_FILE_ENV} is not readable UTF-8")
+        );
+    }
+
+    #[test]
+    fn token_files_must_be_regular_and_at_most_4096_bytes_before_trimming_or_stripping() {
+        let directory = TokenDirectory::new();
+        let path = directory.write("maximum", "d".repeat(4096).as_bytes());
+        assert_eq!(operator_token(&path).unwrap().len(), 4096);
+        for (index, contents) in [
+            "d".repeat(4097),
+            format!("{}\n", "d".repeat(4096)),
+            format!("PHAROS_OPERATOR_TOKEN={}", "d".repeat(4096)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = directory.write(&index.to_string(), contents.as_bytes());
+            assert_eq!(
+                operator_token(&path).unwrap_err(),
+                format!("{TOKEN_FILE_ENV} is not a safe regular file")
+            );
+        }
+        assert!(operator_token(directory.0.to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_files_reject_symlinks_and_group_or_other_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = TokenDirectory::new();
+        let path = directory.write("token", b"dummy");
+        let link = directory.0.join("link");
+        symlink(&path, &link).unwrap();
+        assert_eq!(
+            operator_token(link.to_str().unwrap()).unwrap_err(),
+            format!("{TOKEN_FILE_ENV} is not a safe regular file")
+        );
+        for mode in [0o640, 0o604, 0o610] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                operator_token(&path).unwrap_err(),
+                format!("{TOKEN_FILE_ENV} must not be accessible by group or others")
+            );
+        }
+    }
+
+    #[test]
+    fn a_nonempty_environment_token_wins_and_an_empty_one_falls_back_to_the_file() {
+        let directory = TokenDirectory::new();
+        let path = directory.write("token", b"PHAROS_OPERATOR_TOKEN=dummy-file\n");
+        let missing = directory.0.join("missing");
+        for required in [false, true] {
+            for file in [Some(path.as_str()), missing.to_str(), None] {
+                assert_eq!(
+                    configured_token_from_values(required, Some("dummy-env"), file).unwrap(),
+                    Some("dummy-env".to_string())
+                );
+            }
+            for token in [None, Some("")] {
+                assert_eq!(
+                    configured_token_from_values(required, token, Some(&path)).unwrap(),
+                    Some("dummy-file".to_string())
+                );
+            }
+        }
+        for token in [None, Some("")] {
+            assert_eq!(configured_token_from_values(false, token, None), Ok(None));
+            assert!(configured_token_from_values(true, token, None).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_environment_tokens_fail_without_echoing_or_falling_back() {
+        let directory = TokenDirectory::new();
+        let path = directory.write("token", b"dummy-file");
+        for value in [
+            "dummy\tvalue".to_string(),
+            "dummy\n".to_string(),
+            "dummy\u{85}value".to_string(),
+            "d".repeat(4097),
+        ] {
+            for required in [false, true] {
+                let error =
+                    configured_token_from_values(required, Some(&value), Some(&path)).unwrap_err();
+                assert_eq!(error, format!("{TOKEN_ENV} contains an invalid credential"));
+                assert!(!error.contains(&value));
+            }
+        }
+        for value in ["d".repeat(4096), "ab=cd".to_string()] {
+            assert_eq!(
+                configured_token_from_values(true, Some(&value), None).unwrap(),
+                Some(value)
+            );
+        }
+    }
 
     fn fleet() -> Value {
         json!({

@@ -139,6 +139,8 @@ pharos updates
 
 `health` and `version` work without a token and say more with one; everything
 else needs it. A rejected token fails the command.
+The mode-0600 token file accepts a raw token or `PHAROS_OPERATOR_TOKEN=<token>`.
+Alternatively, set `PHAROS_OPERATOR_TOKEN` in the environment; a non-empty value takes precedence over the file.
 
 ## Trust model
 

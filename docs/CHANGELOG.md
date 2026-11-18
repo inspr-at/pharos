@@ -66,6 +66,8 @@
 
 ## Unreleased
 
+- Accept `PHAROS_OPERATOR_TOKEN=<token>` in the CLI operator token file and prefer a non-empty `PHAROS_OPERATOR_TOKEN` environment value over the file (PHAROS-353).
+
 ## 260922141211.0.0 - 2026-09-22
 
 - Restore compact host cards and list rows with consistent typography, spacing and centered health marks, retaining the sidebar, header and lighthouse artwork (PHAROS-302).
